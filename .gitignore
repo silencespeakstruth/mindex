@@ -1,0 +1,9 @@
+/target
+
+*pem
+
+.vscode
+
+*.db*
+
+.claude/settings.local.json

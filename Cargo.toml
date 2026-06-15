@@ -1,0 +1,30 @@
+[package]
+name = "mindex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["json", "macros"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tree-sitter = "0.26.9"
+tree-sitter-rust = "0.24.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokenizers = { version = "0.23.1", features = ["http"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7.18", features = ["rt", "futures-util"] }
+rusqlite = { version = "0.40.0", features = ["bundled", "hooks", "uuid"] }
+uuid = { version = "1.23.2", features = ["serde", "v4"] }
+sha2 = "0.11.0"
+hex = "0.4.3"
+reqwest = { version = "0.13.4", features = ["json"] }
+async-trait = "0.1.89"
+url = "2.5.8"
+bytemuck = "1.25.0"
+clap = { version = "4.6.1", features = ["derive"] }
+qdrant-client = "1.18.0"
+glob = "0.3.3"
