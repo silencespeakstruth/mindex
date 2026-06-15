@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     let t0 = Instant::now();
 
     let mut new_chunks: u64 = 0;
-    let mut n_unchanged: u64 = 0;
+    let mut n_no_chunks: u64 = 0;
     let mut n_errors: usize = 0;
     let mut n_done: usize = 0;
 
@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(resp) => {
-                tally_response(&resp, &mut new_chunks, &mut n_unchanged);
+                tally_response(&resp, &mut new_chunks, &mut n_no_chunks);
                 if cli.verbose {
                     print_verbose(&pb, &resp);
                 }
@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
     pb.finish_and_clear();
 
     // ── Summary ──────────────────────────────────────────────────────────────
-    print_summary(t0.elapsed(), total, new_chunks, n_unchanged, n_errors, cancel.is_cancelled());
+    print_summary(t0.elapsed(), total, new_chunks, n_no_chunks, n_errors, cancel.is_cancelled());
 
     if cancel.is_cancelled() || n_errors > 0 {
         std::process::exit(1);
@@ -261,11 +261,11 @@ fn print_scan_summary(scan: &ScanResult) {
     eprintln!("\n");
 }
 
-fn tally_response(resp: &IndexResponse, new_chunks: &mut u64, n_unchanged: &mut u64) {
+fn tally_response(resp: &IndexResponse, new_chunks: &mut u64, n_no_chunks: &mut u64) {
     for paths in resp.files.values() {
         for &count in paths.values() {
             if count == 0 {
-                *n_unchanged += 1;
+                *n_no_chunks += 1;
             } else {
                 *new_chunks += count;
             }
@@ -287,7 +287,7 @@ fn print_verbose(pb: &ProgressBar, resp: &IndexResponse) {
                 "  {} {}  {}",
                 style("⊘").dim(),
                 style(&path).dim(),
-                style("unchanged").dim(),
+                style("0 chunks (too short)").dim(),
             ));
         } else {
             pb.println(format!(
@@ -304,7 +304,7 @@ fn print_summary(
     elapsed: Duration,
     total: usize,
     new_chunks: u64,
-    n_unchanged: u64,
+    n_no_chunks: u64,
     n_errors: usize,
     cancelled: bool,
 ) {
@@ -312,28 +312,28 @@ fn print_summary(
 
     if cancelled {
         eprintln!(
-            "  {} Cancelled after {secs:.1}s — {total} files queued · {} new chunks · {} unchanged · {} errors",
+            "  {} Cancelled after {secs:.1}s — {total} files queued · {} new chunks · {} too short · {} errors",
             style("⚠").yellow(),
             style(new_chunks).green(),
-            n_unchanged,
+            n_no_chunks,
             style(n_errors).red(),
         );
     } else if n_errors > 0 {
         eprintln!(
-            "  {} {secs:.1}s · {} files · {} new chunks · {} unchanged · {} errors",
+            "  {} {secs:.1}s · {} files · {} new chunks · {} too short · {} errors",
             style("⚠").yellow(),
             style(total).bold(),
             style(new_chunks).green(),
-            n_unchanged,
+            n_no_chunks,
             style(n_errors).red(),
         );
     } else {
         eprintln!(
-            "  {} {secs:.1}s · {} files · {} new chunks · {} unchanged",
+            "  {} {secs:.1}s · {} files · {} new chunks · {} too short",
             style("✓").green(),
             style(total).bold(),
             style(new_chunks).green(),
-            n_unchanged,
+            n_no_chunks,
         );
     }
     eprintln!();
