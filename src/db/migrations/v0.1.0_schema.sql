@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS project_files (
     ),
 
     sha256               TEXT    NOT NULL COLLATE NOCASE CHECK (length(sha256) = 64),
-    programming_language TEXT    NOT NULL CHECK (programming_language IN ('rust')),
+    programming_language TEXT    NOT NULL CHECK (programming_language IN (
+        'rust', 'python', 'javascript', 'typescript', 'tsx',
+        'go', 'c', 'cpp', 'java', 'csharp', 'ruby', 'php', 'bash',
+        'html', 'css', 'json', 'scala', 'haskell', 'ocaml', 'zig'
+    )),
 
     status TEXT NOT NULL DEFAULT 'just_uploaded' CHECK (
         status IN ('just_uploaded', 'indexing', 'indexed', 'cancelled', 'failed')

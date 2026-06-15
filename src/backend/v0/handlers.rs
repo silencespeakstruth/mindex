@@ -258,12 +258,30 @@ pub async fn post_index(
                             params![project_guid, path_m, model_id_m],
                         )?;
 
-                        let mut slicer = Slicer::new(
-                            Language::new(match pl {
-                                ProgrammingLanguage::Rust => tree_sitter_rust::LANGUAGE,
-                            }),
-                            &tokenizer,
-                        )
+                        let ts_language = match pl {
+                            ProgrammingLanguage::Rust       => Language::new(tree_sitter_rust::LANGUAGE),
+                            ProgrammingLanguage::Python     => Language::new(tree_sitter_python::LANGUAGE),
+                            ProgrammingLanguage::JavaScript => Language::new(tree_sitter_javascript::LANGUAGE),
+                            ProgrammingLanguage::TypeScript => Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
+                            ProgrammingLanguage::Tsx        => Language::new(tree_sitter_typescript::LANGUAGE_TSX),
+                            ProgrammingLanguage::Go         => Language::new(tree_sitter_go::LANGUAGE),
+                            ProgrammingLanguage::C          => Language::new(tree_sitter_c::LANGUAGE),
+                            ProgrammingLanguage::Cpp        => Language::new(tree_sitter_cpp::LANGUAGE),
+                            ProgrammingLanguage::Java       => Language::new(tree_sitter_java::LANGUAGE),
+                            ProgrammingLanguage::CSharp     => Language::new(tree_sitter_c_sharp::LANGUAGE),
+                            ProgrammingLanguage::Ruby       => Language::new(tree_sitter_ruby::LANGUAGE),
+                            ProgrammingLanguage::Php        => Language::new(tree_sitter_php::LANGUAGE_PHP),
+                            ProgrammingLanguage::Bash       => Language::new(tree_sitter_bash::LANGUAGE),
+                            ProgrammingLanguage::Html       => Language::new(tree_sitter_html::LANGUAGE),
+                            ProgrammingLanguage::Css        => Language::new(tree_sitter_css::LANGUAGE),
+                            ProgrammingLanguage::Json       => Language::new(tree_sitter_json::LANGUAGE),
+                            ProgrammingLanguage::Scala      => Language::new(tree_sitter_scala::LANGUAGE),
+                            ProgrammingLanguage::Haskell    => Language::new(tree_sitter_haskell::LANGUAGE),
+                            ProgrammingLanguage::Ocaml      => Language::new(tree_sitter_ocaml::LANGUAGE_OCAML),
+                            ProgrammingLanguage::Zig        => Language::new(tree_sitter_zig::LANGUAGE),
+                        };
+
+                        let mut slicer = Slicer::new(ts_language, &tokenizer)
                         .map_err(slicer_err_to_pool_err)?;
 
                         let chunks = slicer

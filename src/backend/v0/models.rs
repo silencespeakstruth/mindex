@@ -14,14 +14,51 @@ pub struct Code {
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum ProgrammingLanguage {
-    #[serde(rename = "rust")]
-    Rust,
+    #[serde(rename = "rust")]       Rust,
+    #[serde(rename = "python")]     Python,
+    #[serde(rename = "javascript")] JavaScript,
+    #[serde(rename = "typescript")] TypeScript,
+    #[serde(rename = "tsx")]        Tsx,
+    #[serde(rename = "go")]         Go,
+    #[serde(rename = "c")]          C,
+    #[serde(rename = "cpp")]        Cpp,
+    #[serde(rename = "java")]       Java,
+    #[serde(rename = "csharp")]     CSharp,
+    #[serde(rename = "ruby")]       Ruby,
+    #[serde(rename = "php")]        Php,
+    #[serde(rename = "bash")]       Bash,
+    #[serde(rename = "html")]       Html,
+    #[serde(rename = "css")]        Css,
+    #[serde(rename = "json")]       Json,
+    #[serde(rename = "scala")]      Scala,
+    #[serde(rename = "haskell")]    Haskell,
+    #[serde(rename = "ocaml")]      Ocaml,
+    #[serde(rename = "zig")]        Zig,
 }
 
 impl ToSql for ProgrammingLanguage {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         let val = match self {
-            ProgrammingLanguage::Rust => "rust",
+            ProgrammingLanguage::Rust       => "rust",
+            ProgrammingLanguage::Python     => "python",
+            ProgrammingLanguage::JavaScript => "javascript",
+            ProgrammingLanguage::TypeScript => "typescript",
+            ProgrammingLanguage::Tsx        => "tsx",
+            ProgrammingLanguage::Go         => "go",
+            ProgrammingLanguage::C          => "c",
+            ProgrammingLanguage::Cpp        => "cpp",
+            ProgrammingLanguage::Java       => "java",
+            ProgrammingLanguage::CSharp     => "csharp",
+            ProgrammingLanguage::Ruby       => "ruby",
+            ProgrammingLanguage::Php        => "php",
+            ProgrammingLanguage::Bash       => "bash",
+            ProgrammingLanguage::Html       => "html",
+            ProgrammingLanguage::Css        => "css",
+            ProgrammingLanguage::Json       => "json",
+            ProgrammingLanguage::Scala      => "scala",
+            ProgrammingLanguage::Haskell    => "haskell",
+            ProgrammingLanguage::Ocaml      => "ocaml",
+            ProgrammingLanguage::Zig        => "zig",
         };
         Ok(ToSqlOutput::from(val))
     }
@@ -30,8 +67,27 @@ impl ToSql for ProgrammingLanguage {
 impl FromSql for ProgrammingLanguage {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         match value.as_str()? {
-            "rust" => Ok(ProgrammingLanguage::Rust),
-            _ => Err(rusqlite::types::FromSqlError::InvalidType),
+            "rust"       => Ok(ProgrammingLanguage::Rust),
+            "python"     => Ok(ProgrammingLanguage::Python),
+            "javascript" => Ok(ProgrammingLanguage::JavaScript),
+            "typescript" => Ok(ProgrammingLanguage::TypeScript),
+            "tsx"        => Ok(ProgrammingLanguage::Tsx),
+            "go"         => Ok(ProgrammingLanguage::Go),
+            "c"          => Ok(ProgrammingLanguage::C),
+            "cpp"        => Ok(ProgrammingLanguage::Cpp),
+            "java"       => Ok(ProgrammingLanguage::Java),
+            "csharp"     => Ok(ProgrammingLanguage::CSharp),
+            "ruby"       => Ok(ProgrammingLanguage::Ruby),
+            "php"        => Ok(ProgrammingLanguage::Php),
+            "bash"       => Ok(ProgrammingLanguage::Bash),
+            "html"       => Ok(ProgrammingLanguage::Html),
+            "css"        => Ok(ProgrammingLanguage::Css),
+            "json"       => Ok(ProgrammingLanguage::Json),
+            "scala"      => Ok(ProgrammingLanguage::Scala),
+            "haskell"    => Ok(ProgrammingLanguage::Haskell),
+            "ocaml"      => Ok(ProgrammingLanguage::Ocaml),
+            "zig"        => Ok(ProgrammingLanguage::Zig),
+            _            => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
 }
