@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::vec;
 
 use super::models::IndexRequest;
 use crate::backend::http3;
@@ -16,10 +15,10 @@ use crate::backend::v0::models::UUIDv4;
 use crate::db::qdrant::ChunkAsVector;
 use crate::db::qdrant::SearchHit;
 use crate::db::qdrant::collection_name;
-use crate::db::qdrant::delete_batch;
 use crate::db::qdrant::ensure_project;
 use crate::db::qdrant::insert_batch;
 use crate::db::qdrant::search;
+use crate::db::sqlite3::SQLite3Pool;
 use crate::db::sqlite3::SQLite3PoolError;
 use crate::models::bge_m3::BGEm3EmbedRequest;
 use crate::models::bge_m3::BGEm3EmbedResponse;
@@ -66,11 +65,45 @@ impl<T> OptionResultExt<T> for Option<Result<T, SQLite3PoolError>> {
     }
 }
 
-fn handle_slicer_error(err: SlicerError) -> StatusCode {
+fn slicer_err_to_pool_err(err: SlicerError) -> SQLite3PoolError {
     match err {
-        SlicerError::Cancelled => cancelled_499(),
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        SlicerError::Cancelled => SQLite3PoolError::Cancelled,
+        other => {
+            error!("Slicer error: {other}");
+            SQLite3PoolError::HTTPStatusCode(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
+}
+
+async fn update_file_status(
+    db_pool: &SQLite3Pool,
+    project_guid: UUIDv4,
+    path: String,
+    model_id: String,
+    status: &'static str,
+    increment_retry: bool,
+    token: CancellationToken,
+) {
+    let _ = db_pool
+        .transaction(token, move |tx| {
+            if increment_retry {
+                tx.execute(
+                    "UPDATE project_files
+                     SET status = ?1, retry_count = retry_count + 1, status_updated_at = unixepoch()
+                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
+                    params![status, project_guid, path, model_id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE project_files
+                     SET status = ?1, status_updated_at = unixepoch()
+                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
+                    params![status, project_guid, path, model_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await;
 }
 
 #[debug_handler]
@@ -82,291 +115,344 @@ pub async fn post_index(
     let span = info_span!("indexing", project_guid = ?project_guid);
 
     async move {
-    let guard: http3::CancellationGuard = http3::CancellationGuard(CancellationToken::new());
+    let guard = http3::CancellationGuard(CancellationToken::new());
 
+    let db_pool = s.db_pool;
+    let qdrant = s.qdrant;
+    let tokenizer = s.tokenizer;
     let EmbeddingModel::BGEm3 { model_id, client } = s.model;
 
-    let token = guard.0.clone();
-    let res = s
-        .db_pool
-        .transaction(guard.0.child_token(), move |tx| {
-            let mut res = IndexResponse {
-                files: HashMap::new(),
+    let project_guid_simple = project_guid.0.as_simple().to_string();
+
+    // ── ensure project row ────────────────────────────────────────────────
+    {
+        let model_id = model_id.clone();
+        db_pool
+            .transaction(guard.0.child_token(), move |tx| {
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM projects WHERE guid = ?1 AND model_id = ?2",
+                        params![project_guid, model_id],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .is_some();
+
+                if !exists {
+                    info!("Project does not exist. Creating a new one.");
+                    tx.execute(
+                        "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                        params![project_guid, model_id],
+                    )?;
+                } else {
+                    info!("Project already exists.");
+                }
+                Ok(())
+            })
+            .with_cancellation_token(&guard.0)
+            .await
+            .from_cancelled()
+            .map_err(|err| {
+                error!(?err);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // ── ensure Qdrant collection ──────────────────────────────────────────
+    ensure_project(&qdrant, &collection_name(&project_guid_simple))
+        .await
+        .map_err(|err| {
+            error!(?err);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut res = IndexResponse { files: HashMap::new() };
+    let mut sha256_hasher = Sha256::default();
+
+    for (pl, files) in payload.files.iter() {
+        let pl = *pl;
+        res.files.entry(pl).or_default();
+
+        for (path, Code { code }) in files.iter() {
+            let path = path.clone();
+            let code = code.clone();
+
+            let file_span = info_span!("indexing_file", ?pl, ?path);
+            let _file_span_guard = file_span.enter();
+
+            sha256_hasher.update(code.as_bytes());
+            let sha256 = hex::encode(sha256_hasher.finalize_fixed_reset());
+
+            // ── hash check ───────────────────────────────────────────────
+            {
+                let (sha256_c, path_c, model_id_c) =
+                    (sha256.clone(), path.clone(), model_id.clone());
+                let unchanged = db_pool
+                    .transaction(guard.0.child_token(), move |tx| {
+                        let existing: Option<String> = tx
+                            .query_row(
+                                "SELECT sha256 FROM project_files
+                                 WHERE project_guid = ?1 AND path = ?2 AND model_id = ?3",
+                                params![project_guid, path_c, model_id_c],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        Ok(existing.as_deref() == Some(sha256_c.as_str()))
+                    })
+                    .with_cancellation_token(&guard.0)
+                    .await
+                    .from_cancelled()
+                    .map_err(|err| {
+                        error!(?err);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                if unchanged {
+                    info!("The source code has not changed: no reindexing is required.");
+                    continue;
+                }
+
+                info!("The source code has changed: reindexing is required.");
+            }
+
+            // ── status = 'indexing' (committed before heavy work) ────────
+            {
+                let (sha256_u, path_u, model_id_u) =
+                    (sha256.clone(), path.clone(), model_id.clone());
+                db_pool
+                    .transaction(guard.0.child_token(), move |tx| {
+                        tx.execute(
+                            "INSERT INTO project_files
+                                 (project_guid, path, sha256, programming_language, model_id,
+                                  status, status_updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 'indexing', unixepoch())
+                             ON CONFLICT (project_guid, model_id, path)
+                             DO UPDATE SET status = 'indexing', status_updated_at = unixepoch()",
+                            params![project_guid, path_u, sha256_u, pl, model_id_u],
+                        )?;
+                        Ok(())
+                    })
+                    .with_cancellation_token(&guard.0)
+                    .await
+                    .from_cancelled()
+                    .map_err(|err| {
+                        error!(?err);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+            }
+
+            // ── mark old chunks deleted + slice + insert new chunks ───────
+            let chunks_to_embed: Vec<(UUIDv4, String)> = {
+                let tokenizer = tokenizer.clone();
+                let (path_m, model_id_m, code_m) =
+                    (path.clone(), model_id.clone(), code.clone());
+                let slicer_token = guard.0.clone();
+
+                let result = db_pool
+                    .transaction(guard.0.child_token(), move |tx| {
+                        tx.execute(
+                            "UPDATE project_file_chunks
+                             SET status = 'deleted'
+                             WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
+                               AND status = 'active'",
+                            params![project_guid, path_m, model_id_m],
+                        )?;
+
+                        let mut slicer = Slicer::new(
+                            Language::new(match pl {
+                                ProgrammingLanguage::Rust => tree_sitter_rust::LANGUAGE,
+                            }),
+                            &tokenizer,
+                        )
+                        .map_err(slicer_err_to_pool_err)?;
+
+                        let chunks = slicer
+                            .parse(&code_m, slicer_token)
+                            .map_err(slicer_err_to_pool_err)?;
+
+                        info!(chunks_len = chunks.len(), "Sliced the source code.");
+
+                        let mut out: Vec<(UUIDv4, String)> = Vec::with_capacity(chunks.len());
+                        for SlicedChunk {
+                            code,
+                            start_line,
+                            end_line,
+                            start_column,
+                            end_column,
+                            ..
+                        } in &chunks
+                        {
+                            let qdrant_guid = UUIDv4(Uuid::new_v4());
+                            tx.execute(
+                                "INSERT INTO project_file_chunks
+                                     (project_guid, file_path, code, model_id, qdrant_guid,
+                                      start_line, end_line, start_column, end_column, status)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
+                                params![
+                                    project_guid,
+                                    path_m,
+                                    code,
+                                    model_id_m,
+                                    qdrant_guid,
+                                    *start_line as i64,
+                                    *end_line as i64,
+                                    *start_column as i64,
+                                    *end_column as i64
+                                ],
+                            )?;
+                            out.push((qdrant_guid, code.clone()));
+                        }
+
+                        Ok(out)
+                    })
+                    .with_cancellation_token(&guard.0)
+                    .await
+                    .from_cancelled();
+
+                match result {
+                    Ok(v) => v,
+                    Err(SQLite3PoolError::Cancelled) => {
+                        update_file_status(
+                            &db_pool, project_guid, path.clone(), model_id.clone(),
+                            "cancelled", false, guard.0.child_token(),
+                        )
+                        .await;
+                        return Err(cancelled_499().into());
+                    }
+                    Err(SQLite3PoolError::HTTPStatusCode(sc)) => {
+                        update_file_status(
+                            &db_pool, project_guid, path.clone(), model_id.clone(),
+                            "failed", true, guard.0.child_token(),
+                        )
+                        .await;
+                        return Err(sc.into());
+                    }
+                    Err(err) => {
+                        error!(?err);
+                        update_file_status(
+                            &db_pool, project_guid, path.clone(), model_id.clone(),
+                            "failed", true, guard.0.child_token(),
+                        )
+                        .await;
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+                    }
+                }
             };
 
-            let project_exists = tx
-                .query_row(
-                    "
-    SELECT 1 FROM projects WHERE guid = ?1 AND model_id = ?2",
-                    params![project_guid, model_id],
-                    |_| Ok(true),
-                )
-                .optional()
-                .map_err(SQLite3PoolError::from)?
-                .is_some();
+            // ── embed + Qdrant upsert ─────────────────────────────────────
+            let collection = collection_name(&project_guid_simple);
+            let mut embed_error: Option<StatusCode> = None;
 
-            if !project_exists {
-                info!("Project does not exist. Creating a new one.");
+            'embed: for batch in chunks_to_embed.chunks(64) {
+                let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+                let guids: Vec<UUIDv4> = batch.iter().map(|(g, _)| *g).collect();
 
-                tx.execute(
-                    "
-    INSERT INTO projects (guid, model_id) VALUES (?, ?)",
-                    params![project_guid, model_id],
-                )?;
-            } else {
-                info!("Project already exists.");
-            }
+                info!(batch_len = batch.len(), "Embedding a batch.");
 
-            let project_guid_simple = project_guid.0.as_simple().to_string();
-            let _ = match tokio::runtime::Handle::current()
-                .block_on(ensure_project(&s.qdrant, &collection_name(project_guid_simple.as_str())))
-            {
-                Ok(_) => Ok(()),
-                Err(qdrant_err) => {
-                    error!(?qdrant_err);
-                    Err(SQLite3PoolError::HTTPStatusCode(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    ))
-                }
-            }?;
-
-            let mut sha256_hasher = Sha256::default();
-
-            for (pl, files) in payload.files.iter() {
-                let mut slicer = Slicer::new(
-                    Language::new(match pl {
-                        ProgrammingLanguage::Rust => tree_sitter_rust::LANGUAGE,
-                    }),
-                    &s.tokenizer,
-                )
-                .map_err(handle_slicer_error)?;
-
-                res.files.insert(*(pl), HashMap::new());
-
-                for (path, Code { code }) in files.iter() {
-                    let file_span = info_span!("indexing_file", ?pl, ?path);
-                    let _ = file_span.enter();
-
-                    sha256_hasher.update(code.as_bytes());
-                    let sha256 = hex::encode(sha256_hasher.finalize_fixed_reset());
-
-                    let actual_sha256: Option<String> = tx
-                        .query_row(
-                            "
-    SELECT sha256 FROM project_files
-    WHERE project_guid = ?1
-        AND path = ?2
-        AND programming_language = ?3
-        AND model_id = ?4",
-                            params![project_guid, path, pl, model_id],
-                            |row| row.get(0),
+                let BGEm3EmbedResponse {
+                    dense_vecs,
+                    sparse_vecs,
+                    colbert_vecs,
+                } = match client.encode(BGEm3EmbedRequest { texts }, guard.0.clone()).await {
+                    Ok(val) => val,
+                    Err(EncodeError::Cancelled) => {
+                        update_file_status(
+                            &db_pool, project_guid, path.clone(), model_id.clone(),
+                            "cancelled", false, guard.0.child_token(),
                         )
-                        .optional()
-                        .map_err(SQLite3PoolError::from)?;
-
-                    if let Some(ref actual_sha256) = actual_sha256 {
-                        if *actual_sha256 == sha256 {
-                            info!(
-                                actual_sha256 = *actual_sha256,
-                                ?sha256,
-                                "The source code has not changed: no reindexing is required."
-                            );
-
-                            continue;
-                        }
-
-                        info!("The source code has changed: a reindexing is required.");
-
-                        let qdrant_guids: Vec<String> = tx
-                            .prepare(
-                                "
-    SELECT qdrant_guid
-    FROM project_file_chunks
-        WHERE project_guid = ?1
-            AND file_path = ?2
-            AND model_id = ?3
-                            ",
-                            )?
-                            .query_map(params![project_guid, path, model_id], |row| row.get(0))?
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        for qdrant_guids_batch in qdrant_guids.chunks(256) {
-                            let _ = match tokio::runtime::Handle::current().block_on(delete_batch(
-                                &s.qdrant,
-                                &collection_name(project_guid_simple.as_str()),
-                                qdrant_guids_batch.to_vec(),
-                            )) {
-                                Ok(_) => Ok(()),
-                                Err(qdrant_err) => {
-                                    error!(?qdrant_err);
-                                    Err(SQLite3PoolError::HTTPStatusCode(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                    ))
-                                }
-                            }?;
-                        }
-
-                        let deleted_files = tx
-                            .execute(
-                                "
-    DELETE FROM project_files
-    WHERE project_guid = ?1
-        AND path = ?2
-        AND programming_language = ?3
-        AND model_id = ?4",
-                                params![project_guid, path, pl, model_id],
-                            )
-                            .map_err(SQLite3PoolError::from)?;
-
-                        info!(
-                            ?deleted_files,
-                            deleted_qdrant_points = qdrant_guids.len(),
-                            "Pruned old chunks."
-                        );
+                        .await;
+                        return Err(cancelled_499().into());
                     }
-
-                    tx.execute(
-                        "
-    INSERT INTO project_files (project_guid, path, sha256, programming_language, model_id)
-    VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![project_guid, path, sha256, pl, model_id],
-                    )
-                    .map_err(SQLite3PoolError::from)?;
-
-                    info!("Processing the source code.");
-
-                    let chunks = slicer
-                        .parse(code, token.clone())
-                        .map_err(handle_slicer_error)?;
-
-                    info!(chunks_len = ?chunks.len(), "Sliced the source code.");
-
-                    let counter = match res.files.get_mut(pl) {
-                        Some(map) => map,
-                        None => panic!("BUG: language key missing from response map"),
+                    Err(EncodeError::Request(request_err)) => {
+                        error!(?project_guid, ?request_err);
+                        embed_error = Some(StatusCode::SERVICE_UNAVAILABLE);
+                        break 'embed;
                     }
-                    .entry(path.clone())
-                    .or_insert(0);
+                };
 
-                    for chunks_batch in chunks.chunks(64) {
-                        let mut req = BGEm3EmbedRequest {
-                            texts: Vec::with_capacity(chunks_batch.len()),
-                        };
+                let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
+                for (i, ((dense, sparse), colbert)) in dense_vecs
+                    .iter()
+                    .zip(sparse_vecs.iter())
+                    .zip(colbert_vecs.iter())
+                    .enumerate()
+                {
+                    let sparse_indices: Vec<u32> = sparse
+                        .iter()
+                        .filter(|(_, w)| **w > 1e-5)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    let sparse_values: Vec<f32> = sparse
+                        .iter()
+                        .filter(|(_, w)| **w > 1e-5)
+                        .map(|(_, v)| *v)
+                        .collect();
 
-                        let mut qdrant_guids = Vec::with_capacity(chunks_batch.len());
+                    vector_batch.push(ChunkAsVector {
+                        guid: guids[i],
+                        dense: dense.clone(),
+                        sparse_indices,
+                        sparse_values,
+                        colbert: colbert.clone(),
+                    });
+                }
 
-                        for SlicedChunk { code, start_line, end_line, start_column, end_column, .. } in chunks_batch {
-                            *counter += 1;
-
-                            req.texts.push(code.to_string());
-
-                            let qdrant_guid = UUIDv4(Uuid::new_v4());
-
-                            tx.execute(
-                                "
-    INSERT INTO project_file_chunks
-        (project_guid, file_path, code, model_id, qdrant_guid,
-         start_line, end_line, start_column, end_column)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                params![
-                                    project_guid, path, code, model_id, qdrant_guid,
-                                    *start_line as i64, *end_line as i64,
-                                    *start_column as i64, *end_column as i64
-                                ],
-                            )
-                            .map_err(SQLite3PoolError::from)?;
-
-                            qdrant_guids.push(qdrant_guid);
-                        }
-
-                        info!(batch_len = chunks_batch.len(), "Embedding a batch.");
-
-                        let BGEm3EmbedResponse {
-                            dense_vecs,
-                            sparse_vecs,
-                            colbert_vecs,
-                        } = match tokio::runtime::Handle::current()
-                            .block_on(client.encode(req, token.clone()))
-                        {
-                            Ok(val) => Ok(val),
-                            Err(EncodeError::Cancelled) => Err(SQLite3PoolError::Cancelled),
-                            Err(EncodeError::Request(request_err)) => {
-                                error!(?project_guid, ?request_err);
-                                Err(SQLite3PoolError::HTTPStatusCode(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                ))
-                            }
-                        }?;
-
-                        let mut chunks: Vec<ChunkAsVector> = Vec::with_capacity(dense_vecs.len());
-
-                        for (i, ((dense_vec, sparse_vec), colbert_vec)) in dense_vecs
-                            .iter()
-                            .zip(sparse_vecs.iter())
-                            .zip(colbert_vecs.iter())
-                            .enumerate()
-                        {
-                            let qdrant_guid = qdrant_guids[i];
-
-                            let sparse_indices: Vec<u32> = sparse_vec
-                                .iter()
-                                .filter(|(_, w)| **w > 1e-5)
-                                .map(|(k, _)| *k)
-                                .collect();
-
-                            let sparse_values: Vec<f32> = sparse_vec
-                                .iter()
-                                .filter(|(_, w)| **w > 1e-5)
-                                .map(|(_, v)| v)
-                                .copied()
-                                .collect();
-
-                            chunks.push(ChunkAsVector {
-                                guid: qdrant_guid,
-                                dense: dense_vec.clone(),
-                                sparse_indices,
-                                sparse_values,
-                                colbert: colbert_vec.clone(),
-                            });
-                        }
-
-                        for chunks_batch in chunks.chunks(256) {
-                            let _ = match tokio::runtime::Handle::current().block_on(insert_batch(
-                                &s.qdrant,
-                                &collection_name(project_guid_simple.as_str()),
-                                chunks_batch.to_vec(),
-                            )) {
-                                Ok(_) => Ok(()),
-                                Err(qdrant_err) => {
-                                    error!(?qdrant_err);
-                                    Err(SQLite3PoolError::HTTPStatusCode(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                    ))
-                                }
-                            }?;
-                        }
+                for points_batch in vector_batch.chunks(256) {
+                    if let Err(qdrant_err) =
+                        insert_batch(&qdrant, &collection, points_batch.to_vec()).await
+                    {
+                        error!(?qdrant_err);
+                        embed_error = Some(StatusCode::INTERNAL_SERVER_ERROR);
+                        break 'embed;
                     }
                 }
             }
 
-            info!("All good.");
+            if let Some(sc) = embed_error {
+                update_file_status(
+                    &db_pool, project_guid, path.clone(), model_id.clone(),
+                    "failed", true, guard.0.child_token(),
+                )
+                .await;
+                return Err(sc.into());
+            }
 
-            Ok(res)
-        })
-        .with_cancellation_token(&guard.0)
-        .await
-        .from_cancelled();
+            // ── status = 'indexed' + record new sha256 ────────────────────
+            {
+                let (sha256_f, path_f, model_id_f) =
+                    (sha256.clone(), path.clone(), model_id.clone());
+                db_pool
+                    .transaction(guard.0.child_token(), move |tx| {
+                        tx.execute(
+                            "UPDATE project_files
+                             SET status = 'indexed', sha256 = ?1, status_updated_at = unixepoch()
+                             WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
+                            params![sha256_f, project_guid, path_f, model_id_f],
+                        )?;
+                        Ok(())
+                    })
+                    .with_cancellation_token(&guard.0)
+                    .await
+                    .from_cancelled()
+                    .map_err(|err| {
+                        error!(?err);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+            }
 
-    match res {
-        Ok(res) => Ok(Json(res)),
-        Err(SQLite3PoolError::Cancelled) => Err(cancelled_499().into()),
-        Err(SQLite3PoolError::HTTPStatusCode(status_code)) => Err(status_code.into()),
-        Err(err) => {
-            error!(?project_guid, "{}", err);
+            *res.files
+                .entry(pl)
+                .or_default()
+                .entry(path.clone())
+                .or_insert(0) += chunks_to_embed.len() as u64;
 
-            Err(StatusCode::INTERNAL_SERVER_ERROR.into())
+            info!("File indexed successfully.");
         }
     }
+
+    info!("All files processed.");
+    Ok(Json(res))
+
     }
     .instrument(span)
     .await
@@ -410,7 +496,11 @@ pub async fn post_search(
         .transaction(guard.0.child_token(), move |tx| {
             let mut param_number: usize = 1;
 
-            let mut meta_where = vec![format!("c.project_guid = ?{}", param_number).to_string()];
+            // c.status = 'active' is always required to exclude soft-deleted chunks.
+            let mut meta_where = vec![
+                format!("c.project_guid = ?{}", param_number),
+                "c.status = 'active'".to_string(),
+            ];
             param_number += 1;
             let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(project_guid)];
 
@@ -443,7 +533,6 @@ pub async fn post_search(
                                 param_number += 1;
                                 tmp
                             })
-                            .to_string()
                         })
                         .collect();
 
@@ -481,7 +570,6 @@ pub async fn post_search(
                                 param_number += 1;
                                 tmp
                             })
-                            .to_string()
                         })
                         .collect();
 
@@ -534,10 +622,13 @@ pub async fn post_search(
             SQLite3PoolError::HTTPStatusCode(status_code) => status_code,
             err => {
                 error!(?project_guid, "{}", err);
-
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         })?;
+
+    if chunks.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     let dense = dense_vecs
         .into_iter()

@@ -1,0 +1,44 @@
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  mindex:
+    build: .
+    ports:
+      - "11111:11111"
+    volumes:
+      - mindex_db:/data
+      - hf_cache:/root/.cache/huggingface
+      # Optional: mount a directory with real certs.
+      # If absent, a self-signed cert is generated automatically on first start.
+      #   mkdir -p certs && openssl req -x509 -newkey rsa:4096 -nodes \
+      #     -keyout certs/key.pem -out certs/cert.pem -days 3650 \
+      #     -subj "/CN=mindex"
+      - mindex_certs:/certs
+    environment:
+      RUST_LOG: info
+    # Allows the container to reach the embedder running on the host.
+    # host-gateway resolves to the Docker host IP on Linux.
+    # On Docker Desktop (Mac/Windows) this mapping is not needed but is harmless.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - --bind=0.0.0.0:11111
+      - --db-path=/data/mindex.db
+      - --cert-path=/certs/cert.pem
+      - --key-path=/certs/key.pem
+      - --qdrant-server=http://qdrant:6334
+      - --model-server=http://host.docker.internal:11211
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  mindex_db:
+  mindex_certs:
+  hf_cache:

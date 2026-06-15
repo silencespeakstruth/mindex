@@ -18,6 +18,7 @@ mod backend;
 mod db;
 mod models;
 mod slicing;
+mod worker;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -129,7 +130,24 @@ async fn main() -> Result<(), BoxError> {
 
     let model_id = args.model.as_str(); // For now, only one model is supported.
 
-    let qdrant_client = Qdrant::from_url(args.qdrant_server.as_str()).build()?;
+    let qdrant_client = Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
+
+    let gc_token = sigterm_token.child_token();
+    let retry_token = sigterm_token.child_token();
+
+    tokio::spawn(worker::gc::run(
+        db_pool.clone(),
+        qdrant_client.clone(),
+        gc_token,
+    ));
+
+    tokio::spawn(worker::retry::run(
+        db_pool.clone(),
+        qdrant_client.clone(),
+        Arc::new(BGEm3HttpClient::new(args.model_server.clone())),
+        model_id.to_string(),
+        retry_token,
+    ));
 
     loop {
         tokio::select! {
@@ -139,7 +157,7 @@ async fn main() -> Result<(), BoxError> {
                 RouterState {
                     tokenizer: Arc::new(Tokenizer::from_pretrained(model_id, None)?),
                     db_pool: db_pool.clone(),
-                    qdrant: Arc::new(qdrant_client.clone()),
+                    qdrant: qdrant_client.clone(),
                     model: EmbeddingModel::BGEm3 {
                         model_id: model_id.to_string(),
                         client: Arc::new(BGEm3HttpClient::new(args.model_server.clone()))

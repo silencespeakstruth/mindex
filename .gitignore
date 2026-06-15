@@ -6,4 +6,6 @@
 
 *.db*
 
+certs/
+
 .claude/settings.local.json

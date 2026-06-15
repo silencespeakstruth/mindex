@@ -1,0 +1,53 @@
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  mock-embedder:
+    build:
+      context: tests/mock_embedder
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:11211/docs')"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  mindex:
+    build: .
+    volumes:
+      - test_mindex_db:/data
+      - test_mindex_certs:/certs
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      RUST_LOG: info
+    command:
+      - --bind=0.0.0.0:11111
+      - --db-path=/data/mindex.db
+      - --cert-path=/certs/cert.pem
+      - --key-path=/certs/key.pem
+      - --qdrant-server=http://qdrant:6334
+      - --model-server=http://mock-embedder:11211
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      mock-embedder:
+        condition: service_healthy
+
+  test-runner:
+    build:
+      context: tests/integration
+    environment:
+      MINDEX_URL: https://mindex:11111
+    depends_on:
+      - mindex
+
+volumes:
+  test_mindex_db:
+  test_mindex_certs:
+  hf_cache:
