@@ -37,6 +37,12 @@ mindex/
       test_e2e.py             — 8 integration tests
       Dockerfile
       requirements.txt
+  tools/
+    indexer/                  — Standalone Rust crate: mindex-index CLI (own Cargo.toml/Cargo.lock)
+      src/
+        main.rs               — CLI (clap), orchestration, progress display (indicatif + console)
+        scanner.rs            — walkdir + globset: file discovery, extension→language detection
+        client.rs             — reqwest: upload_batch(), IndexRequest/IndexResponse types
   Dockerfile                  — Multi-stage: rust:1.95-bookworm builder → debian:bookworm-slim
   docker-compose.yml          — Production stack: qdrant + mindex
   docker-compose.test.yml     — Standalone test stack: qdrant + mock-embedder + mindex + test-runner
@@ -194,6 +200,44 @@ Both workers are spawned with `tokio::spawn` in `main.rs` and receive a child of
 - Reads `status='active'` chunks from SQLite (their `code` column holds the text), re-embeds, upserts to Qdrant. Does **not** re-slice — sliced code is stored verbatim in the `code` column.
 - On success: `status='indexed'`. On failure: `status='failed'`, `retry_count++`.
 - `MAX_RETRIES = 3`. After 3 failures the file stays `status='failed'` and requires manual re-indexing.
+
+## Indexer CLI (`tools/indexer/`)
+
+Standalone Rust binary (`mindex-index`) that walks a directory tree and uploads source files to a running mindex server. It is **not** part of the main Cargo workspace — it has its own `Cargo.toml` and `Cargo.lock`.
+
+**Build:** `cd tools/indexer && cargo build --release`
+
+**Key flags:**
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--server` | `https://127.0.0.1:11111` | mindex server URL |
+| `--project` | (required) | 32-char hex UUID without dashes |
+| `--root` | `.` | all stored paths are relative to this |
+| `--include GLOB` | all recognised extensions | repeatable; matched against rel path |
+| `--exclude GLOB` | — | repeatable; evaluated before includes |
+| `--no-verify` | off | skip TLS cert check (self-signed default cert) |
+| `--protocol` | `v0` | API version in URL path |
+| `--batch-size` | `100` | files per HTTP request |
+| `-v / --verbose` | off | print one line per file |
+
+**Typical invocation (indexing mindex itself):**
+```bash
+cd tools/indexer
+./target/release/mindex-index \
+  --project $(uuidgen | tr -d - | tr '[:upper:]' '[:lower:]') \
+  --root /data/silencespeakstruth/Projects/mindex \
+  --include '**/*.rs' \
+  --exclude 'target/**' --exclude 'tools/**' \
+  --no-verify --verbose
+```
+Note: always `--exclude 'tools/**'` when indexing the mindex repo itself — otherwise the indexer's own `long_about` strings contaminate search results.
+
+**Cancellation:** Ctrl+C drops the TCP connection. The server detects client disconnect and cancels in-flight work (returns HTTP 499). The CLI exits with code 1 and prints a partial summary.
+
+**Response semantics:** `chunk_count == 0` in the server response means the slicer produced no chunks (file below 128-token threshold), not that the file was unchanged. Hash-unchanged files are silently skipped server-side and never appear in the response.
+
+**Language detection** (extension → API key): `.rs`→rust, `.py`→python, `.js/.mjs/.cjs/.jsx`→javascript, `.ts/.mts/.cts`→typescript, `.tsx`→tsx, `.go`→go, `.c/.h`→c, `.cpp/.cc/.cxx/.hpp`→cpp, `.java`→java, `.cs`→csharp, `.rb`→ruby, `.php`→php, `.sh/.bash`→bash, `.html/.htm`→html, `.css`→css, `.json`→json, `.scala/.sc`→scala, `.hs/.lhs`→haskell, `.ml/.mli`→ocaml, `.zig`→zig.
 
 ## Supported Languages
 
