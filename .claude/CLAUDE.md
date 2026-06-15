@@ -3,27 +3,44 @@
 ## Project Overview
 `mindex` is a high-performance, asynchronous RAG indexing and search engine built in Rust. It exposes an HTTPS API that indexes source code files using `tree-sitter` for semantic AST chunking, `BGE-M3` for multi-vector embeddings (dense, sparse, ColBERT), `Qdrant` for vector storage, and `SQLite3` for relational metadata. It is an **internal service** — TLS is the only transport-layer security; no API authentication is implemented or planned.
 
-## Module Map
+## Repository Layout
 ```
-src/
-  main.rs                   — CLI (clap), startup, migration runner, worker spawning, signal handling
-  backend/
-    http3.rs                — RouterState, EmbeddingModel enum, CancellationGuard, run()
-    v0/
-      handlers.rs           — post_index, post_search, update_file_status, slicer_err_to_pool_err
-      models.rs             — request/response types, ProgrammingLanguage, UUIDv4, GlobPattern
-  db/
-    sqlite3.rs              — SQLite3Pool, SQLite3PoolError
-    qdrant.rs               — ensure_project, insert_batch, delete_batch, search, collection_name
-    migrations/
-      v0.1.0_schema.sql     — projects, project_files, project_file_chunks tables
-  models/
-    bge_m3.rs               — BGEm3HttpClient, BGEm3Model trait, EncodeError
-  slicing/
-    traits.rs               — Slicer, SlicedChunk, SlicerError
-  worker/
-    gc.rs                   — GC worker: sweeps deleted chunks from Qdrant + SQLite hourly
-    retry.rs                — Retry worker: re-embeds stuck/failed files every 60 s
+mindex/
+  src/
+    main.rs                   — CLI (clap), startup, migration runner, worker spawning, signal handling
+    backend/
+      http3.rs                — RouterState, EmbeddingModel enum, CancellationGuard, run()
+      v0/
+        handlers.rs           — post_index, post_search, update_file_status, slicer_err_to_pool_err
+        models.rs             — request/response types, ProgrammingLanguage, UUIDv4, GlobPattern
+    db/
+      sqlite3.rs              — SQLite3Pool, SQLite3PoolError
+      qdrant.rs               — ensure_project, insert_batch, delete_batch, search, collection_name
+      migrations/
+        v0.1.0_schema.sql     — projects, project_files, project_file_chunks tables
+    models/
+      bge_m3.rs               — BGEm3HttpClient, BGEm3Model trait, EncodeError
+    slicing/
+      traits.rs               — Slicer, SlicedChunk, SlicerError
+    worker/
+      gc.rs                   — GC worker: sweeps deleted chunks from Qdrant + SQLite hourly
+      retry.rs                — Retry worker: re-embeds stuck/failed files every 60 s
+  scripts/
+    entrypoint.sh             — Docker entrypoint: auto-generates self-signed TLS cert on first start
+  tests/
+    mock_embedder/            — FastAPI mock BGE-M3 server (deterministic vectors, seeded by text hash)
+      main.py
+      Dockerfile
+      requirements.txt
+    integration/              — pytest end-to-end test suite
+      conftest.py             — wait_for_mindex fixture (120 s), client, project fixtures
+      test_e2e.py             — 8 integration tests
+      Dockerfile
+      requirements.txt
+  Dockerfile                  — Multi-stage: rust:1.95-bookworm builder → debian:bookworm-slim
+  docker-compose.yml          — Production stack: qdrant + mindex
+  docker-compose.test.yml     — Standalone test stack: qdrant + mock-embedder + mindex + test-runner
+  rust-toolchain.toml         — Pins channel = "1.95" (matches rustc 1.95.0 locally and in CI)
 ```
 
 ## HTTP Server
@@ -49,6 +66,7 @@ Two-layer isolation:
 - **Sparse threshold**: filter out sparse weights `< 1e-5` before sending to Qdrant.
 - **Batch sizes**: 64 chunks per embedding call, 256 points per Qdrant upsert/delete.
 - **Append-only hot path:** Qdrant vectors are **never deleted during indexing**. Old vectors become orphaned; the GC worker removes them asynchronously. This decouples indexing latency from Qdrant delete latency.
+- **Empty project 404:** `post_search` returns 404 immediately when the SQLite `has_id` set is empty (no active chunks), without calling Qdrant. This avoids a 503 from a non-existent collection.
 
 ## Embedding Model Server
 `BGEm3HttpClient` calls a **custom Python/FlagEmbedding server** at `--model-server` (default `http://localhost:11211`).
@@ -142,6 +160,7 @@ For each file, `post_index` executes these sequential transactions (separate `db
   - Batch embedding calls at 64 chunks; batch Qdrant upserts at 256 points.
 - **Retrieval:**
   - Filter at the SQLite level first (project, language, path GLOB, **`status='active'`**) to get the candidate `qdrant_guid` set.
+  - If the set is empty, return 404 immediately without calling Qdrant.
   - Pass those GUIDs as a `has_id` filter to Qdrant — this is the sole project isolation mechanism and also excludes soft-deleted vectors.
   - Multi-vector (dense/sparse/colbert) alignment: each vector list from the embed response is positionally aligned with the chunk list.
 
@@ -172,16 +191,126 @@ Both workers are spawned with `tokio::spawn` in `main.rs` and receive a child of
 **Retry worker** (`worker/retry.rs`):
 - Interval: 60 seconds.
 - Finds files with `status IN ('just_uploaded', 'indexing') AND status_updated_at < unixepoch() - 300` (stuck ≥5 min) OR `status='failed' AND retry_count < MAX_RETRIES AND status_updated_at < unixepoch() - 60`.
-- Reads `status='active'` chunks from SQLite (their `code` column holds the text), re-embeds, upserts to Qdrant.
+- Reads `status='active'` chunks from SQLite (their `code` column holds the text), re-embeds, upserts to Qdrant. Does **not** re-slice — sliced code is stored verbatim in the `code` column.
 - On success: `status='indexed'`. On failure: `status='failed'`, `retry_count++`.
 - `MAX_RETRIES = 3`. After 3 failures the file stays `status='failed'` and requires manual re-indexing.
 
+## Supported Languages
+
+20 languages supported via tree-sitter grammars. All crates must require `tree-sitter ≥ 0.23` (the new `LanguageFn`/`LANGUAGE` constant API). Older crates cause a native `links` conflict and cannot coexist with `tree-sitter 0.26`.
+
+| API key       | Enum variant                      | Crate                         | Constant used                   |
+|---------------|-----------------------------------|-------------------------------|---------------------------------|
+| `rust`        | `ProgrammingLanguage::Rust`       | `tree-sitter-rust 0.24`       | `LANGUAGE`                      |
+| `python`      | `ProgrammingLanguage::Python`     | `tree-sitter-python 0.25`     | `LANGUAGE`                      |
+| `javascript`  | `ProgrammingLanguage::JavaScript` | `tree-sitter-javascript 0.25` | `LANGUAGE`                      |
+| `typescript`  | `ProgrammingLanguage::TypeScript` | `tree-sitter-typescript 0.23` | `LANGUAGE_TYPESCRIPT`           |
+| `tsx`         | `ProgrammingLanguage::Tsx`        | `tree-sitter-typescript 0.23` | `LANGUAGE_TSX`                  |
+| `go`          | `ProgrammingLanguage::Go`         | `tree-sitter-go 0.25`         | `LANGUAGE`                      |
+| `c`           | `ProgrammingLanguage::C`          | `tree-sitter-c 0.24`          | `LANGUAGE`                      |
+| `cpp`         | `ProgrammingLanguage::Cpp`        | `tree-sitter-cpp 0.23`        | `LANGUAGE`                      |
+| `java`        | `ProgrammingLanguage::Java`       | `tree-sitter-java 0.23`       | `LANGUAGE`                      |
+| `csharp`      | `ProgrammingLanguage::CSharp`     | `tree-sitter-c-sharp 0.23`    | `LANGUAGE`                      |
+| `ruby`        | `ProgrammingLanguage::Ruby`       | `tree-sitter-ruby 0.23`       | `LANGUAGE`                      |
+| `php`         | `ProgrammingLanguage::Php`        | `tree-sitter-php 0.24`        | `LANGUAGE_PHP` (PHP+HTML mode)  |
+| `bash`        | `ProgrammingLanguage::Bash`       | `tree-sitter-bash 0.25`       | `LANGUAGE`                      |
+| `html`        | `ProgrammingLanguage::Html`       | `tree-sitter-html 0.23`       | `LANGUAGE`                      |
+| `css`         | `ProgrammingLanguage::Css`        | `tree-sitter-css 0.25`        | `LANGUAGE`                      |
+| `json`        | `ProgrammingLanguage::Json`       | `tree-sitter-json 0.24`       | `LANGUAGE`                      |
+| `scala`       | `ProgrammingLanguage::Scala`      | `tree-sitter-scala 0.26`      | `LANGUAGE`                      |
+| `haskell`     | `ProgrammingLanguage::Haskell`    | `tree-sitter-haskell 0.23`    | `LANGUAGE`                      |
+| `ocaml`       | `ProgrammingLanguage::Ocaml`      | `tree-sitter-ocaml 0.25`      | `LANGUAGE_OCAML` (.ml files)    |
+| `zig`         | `ProgrammingLanguage::Zig`        | `tree-sitter-zig 1.1`         | `LANGUAGE`                      |
+
+**Not yet supported** — crates still require `tree-sitter 0.21–0.22`, causing a native `links` conflict:
+`yaml`, `toml`, `kotlin`, `lua`, `elixir`, `nix`, `erlang`, `swift`.
+Add them once the upstream crates are updated to the `0.23+` API.
+
 ## Language Extensibility
-Any language with a tree-sitter grammar can be supported. When adding a new `ProgrammingLanguage`:
-1. Add the variant to the `ProgrammingLanguage` enum in `models.rs` and its `ToSql`/`FromSql` impls.
-2. Add it to the SQLite `CHECK` constraint in the migration SQL (`project_files.programming_language`).
-3. Add the `tree-sitter-<lang>` crate to `Cargo.toml`.
-4. Map the variant to `Language::new(tree_sitter_<lang>::LANGUAGE)` in the `post_index` handler's main-work transaction closure.
+When adding a new `ProgrammingLanguage`:
+1. Add the variant to the `ProgrammingLanguage` enum in `models.rs` and its `ToSql`/`FromSql` impls. Use a lowercase SQL name matching the serde rename.
+2. Add the SQL name to the `CHECK` constraint in `v0.1.0_schema.sql`.
+3. Add the `tree-sitter-<lang>` crate to `Cargo.toml`. **Verify** its `tree-sitter` dependency is `≥ 0.23`; older versions cause a `links` conflict.
+4. Add an arm to the `let ts_language = match pl { ... }` block in the main-work tx closure in `post_index`. Use `Language::new(tree_sitter_<lang>::LANGUAGE)` for crates that export a plain `LANGUAGE` constant, or the crate-specific name (e.g. `LANGUAGE_TYPESCRIPT`, `LANGUAGE_OCAML`).
+
+## Docker & CI
+
+### Toolchain Pinning
+`rust-toolchain.toml` pins `channel = "1.95"`. Key constraints from `Cargo.lock`:
+- `libsqlite3-sys 0.38.0` requires rustc ≥ 1.87 (`cfg_select!` macro).
+- `icu_collections 2.2.0` requires rustc ≥ 1.86.
+- `cargo-chef` is **not used** — it required rustc 1.88+ but caused its own dependency conflicts. Replaced by `cargo fetch --locked` for layer caching.
+
+### Dockerfile
+Two-stage build:
+```
+FROM rust:1.95-bookworm AS builder
+  COPY Cargo.toml Cargo.lock
+  RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked
+  COPY src ./src
+  RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+  apt-get install ca-certificates openssl
+  COPY --from=builder /app/target/release/mindex /usr/local/bin/mindex
+  COPY scripts/entrypoint.sh /entrypoint.sh
+```
+`cargo fetch --locked` pre-downloads all dependencies into the image layer. When only `src/` changes, Docker reuses the fetch layer and only re-compiles. The legacy Docker builder (no BuildKit) is supported — `--mount=type=cache` is not used.
+
+### scripts/entrypoint.sh
+Generates a self-signed RSA-4096 cert at `/certs/cert.pem` + `/certs/key.pem` on first start if absent. Subsequent starts reuse the existing cert. The cert volume (`mindex_certs`) persists across container restarts.
+
+### docker-compose.yml (production)
+- Services: `qdrant/qdrant:v1.14.1` + `mindex` (built from `Dockerfile`).
+- `mindex` volumes: `mindex_db:/data`, `mindex_certs:/certs`, `hf_cache:/root/.cache/huggingface` (tokenizer cache).
+- `extra_hosts: ["host.docker.internal:host-gateway"]` lets the container reach the Python embedding server on the host (Linux; harmless on Docker Desktop).
+
+### docker-compose.test.yml (standalone test stack)
+Does **not** extend the base compose (to avoid host port binding conflicts). Run with:
+```
+docker compose -f docker-compose.test.yml up --build \
+  --exit-code-from test-runner --abort-on-container-exit
+```
+
+Services and healthcheck strategy:
+
+| Service        | Image / Build                  | Healthcheck                                      |
+|----------------|-------------------------------|--------------------------------------------------|
+| `qdrant`       | `qdrant/qdrant:v1.14.1`       | `bash -c 'exec 3<>/dev/tcp/localhost/6333'` — no curl in the image |
+| `mock-embedder`| `tests/mock_embedder/`        | `python -c "urllib.request.urlopen(...)"` — no curl in python:3.12-slim |
+| `mindex`       | `Dockerfile`                  | none (test-runner uses `wait_for_mindex` fixture) |
+| `test-runner`  | `tests/integration/`          | —                                                |
+
+`mindex` has no host port binding; `test-runner` connects via the Docker internal network (`https://mindex:11111`).
+
+## Integration Test Suite (`tests/`)
+
+### Mock Embedder (`tests/mock_embedder/main.py`)
+FastAPI server on port 11211 implementing the same `POST /encode` contract as the real BGE-M3 server. Returns **deterministic vectors seeded by MD5 of the input text**:
+- `dense`: 1024-dim unit-normalized Gaussian (`numpy` RNG seeded by `int(md5(text), 16) % 2**32`).
+- `sparse`: up to 16 whitespace-split words → `{int(md5(word), 16) % 30000: 0.1 + len(word)*0.01}`.
+- `colbert`: up to 8 per-token dense vectors per text.
+
+Determinism ensures that the same text always produces the same vectors, making search ranking assertions stable across test runs.
+
+### Test Fixtures (`tests/integration/conftest.py`)
+- `wait_for_mindex` (session-scoped, `autouse=True`): polls `POST /v0/{'0'*32}/search` every 1 s for up to 120 s until mindex accepts a connection. Raises `RuntimeError` on timeout.
+- `client`: `httpx.Client(verify=False, timeout=30.0)` — TLS verification disabled for the self-signed cert.
+- `project`: returns `uuid4().hex` (32-char hex, no hyphens) — each test gets a fresh project GUID with no shared state.
+
+### Test Cases (`tests/integration/test_e2e.py`)
+8 end-to-end tests using the `rust` language key with a ~50-line Rust snippet large enough to produce ≥1 chunk (128–512 BGE-M3 tokens):
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_index_new_file_returns_chunk_count` | Index response has `chunk_count ≥ 1` for a new file |
+| `test_search_finds_indexed_content` | Search returns the correct path and `process_records` in code |
+| `test_reindex_unchanged_file_is_noop` | Re-indexing identical content returns `chunk_count = 0` (hash match) |
+| `test_reindex_changed_file_returns_new_chunks` | Modified content produces `chunk_count ≥ 1` |
+| `test_search_after_reindex_reflects_new_content` | Search surfaces v2-specific markers after re-index |
+| `test_search_result_has_line_numbers` | Every result has `start_line ≥ 1`, `end_line ≥ start_line`, columns ≥ 0 |
+| `test_search_empty_project_returns_404` | Search on a never-indexed project returns HTTP 404 |
+| `test_multiple_files_indexed_independently` | Two files in one request each return `chunk_count ≥ 1` |
 
 ## Operational Rules
 - **Data Integrity:** SQLite writes involving multiple rows must be inside a `transaction`. The soft-delete pattern ensures consistency: if the main-work transaction rolls back, old chunks remain `active` and the file status is recoverable.
@@ -197,3 +326,4 @@ Any language with a tree-sitter grammar can be supported. When adding a new `Pro
 4. Always use `collection_name(project_guid.0.as_simple().to_string().as_str())` as the Qdrant collection name. Never hardcode collection names.
 5. The SQLite query in any search path must include `AND c.status = 'active'` to exclude soft-deleted chunks.
 6. Status transitions in `project_files` must always update `status_updated_at = unixepoch()` in the same statement.
+7. When adding a language: update `models.rs`, `v0.1.0_schema.sql`, `Cargo.toml`, and the `let ts_language = match pl` block in `handlers.rs`. Verify the new tree-sitter crate requires `tree-sitter ≥ 0.23` before adding.
