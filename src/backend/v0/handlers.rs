@@ -75,6 +75,122 @@ fn slicer_err_to_pool_err(err: SlicerError) -> SQLite3PoolError {
     }
 }
 
+/// One positional bind value for the search query. Owned (so the whole vec is
+/// `Send` and can move into the `spawn_blocking` transaction closure) and
+/// `PartialEq` (so the query builder can be unit-tested against exact params).
+#[derive(Debug, PartialEq)]
+enum Bind {
+    Guid(UUIDv4),
+    Lang(ProgrammingLanguage),
+    Path(String),
+}
+
+impl ToSql for Bind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match self {
+            Bind::Guid(g) => g.to_sql(),
+            Bind::Lang(l) => l.to_sql(),
+            Bind::Path(p) => p.to_sql(),
+        }
+    }
+}
+
+/// Builds the SQL and ordered bind values for `post_search`'s candidate query.
+///
+/// Pure and side-effect-free so the fragile `?N` parameter-numbering — which must
+/// stay in lock-step with the bind order — can be unit-tested in isolation. The
+/// `WHERE` clause always pins the project and `c.status = 'active'`; the optional
+/// `include`/`exclude` filters append language `IN`/`NOT IN` sets and path `GLOB`
+/// clauses, numbering placeholders in push order.
+fn build_search_query(project_guid: UUIDv4, req: &SearchRequest) -> (String, Vec<Bind>) {
+    let mut param_number: usize = 1;
+
+    // c.status = 'active' is always required to exclude soft-deleted chunks.
+    let mut meta_where = vec![
+        format!("c.project_guid = ?{}", param_number),
+        "c.status = 'active'".to_string(),
+    ];
+    param_number += 1;
+    let mut binds: Vec<Bind> = vec![Bind::Guid(project_guid)];
+
+    if let Some(inc) = &req.include {
+        if let Some(pls) = &inc.programming_languages {
+            let placeholders: Vec<String> = pls
+                .iter()
+                .map(|_| {
+                    let p = format!("?{param_number}");
+                    param_number += 1;
+                    p
+                })
+                .collect();
+            meta_where.push(format!(
+                "f.programming_language IN ({})",
+                placeholders.join(", ")
+            ));
+            binds.extend(pls.iter().map(|l| Bind::Lang(*l)));
+        }
+
+        if let Some(paths) = &inc.paths {
+            let clauses: Vec<String> = paths
+                .iter()
+                .map(|_| {
+                    let c = format!("c.file_path GLOB ?{param_number}");
+                    param_number += 1;
+                    c
+                })
+                .collect();
+            meta_where.push(clauses.join(" OR "));
+            binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
+        }
+    }
+
+    if let Some(exc) = &req.exclude {
+        if let Some(pls) = &exc.programming_languages {
+            let placeholders: Vec<String> = pls
+                .iter()
+                .map(|_| {
+                    let p = format!("?{param_number}");
+                    param_number += 1;
+                    p
+                })
+                .collect();
+            meta_where.push(format!(
+                "f.programming_language NOT IN ({})",
+                placeholders.join(", ")
+            ));
+            binds.extend(pls.iter().map(|l| Bind::Lang(*l)));
+        }
+
+        if let Some(paths) = &exc.paths {
+            let clauses: Vec<String> = paths
+                .iter()
+                .map(|_| {
+                    let c = format!("c.file_path GLOB ?{param_number}");
+                    param_number += 1;
+                    c
+                })
+                .collect();
+            meta_where.push(format!("NOT ({})", clauses.join(" OR ")));
+            binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
+        }
+    }
+
+    let sql = format!(
+        "
+    SELECT c.qdrant_guid, c.file_path, c.code,
+           c.start_line, c.end_line, c.start_column, c.end_column
+    FROM project_file_chunks c
+    JOIN project_files f
+        ON c.project_guid = f.project_guid
+        AND c.model_id = f.model_id
+        AND c.file_path = f.path
+    WHERE {}",
+        meta_where.join(" AND ")
+    );
+
+    (sql, binds)
+}
+
 async fn update_file_status(
     db_pool: &SQLite3Pool,
     project_guid: UUIDv4,
@@ -509,7 +625,7 @@ pub async fn post_search(
     } = match client
         .encode(
             BGEm3EmbedRequest {
-                texts: vec![payload.query],
+                texts: vec![payload.query.clone()],
             },
             guard.0.clone(),
         )
@@ -527,113 +643,14 @@ pub async fn post_search(
         }
     }?;
 
+    let (sql, binds) = build_search_query(project_guid, &payload);
+
     let chunks = state
         .db_pool
         .transaction(guard.0.child_token(), move |tx| {
-            let mut param_number: usize = 1;
-
-            // c.status = 'active' is always required to exclude soft-deleted chunks.
-            let mut meta_where = vec![
-                format!("c.project_guid = ?{}", param_number),
-                "c.status = 'active'".to_string(),
-            ];
-            param_number += 1;
-            let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(project_guid)];
-
-            if let Some(inc) = &payload.include {
-                if let Some(pls) = &inc.programming_languages {
-                    meta_where.push(format!(
-                        "f.programming_language IN ({})",
-                        vec![
-                            format!("?{}", {
-                                let tmp = param_number;
-                                param_number += 1;
-                                tmp
-                            });
-                            pls.len()
-                        ]
-                        .join(", ")
-                    ));
-
-                    for lang in pls {
-                        params.push(Box::new(*lang));
-                    }
-                }
-
-                if let Some(inc) = &inc.paths {
-                    let clauses: Vec<String> = inc
-                        .iter()
-                        .map(|_| {
-                            format!("c.file_path GLOB ?{}", {
-                                let tmp = param_number;
-                                param_number += 1;
-                                tmp
-                            })
-                        })
-                        .collect();
-
-                    meta_where.push(clauses.join(" OR "));
-                    params.extend(inc.iter().map(|p| Box::new(p.0.as_str()) as Box<dyn ToSql>));
-                }
-            }
-
-            if let Some(exc) = &payload.exclude {
-                if let Some(pls) = &exc.programming_languages {
-                    meta_where.push(format!(
-                        "f.programming_language NOT IN ({})",
-                        vec![
-                            format!("?{}", {
-                                let tmp = param_number;
-                                param_number += 1;
-                                tmp
-                            });
-                            pls.len()
-                        ]
-                        .join(", ")
-                    ));
-
-                    for lang in pls {
-                        params.push(Box::new(*lang));
-                    }
-                }
-
-                if let Some(paths) = &exc.paths {
-                    let clauses: Vec<String> = paths
-                        .iter()
-                        .map(|_| {
-                            format!("c.file_path GLOB ?{}", {
-                                let tmp = param_number;
-                                param_number += 1;
-                                tmp
-                            })
-                        })
-                        .collect();
-
-                    meta_where.push(format!("NOT ({})", clauses.join(" OR ")));
-                    params.extend(
-                        paths
-                            .iter()
-                            .map(|p| Box::new(p.0.as_str()) as Box<dyn ToSql>),
-                    );
-                }
-            }
-
-            let sql = format!(
-                "
-    SELECT c.qdrant_guid, c.file_path, c.code,
-           c.start_line, c.end_line, c.start_column, c.end_column
-    FROM project_file_chunks c
-    JOIN project_files f
-        ON c.project_guid = f.project_guid
-        AND c.model_id = f.model_id
-        AND c.file_path = f.path
-    WHERE {}",
-                meta_where.join(" AND ")
-            );
-
             let chunks: std::collections::HashMap<UUIDv4, (String, String, i64, i64, i64, i64)> = tx
                 .prepare(&sql)?
-                .query_map(params_from_iter(params), |row| {
+                .query_map(params_from_iter(binds), |row| {
                     Ok((
                         row.get::<_, UUIDv4>(0)?,
                         (
@@ -740,4 +757,138 @@ pub async fn post_search(
     }
     .instrument(span)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::v0::models::{GlobPattern, SearchFilter};
+    use glob::Pattern;
+    use uuid::Uuid;
+
+    fn guid() -> UUIDv4 {
+        UUIDv4(Uuid::nil())
+    }
+
+    fn glob(s: &str) -> GlobPattern {
+        GlobPattern(Pattern::new(s).unwrap())
+    }
+
+    fn req(include: Option<SearchFilter>, exclude: Option<SearchFilter>) -> SearchRequest {
+        SearchRequest { query: "q".into(), top_k: None, include, exclude }
+    }
+
+    fn langs(v: Vec<ProgrammingLanguage>) -> SearchFilter {
+        SearchFilter { paths: None, programming_languages: Some(v) }
+    }
+
+    fn paths(v: &[&str]) -> SearchFilter {
+        SearchFilter {
+            paths: Some(v.iter().map(|s| glob(s)).collect()),
+            programming_languages: None,
+        }
+    }
+
+    #[test]
+    fn no_filters_pins_project_and_active_status() {
+        let (sql, binds) = build_search_query(guid(), &req(None, None));
+        assert!(sql.contains("c.project_guid = ?1"));
+        assert!(sql.contains("c.status = 'active'"));
+        // No filter clauses beyond the two mandatory ones.
+        assert!(!sql.contains("programming_language"));
+        assert!(!sql.contains("GLOB"));
+        assert_eq!(binds, vec![Bind::Guid(guid())]);
+    }
+
+    #[test]
+    fn include_languages_numbered_from_two() {
+        let (sql, binds) = build_search_query(
+            guid(),
+            &req(Some(langs(vec![ProgrammingLanguage::Rust, ProgrammingLanguage::Python])), None),
+        );
+        assert!(sql.contains("f.programming_language IN (?2, ?3)"), "sql was: {sql}");
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Guid(guid()),
+                Bind::Lang(ProgrammingLanguage::Rust),
+                Bind::Lang(ProgrammingLanguage::Python),
+            ]
+        );
+    }
+
+    #[test]
+    fn include_paths_use_glob_or() {
+        let (sql, binds) = build_search_query(guid(), &req(Some(paths(&["src/**", "tests/**"])), None));
+        assert!(
+            sql.contains("c.file_path GLOB ?2 OR c.file_path GLOB ?3"),
+            "sql was: {sql}"
+        );
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Guid(guid()),
+                Bind::Path("src/**".into()),
+                Bind::Path("tests/**".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn include_langs_and_paths_continue_numbering() {
+        // langs take ?2,?3 then paths take ?4,?5 — the bind order must match.
+        let inc = SearchFilter {
+            paths: Some(vec![glob("a/**"), glob("b/**")]),
+            programming_languages: Some(vec![ProgrammingLanguage::Go, ProgrammingLanguage::Sql]),
+        };
+        let (sql, binds) = build_search_query(guid(), &req(Some(inc), None));
+        assert!(sql.contains("f.programming_language IN (?2, ?3)"), "sql was: {sql}");
+        assert!(sql.contains("c.file_path GLOB ?4 OR c.file_path GLOB ?5"), "sql was: {sql}");
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Guid(guid()),
+                Bind::Lang(ProgrammingLanguage::Go),
+                Bind::Lang(ProgrammingLanguage::Sql),
+                Bind::Path("a/**".into()),
+                Bind::Path("b/**".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn exclude_languages_use_not_in() {
+        let (sql, _) =
+            build_search_query(guid(), &req(None, Some(langs(vec![ProgrammingLanguage::Json]))));
+        assert!(sql.contains("f.programming_language NOT IN (?2)"), "sql was: {sql}");
+    }
+
+    #[test]
+    fn exclude_paths_are_negated() {
+        let (sql, binds) = build_search_query(guid(), &req(None, Some(paths(&["vendor/**"]))));
+        assert!(sql.contains("NOT (c.file_path GLOB ?2)"), "sql was: {sql}");
+        assert_eq!(binds, vec![Bind::Guid(guid()), Bind::Path("vendor/**".into())]);
+    }
+
+    #[test]
+    fn include_and_exclude_share_one_counter() {
+        // include langs ?2; exclude paths ?3 — numbering is global across both.
+        let (sql, binds) = build_search_query(
+            guid(),
+            &req(
+                Some(langs(vec![ProgrammingLanguage::Rust])),
+                Some(paths(&["target/**"])),
+            ),
+        );
+        assert!(sql.contains("f.programming_language IN (?2)"), "sql was: {sql}");
+        assert!(sql.contains("NOT (c.file_path GLOB ?3)"), "sql was: {sql}");
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Guid(guid()),
+                Bind::Lang(ProgrammingLanguage::Rust),
+                Bind::Path("target/**".into()),
+            ]
+        );
+    }
 }

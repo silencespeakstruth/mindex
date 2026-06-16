@@ -130,3 +130,80 @@ impl SQLite3Pool {
         })?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Each connection to ":memory:" is an independent database, so the pool is
+    // sized to 1 wherever shared state across transactions matters.
+    fn pool(size: usize) -> SQLite3Pool {
+        SQLite3Pool::new(Path::new(":memory:"), size)
+    }
+
+    #[tokio::test]
+    async fn transaction_commits_and_returns_value() {
+        let p = pool(1);
+        let n = p
+            .transaction(CancellationToken::new(), |tx| {
+                tx.execute_batch("CREATE TABLE t (x INTEGER);")?;
+                tx.execute("INSERT INTO t VALUES (42)", [])?;
+                let n: i64 = tx.query_row("SELECT x FROM t", [], |r| r.get(0))?;
+                Ok(n)
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 42);
+    }
+
+    #[tokio::test]
+    async fn precancelled_token_short_circuits() {
+        let p = pool(1);
+        let token = CancellationToken::new();
+        token.cancel();
+        let res = p.transaction(token, |_tx| Ok(())).await;
+        assert!(matches!(res, Err(SQLite3PoolError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn empty_pool_reports_pool_empty() {
+        // Zero connections: every acquire fails.
+        let p = pool(0);
+        let res = p.transaction(CancellationToken::new(), |_tx| Ok(())).await;
+        assert!(matches!(res, Err(SQLite3PoolError::PoolEmpty)));
+    }
+
+    // Regression for the connection-leak bug: if the caller's future is dropped while
+    // the blocking transaction is still running (client disconnect / cancellation), the
+    // connection must still be returned to the pool by the blocking task — otherwise the
+    // pool drains and every later transaction returns PoolEmpty.
+    #[tokio::test]
+    async fn connection_returned_when_future_dropped_midflight() {
+        let p = pool(1);
+
+        // A transaction whose closure blocks for 300ms.
+        let slow = p.transaction(CancellationToken::new(), |tx| {
+            std::thread::sleep(Duration::from_millis(300));
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS t (x);")?;
+            Ok(())
+        });
+
+        // Drop the future after 50ms — it is parked at `handle.await`, so this is exactly
+        // the "client went away mid-transaction" case. The spawn_blocking task keeps
+        // running to completion regardless.
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), slow).await;
+        assert!(timed_out.is_err(), "the slow transaction future should have been dropped");
+
+        // Give the orphaned blocking task time to finish and push the connection back.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // The single connection must be back in the pool. Before the fix this was lost
+        // and the call below returned PoolEmpty.
+        let res = p.transaction(CancellationToken::new(), |_tx| Ok(7)).await;
+        assert!(
+            matches!(res, Ok(7)),
+            "connection leaked on drop — pool exhausted: {res:?}"
+        );
+    }
+}

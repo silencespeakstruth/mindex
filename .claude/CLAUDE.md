@@ -34,7 +34,8 @@ mindex/
       requirements.txt
     integration/              — pytest end-to-end test suite
       conftest.py             — wait_for_mindex fixture (120 s), client, project fixtures
-      test_e2e.py             — 8 integration tests
+      test_e2e.py             — 8 integration tests (rust happy path)
+      test_filters_and_languages.py — multi-language indexing + search include/exclude filters
       Dockerfile
       requirements.txt
   tools/
@@ -441,6 +442,27 @@ Determinism ensures that the same text always produces the same vectors, making 
 | `test_search_result_has_line_numbers` | Every result has `start_line ≥ 1`, `end_line ≥ start_line`, columns ≥ 0 |
 | `test_search_empty_project_returns_404` | Search on a never-indexed project returns HTTP 404 |
 | `test_multiple_files_indexed_independently` | Two files in one request each return `chunk_count ≥ 1` |
+
+### Test Cases (`tests/integration/test_filters_and_languages.py`)
+Covers non-rust languages and the search filters (which `test_e2e.py` does not exercise). Imports `RUST_V1`/`RUST_V2` from `test_e2e`; the `PYTHON_SRC`/`SQL_SRC` fixtures were validated to each produce ≥1 chunk through the real slicer before being committed.
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_index_python_file_returns_chunks` / `test_index_sql_file_returns_chunks` | python and sql files index to ≥1 chunk (exercises those `match pl` arms) |
+| `test_search_finds_python_content` | search surfaces the indexed python source |
+| `test_multi_language_single_request` | one request mixing rust+python+sql indexes all three independently |
+| `test_search_include_language_returns_only_that_language` | `include.programming_languages` restricts results to that language |
+| `test_search_exclude_language_omits_that_language` | `exclude.programming_languages` removes that language |
+| `test_search_include_path_glob_restricts_results` | `include.paths` GLOB keeps only matching paths |
+| `test_search_exclude_path_glob_omits_matches` | `exclude.paths` GLOB drops matching paths |
+| `test_search_invalid_language_in_filter_is_rejected` | an unknown language enum value → HTTP 422, not silently ignored |
+
+### Rust unit tests (`cargo test --bin mindex`)
+23 unit tests, no server or Docker needed (the slicer/handler tests use the BGE-M3 tokenizer from the HF cache):
+- `slicing/traits.rs` (9): chunk byte/line alignment, token window, indentation, non-overlap, cancellation.
+- `backend/v0/handlers.rs` (7): `build_search_query` — the SQL string and the ordered bind list for every include/exclude combination, guarding the fragile `?N` parameter numbering. `build_search_query` was **extracted from `post_search` specifically to make this logic unit-testable** (it had no coverage before; the handler is otherwise only reachable via integration).
+- `db/sqlite3.rs` (4): commit/return value, pre-cancelled short-circuit, `PoolEmpty`, and the **connection-leak regression** (a transaction future dropped mid-flight must still return its connection — see SQLite3 Pool).
+- `worker/gc.rs` (3): sweep removes confirmed rows, **keeps rows whose Qdrant delete failed** (orphan-prevention regression), and is a no-op when empty. `sweep` is generic over a `VectorDeleter` trait so tests inject a fake that fails for chosen collections without a live Qdrant; `run` passes the real `QdrantDeleter`.
 
 ## Manual End-to-End Walkthrough
 
