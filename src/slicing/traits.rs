@@ -3,8 +3,22 @@ use tokenizers::Tokenizer;
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Language, LanguageError, Parser};
 
+/// The single tokenizer capability the slicer needs: the byte-offset span of each
+/// token in `text`. Abstracted behind a trait so the AST-walk/selection logic can
+/// be tested with a cheap deterministic tokenizer instead of downloading the real
+/// BGE-M3 tokenizer. The production implementation is `tokenizers::Tokenizer`.
+pub trait Tokenizing {
+    fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>, SlicerError>;
+}
+
+impl Tokenizing for Tokenizer {
+    fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>, SlicerError> {
+        Ok(self.encode(text, false)?.get_offsets().to_vec())
+    }
+}
+
 pub struct Slicer<'a> {
-    pub tokenizer: &'a Tokenizer,
+    pub tokenizer: &'a dyn Tokenizing,
     pub parser: Parser,
 }
 
@@ -41,7 +55,7 @@ pub struct SlicedChunk {
 }
 
 impl<'a> Slicer<'a> {
-    pub fn new(language: Language, tokenizer: &'a Tokenizer) -> Result<Self, SlicerError> {
+    pub fn new(language: Language, tokenizer: &'a dyn Tokenizing) -> Result<Self, SlicerError> {
         let mut parser = Parser::new();
 
         parser.set_language(&language)?;
@@ -54,8 +68,7 @@ impl<'a> Slicer<'a> {
         code: &str,
         token: CancellationToken,
     ) -> Result<Vec<SlicedChunk>, SlicerError> {
-        let encoding = self.tokenizer.encode(code, false)?;
-        let offsets = encoding.get_offsets();
+        let offsets = self.tokenizer.token_offsets(code)?;
 
         /* Important: the tokenization is statistical. Token boundaries do not
         necessarily align with AST node boundaries. Furthermore,
@@ -179,6 +192,28 @@ mod tests {
                 out.push((name, code));
             }
         }
+    }
+
+    /// One token per byte: a node of B bytes counts as B tokens. Lets the
+    /// selection logic be exercised with no real tokenizer (no HF download).
+    struct OnePerByte;
+    impl Tokenizing for OnePerByte {
+        fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>, SlicerError> {
+            Ok((0..text.len()).map(|i| (i, i + 1)).collect())
+        }
+    }
+
+    #[test]
+    fn slices_with_a_fake_tokenizer() {
+        // ~280-byte fn body → in the 128–512 window under one-token-per-byte, so the
+        // function node is selected — demonstrates A3's seam without the real tokenizer.
+        let src = "fn demo() {\n".to_string()
+            + &"    let _ = compute_something_meaningful(1, 2, 3);\n".repeat(5)
+            + "}\n";
+        let mut slicer =
+            Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), &OnePerByte).unwrap();
+        let chunks = slicer.parse(&src, CancellationToken::new()).unwrap();
+        assert!(!chunks.is_empty(), "the fn node should have been selected");
     }
 
     #[test]

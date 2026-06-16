@@ -2,7 +2,6 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum_server::tls_rustls::RustlsConfig;
-use qdrant_client::Qdrant;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::backend::v0::handlers::{post_index, post_search};
+use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::models::bge_m3::BGEm3Model;
 
@@ -27,7 +27,7 @@ pub enum EmbeddingModel {
 pub struct RouterState {
     pub tokenizer: Arc<Tokenizer>,
     pub db_pool: Arc<SQLite3Pool>,
-    pub qdrant: Arc<Qdrant>,
+    pub qdrant: Arc<dyn VectorStore>,
     pub model: EmbeddingModel,
 }
 

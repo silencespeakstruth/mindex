@@ -1,4 +1,5 @@
 use crate::backend::http3::{EmbeddingModel, RouterState};
+use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::models::bge_m3::{BGEm3HttpClient, BGEm3Model};
 use clap::Parser;
@@ -127,7 +128,8 @@ async fn main() -> Result<(), BoxError> {
 
     let model_id = args.model.as_str(); // For now, only one model is supported.
 
-    let qdrant_client = Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
+    let qdrant_client: Arc<dyn VectorStore> =
+        Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
 
     // One embedding client, shared (as a trait object) by the retry worker and the
     // HTTP handlers — built once rather than per consumer.

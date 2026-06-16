@@ -15,13 +15,15 @@ mindex/
         models.rs             — request/response types, ProgrammingLanguage, UUIDv4, GlobPattern
     db/
       sqlite3.rs              — SQLite3Pool, SQLite3PoolError
-      qdrant.rs               — ensure_project, insert_batch, delete_batch, search, collection_name
+      qdrant.rs               — VectorStore trait (+ impl for Qdrant), VectorStoreError, ChunkAsVector, collection_name/collection_for
+      files.rs                — set_file_status: shared project_files.status transition
       migrations/
         v0.1.0_schema.sql     — projects, project_files, project_file_chunks tables
     models/
       bge_m3.rs               — BGEm3HttpClient, BGEm3Model trait, EncodeError
+    embed.rs                  — embed_and_upsert: shared embed→upsert pipeline, EmbedUpsertError
     slicing/
-      traits.rs               — Slicer, SlicedChunk, SlicerError
+      traits.rs               — Slicer, SlicedChunk, SlicerError, Tokenizing trait
     worker/
       gc.rs                   — GC worker: sweeps deleted chunks from Qdrant + SQLite hourly
       retry.rs                — Retry worker: re-embeds stuck/failed files every 60 s
@@ -55,7 +57,7 @@ mindex/
 
 ## HTTP Server
 - Framework: `axum` + `axum-server` with `rustls` (TLS 1.2/1.3).
-- HTTP/3 support is **in-progress** — the `Protocol::Http3` CLI variant and `http3.rs` module name are forward-looking; the current `run()` function uses HTTP/1.1 + HTTP/2 only.
+- HTTP/3 support is **in-progress** — the `http3.rs` module name is forward-looking; the current `run()` function uses HTTP/1.1 + HTTP/2 only. (The unused `--protocol`/`Protocol::Http3` CLI flag was removed; the module keeps the aspirational name.)
 - Default bind: `127.0.0.1:11111`. Default TLS certs: `cert.pem` / `key.pem`.
 - Routes: `POST /v0/{project_guid}/index`, `POST /v0/{project_guid}/search`.
   - Route params use `{param}` syntax (axum 0.8+), **not** `:param`.
@@ -64,8 +66,10 @@ mindex/
 ## Qdrant Architecture (Critical)
 Qdrant uses **one collection per project**, named `{project_guid_simple}_v0` via `collection_name()`. The `_v0` suffix is the collection schema version defined by `COLLECTION_SCHEMA_VERSION` in `db/qdrant.rs`. Within each collection, chunk-level discrimination is done via a `has_id` filter populated from SQLite.
 
+All Qdrant operations go through the **`VectorStore` trait** (`db/qdrant.rs`), implemented for `qdrant_client::Qdrant` and shared as `Arc<dyn VectorStore>` — so handlers and workers can be unit-tested against an in-memory fake (see *Mockable interfaces*). Its error type is `VectorStoreError` (a rendered message), not the raw `QdrantError`, so fakes can simulate failures.
+
 Two-layer isolation:
-1. **Collection = project.** Every `ensure_project`, `insert_batch`, `delete_batch`, and `search` call must pass `collection_name(project_guid.0.as_simple().to_string().as_str())` as the collection name.
+1. **Collection = project.** Every `ensure_project`/`insert_batch`/`delete_batch`/`search` call passes the collection name from `collection_for(project_guid)` (or `collection_name(simple_guid)`).
 2. **`has_id` filter = SQLite-derived active chunk GUIDs.** Before calling Qdrant, SQLite is queried to collect all `qdrant_guid` values where `c.status = 'active'` and that match the project + any additional filters (language, path GLOBs). Those GUIDs are passed as the Qdrant `has_id` filter, narrowing the vector search to the relevant subset.
 
 - **Collection schema** (three named vectors per collection):
@@ -84,7 +88,7 @@ Two-layer isolation:
 API contract:
 - `POST /encode` — body: `{"texts": ["..."]}` — response: `{"dense_vecs": [[f32, ...]], "sparse_vecs": [{u32: f32, ...}], "colbert_vecs": [[[f32, ...]]]}`.
 
-Only one model is supported at runtime, set via `--model` (default `BAAI/bge-m3`). The `EmbeddingModel` enum in `http3.rs` is the extension point for adding models.
+Only one model is supported at runtime, set via `--model` (default `BAAI/bge-m3`). The `EmbeddingModel` enum in `http3.rs` is the extension point for adding models; its `BGEm3` variant holds an `Arc<dyn BGEm3Model>` (not the concrete client), so the embedder is a mockable seam — see *Mockable interfaces*.
 
 ## SQLite3 Pool
 `SQLite3Pool` is a fixed-size pool of `rusqlite::Connection` instances behind a `tokio::sync::Mutex<Vec<Connection>>`. Acquire = `Vec::pop`; release = `Vec::push`. Returns `PoolEmpty` if all connections are checked out.
@@ -148,7 +152,9 @@ For each file, `post_index` executes these sequential transactions (separate `db
    - **Set-indexed tx**: `UPDATE project_files SET status='indexed', sha256=new_hash`.
    - On any error: **Recovery tx** sets `status='cancelled'` or `status='failed'` (with `retry_count++`).
 
-`tree_sitter::Parser` is `Send` (explicitly impl'd by tree-sitter), so the slicer can be created inside `spawn_blocking` closures. The `Arc<Tokenizer>` is moved into the closure; `Slicer::new(lang, &tokenizer)` borrows within the closure's scope.
+`post_index` builds a `FileIndexer` (borrowed view of `db_pool`/`store`/`tokenizer`/`embedder`/etc.) and calls `index_one` per file; `index_one` returns `Ok(None)` (unchanged/skipped), `Ok(Some(n))` (indexed n chunks), or `Err` (status already recovered, HTTP status to return). It instruments its own future with the `indexing_file` span (no `Entered` guard held across `.await`). The embed→upsert step is the shared `embed::embed_and_upsert`.
+
+`tree_sitter::Parser` is `Send` (explicitly impl'd by tree-sitter), so the slicer can be created inside `spawn_blocking` closures. The `Arc<Tokenizer>` is moved into the closure; `Slicer::new(lang, &*tokenizer)` borrows within the closure's scope (the param is `&dyn Tokenizing`).
 
 **Known correctness follow-up (observability, not data):** the per-file `info_span!("indexing_file", …)` is currently entered with `let _guard = file_span.enter();` and that guard is held across the file's `.await` points. Holding a `tracing` `Entered` guard across `.await` is the `await_holding_span_guard` anti-pattern: when the future parks at an await, the guard is not dropped, so the span stays entered on the worker thread and can mis-attribute *other* concurrently-running tasks' log events to this file span. It does **not** corrupt indexing data — only log/span attribution under concurrency. The correct fix is to wrap the per-file body in `async { … }.instrument(file_span).await`, but the body uses `continue`/`return` for control flow, so it needs the outcome re-encoded as a returned enum; deferred to avoid reshaping a tested path without e2e coverage. The outer `post_index`/`post_search` request spans use `.instrument(span)` correctly and are unaffected.
 
@@ -358,7 +364,7 @@ When adding a new `ProgrammingLanguage`, touch all of these — `sql` (`tree-sit
 1. Add the variant to the `ProgrammingLanguage` enum in `models.rs` and its `ToSql`/`FromSql` impls. Use a lowercase SQL name matching the serde rename. Skipping this → server returns `422 unknown variant`.
 2. Add the SQL name to the `CHECK` constraint in `v0.1.0_schema.sql`. Skipping this → `SqliteFailure(ConstraintViolation, "CHECK constraint failed...")`, surfaced to the client as a bare `500`.
 3. Add the `tree-sitter-<lang>` crate to `Cargo.toml`. **Verify** its `tree-sitter` dependency is `≥ 0.23` (check the crate's own `Cargo.toml`, e.g. via `cargo info <crate>` + inspecting the downloaded source in `~/.cargo/registry/src/`) — modern grammar crates depend on the lightweight `tree-sitter-language` ABI crate and only dev-depend on full `tree-sitter`, which is what avoids the `links` conflict. Older crates depend on full `tree-sitter` directly at an old version and will conflict.
-4. Add an arm to the `let ts_language = match pl { ... }` block in the main-work tx closure in `post_index`. Use `Language::new(tree_sitter_<lang>::LANGUAGE)` for crates that export a plain `LANGUAGE` constant, or the crate-specific name (e.g. `LANGUAGE_TYPESCRIPT`, `LANGUAGE_OCAML`).
+4. Add an arm to the `tree_sitter_language(pl)` match in `handlers.rs`. Use `Language::new(tree_sitter_<lang>::LANGUAGE)` for crates that export a plain `LANGUAGE` constant, or the crate-specific name (e.g. `LANGUAGE_TYPESCRIPT`, `LANGUAGE_OCAML`). The match is total, so a missing arm is a compile error.
 5. Add the extension(s) to `detect_language` in `tools/indexer/src/scanner.rs` and the matching arm to `Language::name()` in the same file. Skipping this → the indexer silently counts the file under `skipped_unknown` and it never reaches the server at all (no error, just absent from results — the easiest of these to miss).
 6. Add the language to `VALID_LANGS` in `tools/search/mindex-search` (client-side `--include-lang`/`--exclude-lang` validation) and, if it has a natural source-file extension, to `ext_to_lexer()` in the same file for syntax-highlighted search output.
 7. Update the table in this file's **Supported Languages** section (bump the language count) and the indexer's **Language detection** line above.
@@ -448,7 +454,7 @@ Covers non-rust languages and the search filters (which `test_e2e.py` does not e
 
 | Test | What it verifies |
 |------|-----------------|
-| `test_index_python_file_returns_chunks` / `test_index_sql_file_returns_chunks` | python and sql files index to ≥1 chunk (exercises those `match pl` arms) |
+| `test_index_python_file_returns_chunks` / `test_index_sql_file_returns_chunks` | python and sql files index to ≥1 chunk (exercises those `tree_sitter_language` arms) |
 | `test_search_finds_python_content` | search surfaces the indexed python source |
 | `test_multi_language_single_request` | one request mixing rust+python+sql indexes all three independently |
 | `test_search_include_language_returns_only_that_language` | `include.programming_languages` restricts results to that language |
@@ -457,12 +463,21 @@ Covers non-rust languages and the search filters (which `test_e2e.py` does not e
 | `test_search_exclude_path_glob_omits_matches` | `exclude.paths` GLOB drops matching paths |
 | `test_search_invalid_language_in_filter_is_rejected` | an unknown language enum value → HTTP 422, not silently ignored |
 
+### Mockable interfaces
+Three traits exist so handlers and workers can be unit-tested without live infrastructure; the production type is the only real impl, fakes live in `#[cfg(test)]`:
+- **`BGEm3Model`** (`models/bge_m3.rs`) — the embedder. `RouterState`/`EmbeddingModel` and the retry worker hold `Arc<dyn BGEm3Model>`.
+- **`VectorStore`** (`db/qdrant.rs`) — all Qdrant ops; impl'd for `Qdrant`. Error type `VectorStoreError` (rendered string) so fakes can return failures.
+- **`Tokenizing`** (`slicing/traits.rs`) — the one tokenizer capability the slicer needs (`token_offsets`); impl'd for `tokenizers::Tokenizer`. Lets slicing logic be tested with a deterministic fake (no HF download).
+
+When extracting a new seam, follow this shape: trait with the minimal surface, production type as the sole real impl, a custom owned error if the underlying error isn't constructible in tests. (`SQLite3Pool` is *not* behind a trait — its generic-closure `transaction` isn't object-safe; test DB code against a real `:memory:` pool instead.)
+
 ### Rust unit tests (`cargo test --bin mindex`)
-23 unit tests, no server or Docker needed (the slicer/handler tests use the BGE-M3 tokenizer from the HF cache):
-- `slicing/traits.rs` (9): chunk byte/line alignment, token window, indentation, non-overlap, cancellation.
-- `backend/v0/handlers.rs` (7): `build_search_query` — the SQL string and the ordered bind list for every include/exclude combination, guarding the fragile `?N` parameter numbering. `build_search_query` was **extracted from `post_search` specifically to make this logic unit-testable** (it had no coverage before; the handler is otherwise only reachable via integration).
+28 unit tests, no server or Docker needed (some slicer tests use the BGE-M3 tokenizer from the HF cache; the rest are network-free):
+- `slicing/traits.rs` (10): chunk byte/line alignment, token window, indentation, non-overlap, cancellation, plus `slices_with_a_fake_tokenizer` (a `Tokenizing` fake — no HF download).
+- `backend/v0/handlers.rs` (7): `build_search_query` — the SQL string and ordered bind list for every include/exclude combination, guarding the fragile `?N` numbering (extracted from `post_search` to make it unit-testable).
+- `embed.rs` (4): `embed_and_upsert` driven by a fake `BGEm3Model` + fake `VectorStore` — upserts every chunk in order, no-op on empty, and maps store-failure→`Store`, embed-cancel→`Cancelled`. Demonstrates the mockable seams.
 - `db/sqlite3.rs` (4): commit/return value, pre-cancelled short-circuit, `PoolEmpty`, and the **connection-leak regression** (a transaction future dropped mid-flight must still return its connection — see SQLite3 Pool).
-- `worker/gc.rs` (3): sweep removes confirmed rows, **keeps rows whose Qdrant delete failed** (orphan-prevention regression), and is a no-op when empty. `sweep` is generic over a `VectorDeleter` trait so tests inject a fake that fails for chosen collections without a live Qdrant; `run` passes the real `QdrantDeleter`.
+- `worker/gc.rs` (3): sweep removes confirmed rows, **keeps rows whose Qdrant delete failed** (orphan-prevention regression), and is a no-op when empty. The test injects a `FakeStore: VectorStore` that fails for chosen collections; `run` passes the real `Qdrant`.
 
 ## Manual End-to-End Walkthrough
 
@@ -503,15 +518,15 @@ When a lint fires on intentional code, prefer a **scoped `#[allow(...)]` / confi
 ## Operational Rules
 - **Data Integrity:** SQLite writes involving multiple rows must be inside a `transaction`. The soft-delete pattern ensures consistency: if the main-work transaction rolls back, old chunks remain `active` and the file status is recoverable.
 - **Chunk FK is RESTRICT, not CASCADE.** Never delete a `project_files` row while its chunks exist. Always mark chunks `deleted` first (or let them be GC'd), then delete the project row.
-- **Qdrant Safety:** Always call `ensure_project(collection_name(...))` before any vector operation; always use batch upsert/delete. Never delete from Qdrant in the hot indexing path — mark chunks deleted in SQLite and let the GC handle it.
+- **Qdrant Safety:** Always call `VectorStore::ensure_project` before any vector operation; always use batch upsert/delete. Never delete from Qdrant in the hot indexing path — mark chunks deleted in SQLite and let the GC handle it.
 - **Migration:** New schema changes go in a new SQL file added to the `MIGRATIONS` slice in `main.rs`. Migrations run inside a transaction on startup. The DB can be dropped and recreated freely; no migration upgrade path is maintained.
-- **Shared `Arc<Qdrant>`:** A single `Arc<Qdrant>` instance is created in `main.rs` and shared between the HTTP server (`RouterState`) and the two workers. Do not create separate Qdrant clients per component.
+- **Shared store + embedder:** One vector store (a `Qdrant` built in `main.rs`, held as `Arc<dyn VectorStore>`) and one `Arc<dyn BGEm3Model>` embedder are shared between the HTTP server (`RouterState`) and the two workers. Do not create separate clients per component.
 
 ## When Modifying Code
 1. Any new loop touching Qdrant, SQLite, or the model server must check/respect the `CancellationToken`.
 2. Any multi-row database write must be inside a `transaction`.
 3. New endpoints must be registered in `backend::http3::run` and must respect `RouterState`. Route params use `{param}` syntax.
-4. Always use `collection_name(project_guid.0.as_simple().to_string().as_str())` as the Qdrant collection name. Never hardcode collection names.
+4. Always derive the Qdrant collection name from `collection_for(project_guid)` (or `collection_name(simple_guid)`). Never hardcode collection names. Reach Qdrant only through the `VectorStore` trait.
 5. The SQLite query in any search path must include `AND c.status = 'active'` to exclude soft-deleted chunks.
 6. Status transitions in `project_files` must always update `status_updated_at = unixepoch()` in the same statement.
 7. When adding a language, follow the full **Language Extensibility** checklist above (8 steps: enum, schema CHECK, Cargo.toml, handlers.rs match arm, indexer scanner.rs, search CLI's `VALID_LANGS`, docs, and a Docker image rebuild + DB volume recreate) — not just the enum and match arm.

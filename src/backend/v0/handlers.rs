@@ -14,9 +14,8 @@ use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
 use crate::backend::v0::models::UUIDv4;
 use crate::db::qdrant::SearchHit;
+use crate::db::qdrant::VectorStore;
 use crate::db::qdrant::collection_for;
-use crate::db::qdrant::ensure_project;
-use crate::db::qdrant::search;
 use crate::db::files::set_file_status;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::db::sqlite3::SQLite3PoolError;
@@ -35,7 +34,6 @@ use axum::extract::Path;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::ErrorResponse;
-use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use rusqlite::OptionalExtension;
 use rusqlite::ToSql;
@@ -234,7 +232,7 @@ fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
 /// test — instead of inline in `post_index`'s nested loops.
 struct FileIndexer<'a> {
     db_pool: &'a SQLite3Pool,
-    qdrant: &'a Qdrant,
+    store: &'a dyn VectorStore,
     tokenizer: &'a Arc<Tokenizer>,
     embedder: &'a dyn BGEm3Model,
     model_id: &'a str,
@@ -340,7 +338,7 @@ impl FileIndexer<'_> {
                             params![project_guid, path_m, model_id_m],
                         )?;
 
-                        let mut slicer = Slicer::new(tree_sitter_language(pl), &tokenizer)
+                        let mut slicer = Slicer::new(tree_sitter_language(pl), &*tokenizer)
                             .map_err(slicer_err_to_pool_err)?;
 
                         let chunks = slicer
@@ -407,7 +405,7 @@ impl FileIndexer<'_> {
             // ── embed + Qdrant upsert ─────────────────────────────────────
             match embed_and_upsert(
                 self.embedder,
-                self.qdrant,
+                self.store,
                 self.collection,
                 &chunks_to_embed,
                 self.token,
@@ -539,7 +537,8 @@ pub async fn post_index(
     }
 
     // ── ensure Qdrant collection ──────────────────────────────────────────
-    ensure_project(&qdrant, &collection)
+    qdrant
+        .ensure_project(&collection)
         .await
         .map_err(|err| {
             error!(
@@ -555,7 +554,7 @@ pub async fn post_index(
 
     let indexer = FileIndexer {
         db_pool: &db_pool,
-        qdrant: &qdrant,
+        store: &*qdrant,
         tokenizer: &tokenizer,
         embedder: &*client,
         model_id: &model_id,
@@ -673,17 +672,18 @@ pub async fn post_search(
         .next()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let search_hits = search(
-        &state.qdrant,
-        &collection_for(project_guid),
-        chunks.keys().copied().collect(),
-        dense,
-        sparse.keys().copied().collect(),
-        sparse.values().copied().collect(),
-        colbert,
-        payload.top_k.unwrap_or(5) as u64,
-    )
-    .await
+    let search_hits = state
+        .qdrant
+        .search(
+            &collection_for(project_guid),
+            chunks.keys().copied().collect(),
+            dense,
+            sparse.keys().copied().collect(),
+            sparse.values().copied().collect(),
+            colbert,
+            payload.top_k.unwrap_or(5) as u64,
+        )
+        .await
     .map_err(|err| {
         error!(
             error = ?err,

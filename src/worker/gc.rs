@@ -2,41 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use qdrant_client::Qdrant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::db::qdrant::{collection_name, delete_batch};
+use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 
-/// Removes a batch of vectors from one Qdrant collection. Abstracted behind a trait
-/// so `sweep` can be unit-tested with a fake that fails for chosen collections,
-/// exercising the "only hard-delete confirmed rows" logic without a live Qdrant.
-#[async_trait]
-trait VectorDeleter: Sync {
-    /// On failure, returns the error rendered as a string for logging.
-    async fn delete(&self, collection: &str, guids: Vec<String>) -> Result<(), String>;
-}
-
-struct QdrantDeleter<'a> {
-    qdrant: &'a Qdrant,
-}
-
-#[async_trait]
-impl VectorDeleter for QdrantDeleter<'_> {
-    async fn delete(&self, collection: &str, guids: Vec<String>) -> Result<(), String> {
-        delete_batch(self.qdrant, collection, guids)
-            .await
-            .map_err(|e| format!("{e:?}"))
-    }
-}
-
-pub async fn run(db_pool: Arc<SQLite3Pool>, qdrant: Arc<Qdrant>, token: CancellationToken) {
+pub async fn run(db_pool: Arc<SQLite3Pool>, store: Arc<dyn VectorStore>, token: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let deleter = QdrantDeleter { qdrant: &qdrant };
 
     loop {
         tokio::select! {
@@ -48,12 +22,12 @@ pub async fn run(db_pool: Arc<SQLite3Pool>, qdrant: Arc<Qdrant>, token: Cancella
         }
 
         info!("GC worker: starting sweep.");
-        sweep(&db_pool, &deleter, &token).await;
+        sweep(&db_pool, &*store, &token).await;
         info!("GC worker: sweep complete.");
     }
 }
 
-async fn sweep(db_pool: &SQLite3Pool, deleter: &impl VectorDeleter, token: &CancellationToken) {
+async fn sweep(db_pool: &SQLite3Pool, store: &dyn VectorStore, token: &CancellationToken) {
     loop {
         if token.is_cancelled() {
             break;
@@ -103,7 +77,7 @@ async fn sweep(db_pool: &SQLite3Pool, deleter: &impl VectorDeleter, token: &Canc
         let mut confirmed_deleted: Vec<String> = Vec::new();
         for (project_guid, guids) in &by_project {
             let coll = collection_name(project_guid);
-            match deleter.delete(&coll, guids.clone()).await {
+            match store.delete_batch(&coll, guids.clone()).await {
                 Ok(()) => confirmed_deleted.extend(guids.iter().cloned()),
                 Err(e) => error!(
                     error = %e,
@@ -144,24 +118,56 @@ async fn sweep(db_pool: &SQLite3Pool, deleter: &impl VectorDeleter, token: &Canc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use rusqlite::params;
     use std::collections::HashSet;
     use std::path::Path;
     use uuid::Uuid;
 
-    /// Fails `delete` for any collection in `fail`, succeeds otherwise.
-    struct FakeDeleter {
+    use crate::backend::v0::models::UUIDv4;
+    use crate::db::qdrant::{ChunkAsVector, SearchHit, VectorStoreError};
+
+    /// `VectorStore` fake: `delete_batch` fails for any collection in `fail` and
+    /// succeeds otherwise. The other methods are unreachable from `sweep`.
+    struct FakeStore {
         fail: HashSet<String>,
     }
 
     #[async_trait]
-    impl VectorDeleter for FakeDeleter {
-        async fn delete(&self, collection: &str, _guids: Vec<String>) -> Result<(), String> {
+    impl VectorStore for FakeStore {
+        async fn delete_batch(
+            &self,
+            collection: &str,
+            _guids: Vec<String>,
+        ) -> Result<(), VectorStoreError> {
             if self.fail.contains(collection) {
-                Err("forced failure".to_string())
+                Err(VectorStoreError("forced failure".to_string()))
             } else {
                 Ok(())
             }
+        }
+
+        async fn ensure_project(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            unreachable!("sweep does not call ensure_project")
+        }
+        async fn insert_batch(
+            &self,
+            _collection: &str,
+            _chunks: Vec<ChunkAsVector>,
+        ) -> Result<(), VectorStoreError> {
+            unreachable!("sweep does not call insert_batch")
+        }
+        async fn search(
+            &self,
+            _collection: &str,
+            _chunk_ids: Vec<UUIDv4>,
+            _dense: Vec<f32>,
+            _sparse_indices: Vec<u32>,
+            _sparse_values: Vec<f32>,
+            _colbert: Vec<Vec<f32>>,
+            _top_k: u64,
+        ) -> Result<Vec<SearchHit>, VectorStoreError> {
+            unreachable!("sweep does not call search")
         }
     }
 
@@ -229,8 +235,8 @@ mod tests {
         let guid = "a".repeat(32);
         seed_deleted_chunks(&pool, &guid, 3).await;
 
-        let deleter = FakeDeleter { fail: HashSet::new() };
-        sweep(&pool, &deleter, &CancellationToken::new()).await;
+        let store = FakeStore { fail: HashSet::new() };
+        sweep(&pool, &store, &CancellationToken::new()).await;
 
         assert_eq!(deleted_count(&pool, &guid).await, 0, "all confirmed rows should be gone");
     }
@@ -244,10 +250,10 @@ mod tests {
         seed_deleted_chunks(&pool, &guid_fail, 2).await;
 
         // Fail only the second project's collection.
-        let deleter = FakeDeleter {
+        let store = FakeStore {
             fail: HashSet::from([collection_name(&guid_fail)]),
         };
-        sweep(&pool, &deleter, &CancellationToken::new()).await;
+        sweep(&pool, &store, &CancellationToken::new()).await;
 
         // Confirmed-deleted project: rows gone. Failed project: rows kept for retry
         // (this is the orphan-prevention regression — old code deleted them anyway).
@@ -258,8 +264,8 @@ mod tests {
     #[tokio::test]
     async fn sweep_on_empty_is_a_noop() {
         let pool = migrated_pool().await;
-        let deleter = FakeDeleter { fail: HashSet::new() };
+        let store = FakeStore { fail: HashSet::new() };
         // No deleted chunks at all: must return promptly without error.
-        sweep(&pool, &deleter, &CancellationToken::new()).await;
+        sweep(&pool, &store, &CancellationToken::new()).await;
     }
 }

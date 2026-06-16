@@ -1,14 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use qdrant_client::Qdrant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::backend::v0::models::UUIDv4;
 use crate::db::files::set_file_status;
-use crate::db::qdrant::collection_name;
+use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 use crate::embed::{EmbedUpsertError, embed_and_upsert};
 use crate::models::bge_m3::BGEm3Model;
@@ -17,7 +16,7 @@ const MAX_RETRIES: i64 = 3;
 
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
-    qdrant: Arc<Qdrant>,
+    store: Arc<dyn VectorStore>,
     model_client: Arc<dyn BGEm3Model>,
     model_id: String,
     token: CancellationToken,
@@ -103,7 +102,7 @@ pub async fn run(
                 .collect();
 
             let success =
-                match embed_and_upsert(&*model_client, &qdrant, &collection, &to_embed, &token).await
+                match embed_and_upsert(&*model_client, &*store, &collection, &to_embed, &token).await
                 {
                     Ok(()) => true,
                     Err(EmbedUpsertError::Cancelled) => false,

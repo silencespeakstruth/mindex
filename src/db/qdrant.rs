@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use qdrant_client::Payload;
 use qdrant_client::Qdrant;
 use qdrant_client::QdrantError;
@@ -38,37 +39,6 @@ pub fn collection_for(project_guid: UUIDv4) -> String {
     collection_name(&project_guid.0.as_simple().to_string())
 }
 
-pub async fn ensure_project(client: &Qdrant, project_guid: &str) -> Result<(), QdrantError> {
-    if client.collection_exists(project_guid).await? {
-        return Ok(());
-    }
-
-    let mut vectors_config = VectorsConfigBuilder::default();
-
-    vectors_config
-        .add_named_vector_params("dense", VectorParamsBuilder::new(1024, Distance::Cosine));
-
-    vectors_config.add_named_vector_params(
-        "colbert",
-        VectorParamsBuilder::new(1024, Distance::Cosine)
-            .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim)),
-    );
-
-    let mut sparse_config = SparseVectorsConfigBuilder::default();
-
-    sparse_config.add_named_vector_params("sparse", SparseVectorParamsBuilder::default());
-
-    client
-        .create_collection(
-            CreateCollectionBuilder::new(project_guid)
-                .vectors_config(vectors_config)
-                .sparse_vectors_config(sparse_config),
-        )
-        .await?;
-
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct ChunkAsVector {
     pub guid: UUIDv4,
@@ -96,96 +66,174 @@ impl From<ChunkAsVector> for PointStruct {
     }
 }
 
-pub async fn insert_batch(
-    client: &Qdrant,
-    collection: &str,
-    chunks: Vec<ChunkAsVector>,
-) -> Result<(), QdrantError> {
-    let points: Vec<PointStruct> = chunks.into_iter().map(|c| c.into()).collect();
-
-    client
-        .upsert_points(UpsertPointsBuilder::new(collection, points))
-        .await?;
-
-    Ok(())
-}
-
-pub async fn delete_batch(
-    client: &Qdrant,
-    collection: &str,
-    qdrant_guids: Vec<String>,
-) -> Result<(), QdrantError> {
-    client
-        .delete_points(DeletePointsBuilder::new(collection).points(qdrant_guids))
-        .await?;
-
-    Ok(())
-}
-
 pub struct SearchHit {
     pub id: PointId,
     pub score: f32,
 }
 
-// The eight parameters are the irreducible inputs of one hybrid query (collection,
-// id filter, the three vector modalities, and top_k); bundling them into a struct
-// would only move the same fields around without improving clarity.
-#[allow(clippy::too_many_arguments)]
-pub async fn search(
-    client: &Qdrant,
-    collection: &str,
-    chunk_ids: Vec<UUIDv4>,
-    dense: Vec<f32>,
-    sparse_indices: Vec<u32>,
-    sparse_values: Vec<f32>,
-    colbert: Vec<Vec<f32>>,
-    top_k: u64,
-) -> Result<Vec<SearchHit>, QdrantError> {
-    let filter = Filter {
-        must: vec![Condition {
-            condition_one_of: Some(condition::ConditionOneOf::HasId(HasIdCondition {
-                has_id: chunk_ids
-                    .into_iter()
-                    .map(|UUIDv4(v4)| v4.simple().to_string())
-                    .map(Into::into)
-                    .collect(),
-            })),
-        }],
-        ..Default::default()
-    };
+/// Error surfaced by [`VectorStore`]. Owns a rendered message so test fakes can
+/// construct failures without needing to build a real `QdrantError`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct VectorStoreError(pub String);
 
-    let sparse_query: Vec<(u32, f32)> = sparse_indices.into_iter().zip(sparse_values).collect();
+impl From<QdrantError> for VectorStoreError {
+    fn from(e: QdrantError) -> Self {
+        VectorStoreError(e.to_string())
+    }
+}
 
-    let response = client
-        .query(
-            QueryPointsBuilder::new(collection)
-                .prefetch(vec![
-                    PrefetchQueryBuilder::default()
-                        .query(dense)
-                        .using("dense")
-                        .limit(200u32)
-                        .filter(filter.clone())
-                        .build(),
-                    PrefetchQueryBuilder::default()
-                        .query(Query::from(sparse_query))
-                        .using("sparse")
-                        .limit(200u32)
-                        .filter(filter.clone())
-                        .build(),
-                ])
-                .query(Query::new_fusion(Fusion::Rrf))
-                .query(colbert)
-                .using("colbert")
-                .limit(top_k)
-                .filter(filter)
-                .with_payload(false)
-                .with_vectors(false),
+/// The vector-store operations mindex performs, abstracted behind a trait so the
+/// indexing handler, the search handler, and both workers can be unit-tested
+/// against an in-memory fake instead of a live Qdrant. The production
+/// implementation is `Qdrant` itself.
+#[async_trait]
+pub trait VectorStore: Send + Sync {
+    /// Creates the collection (dense + sparse + colbert vectors) if it is absent.
+    async fn ensure_project(&self, collection: &str) -> Result<(), VectorStoreError>;
+
+    /// Upserts a batch of chunk vectors into `collection`.
+    async fn insert_batch(
+        &self,
+        collection: &str,
+        chunks: Vec<ChunkAsVector>,
+    ) -> Result<(), VectorStoreError>;
+
+    /// Deletes the named points from `collection`.
+    async fn delete_batch(
+        &self,
+        collection: &str,
+        qdrant_guids: Vec<String>,
+    ) -> Result<(), VectorStoreError>;
+
+    /// Hybrid search: dense + sparse prefetch → RRF fusion → ColBERT MaxSim rerank,
+    /// restricted to `chunk_ids` via a `has_id` filter, returning the top `top_k`.
+    #[allow(clippy::too_many_arguments)] // irreducible inputs of one hybrid query
+    async fn search(
+        &self,
+        collection: &str,
+        chunk_ids: Vec<UUIDv4>,
+        dense: Vec<f32>,
+        sparse_indices: Vec<u32>,
+        sparse_values: Vec<f32>,
+        colbert: Vec<Vec<f32>>,
+        top_k: u64,
+    ) -> Result<Vec<SearchHit>, VectorStoreError>;
+}
+
+#[async_trait]
+impl VectorStore for Qdrant {
+    async fn ensure_project(&self, collection: &str) -> Result<(), VectorStoreError> {
+        if self.collection_exists(collection).await? {
+            return Ok(());
+        }
+
+        let mut vectors_config = VectorsConfigBuilder::default();
+
+        vectors_config
+            .add_named_vector_params("dense", VectorParamsBuilder::new(1024, Distance::Cosine));
+
+        vectors_config.add_named_vector_params(
+            "colbert",
+            VectorParamsBuilder::new(1024, Distance::Cosine)
+                .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim)),
+        );
+
+        let mut sparse_config = SparseVectorsConfigBuilder::default();
+
+        sparse_config.add_named_vector_params("sparse", SparseVectorParamsBuilder::default());
+
+        self.create_collection(
+            CreateCollectionBuilder::new(collection)
+                .vectors_config(vectors_config)
+                .sparse_vectors_config(sparse_config),
         )
         .await?;
 
-    Ok(response
-        .result
-        .into_iter()
-        .filter_map(|p| p.id.map(|id| SearchHit { id, score: p.score }))
-        .collect())
+        Ok(())
+    }
+
+    async fn insert_batch(
+        &self,
+        collection: &str,
+        chunks: Vec<ChunkAsVector>,
+    ) -> Result<(), VectorStoreError> {
+        let points: Vec<PointStruct> = chunks.into_iter().map(|c| c.into()).collect();
+
+        self.upsert_points(UpsertPointsBuilder::new(collection, points))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn delete_batch(
+        &self,
+        collection: &str,
+        qdrant_guids: Vec<String>,
+    ) -> Result<(), VectorStoreError> {
+        self.delete_points(DeletePointsBuilder::new(collection).points(qdrant_guids))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        collection: &str,
+        chunk_ids: Vec<UUIDv4>,
+        dense: Vec<f32>,
+        sparse_indices: Vec<u32>,
+        sparse_values: Vec<f32>,
+        colbert: Vec<Vec<f32>>,
+        top_k: u64,
+    ) -> Result<Vec<SearchHit>, VectorStoreError> {
+        let filter = Filter {
+            must: vec![Condition {
+                condition_one_of: Some(condition::ConditionOneOf::HasId(HasIdCondition {
+                    has_id: chunk_ids
+                        .into_iter()
+                        .map(|UUIDv4(v4)| v4.simple().to_string())
+                        .map(Into::into)
+                        .collect(),
+                })),
+            }],
+            ..Default::default()
+        };
+
+        let sparse_query: Vec<(u32, f32)> =
+            sparse_indices.into_iter().zip(sparse_values).collect();
+
+        let response = self
+            .query(
+                QueryPointsBuilder::new(collection)
+                    .prefetch(vec![
+                        PrefetchQueryBuilder::default()
+                            .query(dense)
+                            .using("dense")
+                            .limit(200u32)
+                            .filter(filter.clone())
+                            .build(),
+                        PrefetchQueryBuilder::default()
+                            .query(Query::from(sparse_query))
+                            .using("sparse")
+                            .limit(200u32)
+                            .filter(filter.clone())
+                            .build(),
+                    ])
+                    .query(Query::new_fusion(Fusion::Rrf))
+                    .query(colbert)
+                    .using("colbert")
+                    .limit(top_k)
+                    .filter(filter)
+                    .with_payload(false)
+                    .with_vectors(false),
+            )
+            .await?;
+
+        Ok(response
+            .result
+            .into_iter()
+            .filter_map(|p| p.id.map(|id| SearchHit { id, score: p.score }))
+            .collect())
+    }
 }
