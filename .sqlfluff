@@ -13,4 +13,6 @@ dialect = sqlite
 #   LT05 — max line length (a few aligned lines exceed 80)
 #   LT15 — consecutive blank lines (section separators)
 #   CP02 — identifier casing (false positive on NOCASE)
-exclude_rules = LT01, LT02, LT03, LT05, LT15, CP02
+#   CP03 — function casing: trigger bodies mix uppercase RAISE(...) with lowercase
+#          unixepoch() (kept lowercase to match v0.1.0); the mix is unavoidable.
+exclude_rules = LT01, LT02, LT03, LT05, LT15, CP02, CP03

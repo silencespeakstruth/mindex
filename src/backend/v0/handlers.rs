@@ -446,7 +446,8 @@ impl FileIndexer<'_> {
                     .transaction(self.token.child_token(), move |tx| {
                         tx.execute(
                             "UPDATE project_files
-                             SET status = 'indexed', sha256 = ?1, status_updated_at = unixepoch()
+                             SET status = 'indexed', sha256 = ?1, retry_count = 0,
+                                 status_updated_at = unixepoch()
                              WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
                             params![sha256_f, project_guid, path_f, model_id_f],
                         )?;

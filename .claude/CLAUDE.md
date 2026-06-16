@@ -25,7 +25,8 @@ src/
     sqlite3.rs          SQLite3Pool, SQLite3PoolError
     qdrant.rs           VectorStore trait (+impl for Qdrant), VectorStoreError, ChunkAsVector, collection_name/collection_for
     files.rs            set_file_status — shared project_files.status transition
-    migrations/v0.1.0_schema.sql   projects, project_files, project_file_chunks
+    migrations/   v0.1.0_schema.sql (projects, project_files, project_file_chunks);
+                  v0.2.0_status_machine.sql (status-transition triggers + project_file_status_log)
   models/bge_m3.rs      BGEm3HttpClient, BGEm3Model trait, EncodeError
   embed.rs              embed_and_upsert — shared embed→upsert pipeline, EmbedUpsertError
   slicing/traits.rs     Slicer, SlicedChunk, SlicerError, Tokenizing trait
@@ -58,11 +59,21 @@ SQLite row before Qdrant confirms would orphan the vector forever (nothing track
 it). If every collection in a batch fails, the inner loop breaks rather than
 spinning.
 
-**Status state machine** (`project_files.status`): `just_uploaded → indexing →
-indexed`, with `cancelled`/`failed` branches. `indexing` is committed durably
-*before* heavy work so a crash is recoverable; the retry worker picks up files
-stuck ≥5 min. `sha256` is written only when reaching `indexed`. Any status write
-must also set `status_updated_at = unixepoch()` (use `db::files::set_file_status`).
+**Status state machine** (`project_files.status`), enforced by SQLite triggers
+(`v0.2.0_status_machine.sql`), not just convention. Legal moves: **any → `indexing`**
+(start / reindex / retry) and **`indexing` → `indexed`|`cancelled`|`failed`** (a
+terminal is reachable only from in-progress work); a new row may only enter as
+`just_uploaded`/`indexing`. Anything else (e.g. `indexed→failed`, `failed→indexed`,
+`just_uploaded→indexed`) raises `SQLITE_CONSTRAINT_TRIGGER`. So the retry worker
+moves `failed → indexing → {indexed|failed}` (never `failed→failed`). `indexing`
+is committed durably *before* heavy work (crash-recoverable; retry worker picks up
+files stuck ≥5 min). `sha256` is written only when reaching `indexed`; `retry_count`
+resets to 0 there and bumps on each `→failed`. Any status write sets
+`status_updated_at = unixepoch()` — use `db::files::set_file_status`, which also
+logs a WARN if the transition is rejected. Every transition is recorded in
+`project_file_status_log` by AFTER-triggers (durable audit trail). A file that
+exhausts `MAX_RETRIES` (3) stays `failed` and is never retried again — surfaced by
+`worker::retry::warn_permanently_failed` at startup and hourly.
 
 **sha256 skip / empty 404.** Re-indexing identical content is skipped by hash.
 `post_search` returns 404 immediately when the SQLite candidate set is empty (no
@@ -256,8 +267,8 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
 - Python (`tests/`): `ruff check`, `ruff format --check` **and** `black --check`
   (kept compatible — avoid the long `assert cond, "msg"` they format differently),
   `mypy` (`fastapi` is `# type: ignore` — its stubs live only in the mock's image).
-- SQL: `sqlfluff lint src/db/migrations/v0.1.0_schema.sql` — dialect + relaxed
-  layout rules come from repo-root `.sqlfluff` (schema is intentionally column-aligned).
+- SQL: `sqlfluff lint src/db/migrations/` — dialect + relaxed layout rules come
+  from repo-root `.sqlfluff` (schema is intentionally column-aligned).
 - On intentional code, prefer a scoped `#[allow(...)]`/config exclusion **with a
   reason** over contorting code (see `OptionResultExt::from_cancelled`,
   `qdrant::VectorStore::search`, `.sqlfluff`). Never project-wide suppression.
@@ -269,7 +280,9 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
 3. New endpoints register in `backend::http3::run`, use `RouterState`, `{param}` route syntax, `#[debug_handler]`.
 4. Reach Qdrant only via `VectorStore`; derive collection names from `collection_for`.
 5. Any search path's SQLite query must include `AND c.status = 'active'`.
-6. Status writes set `status_updated_at = unixepoch()` (use `set_file_status`).
+6. Status writes set `status_updated_at = unixepoch()` (use `set_file_status`) and
+   must be a legal transition (triggers enforce it; only `any→indexing` and
+   `indexing→terminal`). New status-changing code paths need a transition test.
 7. Adding a language → the full checklist under **Languages**.
 8. Schema change → new migration file in the `MIGRATIONS` slice; the DB is
    droppable (no upgrade path).

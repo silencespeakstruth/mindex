@@ -174,7 +174,9 @@ mod tests {
     async fn migrated_pool() -> SQLite3Pool {
         let pool = SQLite3Pool::new(Path::new(":memory:"), 1);
         pool.transaction(CancellationToken::new(), |tx| {
-            tx.execute_batch(include_str!("../db/migrations/v0.1.0_schema.sql"))?;
+            for migration in crate::MIGRATIONS {
+                tx.execute_batch(migration)?;
+            }
             Ok(())
         })
         .await
@@ -193,10 +195,12 @@ mod tests {
                 "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
                 params![g],
             )?;
+            // 'indexing' is a legal entry status (the insert guard rejects terminal
+            // states); GC only touches chunk rows, so the file's status is irrelevant.
             tx.execute(
                 "INSERT INTO project_files
                      (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'a.rs', ?2, 'rust', 'indexed')",
+                 VALUES (?1, 'BAAI/bge-m3', 'a.rs', ?2, 'rust', 'indexing')",
                 params![g, "0".repeat(64)],
             )?;
             for qg in &qdrant_guids {

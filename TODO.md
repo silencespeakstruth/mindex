@@ -18,7 +18,15 @@ is *not done* or *deliberately constrained*.
   collections may want a stored Qdrant payload field (`project_guid`) + a `match`
   filter instead.
 - **After `MAX_RETRIES` (3) failures a file stays `status='failed'`** and needs
-  manual re-indexing — no dead-letter surfacing or alerting.
+  manual re-indexing (re-push). Surfaced now via a WARN at startup and hourly
+  (`worker::retry::warn_permanently_failed`); a real dead-letter view / metric /
+  alert is still future work.
+- **`project_file_status_log` grows unbounded.** Every status transition appends a
+  row and nothing prunes them. Add a retention sweep (e.g. fold into the GC worker:
+  delete rows older than N days) before this matters at scale.
+- **`cancelled` files are never retried** by the worker (by design — the client
+  gave up). They only revive on an explicit re-push (`cancelled → indexing` via the
+  handler). A cancelled file never re-pushed keeps no vectors.
 - **No API authentication** (by design — internal service, TLS only). Revisit if
   ever exposed beyond a trusted network.
 - **HTTP/3 is not implemented.** `run()` is HTTP/1.1 + HTTP/2; the `http3.rs`

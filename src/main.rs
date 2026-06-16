@@ -24,7 +24,12 @@ mod worker;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-const MIGRATIONS: &[&str] = &[include_str!("db/migrations/v0.1.0_schema.sql")];
+// Applied in order on startup, inside one transaction. `pub(crate)` so test
+// modules build a schema-identical `:memory:` pool from the same source.
+pub(crate) const MIGRATIONS: &[&str] = &[
+    include_str!("db/migrations/v0.1.0_schema.sql"),
+    include_str!("db/migrations/v0.2.0_status_machine.sql"),
+];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -127,6 +132,10 @@ async fn main() -> Result<(), BoxError> {
     }
 
     let model_id = args.model.as_str(); // For now, only one model is supported.
+
+    // Surface files that have exhausted their retries — the retry worker stops
+    // touching them, so without this they are silently stuck in 'failed'.
+    worker::retry::warn_permanently_failed(&db_pool, sigterm_token.child_token()).await;
 
     let qdrant_client: Arc<dyn VectorStore> =
         Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
