@@ -1,4 +1,5 @@
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum_server::tls_rustls::RustlsConfig;
@@ -29,6 +30,8 @@ pub struct RouterState {
     pub db_pool: Arc<SQLite3Pool>,
     pub qdrant: Arc<dyn VectorStore>,
     pub model: EmbeddingModel,
+    /// Chunks per `/encode` call during indexing (GPU batch lever).
+    pub embed_batch: usize,
 }
 
 pub struct CancellationGuard(pub CancellationToken);
@@ -47,14 +50,18 @@ pub async fn run(
     addr: SocketAddr,
     pem_files: (&Path, &Path),
     state: RouterState,
+    body_limit_bytes: usize,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Indexing posts many files at once, so the body easily exceeds axum's 2 MB
+    // default; lift the limit (configurable via --max-body-mb).
     let router = Router::new()
         .route("/v0/{project_guid}/index", post(post_index))
         .route("/v0/{project_guid}/search", post(post_search))
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
         .with_state(state);
 
-    info!(?addr, "The HTTP server is ready.");
+    info!(?addr, body_limit_bytes, "The HTTP server is ready.");
 
     let (cert, key) = pem_files;
     axum_server::bind_rustls(addr, RustlsConfig::from_pem_file(cert, key).await?)

@@ -227,9 +227,19 @@ fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
     }
 }
 
-/// Borrowed view of everything one file's indexing needs. Lets the per-file
-/// pipeline live in `index_one` — independently readable and the natural unit to
-/// test — instead of inline in `post_index`'s nested loops.
+/// A file that has been hash-checked, marked `indexing`, sliced, and had its
+/// chunks inserted — awaiting the shared embed pass. `chunks` is drained into the
+/// cross-file batch before `mark_indexed`.
+struct Prepared {
+    pl: ProgrammingLanguage,
+    path: String,
+    sha256: String,
+    chunks: Vec<(UUIDv4, String)>,
+}
+
+/// Borrowed view of everything indexing needs. `post_index` drives it in two
+/// phases — `prepare` every file, then one batched `embed_all` across all of them —
+/// so the GPU sees `embed_batch`-sized batches instead of one file's chunks at a time.
 struct FileIndexer<'a> {
     db_pool: &'a SQLite3Pool,
     store: &'a dyn VectorStore,
@@ -238,22 +248,24 @@ struct FileIndexer<'a> {
     model_id: &'a str,
     project_guid: UUIDv4,
     collection: &'a str,
+    /// Chunks per `/encode` call (GPU batch lever).
+    embed_batch: usize,
     /// Request-scoped cancellation token (the handler's `CancellationGuard`).
     token: &'a CancellationToken,
 }
 
 impl FileIndexer<'_> {
-    /// Indexes one file end to end. Returns `Ok(None)` if the content is unchanged
-    /// (hash match, skipped), `Ok(Some(n))` if (re)indexed into `n` chunks, or
-    /// `Err` on failure — in which case the file's status has already been recovered
-    /// to `cancelled`/`failed` and the error carries the HTTP status to return.
-    async fn index_one(
+    /// Phase 1 for one file: hash-check → mark `indexing` → mark old chunks deleted,
+    /// slice, insert new chunks. Returns `Ok(None)` if unchanged (skipped),
+    /// `Ok(Some(Prepared))` with its chunks (possibly empty, for too-short files),
+    /// or `Err` — in which case *this* file's status is already recovered.
+    async fn prepare(
         &self,
         pl: ProgrammingLanguage,
         path: &str,
         code: &str,
         hasher: &mut Sha256,
-    ) -> Result<Option<u64>, ErrorResponse> {
+    ) -> Result<Option<Prepared>, ErrorResponse> {
         let span = info_span!("indexing_file", ?pl, path);
         async move {
             let project_guid = self.project_guid;
@@ -321,152 +333,129 @@ impl FileIndexer<'_> {
             }
 
             // ── mark old chunks deleted + slice + insert new chunks ───────
-            let chunks_to_embed: Vec<(UUIDv4, String)> = {
-                let tokenizer = self.tokenizer.clone();
-                let (path_m, model_id_m, code_m) =
-                    (path.to_string(), self.model_id.to_string(), code.to_string());
-                let slicer_token = self.token.clone();
+            let tokenizer = self.tokenizer.clone();
+            let (path_m, model_id_m, code_m) =
+                (path.to_string(), self.model_id.to_string(), code.to_string());
+            let slicer_token = self.token.clone();
 
-                let result = self
-                    .db_pool
-                    .transaction(self.token.child_token(), move |tx| {
+            let result = self
+                .db_pool
+                .transaction(self.token.child_token(), move |tx| {
+                    tx.execute(
+                        "UPDATE project_file_chunks
+                         SET status = 'deleted'
+                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
+                           AND status = 'active'",
+                        params![project_guid, path_m, model_id_m],
+                    )?;
+
+                    let mut slicer = Slicer::new(tree_sitter_language(pl), &*tokenizer)
+                        .map_err(slicer_err_to_pool_err)?;
+
+                    let chunks = slicer
+                        .parse(&code_m, slicer_token)
+                        .map_err(slicer_err_to_pool_err)?;
+
+                    info!(chunks_len = chunks.len(), "Sliced the source code.");
+
+                    let mut out: Vec<(UUIDv4, String)> = Vec::with_capacity(chunks.len());
+                    for SlicedChunk {
+                        code,
+                        start_line,
+                        end_line,
+                        start_column,
+                        end_column,
+                        ..
+                    } in &chunks
+                    {
+                        let qdrant_guid = UUIDv4(Uuid::new_v4());
                         tx.execute(
-                            "UPDATE project_file_chunks
-                             SET status = 'deleted'
-                             WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
-                               AND status = 'active'",
-                            params![project_guid, path_m, model_id_m],
+                            "INSERT INTO project_file_chunks
+                                 (project_guid, file_path, code, model_id, qdrant_guid,
+                                  start_line, end_line, start_column, end_column, status)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
+                            params![
+                                project_guid,
+                                path_m,
+                                code,
+                                model_id_m,
+                                qdrant_guid,
+                                *start_line as i64,
+                                *end_line as i64,
+                                *start_column as i64,
+                                *end_column as i64
+                            ],
                         )?;
-
-                        let mut slicer = Slicer::new(tree_sitter_language(pl), &*tokenizer)
-                            .map_err(slicer_err_to_pool_err)?;
-
-                        let chunks = slicer
-                            .parse(&code_m, slicer_token)
-                            .map_err(slicer_err_to_pool_err)?;
-
-                        info!(chunks_len = chunks.len(), "Sliced the source code.");
-
-                        let mut out: Vec<(UUIDv4, String)> = Vec::with_capacity(chunks.len());
-                        for SlicedChunk {
-                            code,
-                            start_line,
-                            end_line,
-                            start_column,
-                            end_column,
-                            ..
-                        } in &chunks
-                        {
-                            let qdrant_guid = UUIDv4(Uuid::new_v4());
-                            tx.execute(
-                                "INSERT INTO project_file_chunks
-                                     (project_guid, file_path, code, model_id, qdrant_guid,
-                                      start_line, end_line, start_column, end_column, status)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
-                                params![
-                                    project_guid,
-                                    path_m,
-                                    code,
-                                    model_id_m,
-                                    qdrant_guid,
-                                    *start_line as i64,
-                                    *end_line as i64,
-                                    *start_column as i64,
-                                    *end_column as i64
-                                ],
-                            )?;
-                            out.push((qdrant_guid, code.clone()));
-                        }
-
-                        Ok(out)
-                    })
-                    .with_cancellation_token(self.token)
-                    .await
-                    .from_cancelled();
-
-                match result {
-                    Ok(v) => v,
-                    Err(SQLite3PoolError::Cancelled) => {
-                        self.recover(path, "cancelled", false).await;
-                        return Err(cancelled_499().into());
+                        out.push((qdrant_guid, code.clone()));
                     }
-                    Err(SQLite3PoolError::HTTPStatusCode(sc)) => {
-                        self.recover(path, "failed", true).await;
-                        return Err(sc.into());
-                    }
-                    Err(err) => {
-                        error!(error = ?err, "Slicing / chunk insertion failed; marking file 'failed'.");
-                        self.recover(path, "failed", true).await;
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
-                    }
-                }
-            };
 
-            // ── embed + Qdrant upsert ─────────────────────────────────────
-            match embed_and_upsert(
-                self.embedder,
-                self.store,
-                self.collection,
-                &chunks_to_embed,
-                self.token,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(EmbedUpsertError::Cancelled) => {
+                    Ok(out)
+                })
+                .with_cancellation_token(self.token)
+                .await
+                .from_cancelled();
+
+            let chunks = match result {
+                Ok(v) => v,
+                Err(SQLite3PoolError::Cancelled) => {
                     self.recover(path, "cancelled", false).await;
                     return Err(cancelled_499().into());
                 }
-                Err(EmbedUpsertError::Embed(request_err)) => {
-                    error!(
-                        error = ?request_err,
-                        "Embedding request failed; marking file 'failed'. \
-                         Check the model server at --model-server is up and reachable \
-                         (from inside the container it must bind 0.0.0.0, not 127.0.0.1)."
-                    );
+                Err(SQLite3PoolError::HTTPStatusCode(sc)) => {
                     self.recover(path, "failed", true).await;
-                    return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+                    return Err(sc.into());
                 }
-                Err(EmbedUpsertError::Store(qdrant_err)) => {
-                    error!(
-                        error = ?qdrant_err,
-                        "Qdrant upsert failed; marking file 'failed'. \
-                         Check Qdrant is reachable at --qdrant-server."
-                    );
+                Err(err) => {
+                    error!(error = ?err, "Slicing / chunk insertion failed; marking file 'failed'.");
                     self.recover(path, "failed", true).await;
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                 }
-            }
+            };
 
-            // ── status = 'indexed' + record new sha256 ────────────────────
-            {
-                let (sha256_f, path_f, model_id_f) =
-                    (sha256.clone(), path.to_string(), self.model_id.to_string());
-                self.db_pool
-                    .transaction(self.token.child_token(), move |tx| {
-                        tx.execute(
-                            "UPDATE project_files
-                             SET status = 'indexed', sha256 = ?1, retry_count = 0,
-                                 status_updated_at = unixepoch()
-                             WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
-                            params![sha256_f, project_guid, path_f, model_id_f],
-                        )?;
-                        Ok(())
-                    })
-                    .with_cancellation_token(self.token)
-                    .await
-                    .from_cancelled()
-                    .map_err(|err| {
-                        error!(error = ?err, "Failed to mark the file 'indexed' in SQLite.");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-            }
-
-            info!("File indexed successfully.");
-            Ok(Some(chunks_to_embed.len() as u64))
+            Ok(Some(Prepared { pl, path: path.to_string(), sha256, chunks }))
         }
         .instrument(span)
         .await
+    }
+
+    /// Phase 2: embed + upsert every chunk across all prepared files in one batched
+    /// pass (`embed_batch` chunks per `/encode`).
+    async fn embed_all(&self, chunks: &[(UUIDv4, String)]) -> Result<(), EmbedUpsertError> {
+        embed_and_upsert(
+            self.embedder,
+            self.store,
+            self.collection,
+            chunks,
+            self.token,
+            self.embed_batch,
+        )
+        .await
+    }
+
+    /// Phase 3 for one file: mark it `indexed` and record the new sha256.
+    async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<(), ErrorResponse> {
+        let project_guid = self.project_guid;
+        let (sha256_f, path_f, model_id_f) =
+            (sha256.to_string(), path.to_string(), self.model_id.to_string());
+        self.db_pool
+            .transaction(self.token.child_token(), move |tx| {
+                tx.execute(
+                    "UPDATE project_files
+                     SET status = 'indexed', sha256 = ?1, retry_count = 0,
+                         status_updated_at = unixepoch()
+                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
+                    params![sha256_f, project_guid, path_f, model_id_f],
+                )?;
+                Ok(())
+            })
+            .with_cancellation_token(self.token)
+            .await
+            .from_cancelled()
+            .map_err(|err| {
+                error!(error = ?err, "Failed to mark the file 'indexed' in SQLite.");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        Ok(())
     }
 
     /// Best-effort recovery: move the file to `status` (incrementing `retry_count`
@@ -482,6 +471,15 @@ impl FileIndexer<'_> {
             self.token.child_token(),
         )
         .await;
+    }
+
+    /// Recovers every already-prepared file when the batch is aborted (a later
+    /// file's prepare failed, or the shared embed failed) — they are still
+    /// `indexing` with chunks inserted, so this hands them to the retry worker.
+    async fn recover_all(&self, prepared: &[Prepared], status: &'static str, increment_retry: bool) {
+        for p in prepared {
+            self.recover(&p.path, status, increment_retry).await;
+        }
     }
 }
 
@@ -561,18 +559,68 @@ pub async fn post_index(
         model_id: &model_id,
         project_guid,
         collection: &collection,
+        embed_batch: s.embed_batch,
         token: &guard.0,
     };
 
+    // ── Phase 1: prepare every file (hash-check, mark indexing, slice + insert).
+    let mut prepared: Vec<Prepared> = Vec::new();
     for (pl, files) in payload.files.iter() {
         let pl = *pl;
         res.files.entry(pl).or_default();
 
         for (path, Code { code }) in files.iter() {
-            if let Some(count) = indexer.index_one(pl, path, code, &mut sha256_hasher).await? {
-                *res.files.entry(pl).or_default().entry(path.clone()).or_insert(0) += count;
+            match indexer.prepare(pl, path, code, &mut sha256_hasher).await {
+                Ok(Some(p)) => prepared.push(p),
+                Ok(None) => {} // unchanged — skipped
+                Err(e) => {
+                    // A later file failed to prepare; recover the ones already prepared
+                    // (they're 'indexing' with chunks inserted) before bailing.
+                    indexer.recover_all(&prepared, "failed", true).await;
+                    return Err(e);
+                }
             }
         }
+    }
+
+    // ── Phase 2: embed + upsert every chunk across all files in one batched pass.
+    let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
+    let all_chunks: Vec<(UUIDv4, String)> =
+        prepared.iter_mut().flat_map(|p| std::mem::take(&mut p.chunks)).collect();
+
+    info!(files = prepared.len(), chunks = all_chunks.len(), "Embedding request in batches.");
+
+    match indexer.embed_all(&all_chunks).await {
+        Ok(()) => {}
+        Err(EmbedUpsertError::Cancelled) => {
+            indexer.recover_all(&prepared, "cancelled", false).await;
+            return Err(cancelled_499().into());
+        }
+        Err(EmbedUpsertError::Embed(request_err)) => {
+            error!(
+                error = ?request_err,
+                "Embedding request failed; marking batch 'failed'. \
+                 Check the model server at --model-server is up and reachable \
+                 (from inside the container it must bind 0.0.0.0, not 127.0.0.1)."
+            );
+            indexer.recover_all(&prepared, "failed", true).await;
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+        }
+        Err(EmbedUpsertError::Store(qdrant_err)) => {
+            error!(
+                error = ?qdrant_err,
+                "Qdrant upsert failed; marking batch 'failed'. \
+                 Check Qdrant is reachable at --qdrant-server."
+            );
+            indexer.recover_all(&prepared, "failed", true).await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+        }
+    }
+
+    // ── Phase 3: mark each prepared file 'indexed' and tally the response.
+    for (p, count) in prepared.iter().zip(counts) {
+        indexer.mark_indexed(&p.path, &p.sha256).await?;
+        *res.files.entry(p.pl).or_default().entry(p.path.clone()).or_insert(0) += count;
     }
 
     info!("All files processed.");

@@ -52,6 +52,7 @@ pub async fn run(
     store: Arc<dyn VectorStore>,
     model_client: Arc<dyn BGEm3Model>,
     model_id: String,
+    embed_batch: usize,
     token: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -108,8 +109,11 @@ pub async fn run(
             }
 
             info!(%project_guid, %path, "Retry worker: retrying stuck file.");
-            retry_file(&db_pool, &*store, &*model_client, &project_guid, &path, &file_model_id, &token)
-                .await;
+            retry_file(
+                &db_pool, &*store, &*model_client, &project_guid, &path, &file_model_id,
+                embed_batch, &token,
+            )
+            .await;
         }
     }
 }
@@ -117,6 +121,7 @@ pub async fn run(
 /// Re-indexes one stuck/failed file: `*→indexing → {indexed | failed}`. Extracted
 /// from the `run` loop so it can be unit-tested with a fake `VectorStore` +
 /// `BGEm3Model` (no live Qdrant or model server).
+#[allow(clippy::too_many_arguments)] // irreducible per-file deps (db, store, embedder, ids, batch, token)
 async fn retry_file(
     db_pool: &SQLite3Pool,
     store: &dyn VectorStore,
@@ -124,6 +129,7 @@ async fn retry_file(
     project_guid: &str,
     path: &str,
     model_id: &str,
+    embed_batch: usize,
     token: &CancellationToken,
 ) {
     // Move to 'indexing' first so the whole attempt is a clean
@@ -165,7 +171,9 @@ async fn retry_file(
         .map(|(g, code)| (UUIDv4(Uuid::parse_str(&g).unwrap_or_default()), code))
         .collect();
 
-    let success = match embed_and_upsert(embedder, store, &collection, &to_embed, token).await {
+    let success = match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed_batch)
+        .await
+    {
         Ok(()) => true,
         Err(EmbedUpsertError::Cancelled) => false,
         Err(EmbedUpsertError::Embed(e)) => {
@@ -339,7 +347,7 @@ mod tests {
         let pool = pool_with_failed_file(2).await;
         let store = Store { fail_upsert: false };
 
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
 
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
         // The transition log proves the path went through 'indexing', never failed→indexed.
@@ -353,7 +361,7 @@ mod tests {
         let pool = pool_with_failed_file(2).await;
         let store = Store { fail_upsert: true };
 
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
 
         // Was failed(1) → indexing → failed(2).
         assert_eq!(current(&pool).await, ("failed".to_string(), 2));
@@ -367,7 +375,7 @@ mod tests {
         let pool = pool_with_failed_file(0).await;
         let store = Store { fail_upsert: false };
 
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
 
         // indexing → failed (no chunks); retry_count bumped to 2.
         assert_eq!(current(&pool).await, ("failed".to_string(), 2));

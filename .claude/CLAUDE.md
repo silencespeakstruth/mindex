@@ -89,9 +89,10 @@ clean up), then delete the parent.
 Collection has three named vectors: `dense` (1024-d cosine), `sparse` (SPLADE-style),
 `colbert` (1024-d cosine, multivector MaxSim). Search: prefetch top-200 dense +
 top-200 sparse → RRF fusion → ColBERT MaxSim rerank → top-k. Sparse weights `≤ 1e-5`
-are dropped before upsert. Batch sizes: 64 chunks per embed call, 256 points per
-Qdrant upsert/delete (`embed.rs`). Embed-response vector lists are positionally
-aligned with the chunk list.
+are dropped before upsert. Batch sizes: `--embed-batch` chunks per `/encode` call
+(default 256 — the GPU-load lever, paired with the embedder's own `--batch`), 256
+points per Qdrant upsert/delete (`embed.rs`). Embed-response vector lists are
+positionally aligned with the chunk list.
 
 The embedder client (`bge_m3.rs::BGEm3HttpClient`) retries HTTP **429** (embedder
 busy/backpressure) up to 3× with exponential backoff (200/400/800ms), respecting
@@ -144,14 +145,22 @@ fails.
 
 ## post_index shape
 
-`post_index` builds a `FileIndexer` (borrowed view of db/store/tokenizer/embedder)
-and calls `index_one` per file → `Ok(None)` (unchanged, skipped), `Ok(Some(n))`
-(indexed n chunks), or `Err` (status already recovered, carries HTTP status).
-`index_one` instruments its own future with the `indexing_file` span (no `Entered`
-guard held across `.await`). Per file: hash-check → set `indexing` → main tx (mark
-old chunks deleted + slice + insert) → `embed::embed_and_upsert` → set `indexed`;
-any error path recovers status to `cancelled`/`failed`. `tree_sitter::Parser` is
-`Send`, so the slicer is built inside the `spawn_blocking` closure.
+`post_index` runs a `FileIndexer` in **two phases** so the GPU sees big batches
+(not one file's chunks at a time):
+1. **`prepare` every file** — hash-check (`Ok(None)` = unchanged, skipped) → set
+   `indexing` → main tx (mark old chunks deleted + slice + insert) → returns a
+   `Prepared` carrying that file's chunks. Each runs in its own `indexing_file`
+   span (no `Entered` guard across `.await`).
+2. **`embed_all`** the chunks from *all* prepared files in one batched pass
+   (`embed::embed_and_upsert`, `--embed-batch` chunks per `/encode`).
+3. **`mark_indexed`** each file + tally the response.
+
+Recovery is per-batch: if any `prepare` or the shared embed fails, every
+already-prepared file (still `indexing`, chunks inserted) is recovered to
+`failed`/`cancelled` via `recover_all` and the retry worker re-embeds them later.
+`tree_sitter::Parser` is `Send`, so the slicer is built inside the `spawn_blocking`
+closure. The `/index` request body limit is `--max-body-mb` (default 256 MiB) via
+`DefaultBodyLimit` — axum's 2 MB default is far too small for multi-file posts.
 
 ## Mockable interfaces
 

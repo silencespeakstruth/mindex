@@ -1,8 +1,7 @@
 //! Shared embedding + Qdrant upsert pipeline used by both the indexing handler
 //! (`post_index`) and the retry worker. Both need the identical "encode in
-//! batches of 64, split sparse weights, upsert in batches of 256" loop; keeping
-//! it here means one code path and one place to change batch sizes or vector
-//! assembly.
+//! batches of `embed_batch`, split sparse weights, upsert in batches of 256" loop;
+//! keeping it here means one code path and one place to change vector assembly.
 
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -11,8 +10,6 @@ use crate::backend::v0::models::UUIDv4;
 use crate::db::qdrant::{ChunkAsVector, VectorStore, VectorStoreError};
 use crate::models::bge_m3::{BGEm3EmbedRequest, BGEm3EmbedResponse, BGEm3Model, EncodeError};
 
-/// Number of chunks sent to the model server per `/encode` call.
-const EMBED_BATCH: usize = 64;
 /// Number of points sent to Qdrant per upsert.
 const UPSERT_BATCH: usize = 256;
 /// Sparse weights at or below this magnitude are dropped before upsert.
@@ -32,7 +29,9 @@ pub enum EmbedUpsertError {
 }
 
 /// Embeds `chunks` (each `(qdrant_guid, code)`) and upserts the resulting
-/// multi-vectors into `collection`. Side-effect-free apart from the embed/upsert
+/// multi-vectors into `collection`. `embed_batch` is the number of chunks sent per
+/// `/encode` call — the lever for GPU batch size (the model server further
+/// sub-batches by its own `--batch`). Side-effect-free apart from the embed/upsert
 /// I/O, so behaviour is identical for every caller.
 pub async fn embed_and_upsert(
     embedder: &dyn BGEm3Model,
@@ -40,8 +39,9 @@ pub async fn embed_and_upsert(
     collection: &str,
     chunks: &[(UUIDv4, String)],
     token: &CancellationToken,
+    embed_batch: usize,
 ) -> Result<(), EmbedUpsertError> {
-    for batch in chunks.chunks(EMBED_BATCH) {
+    for batch in chunks.chunks(embed_batch.max(1)) {
         let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
         let guids: Vec<UUIDv4> = batch.iter().map(|(g, _)| *g).collect();
 
@@ -189,7 +189,7 @@ mod tests {
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
         let input = chunks(3);
 
-        embed_and_upsert(&embedder, &store, "c", &input, &CancellationToken::new())
+        embed_and_upsert(&embedder, &store, "c", &input, &CancellationToken::new(), 64)
             .await
             .expect("should succeed");
 
@@ -203,7 +203,7 @@ mod tests {
         let embedder = StubEmbedder { cancel: false };
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
 
-        embed_and_upsert(&embedder, &store, "c", &[], &CancellationToken::new())
+        embed_and_upsert(&embedder, &store, "c", &[], &CancellationToken::new(), 64)
             .await
             .expect("empty is a no-op success");
 
@@ -215,7 +215,7 @@ mod tests {
         let embedder = StubEmbedder { cancel: false };
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: true };
 
-        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new()).await;
+        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), 64).await;
         assert!(matches!(res, Err(EmbedUpsertError::Store(_))));
     }
 
@@ -224,7 +224,7 @@ mod tests {
         let embedder = StubEmbedder { cancel: true };
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
 
-        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new()).await;
+        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), 64).await;
         assert!(matches!(res, Err(EmbedUpsertError::Cancelled)));
         // Nothing should have been upserted on the cancel path.
         assert!(store.upserted.lock().unwrap().is_empty());

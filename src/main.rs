@@ -74,6 +74,16 @@ struct Args {
     /// DB pool size.
     #[arg(long, default_value = "4")]
     db_pool_size: usize,
+
+    /// Chunks sent to the model server per /encode call during indexing. The GPU
+    /// batch lever — raise it (and the embedder's --batch) to load the GPU harder.
+    #[arg(long, default_value = "256")]
+    embed_batch: usize,
+
+    /// Max /index request body size in MiB (indexing posts many files at once;
+    /// axum's default is only 2 MB).
+    #[arg(long, default_value = "256")]
+    max_body_mb: usize,
 }
 
 #[tokio::main]
@@ -159,6 +169,7 @@ async fn main() -> Result<(), BoxError> {
         qdrant_client.clone(),
         embed_client.clone(),
         model_id.to_string(),
+        args.embed_batch,
         retry_token,
     ));
 
@@ -176,7 +187,9 @@ async fn main() -> Result<(), BoxError> {
                     model_id: model_id.to_string(),
                     client: embed_client.clone(),
                 },
+                embed_batch: args.embed_batch,
             },
+            args.max_body_mb * 1024 * 1024,
             sigterm_token.child_token()) => {
             if let Err(err) = res {
                 error!(
