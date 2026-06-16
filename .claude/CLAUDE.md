@@ -43,6 +43,9 @@ mindex/
         main.rs               — CLI (clap), orchestration, progress display (indicatif + console)
         scanner.rs            — walkdir + globset: file discovery, extension→language detection
         client.rs             — reqwest: upload_batch(), IndexRequest/IndexResponse types
+    search/
+      mindex-search            — Bash CLI: terminal search frontend (curl + jq + pygmentize)
+      mindex-search-edit       — POSIX sh wrapper: $EDITOR pipeline glue, env-var driven, no bashisms
   Dockerfile                  — Multi-stage: rust:1.95-bookworm builder → debian:bookworm-slim
   docker-compose.yml          — Production stack: qdrant + mindex
   docker-compose.test.yml     — Standalone test stack: qdrant + mock-embedder + mindex + test-runner
@@ -174,7 +177,9 @@ For each file, `post_index` executes these sequential transactions (separate `db
 ```rust
 pub struct SlicedChunk {
     pub code: String,        // source text from start of node's line to end_byte (includes leading whitespace)
+    #[cfg(test)]
     pub start_byte: usize,   // node.start_byte() (not line_start)
+    #[cfg(test)]
     pub end_byte: usize,
     pub start_line: usize,   // 1-indexed
     pub end_line: usize,     // 1-indexed
@@ -183,6 +188,8 @@ pub struct SlicedChunk {
 }
 ```
 Leading whitespace: `code` is extended to the start of the node's line only when the intervening bytes are pure whitespace (indentation). Mid-line nodes are not extended.
+
+`start_byte`/`end_byte` are `#[cfg(test)]`-gated (both on the struct and at the construction site in the slicer's main loop): they exist only to let the slicer's own unit tests assert byte-exact alignment between `code` and the source. Production code (`handlers.rs`) never reads them — it only destructures `code`/`start_line`/`end_line`/`start_column`/`end_column` — so leaving them as plain `pub` fields would otherwise be permanently flagged by `dead_code` on every non-test build.
 
 ## Slicer
 `Slicer` (`slicing/traits.rs`) traverses the tree-sitter AST depth-first and selects **named nodes** whose token span (measured against the HuggingFace tokenizer) falls in the range **128–512 tokens** — the range where BGE-M3 performs best. Token boundaries do not align with AST node boundaries; the tokenizer is context-dependent. The slicer has 9 unit tests in `slicing/traits.rs`.
@@ -237,11 +244,57 @@ Note: always `--exclude 'tools/**'` when indexing the mindex repo itself — oth
 
 **Response semantics:** `chunk_count == 0` in the server response means the slicer produced no chunks (file below 128-token threshold), not that the file was unchanged. Hash-unchanged files are silently skipped server-side and never appear in the response.
 
-**Language detection** (extension → API key): `.rs`→rust, `.py`→python, `.js/.mjs/.cjs/.jsx`→javascript, `.ts/.mts/.cts`→typescript, `.tsx`→tsx, `.go`→go, `.c/.h`→c, `.cpp/.cc/.cxx/.hpp`→cpp, `.java`→java, `.cs`→csharp, `.rb`→ruby, `.php`→php, `.sh/.bash`→bash, `.html/.htm`→html, `.css`→css, `.json`→json, `.scala/.sc`→scala, `.hs/.lhs`→haskell, `.ml/.mli`→ocaml, `.zig`→zig.
+**Language detection** (extension → API key): `.rs`→rust, `.py`→python, `.js/.mjs/.cjs/.jsx`→javascript, `.ts/.mts/.cts`→typescript, `.tsx`→tsx, `.go`→go, `.c/.h`→c, `.cpp/.cc/.cxx/.hpp`→cpp, `.java`→java, `.cs`→csharp, `.rb`→ruby, `.php`→php, `.sh/.bash`→bash, `.html/.htm`→html, `.css`→css, `.json`→json, `.scala/.sc`→scala, `.hs/.lhs`→haskell, `.ml/.mli`→ocaml, `.zig`→zig, `.sql`→sql.
+
+## Search CLI (`tools/search/mindex-search`)
+
+A standalone Bash script (not Rust) that POSTs to `/v0/{project}/search` and renders results in the terminal. Built around `curl` + `jq`; uses `pygmentize` for syntax highlighting if present on `$PATH` (falls back to plain text otherwise — `bat`/`highlight`/`chroma` are not assumed to be installed).
+
+**Designed to sit at the end of a shell pipe:**
+```bash
+tmp=$(mktemp); "${EDITOR:-vim}" "$tmp"
+tools/search/mindex-search --project "$PROJECT" --no-verify < "$tmp"
+rm -f "$tmp"
+```
+Or let it drive the editor itself with `--edit` (skips stdin, opens `$EDITOR` on a temp file, reads the result back). `--query TEXT` bypasses both for one-off non-interactive use.
+
+**Key flags** (mirrors the indexer CLI's flag-naming conventions):
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--server` | `https://127.0.0.1:11111` | mindex server URL |
+| `--project` | (required) | 32-char hex GUID without dashes |
+| `--protocol` | `v0` | API version in URL path |
+| `--no-verify` | off | skip TLS cert check (self-signed default cert) |
+| `--top-k N` | server default (5) | maps to `SearchRequest.top_k` |
+| `--include-lang LANG` / `--exclude-lang LANG` | — | repeatable; validated against the 21 supported API keys before sending |
+| `--include-path GLOB` / `--exclude-path GLOB` | — | repeatable; maps to `SearchFilter.paths` |
+| `--edit` | off | open `$EDITOR` on a temp file instead of reading stdin |
+| `--query TEXT` | — | use TEXT directly, skipping stdin/`--edit` |
+| `--theme STYLE` | `monokai` | pygments style name |
+| `--color always\|auto\|never` | `auto` | `auto` disables color when stdout isn't a TTY or `$NO_COLOR` is set |
+| `-v / --verbose` | off | print the outgoing request JSON to stderr |
+
+**Output order is intentionally inverted relative to the API/Qdrant response:** results are re-sorted ascending by `score` before printing, so the single best match is the last thing printed — right above the next shell prompt, where it's most visible without scrolling.
+
+**Rendering:** each result prints a separator, `path:start_line-end_line  score=X.XXXX` header, then the full `code` field (never truncated) with a left-hand line-number gutter starting at `start_line`. The gutter is generated independently of the syntax highlighter (via `awk` after `pygmentize`) so highlighting never corrupts line-number alignment. The language passed to `pygmentize -l` is inferred from the result's file extension using the same extension→language table as the indexer CLI, since `SearchResult` carries no `programming_language` field.
+
+**Error handling:** every status code the API can actually return is handled explicitly and distinctly — `200` (render), `404` (no active chunks matched; not an error, exits 1 with a plain message), `400`/`422` (malformed request; prints the server's body text, which axum's `Json` extractor populates on schema mismatches like an unknown language enum value), `499` (server treated the request as a cancelled client disconnect), `503` (embedding server or Qdrant down), `500` (server said + generic message), and any other code (raw status + body). A `curl` transport failure (connection refused, TLS error, timeout) is reported separately from HTTP-level errors. `--project`, `--top-k`, and `--include/exclude-lang` are validated client-side before any network call.
+
+### `tools/search/mindex-search-edit` — POSIX sh pipeline wrapper
+
+A separate, pure-POSIX `#!/bin/sh` script (no bashisms — no arrays, `[[ ]]`, or `local`; uses the `set -- "$@" ...` trick to build argument lists and `set -f` to suppress local glob expansion of path patterns like `src/**`). It is the piece meant to be distributed/packaged across heterogeneous environments and invoked directly by end users; `mindex-search` itself is the rendering engine it drives.
+
+It implements the editor → pipe → render pipeline end to end:
+1. Validates required tools (`mktemp`, `grep`, `tr`, `dirname`, `basename`) and resolves the `mindex-search` binary (`$MINDEX_SEARCH_BIN`, else alongside this script, else `$PATH`) — and validates `$MINDEX_PROJECT` is set — all *before* opening an editor, so a missing prerequisite never wastes a typed query.
+2. Opens `$EDITOR` (default `vi`; may contain arguments, e.g. `EDITOR="code --wait"`) on a `mktemp`-created temp file, unless `$MINDEX_QUERY` is set, in which case that value is used directly and the editor step is skipped entirely (the mechanism for non-interactive/cron/CI use).
+3. Translates `MINDEX_*` environment variables into `mindex-search` flags and execs it with the query file on stdin, propagating its exit code unchanged.
+
+Every other `mindex-search` flag has a same-named `MINDEX_*` environment variable (`MINDEX_SERVER`, `MINDEX_PROTOCOL`, `MINDEX_NO_VERIFY`, `MINDEX_TOP_K`, `MINDEX_INCLUDE_LANG`/`MINDEX_INCLUDE_PATH`/`MINDEX_EXCLUDE_LANG`/`MINDEX_EXCLUDE_PATH` as space-separated lists, `MINDEX_THEME`, `MINDEX_COLOR`, `MINDEX_VERBOSE`). Any CLI arguments given to the wrapper are forwarded after the environment-derived flags, so they win on conflicting scalar options (`mindex-search`'s flag parser is last-one-wins). See `mindex-search-edit --help` for the full reference.
 
 ## Supported Languages
 
-20 languages supported via tree-sitter grammars. All crates must require `tree-sitter ≥ 0.23` (the new `LanguageFn`/`LANGUAGE` constant API). Older crates cause a native `links` conflict and cannot coexist with `tree-sitter 0.26`.
+21 languages supported via tree-sitter grammars. All crates must require `tree-sitter ≥ 0.23` (the new `LanguageFn`/`LANGUAGE` constant API). Older crates cause a native `links` conflict and cannot coexist with `tree-sitter 0.26`.
 
 | API key       | Enum variant                      | Crate                         | Constant used                   |
 |---------------|-----------------------------------|-------------------------------|---------------------------------|
@@ -265,17 +318,22 @@ Note: always `--exclude 'tools/**'` when indexing the mindex repo itself — oth
 | `haskell`     | `ProgrammingLanguage::Haskell`    | `tree-sitter-haskell 0.23`    | `LANGUAGE`                      |
 | `ocaml`       | `ProgrammingLanguage::Ocaml`      | `tree-sitter-ocaml 0.25`      | `LANGUAGE_OCAML` (.ml files)    |
 | `zig`         | `ProgrammingLanguage::Zig`        | `tree-sitter-zig 1.1`         | `LANGUAGE`                      |
+| `sql`         | `ProgrammingLanguage::Sql`        | `tree-sitter-sequel 0.3`      | `LANGUAGE`                      |
 
 **Not yet supported** — crates still require `tree-sitter 0.21–0.22`, causing a native `links` conflict:
 `yaml`, `toml`, `kotlin`, `lua`, `elixir`, `nix`, `erlang`, `swift`.
 Add them once the upstream crates are updated to the `0.23+` API.
 
 ## Language Extensibility
-When adding a new `ProgrammingLanguage`:
-1. Add the variant to the `ProgrammingLanguage` enum in `models.rs` and its `ToSql`/`FromSql` impls. Use a lowercase SQL name matching the serde rename.
-2. Add the SQL name to the `CHECK` constraint in `v0.1.0_schema.sql`.
-3. Add the `tree-sitter-<lang>` crate to `Cargo.toml`. **Verify** its `tree-sitter` dependency is `≥ 0.23`; older versions cause a `links` conflict.
+When adding a new `ProgrammingLanguage`, touch all of these — `sql` (`tree-sitter-sequel`) was added this way and missing any single one produces a distinct, separately-discovered failure (422 from the API, then a SQLite `CHECK constraint failed`, then a silently-skipped file in the indexer):
+1. Add the variant to the `ProgrammingLanguage` enum in `models.rs` and its `ToSql`/`FromSql` impls. Use a lowercase SQL name matching the serde rename. Skipping this → server returns `422 unknown variant`.
+2. Add the SQL name to the `CHECK` constraint in `v0.1.0_schema.sql`. Skipping this → `SqliteFailure(ConstraintViolation, "CHECK constraint failed...")`, surfaced to the client as a bare `500`.
+3. Add the `tree-sitter-<lang>` crate to `Cargo.toml`. **Verify** its `tree-sitter` dependency is `≥ 0.23` (check the crate's own `Cargo.toml`, e.g. via `cargo info <crate>` + inspecting the downloaded source in `~/.cargo/registry/src/`) — modern grammar crates depend on the lightweight `tree-sitter-language` ABI crate and only dev-depend on full `tree-sitter`, which is what avoids the `links` conflict. Older crates depend on full `tree-sitter` directly at an old version and will conflict.
 4. Add an arm to the `let ts_language = match pl { ... }` block in the main-work tx closure in `post_index`. Use `Language::new(tree_sitter_<lang>::LANGUAGE)` for crates that export a plain `LANGUAGE` constant, or the crate-specific name (e.g. `LANGUAGE_TYPESCRIPT`, `LANGUAGE_OCAML`).
+5. Add the extension(s) to `detect_language` in `tools/indexer/src/scanner.rs` and the matching arm to `Language::name()` in the same file. Skipping this → the indexer silently counts the file under `skipped_unknown` and it never reaches the server at all (no error, just absent from results — the easiest of these to miss).
+6. Add the language to `VALID_LANGS` in `tools/search/mindex-search` (client-side `--include-lang`/`--exclude-lang` validation) and, if it has a natural source-file extension, to `ext_to_lexer()` in the same file for syntax-highlighted search output.
+7. Update the table in this file's **Supported Languages** section (bump the language count) and the indexer's **Language detection** line above.
+8. **Rebuild and recreate, don't just restart:** `docker compose build mindex` (the running container is a stale image otherwise) — and if step 2's `CHECK` constraint changed, the existing `mindex_db` Docker volume still has the *old* constraint baked into its already-created table (`CREATE TABLE IF NOT EXISTS` does not retroactively alter it). Per the Operational Rules below, no migration upgrade path is maintained — drop and recreate: `docker compose down && docker volume rm mindex_mindex_db && docker compose up -d`.
 
 ## Docker & CI
 
@@ -356,6 +414,25 @@ Determinism ensures that the same text always produces the same vectors, making 
 | `test_search_empty_project_returns_404` | Search on a never-indexed project returns HTTP 404 |
 | `test_multiple_files_indexed_independently` | Two files in one request each return `chunk_count ≥ 1` |
 
+## Manual End-to-End Walkthrough
+
+To stand up the full stack by hand and index + search a real project (e.g. mindex itself):
+
+1. **Embedding model server must be reachable from inside the `mindex` container at `host.docker.internal:11211`.** If it runs on the host (outside Docker, e.g. a local `bge-m3-api`/FlagEmbedding process), it must bind `0.0.0.0`, not `127.0.0.1` — traffic from the container arrives via the Docker bridge gateway IP (e.g. `172.18.0.1`), not via loopback, and a server bound to `127.0.0.1` only refuses it with `ECONNREFUSED` even though the route itself is fine. (`tests/mock_embedder`'s own Dockerfile already binds `0.0.0.0`, which is why it doesn't hit this.)
+2. `docker compose up -d` (qdrant + mindex). Don't assume the container picked up your latest source changes — `build: .` only rebuilds the image on an explicit `docker compose build mindex`; `up -d` alone reuses whatever image already exists.
+3. Don't hardcode `https://127.0.0.1:11111` in scripts meant to be portable: ask Compose for the real published port, `docker compose port mindex 11111`, and poll it until the API responds (any of `200`/`404` to a search on an all-zero project GUID is "alive").
+4. Build the indexer once: `cd tools/indexer && cargo build --release`.
+5. Index with multiple languages in a single invocation — one `--include GLOB` per language is enough; the indexer groups files by extension-detected language automatically, no per-language invocation needed:
+   ```bash
+   tools/indexer/target/release/mindex-index \
+       --project "$MINDEX_PROJECT" --root /data/silencespeakstruth/Projects/mindex \
+       --include '**/*.rs' --include '**/*.py' --include '**/*.sql' \
+       --exclude 'target/**' --exclude 'tools/**' --exclude '.git/**' \
+       --no-verify --verbose
+   ```
+   If the total file count is smaller than `--batch-size` (default 100), everything goes out as a single HTTP request — the progress bar will not move at all until that one request completes (which, with a real BGE-M3 model rather than the mock, can take well over a minute). This is expected, not a hang; pass a smaller `--batch-size` for incremental progress feedback.
+6. Search with `tools/search/mindex-search --project "$MINDEX_PROJECT" --no-verify --query "..."`. Results print in ascending score order (best match last); `--include-lang`/`--exclude-lang` filter by the languages indexed in step 5.
+
 ## Operational Rules
 - **Data Integrity:** SQLite writes involving multiple rows must be inside a `transaction`. The soft-delete pattern ensures consistency: if the main-work transaction rolls back, old chunks remain `active` and the file status is recoverable.
 - **Chunk FK is RESTRICT, not CASCADE.** Never delete a `project_files` row while its chunks exist. Always mark chunks `deleted` first (or let them be GC'd), then delete the project row.
@@ -370,4 +447,4 @@ Determinism ensures that the same text always produces the same vectors, making 
 4. Always use `collection_name(project_guid.0.as_simple().to_string().as_str())` as the Qdrant collection name. Never hardcode collection names.
 5. The SQLite query in any search path must include `AND c.status = 'active'` to exclude soft-deleted chunks.
 6. Status transitions in `project_files` must always update `status_updated_at = unixepoch()` in the same statement.
-7. When adding a language: update `models.rs`, `v0.1.0_schema.sql`, `Cargo.toml`, and the `let ts_language = match pl` block in `handlers.rs`. Verify the new tree-sitter crate requires `tree-sitter ≥ 0.23` before adding.
+7. When adding a language, follow the full **Language Extensibility** checklist above (8 steps: enum, schema CHECK, Cargo.toml, handlers.rs match arm, indexer scanner.rs, search CLI's `VALID_LANGS`, docs, and a Docker image rebuild + DB volume recreate) — not just the enum and match arm.
