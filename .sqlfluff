@@ -1,0 +1,16 @@
+[sqlfluff]
+dialect = sqlite
+
+# The migration schema is hand-aligned for readability: column types are padded
+# to a common width, CHECK predicates use trailing `AND`, and double blank lines
+# separate sections. The excluded layout rules war with that intentional style
+# and flag no actual defect. CP02 additionally misfires on the SQLite collation
+# keyword `NOCASE`, classifying it as a lowercase-required identifier.
+#
+#   LT01 — single-space spacing (breaks column alignment)
+#   LT02 — indentation width (deliberate alignment)
+#   LT03 — operator line position (trailing AND in CHECK blocks)
+#   LT05 — max line length (a few aligned lines exceed 80)
+#   LT15 — consecutive blank lines (section separators)
+#   CP02 — identifier casing (false positive on NOCASE)
+exclude_rules = LT01, LT02, LT03, LT05, LT15, CP02

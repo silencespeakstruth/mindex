@@ -11,7 +11,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum SQLite3PoolError {
     #[error("sql error: {0}")]
-    SQL(#[from] rusqlite::Error),
+    Sql(#[from] rusqlite::Error),
 
     #[error("pool empty")]
     PoolEmpty,

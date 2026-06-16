@@ -121,6 +121,10 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+// The eight parameters are the irreducible inputs of one hybrid query (collection,
+// id filter, the three vector modalities, and top_k); bundling them into a struct
+// would only move the same fields around without improving clarity.
+#[allow(clippy::too_many_arguments)]
 pub async fn search(
     client: &Qdrant,
     collection: &str,

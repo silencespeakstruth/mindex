@@ -89,7 +89,7 @@ impl<'a> Slicer<'a> {
                     /* In practice, BGE-M3 models perform best with input sequences
                      * within this length range to balance context and semantic density.
                      */
-                    if len >= 128 && len <= 512 {
+                    if (128..=512).contains(&len) {
                         let line_start = code[..node.start_byte()]
                             .rfind('\n')
                             .map_or(0, |i| i + 1);

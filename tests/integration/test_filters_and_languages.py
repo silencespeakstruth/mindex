@@ -5,6 +5,7 @@ filters (programming languages + path GLOBs).
 Complements test_e2e.py (which covers the rust-only happy path). Fixtures
 (client, project, wait_for_mindex) come from conftest.py.
 """
+
 import httpx
 
 from test_e2e import RUST_V1, RUST_V2  # reuse the validated rust snippets
@@ -16,7 +17,7 @@ MINDEX_URL = __import__("conftest").MINDEX_URL
 # (128-512 BGE-M3 tokens) by the real tree-sitter slicer.
 # ---------------------------------------------------------------------------
 
-PYTHON_SRC = '''\
+PYTHON_SRC = """\
 def process_records(records, config, output):
     stats = {"processed": 0, "batches": 0, "retries": 0}
     batch_size = config.get("batch_size", 64)
@@ -38,9 +39,9 @@ def process_records(records, config, output):
                     continue
                 raise PipelineError(batch_index=batch_idx) from err
     return stats
-'''
+"""
 
-SQL_SRC = '''\
+SQL_SRC = """\
 CREATE TABLE analytics_events (
     id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     event_uuid UUID NOT NULL UNIQUE,
@@ -69,14 +70,17 @@ CREATE TABLE analytics_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at TIMESTAMPTZ
 );
-'''
+"""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def index_files(client: httpx.Client, project: str, files: dict[str, dict[str, str]]) -> httpx.Response:
+
+def index_files(
+    client: httpx.Client, project: str, files: dict[str, dict[str, str]]
+) -> httpx.Response:
     """files = {language: {path: code}}."""
     body = {
         "files": {
@@ -106,6 +110,7 @@ def search(
 # ---------------------------------------------------------------------------
 # Non-rust languages
 # ---------------------------------------------------------------------------
+
 
 def test_index_python_file_returns_chunks(client: httpx.Client, project: str) -> None:
     resp = index_files(client, project, {"python": {"app.py": PYTHON_SRC}})
@@ -150,9 +155,19 @@ def test_multi_language_single_request(client: httpx.Client, project: str) -> No
 # Search filters: programming language
 # ---------------------------------------------------------------------------
 
-def test_search_include_language_returns_only_that_language(client: httpx.Client, project: str) -> None:
-    index_files(client, project, {"rust": {"a.rs": RUST_V1}, "python": {"b.py": PYTHON_SRC}})
-    resp = search(client, project, "process records", include={"programming_languages": ["python"]})
+
+def test_search_include_language_returns_only_that_language(
+    client: httpx.Client, project: str
+) -> None:
+    index_files(
+        client, project, {"rust": {"a.rs": RUST_V1}, "python": {"b.py": PYTHON_SRC}}
+    )
+    resp = search(
+        client,
+        project,
+        "process records",
+        include={"programming_languages": ["python"]},
+    )
     assert resp.status_code == 200
     results = resp.json()["results"]
     assert len(results) >= 1
@@ -160,9 +175,18 @@ def test_search_include_language_returns_only_that_language(client: httpx.Client
     assert all(r["path"] == "b.py" for r in results), [r["path"] for r in results]
 
 
-def test_search_exclude_language_omits_that_language(client: httpx.Client, project: str) -> None:
-    index_files(client, project, {"rust": {"a.rs": RUST_V1}, "python": {"b.py": PYTHON_SRC}})
-    resp = search(client, project, "process records", exclude={"programming_languages": ["python"]})
+def test_search_exclude_language_omits_that_language(
+    client: httpx.Client, project: str
+) -> None:
+    index_files(
+        client, project, {"rust": {"a.rs": RUST_V1}, "python": {"b.py": PYTHON_SRC}}
+    )
+    resp = search(
+        client,
+        project,
+        "process records",
+        exclude={"programming_languages": ["python"]},
+    )
     assert resp.status_code == 200
     results = resp.json()["results"]
     assert len(results) >= 1
@@ -173,25 +197,36 @@ def test_search_exclude_language_omits_that_language(client: httpx.Client, proje
 # Search filters: path GLOB
 # ---------------------------------------------------------------------------
 
-def test_search_include_path_glob_restricts_results(client: httpx.Client, project: str) -> None:
+
+def test_search_include_path_glob_restricts_results(
+    client: httpx.Client, project: str
+) -> None:
     index_files(client, project, {"rust": {"src/a.rs": RUST_V1, "tests/b.rs": RUST_V2}})
     resp = search(client, project, "process records", include={"paths": ["src/**"]})
     assert resp.status_code == 200
     results = resp.json()["results"]
     assert len(results) >= 1
-    assert all(r["path"].startswith("src/") for r in results), [r["path"] for r in results]
+    assert all(r["path"].startswith("src/") for r in results), [
+        r["path"] for r in results
+    ]
 
 
-def test_search_exclude_path_glob_omits_matches(client: httpx.Client, project: str) -> None:
+def test_search_exclude_path_glob_omits_matches(
+    client: httpx.Client, project: str
+) -> None:
     index_files(client, project, {"rust": {"src/a.rs": RUST_V1, "tests/b.rs": RUST_V2}})
     resp = search(client, project, "process records", exclude={"paths": ["tests/**"]})
     assert resp.status_code == 200
     results = resp.json()["results"]
     assert len(results) >= 1
-    assert all(not r["path"].startswith("tests/") for r in results), [r["path"] for r in results]
+    assert all(not r["path"].startswith("tests/") for r in results), [
+        r["path"] for r in results
+    ]
 
 
-def test_search_invalid_language_in_filter_is_rejected(client: httpx.Client, project: str) -> None:
+def test_search_invalid_language_in_filter_is_rejected(
+    client: httpx.Client, project: str
+) -> None:
     # An unknown language enum value must be refused by the JSON schema (422),
     # not silently ignored.
     index_files(client, project, {"rust": {"a.rs": RUST_V1}})

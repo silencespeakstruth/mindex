@@ -90,21 +90,66 @@ is_valid_lang() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --server) SERVER="$2"; shift 2 ;;
-        --project) PROJECT="$2"; shift 2 ;;
-        --protocol) PROTOCOL="$2"; shift 2 ;;
-        --no-verify) NO_VERIFY=1; shift ;;
-        --top-k) TOP_K="$2"; shift 2 ;;
-        --include-lang) INC_LANGS+=("$2"); shift 2 ;;
-        --include-path) INC_PATHS+=("$2"); shift 2 ;;
-        --exclude-lang) EXC_LANGS+=("$2"); shift 2 ;;
-        --exclude-path) EXC_PATHS+=("$2"); shift 2 ;;
-        --edit) EDIT=1; shift ;;
-        --query) QUERY="$2"; shift 2 ;;
-        --theme) THEME="$2"; shift 2 ;;
-        --color) COLOR="$2"; shift 2 ;;
-        -v|--verbose) VERBOSE=1; shift ;;
-        -h|--help) usage; exit 0 ;;
+        --server)
+            SERVER="$2"
+            shift 2
+            ;;
+        --project)
+            PROJECT="$2"
+            shift 2
+            ;;
+        --protocol)
+            PROTOCOL="$2"
+            shift 2
+            ;;
+        --no-verify)
+            NO_VERIFY=1
+            shift
+            ;;
+        --top-k)
+            TOP_K="$2"
+            shift 2
+            ;;
+        --include-lang)
+            INC_LANGS+=("$2")
+            shift 2
+            ;;
+        --include-path)
+            INC_PATHS+=("$2")
+            shift 2
+            ;;
+        --exclude-lang)
+            EXC_LANGS+=("$2")
+            shift 2
+            ;;
+        --exclude-path)
+            EXC_PATHS+=("$2")
+            shift 2
+            ;;
+        --edit)
+            EDIT=1
+            shift
+            ;;
+        --query)
+            QUERY="$2"
+            shift 2
+            ;;
+        --theme)
+            THEME="$2"
+            shift 2
+            ;;
+        --color)
+            COLOR="$2"
+            shift 2
+            ;;
+        -v | --verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -122,7 +167,7 @@ for l in "${INC_LANGS[@]}" "${EXC_LANGS[@]}"; do
 done
 
 case "$COLOR" in
-    always|auto|never) ;;
+    always | auto | never) ;;
     *) die "--color must be always, auto, or never" ;;
 esac
 
@@ -195,7 +240,7 @@ jq -n \
     + (if $top_k == null then {} else {top_k: $top_k} end)
     + (filt($inc_langs; $inc_paths) as $i | if $i == null then {} else {include: $i} end)
     + (filt($exc_langs; $exc_paths) as $e | if $e == null then {} else {exclude: $e} end)
-    ' > "$req_file"
+    ' >"$req_file"
 
 if [[ "$VERBOSE" -eq 1 ]]; then
     printf -- '--- request ---\n' >&2
@@ -274,23 +319,23 @@ ext_to_lexer() {
     case "$1" in
         *.rs) echo rust ;;
         *.py) echo python ;;
-        *.js|*.mjs|*.cjs|*.jsx) echo javascript ;;
-        *.ts|*.mts|*.cts) echo typescript ;;
+        *.js | *.mjs | *.cjs | *.jsx) echo javascript ;;
+        *.ts | *.mts | *.cts) echo typescript ;;
         *.tsx) echo tsx ;;
         *.go) echo go ;;
-        *.c|*.h) echo c ;;
-        *.cpp|*.cc|*.cxx|*.hpp) echo cpp ;;
+        *.c | *.h) echo c ;;
+        *.cpp | *.cc | *.cxx | *.hpp) echo cpp ;;
         *.java) echo java ;;
         *.cs) echo csharp ;;
         *.rb) echo ruby ;;
         *.php) echo php ;;
-        *.sh|*.bash) echo bash ;;
-        *.html|*.htm) echo html ;;
+        *.sh | *.bash) echo bash ;;
+        *.html | *.htm) echo html ;;
         *.css) echo css ;;
         *.json) echo json ;;
-        *.scala|*.sc) echo scala ;;
-        *.hs|*.lhs) echo haskell ;;
-        *.ml|*.mli) echo ocaml ;;
+        *.scala | *.sc) echo scala ;;
+        *.hs | *.lhs) echo haskell ;;
+        *.ml | *.mli) echo ocaml ;;
         *.zig) echo zig ;;
         *.sql) echo sql ;;
         *) echo "" ;;
@@ -316,8 +361,8 @@ print_result() {
     lexer=$(ext_to_lexer "$path")
 
     if [[ "$HAVE_PYGMENTIZE" -eq 1 && "$USE_COLOR" -eq 1 && -n "$lexer" ]]; then
-        printf '%s' "$code" | pygmentize -l "$lexer" -f terminal256 -O "style=$THEME" 2>/dev/null \
-            | awk -v start="$start_line" -v use_color="$USE_COLOR" '
+        printf '%s' "$code" | pygmentize -l "$lexer" -f terminal256 -O "style=$THEME" 2>/dev/null |
+            awk -v start="$start_line" -v use_color="$USE_COLOR" '
                 {
                     if (use_color == 1)
                         printf "\033[2;37m%6d\033[0m \033[2;37m│\033[0m %s\n", start + NR - 1, $0

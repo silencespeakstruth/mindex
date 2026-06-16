@@ -23,8 +23,9 @@
 # this script, or on $PATH — see --help).
 
 set -eu
-set -f          # disable pathname expansion: glob patterns like 'src/**' must
-                # reach mindex-search literally, never expanded by this shell.
+# set -f disables pathname expansion so glob patterns like 'src/**' reach
+# mindex-search literally, never expanded by this shell.
+set -f
 
 prog=$(basename -- "$0")
 
@@ -101,7 +102,7 @@ EOF
 }
 
 case "${1:-}" in
-    -h|--help)
+    -h | --help)
         show_help
         exit 0
         ;;
@@ -125,7 +126,7 @@ require_tool basename
 
 bin=${MINDEX_SEARCH_BIN:-}
 if [ -z "$bin" ]; then
-    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
     if [ -x "$script_dir/mindex-search" ]; then
         bin="$script_dir/mindex-search"
     elif command -v mindex-search >/dev/null 2>&1; then
@@ -150,7 +151,7 @@ fi
 truthy() {
     val=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
     case "$val" in
-        1|true|yes|on) return 0 ;;
+        1 | true | yes | on) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -161,7 +162,7 @@ tmpfile=$(mktemp "${TMPDIR:-/tmp}/mindex-search-query.XXXXXX") || die "mktemp fa
 trap 'rm -f "$tmpfile"' 0 1 2 3 15
 
 if [ -n "${MINDEX_QUERY:-}" ]; then
-    printf '%s\n' "$MINDEX_QUERY" > "$tmpfile"
+    printf '%s\n' "$MINDEX_QUERY" >"$tmpfile"
 else
     editor=${EDITOR:-vi}
 
@@ -247,5 +248,5 @@ fi
 # ─── Run it ──────────────────────────────────────────────────────────────────
 
 status=0
-"$bin" "$@" < "$tmpfile" || status=$?
+"$bin" "$@" <"$tmpfile" || status=$?
 exit "$status"

@@ -6,12 +6,15 @@ produce identical vectors, and different texts produce different vectors.
 This is sufficient for asserting that indexed content is found in search and
 that re-indexed (changed) content replaces the old content.
 """
+
 import hashlib
 import math
 import random
 from typing import Any
 
-from fastapi import FastAPI
+# fastapi is only present inside this component's Docker image, never alongside
+# the local/CI mypy run, so its stubs are legitimately unresolvable here.
+from fastapi import FastAPI  # type: ignore[import-not-found]
 
 app = FastAPI()
 
@@ -45,7 +48,7 @@ def _colbert(text: str) -> list[list[float]]:
 async def encode(payload: dict[str, Any]) -> dict[str, Any]:
     texts: list[str] = payload["texts"]
     return {
-        "dense_vecs":   [_dense(t) for t in texts],
-        "sparse_vecs":  [_sparse(t) for t in texts],
+        "dense_vecs": [_dense(t) for t in texts],
+        "sparse_vecs": [_sparse(t) for t in texts],
         "colbert_vecs": [_colbert(t) for t in texts],
     }

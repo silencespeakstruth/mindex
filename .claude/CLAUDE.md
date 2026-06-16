@@ -45,8 +45,8 @@ mindex/
         scanner.rs            — walkdir + globset: file discovery, extension→language detection
         client.rs             — reqwest: upload_batch(), IndexRequest/IndexResponse types
     search/
-      mindex-search            — Bash CLI: terminal search frontend (curl + jq + pygmentize)
-      mindex-search-edit       — POSIX sh wrapper: $EDITOR pipeline glue, env-var driven, no bashisms
+      mindex-search           — Bash CLI: terminal search frontend (curl + jq + pygmentize)
+      mindex-search-edit      — POSIX sh wrapper: $EDITOR pipeline glue, env-var driven, no bashisms
   Dockerfile                  — Multi-stage: rust:1.95-bookworm builder → debian:bookworm-slim
   docker-compose.yml          — Production stack: qdrant + mindex
   docker-compose.test.yml     — Standalone test stack: qdrant + mock-embedder + mindex + test-runner
@@ -482,6 +482,23 @@ To stand up the full stack by hand and index + search a real project (e.g. minde
    ```
    If the total file count is smaller than `--batch-size` (default 100), everything goes out as a single HTTP request — the progress bar will not move at all until that one request completes (which, with a real BGE-M3 model rather than the mock, can take well over a minute). This is expected, not a hang; pass a smaller `--batch-size` for incremental progress feedback.
 6. Search with `tools/search/mindex-search --project "$MINDEX_PROJECT" --no-verify --query "..."`. Results print in ascending score order (best match last); `--include-lang`/`--exclude-lang` filter by the languages indexed in step 5.
+
+## Linting & Formatting
+
+The project is kept at **zero warnings across every language**. The flags below are not all defaults — use exactly these so "clean" is reproducible:
+
+| Language | Command | Notes |
+|----------|---------|-------|
+| Rust (server) | `cargo clippy --bin mindex` | zero warnings; tests `cargo test --bin mindex` (23) |
+| Rust (indexer) | `cd tools/indexer && cargo clippy` | separate crate |
+| Shell — lint | `shellcheck scripts/entrypoint.sh`; `shellcheck --shell=bash tools/search/mindex-search`; `shellcheck --shell=sh tools/search/mindex-search-edit` | `mindex-search-edit` is POSIX `sh`, so lint it as `sh` (catches bashisms) |
+| Shell — format | `shfmt -i 4 -ci -d <files>` | **non-default flags**: 4-space indent (`-i 4`, matches the rest of the repo) + indent case bodies (`-ci`). Bare `shfmt` defaults to tabs and will show spurious diffs |
+| Python — lint | `ruff check tests/` | |
+| Python — format | `ruff format --check tests/` **and** `black --check tests/` | both must pass; they're kept compatible by avoiding the one construct they format differently (long `assert cond, "msg"` — split the condition into a named bool instead) |
+| Python — types | `mypy tests/` | `fastapi` is `# type: ignore[import-not-found]` in the mock (its stubs live only in that component's Docker image) |
+| SQL | `sqlfluff lint src/db/migrations/v0.1.0_schema.sql` | dialect + relaxed layout rules come from the repo-root `.sqlfluff`; the schema is intentionally column-aligned, so layout rules (LT01/02/03/05/15) and the `NOCASE` false-positive (CP02) are excluded there — keep new SQL consistent with that style |
+
+When a lint fires on intentional code, prefer a **scoped `#[allow(...)]` / config exclusion with a one-line reason** over contorting the code (see `OptionResultExt::from_cancelled`, `qdrant::search`, and `.sqlfluff`). Don't reach for project-wide suppression.
 
 ## Operational Rules
 - **Data Integrity:** SQLite writes involving multiple rows must be inside a `transaction`. The soft-delete pattern ensures consistency: if the main-work transaction rolls back, old chunks remain `active` and the file status is recoverable.

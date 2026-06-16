@@ -3,8 +3,8 @@ End-to-end tests for the mindex index + search pipeline.
 
 Each test gets its own project GUID so tests are fully isolated.
 """
+
 import httpx
-import pytest
 
 MINDEX_URL = __import__("conftest").MINDEX_URL
 
@@ -92,14 +92,18 @@ pub fn process_records(
 FILE_PATH = "src/pipeline.rs"
 
 
-def index(client: httpx.Client, project: str, code: str, path: str = FILE_PATH) -> httpx.Response:
+def index(
+    client: httpx.Client, project: str, code: str, path: str = FILE_PATH
+) -> httpx.Response:
     return client.post(
         f"{MINDEX_URL}/v0/{project}/index",
         json={"files": {"rust": {path: {"code": code}}}},
     )
 
 
-def search(client: httpx.Client, project: str, query: str, top_k: int = 5) -> httpx.Response:
+def search(
+    client: httpx.Client, project: str, query: str, top_k: int = 5
+) -> httpx.Response:
     return client.post(
         f"{MINDEX_URL}/v0/{project}/search",
         json={"query": query, "top_k": top_k},
@@ -109,6 +113,7 @@ def search(client: httpx.Client, project: str, query: str, top_k: int = 5) -> ht
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 def test_index_new_file_returns_chunk_count(client: httpx.Client, project: str) -> None:
     resp = index(client, project, RUST_V1)
@@ -139,7 +144,9 @@ def test_reindex_unchanged_file_is_noop(client: httpx.Client, project: str) -> N
     assert files.get(FILE_PATH, 0) == 0
 
 
-def test_reindex_changed_file_returns_new_chunks(client: httpx.Client, project: str) -> None:
+def test_reindex_changed_file_returns_new_chunks(
+    client: httpx.Client, project: str
+) -> None:
     r1 = index(client, project, RUST_V1)
     assert r1.status_code == 200
     chunks_v1 = r1.json()["files"]["rust"][FILE_PATH]
@@ -153,7 +160,9 @@ def test_reindex_changed_file_returns_new_chunks(client: httpx.Client, project: 
     assert abs(chunks_v1 - chunks_v2) <= max(chunks_v1, chunks_v2)
 
 
-def test_search_after_reindex_reflects_new_content(client: httpx.Client, project: str) -> None:
+def test_search_after_reindex_reflects_new_content(
+    client: httpx.Client, project: str
+) -> None:
     index(client, project, RUST_V1)
     index(client, project, RUST_V2)
 
@@ -164,9 +173,10 @@ def test_search_after_reindex_reflects_new_content(client: httpx.Client, project
 
     # The v2-specific marker must be present somewhere in the returned chunks.
     all_code = " ".join(r["code"] for r in results)
-    assert "version" in all_code or "retry (v2)" in all_code or "'retry" in all_code, (
-        "Search after re-index should surface v2 content"
+    has_v2_marker = (
+        "version" in all_code or "retry (v2)" in all_code or "'retry" in all_code
     )
+    assert has_v2_marker, "Search after re-index should surface v2 content"
 
 
 def test_search_result_has_line_numbers(client: httpx.Client, project: str) -> None:
@@ -188,7 +198,9 @@ def test_search_empty_project_returns_404(client: httpx.Client, project: str) ->
     assert resp.status_code == 404
 
 
-def test_multiple_files_indexed_independently(client: httpx.Client, project: str) -> None:
+def test_multiple_files_indexed_independently(
+    client: httpx.Client, project: str
+) -> None:
     resp = client.post(
         f"{MINDEX_URL}/v0/{project}/index",
         json={

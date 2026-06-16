@@ -52,6 +52,11 @@ use tree_sitter::Language;
 use uuid::Uuid;
 
 pub trait OptionResultExt<T> {
+    // `from_cancelled` takes `self` by value: it consumes the `Option<Result<..>>`
+    // produced by `with_cancellation_token` and reinterprets `None` (timeout/cancel)
+    // as `Err(Cancelled)`. The `from_*`-takes-no-self convention does not fit a
+    // consuming adapter method, so the lint is intentionally allowed here.
+    #[allow(clippy::wrong_self_convention)]
     fn from_cancelled(self) -> Result<T, SQLite3PoolError>;
 }
 

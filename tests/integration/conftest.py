@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -35,7 +36,7 @@ def wait_for_mindex() -> None:
 
 
 @pytest.fixture
-def client() -> httpx.Client:
+def client() -> Iterator[httpx.Client]:
     with httpx.Client(verify=False, timeout=30.0) as c:
         yield c
 
