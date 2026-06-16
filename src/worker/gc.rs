@@ -53,7 +53,7 @@ async fn sweep(db_pool: &SQLite3Pool, qdrant: &Qdrant, token: &CancellationToken
             Ok(b) => b,
             Err(SQLite3PoolError::Cancelled) => break,
             Err(e) => {
-                error!(?e, "GC: failed to query deleted chunks");
+                error!(error = ?e, "GC worker: failed to query deleted chunks from SQLite; aborting this sweep.");
                 break;
             }
         };
@@ -71,18 +71,37 @@ async fn sweep(db_pool: &SQLite3Pool, qdrant: &Qdrant, token: &CancellationToken
                 .push(guid.clone());
         }
 
+        // Only hard-delete SQLite rows whose Qdrant vectors were actually removed.
+        // If a collection's delete fails (transient Qdrant error), we keep its rows
+        // marked 'deleted' so the next sweep retries them — otherwise the vectors would
+        // be orphaned in Qdrant forever, with no SQLite row left to track them.
+        let mut confirmed_deleted: Vec<String> = Vec::new();
         for (project_guid, guids) in &by_project {
             let coll = collection_name(project_guid);
-            if let Err(e) = delete_batch(qdrant, &coll, guids.clone()).await {
-                error!(?e, project_guid, "GC: Qdrant delete_batch failed");
+            match delete_batch(qdrant, &coll, guids.clone()).await {
+                Ok(()) => confirmed_deleted.extend(guids.iter().cloned()),
+                Err(e) => error!(
+                    error = ?e,
+                    project_guid,
+                    collection = %coll,
+                    chunk_count = guids.len(),
+                    "GC: Qdrant delete_batch failed; keeping rows for next sweep. \
+                     Check Qdrant reachability and that the collection exists."
+                ),
             }
         }
 
-        // Hard-delete the rows that have been removed from Qdrant.
-        let all_guids: Vec<String> = batch.into_iter().map(|(g, _)| g).collect();
+        if confirmed_deleted.is_empty() {
+            // Nothing was confirmed removed from Qdrant this iteration (every collection
+            // failed). Stop the inner loop to avoid spinning on the same un-deletable
+            // batch; the next scheduled sweep will retry.
+            break;
+        }
+
+        // Hard-delete only the rows whose vectors are confirmed gone from Qdrant.
         let _ = db_pool
             .transaction(token.clone(), move |tx| {
-                let placeholders = (1..=all_guids.len())
+                let placeholders = (1..=confirmed_deleted.len())
                     .map(|i| format!("?{i}"))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -90,7 +109,7 @@ async fn sweep(db_pool: &SQLite3Pool, qdrant: &Qdrant, token: &CancellationToken
                     "DELETE FROM project_file_chunks
                      WHERE status = 'deleted' AND qdrant_guid IN ({placeholders})"
                 );
-                tx.execute(&sql, rusqlite::params_from_iter(all_guids.iter()))?;
+                tx.execute(&sql, rusqlite::params_from_iter(confirmed_deleted.iter()))?;
                 Ok(())
             })
             .await;

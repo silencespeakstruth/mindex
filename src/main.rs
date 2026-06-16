@@ -121,9 +121,15 @@ async fn main() -> Result<(), BoxError> {
         })
         .await
     {
-        Ok(_) => info!(?args.db_path, "SQL migration completed."),
+        Ok(_) => info!(db_path = ?args.db_path, "Schema migration completed."),
         Err(err) => {
-            error!(?err);
+            error!(
+                error = ?err,
+                db_path = ?args.db_path,
+                "Schema migration failed; cannot start. \
+                 Check the DB file is writable and not from an incompatible older schema \
+                 (no upgrade path is maintained — drop and recreate if so)."
+            );
             return Err(err.into());
         }
     }
@@ -149,36 +155,38 @@ async fn main() -> Result<(), BoxError> {
         retry_token,
     ));
 
-    loop {
-        tokio::select! {
-            res = backend::http3::run(
-                args.bind,
-                (args.cert_path.as_path(), args.key_path.as_path()),
-                RouterState {
-                    tokenizer: Arc::new(Tokenizer::from_pretrained(model_id, None)?),
-                    db_pool: db_pool.clone(),
-                    qdrant: qdrant_client.clone(),
-                    model: EmbeddingModel::BGEm3 {
-                        model_id: model_id.to_string(),
-                        client: Arc::new(BGEm3HttpClient::new(args.model_server.clone()))
-                    },
+    // Whichever arm fires first wins and we proceed to shutdown — there is no
+    // looping (a server exit, SIGINT, or SIGTERM all end the process).
+    tokio::select! {
+        res = backend::http3::run(
+            args.bind,
+            (args.cert_path.as_path(), args.key_path.as_path()),
+            RouterState {
+                tokenizer: Arc::new(Tokenizer::from_pretrained(model_id, None)?),
+                db_pool: db_pool.clone(),
+                qdrant: qdrant_client.clone(),
+                model: EmbeddingModel::BGEm3 {
+                    model_id: model_id.to_string(),
+                    client: Arc::new(BGEm3HttpClient::new(args.model_server.clone()))
                 },
-                sigterm_token.child_token()) => {
-                if let Err(err) = res {
-                    error!(?err);
-                }
-                break;
+            },
+            sigterm_token.child_token()) => {
+            if let Err(err) = res {
+                error!(
+                    error = ?err,
+                    bind = %args.bind,
+                    "HTTP server exited with an error. \
+                     Check the bind address is free and the TLS cert/key paths are valid."
+                );
             }
-            _ = signal::ctrl_c() => {
-                info!("Received SIGINT. Shutting down...");
-                sigterm_token.cancel();
-                break;
-            }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM. Shutting down...");
-                sigterm_token.cancel();
-                break;
-            }
+        }
+        _ = signal::ctrl_c() => {
+            info!("Received SIGINT. Shutting down...");
+            sigterm_token.cancel();
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM. Shutting down...");
+            sigterm_token.cancel();
         }
     }
 

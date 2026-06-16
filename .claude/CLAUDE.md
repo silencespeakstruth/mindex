@@ -98,6 +98,8 @@ PRAGMA page_size = 16384;
 
 Transactions run on `tokio::task::spawn_blocking` threads. Each `db_pool.transaction()` call acquires one connection, runs the closure in a blocking thread, and releases the connection. **Multiple sequential `transaction()` calls are used per handler** (one per logical step), rather than one giant transaction spanning the whole request.
 
+**Connection return is cancellation-safe (critical).** The blocking task pushes the connection back into the pool *itself* (`conns.blocking_lock().push(conn)` at the end of the closure), rather than the awaiting async code releasing it after `handle.await`. This matters because dropping a `spawn_blocking` `JoinHandle` does **not** cancel the task — it runs to completion regardless. If release depended on the awaiting future, then any time that future is dropped mid-transaction (client disconnect, `with_cancellation_token` firing), the connection would be silently lost. After `db_pool_size` (default 4) such events the pool would be permanently empty and every subsequent `transaction()` would return `PoolEmpty`. Returning the connection from inside the blocking task makes release independent of the caller's fate. (A panic in the closure is the one case where the connection is not returned — that is a programmer error, not a runtime condition, and is logged on `JoinError`.)
+
 ## File Status State Machine
 `project_files.status` tracks the indexing lifecycle:
 
@@ -126,7 +128,7 @@ just_uploaded → indexing → indexed
 **GC worker** (`worker/gc.rs`, runs hourly):
 - Reads batches of 256 `status='deleted'` chunks.
 - Groups by `project_guid`, calls `delete_batch()` on each Qdrant collection.
-- Hard-deletes the rows from SQLite after Qdrant confirms deletion.
+- Hard-deletes from SQLite **only the chunks whose Qdrant `delete_batch` succeeded** (`confirmed_deleted`). If a collection's delete fails (transient Qdrant error), its rows stay `'deleted'` so the next sweep retries them. Deleting the SQLite row before Qdrant confirms would orphan the vector permanently — nothing would track it for a future delete. If *every* collection in a batch fails, the inner sweep loop `break`s rather than spinning on the same undeletable rows; the next hourly tick retries.
 
 **FK constraint**: `project_file_chunks` FK to `project_files` is `ON DELETE RESTRICT`. Chunks must be explicitly managed; no silent cascade. To delete a project: hard-delete chunks first (or mark deleted and let GC clean up), then delete the project row.
 
@@ -147,6 +149,8 @@ For each file, `post_index` executes these sequential transactions (separate `db
 
 `tree_sitter::Parser` is `Send` (explicitly impl'd by tree-sitter), so the slicer can be created inside `spawn_blocking` closures. The `Arc<Tokenizer>` is moved into the closure; `Slicer::new(lang, &tokenizer)` borrows within the closure's scope.
 
+**Known correctness follow-up (observability, not data):** the per-file `info_span!("indexing_file", …)` is currently entered with `let _guard = file_span.enter();` and that guard is held across the file's `.await` points. Holding a `tracing` `Entered` guard across `.await` is the `await_holding_span_guard` anti-pattern: when the future parks at an await, the guard is not dropped, so the span stays entered on the worker thread and can mis-attribute *other* concurrently-running tasks' log events to this file span. It does **not** corrupt indexing data — only log/span attribution under concurrency. The correct fix is to wrap the per-file body in `async { … }.instrument(file_span).await`, but the body uses `continue`/`return` for control flow, so it needs the outcome re-encoded as a returned enum; deferred to avoid reshaping a tested path without e2e coverage. The outer `post_index`/`post_search` request spans use `.instrument(span)` correctly and are unaffected.
+
 ## Core Technical Standards
 - **Async-First:** All I/O (Qdrant, SQLite, embedding inference) must be asynchronous. Never use blocking calls directly on a Tokio thread. Embedding and Qdrant calls happen in async context; SQLite calls happen in `spawn_blocking` via `db_pool.transaction()`.
 - **No `block_on` in handlers:** The old pattern of calling `tokio::runtime::Handle::current().block_on(...)` inside `spawn_blocking` for Qdrant/embed is eliminated. Qdrant and embed calls are now `.await`-ed directly in the async handler.
@@ -155,12 +159,26 @@ For each file, `post_index` executes these sequential transactions (separate `db
 - **`from_cancelled`:** The `OptionResultExt` trait converts `Option<Result<T, E>>` → `Result<T, E>`, mapping `None` (returned by `with_cancellation_token` on timeout/cancel) to `Err(SQLite3PoolError::Cancelled)`.
 - **Status 499:** Client-cancelled requests return HTTP 499 (`cancelled_499()`), following nginx convention.
 
+### How cancellation actually propagates (important subtlety)
+The handler's `CancellationGuard` wraps a **fresh** token created at entry, *not* a token derived from the connection. Nothing cancels it during normal execution — it is only cancelled by its own `Drop`. Consequences:
+- **Client disconnect** is handled by axum/hyper, which *drops the handler future*. Dropping the future runs `CancellationGuard::Drop` → `cancel()`. But the future is already gone, so it never resumes to run the `EncodeError::Cancelled` / `SQLite3PoolError::Cancelled` cleanup arms in the handler. Those arms (which set status `cancelled` and return 499) are therefore effectively **defensive / rarely-hit in practice**, not the primary disconnect path. The primary path is: future dropped → in-flight `spawn_blocking` (slicer) and the embed HTTP `tokio::select!` observe the now-cancelled token and bail out early, so they stop burning CPU/credits on a result nobody will read. The half-written DB state is recovered later by the retry worker (file stuck in `indexing` ≥5 min).
+- The token's real, load-bearing job is thus **resource short-circuiting after the future is abandoned**, plus clean worker/server shutdown on SIGTERM (a separate token tree rooted in `main.rs`). It is *not* a mechanism for the handler to observe disconnect and run inline cleanup — don't rely on it for that.
+- This is why `transaction()` returning the connection from inside the blocking task (see SQLite3 Pool) is essential rather than optional: it is the only release path that survives the future being dropped.
+
 ## Error Handling
 - Domain error types: `SQLite3PoolError`, `SlicerError`, `EncodeError`.
 - All custom errors must be convertible to HTTP status codes.
 - Avoid external error-handling crates. Follow the existing `slicer_err_to_pool_err` and `from_cancelled` patterns.
 - `slicer_err_to_pool_err` maps `SlicerError::Cancelled` → `SQLite3PoolError::Cancelled` (not HTTPStatusCode) so the downstream match arm can distinguish cancellation from other errors cleanly.
-- Propagate errors with `?`. No `unwrap()` or `expect()` in production code paths (workers use `.unwrap_or_default()` only for best-effort queries where empty fallback is safe).
+- Propagate errors with `?`. No `unwrap()` or `expect()` in production code paths (workers use `.unwrap_or_default()` only for best-effort queries where empty fallback is safe). Startup-only panics (`SQLite3Pool::new`) use `unwrap_or_else(|err| panic!(...))` with a message naming the file and what the operator should check.
+
+### Logging conventions
+All `error!`/`warn!`/`info!` calls follow one shape so logs are greppable and actionable:
+- **A human-readable message string is mandatory** and states *what operation failed* (not just the error value). e.g. `"Qdrant upsert failed; marking file 'failed'."` — never a bare `error!(?err)`.
+- **The error value is a structured field named `error`**: `error = ?e` (Debug) or `error = %e` (Display). Don't interpolate it into the message.
+- **Identifiers are structured fields, not interpolated:** `project_guid`, `path`, `collection`, `chunk_count`, etc. Use `%` (Display) for `String`/`Uuid`, `?` (Debug) for enums/structs. Request handlers carry `project_guid` (and `pl`/`path` for indexing) on the tracing **span**, so per-event logs there don't repeat them; background workers have no span, so they pass `%project_guid, %path` explicitly.
+- **Infrastructure failures end with a one-line sysadmin hint** telling the operator what to check: model-server reachability (and the `0.0.0.0` vs `127.0.0.1` bind gotcha), Qdrant reachability at `--qdrant-server`, DB writability, free bind address. Logic errors (bad UUID from Qdrant, slicer parse failure) don't need a hint.
+- Spans use `project_guid = %project_guid.0` (hyphenated Display), consistently across `post_index` and `post_search`.
 
 ## BGE-M3 & Retrieval Pipeline
 - **Indexing:**
@@ -172,6 +190,16 @@ For each file, `post_index` executes these sequential transactions (separate `db
   - If the set is empty, return 404 immediately without calling Qdrant.
   - Pass those GUIDs as a `has_id` filter to Qdrant — this is the sole project isolation mechanism and also excludes soft-deleted vectors.
   - Multi-vector (dense/sparse/colbert) alignment: each vector list from the embed response is positionally aligned with the chunk list.
+
+## Performance & Scaling
+
+Conventions to preserve when editing hot paths:
+- **Move, don't clone, embed-response vectors.** When building `ChunkAsVector` from a `BGEm3EmbedResponse`, the per-batch `dense_vecs`/`colbert_vecs` are consumed with `into_iter()` and moved into the points (they're owned per-batch and unused afterwards), not `.clone()`d. The sparse `HashMap` is split into the parallel `(indices, values)` arrays Qdrant needs in a **single pass** with the `> 1e-5` threshold applied once — not two filtered passes. This pattern lives in both `post_index` and `worker/retry.rs`; keep them in sync.
+- **Sparse threshold** (`weight > 1e-5`) is applied before the vector ever leaves the process, so Qdrant never stores near-zero sparse dimensions.
+
+Known scaling consideration (not yet optimized — **the top performance follow-up**):
+- **`post_search` materializes the full `code` of every active chunk in the project**, not just the top-k. The SQLite candidate query selects `qdrant_guid` *and* `code` + line/column metadata for all `status='active'` chunks matching the filters, into a `HashMap<UUIDv4, (code, ...)>`, purely so the post-Qdrant step can look up display data for the ~`top_k` (default 5) winners. For a large project this loads megabytes of source text per query, of which >99% is discarded. The clean fix is two queries: (1) select only `qdrant_guid` to build the `has_id` filter, then (2) after Qdrant returns the top-k ids, `SELECT ... WHERE qdrant_guid IN (<=top_k ids)` to fetch display data for just those. This was left as-is in the current pass because it reshapes a tested core path; do it deliberately, with the e2e suite green, when project sizes grow.
+- The `has_id` filter sent to Qdrant grows linearly with the project's active-chunk count (it lists every candidate GUID). This is the documented isolation mechanism and is fine for moderate projects; very large collections may want a stored Qdrant payload field (e.g. `project_guid`) + a `match` filter instead, trading the per-query GUID list for an indexed payload lookup.
 
 ## SlicedChunk Fields
 ```rust

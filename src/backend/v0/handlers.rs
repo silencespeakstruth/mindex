@@ -69,7 +69,7 @@ fn slicer_err_to_pool_err(err: SlicerError) -> SQLite3PoolError {
     match err {
         SlicerError::Cancelled => SQLite3PoolError::Cancelled,
         other => {
-            error!("Slicer error: {other}");
+            error!(error = %other, "Slicer failed to parse the source into chunks.");
             SQLite3PoolError::HTTPStatusCode(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -112,7 +112,7 @@ pub async fn post_index(
     State(s): State<RouterState>,
     Json(payload): Json<IndexRequest>,
 ) -> Result<Json<IndexResponse>, ErrorResponse> {
-    let span = info_span!("indexing", project_guid = ?project_guid);
+    let span = info_span!("indexing", project_guid = %project_guid.0);
 
     async move {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -153,7 +153,7 @@ pub async fn post_index(
             .await
             .from_cancelled()
             .map_err(|err| {
-                error!(?err);
+                error!(error = ?err, "Failed to ensure the project row in SQLite.");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }
@@ -162,7 +162,11 @@ pub async fn post_index(
     ensure_project(&qdrant, &collection_name(&project_guid_simple))
         .await
         .map_err(|err| {
-            error!(?err);
+            error!(
+                error = ?err,
+                "Failed to ensure the Qdrant collection. \
+                 Check Qdrant is reachable at --qdrant-server and accepting connections."
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -203,7 +207,7 @@ pub async fn post_index(
                     .await
                     .from_cancelled()
                     .map_err(|err| {
-                        error!(?err);
+                        error!(error = ?err, "Failed to read the stored file hash from SQLite.");
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
 
@@ -236,7 +240,7 @@ pub async fn post_index(
                     .await
                     .from_cancelled()
                     .map_err(|err| {
-                        error!(?err);
+                        error!(error = ?err, "Failed to mark the file 'indexing' in SQLite.");
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
             }
@@ -347,7 +351,7 @@ pub async fn post_index(
                         return Err(sc.into());
                     }
                     Err(err) => {
-                        error!(?err);
+                        error!(error = ?err, "Slicing / chunk insertion failed; marking file 'failed'.");
                         update_file_status(
                             &db_pool, project_guid, path.clone(), model_id.clone(),
                             "failed", true, guard.0.child_token(),
@@ -383,7 +387,12 @@ pub async fn post_index(
                         return Err(cancelled_499().into());
                     }
                     Err(EncodeError::Request(request_err)) => {
-                        error!(?project_guid, ?request_err);
+                        error!(
+                            error = ?request_err,
+                            "Embedding request failed; marking file 'failed'. \
+                             Check the model server at --model-server is up and reachable \
+                             (from inside the container it must bind 0.0.0.0, not 127.0.0.1)."
+                        );
                         embed_error = Some(StatusCode::SERVICE_UNAVAILABLE);
                         break 'embed;
                     }
@@ -391,28 +400,28 @@ pub async fn post_index(
 
                 let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
                 for (i, ((dense, sparse), colbert)) in dense_vecs
-                    .iter()
+                    .into_iter()
                     .zip(sparse_vecs.iter())
-                    .zip(colbert_vecs.iter())
+                    .zip(colbert_vecs)
                     .enumerate()
                 {
-                    let sparse_indices: Vec<u32> = sparse
-                        .iter()
-                        .filter(|(_, w)| **w > 1e-5)
-                        .map(|(k, _)| *k)
-                        .collect();
-                    let sparse_values: Vec<f32> = sparse
-                        .iter()
-                        .filter(|(_, w)| **w > 1e-5)
-                        .map(|(_, v)| *v)
-                        .collect();
+                    // Single pass: split the thresholded sparse weights into the
+                    // parallel index/value arrays Qdrant expects.
+                    let mut sparse_indices: Vec<u32> = Vec::with_capacity(sparse.len());
+                    let mut sparse_values: Vec<f32> = Vec::with_capacity(sparse.len());
+                    for (k, w) in sparse.iter() {
+                        if *w > 1e-5 {
+                            sparse_indices.push(*k);
+                            sparse_values.push(*w);
+                        }
+                    }
 
                     vector_batch.push(ChunkAsVector {
                         guid: guids[i],
-                        dense: dense.clone(),
+                        dense,
                         sparse_indices,
                         sparse_values,
-                        colbert: colbert.clone(),
+                        colbert,
                     });
                 }
 
@@ -420,7 +429,11 @@ pub async fn post_index(
                     if let Err(qdrant_err) =
                         insert_batch(&qdrant, &collection, points_batch.to_vec()).await
                     {
-                        error!(?qdrant_err);
+                        error!(
+                            error = ?qdrant_err,
+                            "Qdrant upsert failed; marking file 'failed'. \
+                             Check Qdrant is reachable at --qdrant-server."
+                        );
                         embed_error = Some(StatusCode::INTERNAL_SERVER_ERROR);
                         break 'embed;
                     }
@@ -454,7 +467,7 @@ pub async fn post_index(
                     .await
                     .from_cancelled()
                     .map_err(|err| {
-                        error!(?err);
+                        error!(error = ?err, "Failed to mark the file 'indexed' in SQLite.");
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
             }
@@ -483,7 +496,7 @@ pub async fn post_search(
     State(state): State<RouterState>,
     Json(payload): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, StatusCode> {
-    let span = info_span!("searching", project_guid = ?project_guid.0);
+    let span = info_span!("searching", project_guid = %project_guid.0);
 
     async move {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -505,7 +518,11 @@ pub async fn post_search(
         Ok(val) => Ok(val),
         Err(EncodeError::Cancelled) => Err(cancelled_499()),
         Err(EncodeError::Request(request_err)) => {
-            error!(?project_guid, ?request_err);
+            error!(
+                error = ?request_err,
+                "Failed to embed the search query. \
+                 Check the model server at --model-server is up and reachable."
+            );
             Err(StatusCode::SERVICE_UNAVAILABLE)
         }
     }?;
@@ -640,7 +657,7 @@ pub async fn post_search(
             SQLite3PoolError::Cancelled => cancelled_499(),
             SQLite3PoolError::HTTPStatusCode(status_code) => status_code,
             err => {
-                error!(?project_guid, "{}", err);
+                error!(error = %err, "Failed to query candidate chunks from SQLite.");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         })?;
@@ -676,7 +693,11 @@ pub async fn post_search(
     )
     .await
     .map_err(|err| {
-        error!(?err);
+        error!(
+            error = ?err,
+            "Qdrant query failed. Check Qdrant is reachable at --qdrant-server \
+             and the project's collection exists."
+        );
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
@@ -696,7 +717,7 @@ pub async fn post_search(
                 let uuid = match Uuid::parse_str(uuid) {
                     Ok(uuid) => UUIDv4(uuid),
                     Err(err) => {
-                        warn!(?err, "Bad UUIDv4.");
+                        warn!(error = ?err, point_id = %uuid, "Qdrant returned a point id that is not a valid UUID; skipping it.");
                         return None;
                     }
                 };

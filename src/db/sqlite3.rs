@@ -3,7 +3,7 @@ use rusqlite::{Connection, Transaction};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use thiserror::Error;
@@ -38,7 +38,12 @@ impl SQLite3Pool {
         let mut conns = Vec::with_capacity(len);
 
         for _ in 0..len {
-            let conn = Connection::open(db_path).unwrap();
+            let conn = Connection::open(db_path).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to open SQLite database at {db_path:?}: {err}. \
+                     Check the path exists, is writable by this process, and the disk is not full."
+                )
+            });
 
             conn.execute_batch(
                 r#"
@@ -48,7 +53,12 @@ impl SQLite3Pool {
                 PRAGMA page_size = 16384;
                 "#,
             )
-            .unwrap();
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to apply startup PRAGMAs on {db_path:?}: {err}. \
+                     The database file may be corrupt or locked by another process."
+                )
+            });
 
             conns.push(conn);
         }
@@ -63,11 +73,6 @@ impl SQLite3Pool {
     async fn acquire(&self) -> Option<Connection> {
         let mut guard = self.conns.lock().await;
         guard.pop()
-    }
-
-    async fn release(&self, conn: Connection) {
-        let mut guard = self.conns.lock().await;
-        guard.push(conn);
     }
 
     pub async fn transaction<F, T>(
@@ -87,6 +92,13 @@ impl SQLite3Pool {
 
         let span = tracing::info_span!("sqlite3 transaction", sqlite3_tx_guid = %Uuid::new_v4());
 
+        // The blocking task returns the connection to the pool itself, rather than
+        // relying on the awaiting future to do it after `handle.await`. If the caller's
+        // future is dropped mid-transaction (client disconnect, cancellation), the
+        // spawn_blocking task still runs to completion and re-pushes the connection —
+        // otherwise every cancelled request would permanently leak one connection and
+        // the pool would be exhausted after `db_pool_size` disconnects.
+        let conns = Arc::clone(&self.conns);
         let handle = tokio::task::spawn_blocking(move || {
             let mut conn = conn;
 
@@ -97,18 +109,24 @@ impl SQLite3Pool {
                 let val = f(&tx)?;
                 tx.commit()?;
 
-                info!("Commit.");
+                info!("Transaction committed.");
 
                 Ok(val)
             })();
 
-            (conn, res)
+            // `blocking_lock` is safe here: we are on a dedicated spawn_blocking thread,
+            // not inside the async runtime. The lock is held only for the push.
+            conns.blocking_lock().push(conn);
+
+            res
         });
 
-        let (conn, res) = handle.await.map_err(|_| SQLite3PoolError::Cancelled)?;
-
-        self.release(conn).await;
-
-        res
+        handle.await.map_err(|join_err| {
+            // The blocking task panicked (a bug in `f`) or was aborted. The connection
+            // for a panicked task is dropped rather than returned — acceptable, since a
+            // panicking transaction closure is a programmer error, not a runtime condition.
+            error!(%join_err, "SQLite transaction task failed to join (closure panicked?).");
+            SQLite3PoolError::Cancelled
+        })?
     }
 }

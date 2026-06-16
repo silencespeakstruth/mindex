@@ -64,7 +64,7 @@ pub async fn run(
                 break;
             }
 
-            info!(?project_guid, ?path, "Retry worker: retrying stuck file.");
+            info!(%project_guid, %path, "Retry worker: retrying stuck file.");
 
             let chunks: Vec<(String, String)> = db_pool
                 .transaction(token.clone(), {
@@ -87,7 +87,7 @@ pub async fn run(
                 .unwrap_or_default();
 
             if chunks.is_empty() {
-                warn!(?project_guid, ?path, "Retry: no active chunks found, marking failed.");
+                warn!(%project_guid, %path, "Retry worker: no active chunks found for stuck file; marking 'failed'.");
                 set_status(&db_pool, &project_guid, &path, &file_model_id, "failed", true, token.clone()).await;
                 continue;
             }
@@ -113,7 +113,13 @@ pub async fn run(
                         break 'embed;
                     }
                     Err(EncodeError::Request(e)) => {
-                        error!(?e, "Retry: embed request failed");
+                        error!(
+                            error = ?e,
+                            project_guid,
+                            path,
+                            "Retry worker: embedding request failed; leaving file 'failed'. \
+                             Check the model server at --model-server is up."
+                        );
                         success = false;
                         break 'embed;
                     }
@@ -121,33 +127,39 @@ pub async fn run(
 
                 let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
                 for (i, ((dense, sparse), colbert)) in dense_vecs
-                    .iter()
+                    .into_iter()
                     .zip(sparse_vecs.iter())
-                    .zip(colbert_vecs.iter())
+                    .zip(colbert_vecs)
                     .enumerate()
                 {
-                    let sparse_indices = sparse
-                        .iter()
-                        .filter(|(_, w)| **w > 1e-5)
-                        .map(|(k, _)| *k)
-                        .collect();
-                    let sparse_values: Vec<f32> = sparse
-                        .iter()
-                        .filter(|(_, w)| **w > 1e-5)
-                        .map(|(_, v)| *v)
-                        .collect();
+                    // Single pass: split the thresholded sparse weights into the
+                    // parallel index/value arrays Qdrant expects.
+                    let mut sparse_indices: Vec<u32> = Vec::with_capacity(sparse.len());
+                    let mut sparse_values: Vec<f32> = Vec::with_capacity(sparse.len());
+                    for (k, w) in sparse.iter() {
+                        if *w > 1e-5 {
+                            sparse_indices.push(*k);
+                            sparse_values.push(*w);
+                        }
+                    }
                     vector_batch.push(ChunkAsVector {
                         guid: guids[i],
-                        dense: dense.clone(),
+                        dense,
                         sparse_indices,
                         sparse_values,
-                        colbert: colbert.clone(),
+                        colbert,
                     });
                 }
 
                 for points_batch in vector_batch.chunks(256) {
                     if let Err(e) = insert_batch(&qdrant, &collection, points_batch.to_vec()).await {
-                        error!(?e, "Retry: Qdrant upsert failed");
+                        error!(
+                            error = ?e,
+                            project_guid,
+                            path,
+                            "Retry worker: Qdrant upsert failed; leaving file 'failed'. \
+                             Check Qdrant is reachable at --qdrant-server."
+                        );
                         success = false;
                         break 'embed;
                     }
