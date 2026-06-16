@@ -13,13 +13,13 @@ use tracing::info;
 
 use crate::backend::v0::handlers::{post_index, post_search};
 use crate::db::sqlite3::SQLite3Pool;
-use crate::models::bge_m3::BGEm3HttpClient;
+use crate::models::bge_m3::BGEm3Model;
 
 #[derive(Clone)]
 pub enum EmbeddingModel {
     BGEm3 {
         model_id: String,
-        client: Arc<BGEm3HttpClient>,
+        client: Arc<dyn BGEm3Model>,
     },
 }
 

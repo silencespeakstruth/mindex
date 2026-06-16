@@ -14,9 +14,10 @@ use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
 use crate::backend::v0::models::UUIDv4;
 use crate::db::qdrant::SearchHit;
-use crate::db::qdrant::collection_name;
+use crate::db::qdrant::collection_for;
 use crate::db::qdrant::ensure_project;
 use crate::db::qdrant::search;
+use crate::db::files::set_file_status;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::db::sqlite3::SQLite3PoolError;
 use crate::embed::EmbedUpsertError;
@@ -197,37 +198,6 @@ fn build_search_query(project_guid: UUIDv4, req: &SearchRequest) -> (String, Vec
     );
 
     (sql, binds)
-}
-
-async fn update_file_status(
-    db_pool: &SQLite3Pool,
-    project_guid: UUIDv4,
-    path: String,
-    model_id: String,
-    status: &'static str,
-    increment_retry: bool,
-    token: CancellationToken,
-) {
-    let _ = db_pool
-        .transaction(token, move |tx| {
-            if increment_retry {
-                tx.execute(
-                    "UPDATE project_files
-                     SET status = ?1, retry_count = retry_count + 1, status_updated_at = unixepoch()
-                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
-                    params![status, project_guid, path, model_id],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE project_files
-                     SET status = ?1, status_updated_at = unixepoch()
-                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
-                    params![status, project_guid, path, model_id],
-                )?;
-            }
-            Ok(())
-        })
-        .await;
 }
 
 /// Maps an API language to its tree-sitter grammar. Pure and total over the enum,
@@ -503,11 +473,11 @@ impl FileIndexer<'_> {
     /// Best-effort recovery: move the file to `status` (incrementing `retry_count`
     /// when `increment_retry`) on a cancellation/failure path.
     async fn recover(&self, path: &str, status: &'static str, increment_retry: bool) {
-        update_file_status(
+        set_file_status(
             self.db_pool,
-            self.project_guid,
-            path.to_string(),
-            self.model_id.to_string(),
+            &self.project_guid.0.as_simple().to_string(),
+            path,
+            self.model_id,
             status,
             increment_retry,
             self.token.child_token(),
@@ -532,7 +502,7 @@ pub async fn post_index(
     let tokenizer = s.tokenizer;
     let EmbeddingModel::BGEm3 { model_id, client } = s.model;
 
-    let project_guid_simple = project_guid.0.as_simple().to_string();
+    let collection = collection_for(project_guid);
 
     // ── ensure project row ────────────────────────────────────────────────
     {
@@ -569,7 +539,7 @@ pub async fn post_index(
     }
 
     // ── ensure Qdrant collection ──────────────────────────────────────────
-    ensure_project(&qdrant, &collection_name(&project_guid_simple))
+    ensure_project(&qdrant, &collection)
         .await
         .map_err(|err| {
             error!(
@@ -583,7 +553,6 @@ pub async fn post_index(
     let mut res = IndexResponse { files: HashMap::new() };
     let mut sha256_hasher = Sha256::default();
 
-    let collection = collection_name(&project_guid_simple);
     let indexer = FileIndexer {
         db_pool: &db_pool,
         qdrant: &qdrant,
@@ -704,11 +673,9 @@ pub async fn post_search(
         .next()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let project_guid_simple = project_guid.0.as_simple().to_string();
-
     let search_hits = search(
         &state.qdrant,
-        &collection_name(project_guid_simple.as_str()),
+        &collection_for(project_guid),
         chunks.keys().copied().collect(),
         dense,
         sparse.keys().copied().collect(),

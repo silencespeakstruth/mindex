@@ -7,17 +7,18 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::backend::v0::models::UUIDv4;
+use crate::db::files::set_file_status;
 use crate::db::qdrant::collection_name;
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 use crate::embed::{EmbedUpsertError, embed_and_upsert};
-use crate::models::bge_m3::BGEm3HttpClient;
+use crate::models::bge_m3::BGEm3Model;
 
 const MAX_RETRIES: i64 = 3;
 
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     qdrant: Arc<Qdrant>,
-    model_client: Arc<BGEm3HttpClient>,
+    model_client: Arc<dyn BGEm3Model>,
     model_id: String,
     token: CancellationToken,
 ) {
@@ -89,7 +90,7 @@ pub async fn run(
 
             if chunks.is_empty() {
                 warn!(%project_guid, %path, "Retry worker: no active chunks found for stuck file; marking 'failed'.");
-                set_status(&db_pool, &project_guid, &path, &file_model_id, "failed", true, token.clone()).await;
+                set_file_status(&db_pool, &project_guid, &path, &file_model_id, "failed", true, token.clone()).await;
                 continue;
             }
 
@@ -128,7 +129,7 @@ pub async fn run(
                     }
                 };
 
-            set_status(
+            set_file_status(
                 &db_pool,
                 &project_guid,
                 &path,
@@ -140,36 +141,4 @@ pub async fn run(
             .await;
         }
     }
-}
-
-async fn set_status(
-    db_pool: &SQLite3Pool,
-    project_guid: &str,
-    path: &str,
-    model_id: &str,
-    status: &'static str,
-    increment_retry: bool,
-    token: CancellationToken,
-) {
-    let (pg, p, m) = (project_guid.to_string(), path.to_string(), model_id.to_string());
-    let _ = db_pool
-        .transaction(token, move |tx| {
-            if increment_retry {
-                tx.execute(
-                    "UPDATE project_files
-                     SET status = ?1, retry_count = retry_count + 1, status_updated_at = unixepoch()
-                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
-                    rusqlite::params![status, pg, p, m],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE project_files
-                     SET status = ?1, status_updated_at = unixepoch()
-                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
-                    rusqlite::params![status, pg, p, m],
-                )?;
-            }
-            Ok(())
-        })
-        .await;
 }

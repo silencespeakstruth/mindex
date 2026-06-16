@@ -1,7 +1,7 @@
 use crate::backend::http3::{EmbeddingModel, RouterState};
 use crate::db::sqlite3::SQLite3Pool;
-use crate::models::bge_m3::BGEm3HttpClient;
-use clap::{Parser, ValueEnum};
+use crate::models::bge_m3::{BGEm3HttpClient, BGEm3Model};
+use clap::Parser;
 use qdrant_client::Qdrant;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -37,10 +37,6 @@ const MIGRATIONS: &[&str] = &[include_str!("db/migrations/v0.1.0_schema.sql")];
     )
 )]
 struct Args {
-    /// Protocol to use for the server: https2 or http3.
-    #[arg(short, default_value = "https2")]
-    protocol: Protocol,
-
     /// Interface to bind the server (e.g., 127.0.0.1:8080).
     #[arg(short, long, default_value = "127.0.0.1:11111")]
     bind: SocketAddr,
@@ -72,12 +68,6 @@ struct Args {
     /// DB pool size.
     #[arg(long, default_value = "4")]
     db_pool_size: usize,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
-enum Protocol {
-    Https2,
-    Http3,
 }
 
 #[tokio::main]
@@ -139,6 +129,11 @@ async fn main() -> Result<(), BoxError> {
 
     let qdrant_client = Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
 
+    // One embedding client, shared (as a trait object) by the retry worker and the
+    // HTTP handlers — built once rather than per consumer.
+    let embed_client: Arc<dyn BGEm3Model> =
+        Arc::new(BGEm3HttpClient::new(args.model_server.clone()));
+
     let gc_token = sigterm_token.child_token();
     let retry_token = sigterm_token.child_token();
 
@@ -151,7 +146,7 @@ async fn main() -> Result<(), BoxError> {
     tokio::spawn(worker::retry::run(
         db_pool.clone(),
         qdrant_client.clone(),
-        Arc::new(BGEm3HttpClient::new(args.model_server.clone())),
+        embed_client.clone(),
         model_id.to_string(),
         retry_token,
     ));
@@ -168,7 +163,7 @@ async fn main() -> Result<(), BoxError> {
                 qdrant: qdrant_client.clone(),
                 model: EmbeddingModel::BGEm3 {
                     model_id: model_id.to_string(),
-                    client: Arc::new(BGEm3HttpClient::new(args.model_server.clone()))
+                    client: embed_client.clone(),
                 },
             },
             sigterm_token.child_token()) => {

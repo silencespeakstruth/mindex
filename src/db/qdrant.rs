@@ -32,6 +32,12 @@ pub fn collection_name(project_guid_simple: &str) -> String {
     format!("{}_{}", project_guid_simple, COLLECTION_SCHEMA_VERSION)
 }
 
+/// Qdrant collection name for a project GUID (its dashless simple form + schema
+/// version). Convenience over `collection_name(&guid.0.as_simple().to_string())`.
+pub fn collection_for(project_guid: UUIDv4) -> String {
+    collection_name(&project_guid.0.as_simple().to_string())
+}
+
 pub async fn ensure_project(client: &Qdrant, project_guid: &str) -> Result<(), QdrantError> {
     if client.collection_exists(project_guid).await? {
         return Ok(());
