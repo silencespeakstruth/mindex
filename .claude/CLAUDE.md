@@ -93,6 +93,11 @@ are dropped before upsert. Batch sizes: 64 chunks per embed call, 256 points per
 Qdrant upsert/delete (`embed.rs`). Embed-response vector lists are positionally
 aligned with the chunk list.
 
+The embedder client (`bge_m3.rs::BGEm3HttpClient`) retries HTTP **429** (embedder
+busy/backpressure) up to 3× with exponential backoff (200/400/800ms), respecting
+the cancellation token during sleeps; if it's still 429, it gives up — the file is
+marked `failed` and the retry worker re-attempts later (layered backoff).
+
 ## Slicer
 
 `Slicer` (`slicing/traits.rs`) walks the tree-sitter AST depth-first and selects
