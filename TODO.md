@@ -21,9 +21,6 @@ is *not done* or *deliberately constrained*.
   manual re-indexing (re-push). Surfaced now via a WARN at startup and hourly
   (`worker::retry::warn_permanently_failed`); a real dead-letter view / metric /
   alert is still future work.
-- **`project_file_status_log` grows unbounded.** Every status transition appends a
-  row and nothing prunes them. Add a retention sweep (e.g. fold into the GC worker:
-  delete rows older than N days) before this matters at scale.
 - **`cancelled` files are never retried** by the worker (by design — the client
   gave up). They only revive on an explicit re-push (`cancelled → indexing` via the
   handler). A cancelled file never re-pushed keeps no vectors.

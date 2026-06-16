@@ -8,6 +8,10 @@ use tracing::{error, info};
 use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 
+/// How long transition rows are kept in `project_file_status_log`. The log grows
+/// one row per status change, so it is pruned alongside the chunk sweep.
+const STATUS_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600); // 30 days
+
 pub async fn run(db_pool: Arc<SQLite3Pool>, store: Arc<dyn VectorStore>, token: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -23,7 +27,36 @@ pub async fn run(db_pool: Arc<SQLite3Pool>, store: Arc<dyn VectorStore>, token: 
 
         info!("GC worker: starting sweep.");
         sweep(&db_pool, &*store, &token).await;
+        prune_status_log(&db_pool, &token).await;
         info!("GC worker: sweep complete.");
+    }
+}
+
+/// Deletes `project_file_status_log` rows older than [`STATUS_LOG_RETENTION`].
+/// A single `DELETE` (SQLite has no `DELETE ... LIMIT` in the bundled build); the
+/// audit log is small relative to the chunk tables, so one statement is fine.
+async fn prune_status_log(db_pool: &SQLite3Pool, token: &CancellationToken) {
+    let max_age_secs = STATUS_LOG_RETENTION.as_secs() as i64;
+
+    let pruned = db_pool
+        .transaction(token.clone(), move |tx| {
+            let n = tx.execute(
+                "DELETE FROM project_file_status_log WHERE at < unixepoch() - ?1",
+                rusqlite::params![max_age_secs],
+            )?;
+            Ok(n)
+        })
+        .await;
+
+    match pruned {
+        Ok(0) => {}
+        Ok(rows) => info!(
+            rows,
+            retention_days = STATUS_LOG_RETENTION.as_secs() / 86_400,
+            "GC worker: pruned old status-log rows."
+        ),
+        Err(SQLite3PoolError::Cancelled) => {}
+        Err(e) => error!(error = ?e, "GC worker: failed to prune the status log."),
     }
 }
 
@@ -271,5 +304,41 @@ mod tests {
         let store = FakeStore { fail: HashSet::new() };
         // No deleted chunks at all: must return promptly without error.
         sweep(&pool, &store, &CancellationToken::new()).await;
+    }
+
+    async fn status_log_count(pool: &SQLite3Pool) -> i64 {
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.query_row("SELECT COUNT(*) FROM project_file_status_log", [], |r| r.get(0))
+                .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_status_log_removes_only_expired_rows() {
+        let pool = migrated_pool().await;
+
+        // Two rows older than the 30-day retention, one fresh — inserted directly
+        // with explicit `at` (the table has no insert guard).
+        pool.transaction(CancellationToken::new(), |tx| {
+            for age_days in [40_i64, 31, 1] {
+                tx.execute(
+                    "INSERT INTO project_file_status_log
+                         (project_guid, model_id, path, old_status, new_status, retry_count, at)
+                     VALUES ('p', 'BAAI/bge-m3', 'a.rs', NULL, 'indexing', 0, unixepoch() - ?1)",
+                    params![age_days * 86_400],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(status_log_count(&pool).await, 3);
+
+        prune_status_log(&pool, &CancellationToken::new()).await;
+
+        // The 40- and 31-day rows are gone; the 1-day row remains.
+        assert_eq!(status_log_count(&pool).await, 1);
     }
 }

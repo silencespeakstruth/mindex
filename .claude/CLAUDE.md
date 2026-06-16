@@ -30,7 +30,7 @@ src/
   models/bge_m3.rs      BGEm3HttpClient, BGEm3Model trait, EncodeError
   embed.rs              embed_and_upsert — shared embed→upsert pipeline, EmbedUpsertError
   slicing/traits.rs     Slicer, SlicedChunk, SlicerError, Tokenizing trait
-  worker/{gc,retry}.rs  GC sweep (hourly), retry of stuck/failed files (60s)
+  worker/{gc,retry}.rs  GC sweep + status-log prune (hourly), retry of stuck/failed files (60s)
 scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
@@ -57,7 +57,8 @@ deletes from SQLite *only* chunks whose Qdrant `delete_batch` succeeded; if a
 collection's delete fails the rows stay `deleted` for the next sweep. Deleting the
 SQLite row before Qdrant confirms would orphan the vector forever (nothing tracks
 it). If every collection in a batch fails, the inner loop breaks rather than
-spinning.
+spinning. The same hourly GC tick also prunes `project_file_status_log` rows older
+than `STATUS_LOG_RETENTION` (30 days), logging the count removed.
 
 **Status state machine** (`project_files.status`), enforced by SQLite triggers
 (`v0.2.0_status_machine.sql`), not just convention. Legal moves: **any → `indexing`**
