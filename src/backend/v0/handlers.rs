@@ -279,6 +279,7 @@ pub async fn post_index(
                             ProgrammingLanguage::Haskell    => Language::new(tree_sitter_haskell::LANGUAGE),
                             ProgrammingLanguage::Ocaml      => Language::new(tree_sitter_ocaml::LANGUAGE_OCAML),
                             ProgrammingLanguage::Zig        => Language::new(tree_sitter_zig::LANGUAGE),
+                            ProgrammingLanguage::Sql        => Language::new(tree_sitter_sequel::LANGUAGE),
                         };
 
                         let mut slicer = Slicer::new(ts_language, &tokenizer)

@@ -34,6 +34,7 @@ pub enum ProgrammingLanguage {
     #[serde(rename = "haskell")]    Haskell,
     #[serde(rename = "ocaml")]      Ocaml,
     #[serde(rename = "zig")]        Zig,
+    #[serde(rename = "sql")]        Sql,
 }
 
 impl ToSql for ProgrammingLanguage {
@@ -59,6 +60,7 @@ impl ToSql for ProgrammingLanguage {
             ProgrammingLanguage::Haskell    => "haskell",
             ProgrammingLanguage::Ocaml      => "ocaml",
             ProgrammingLanguage::Zig        => "zig",
+            ProgrammingLanguage::Sql        => "sql",
         };
         Ok(ToSqlOutput::from(val))
     }
@@ -87,6 +89,7 @@ impl FromSql for ProgrammingLanguage {
             "haskell"    => Ok(ProgrammingLanguage::Haskell),
             "ocaml"      => Ok(ProgrammingLanguage::Ocaml),
             "zig"        => Ok(ProgrammingLanguage::Zig),
+            "sql"        => Ok(ProgrammingLanguage::Sql),
             _            => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }

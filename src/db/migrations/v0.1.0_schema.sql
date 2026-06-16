@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS project_files (
     programming_language TEXT    NOT NULL CHECK (programming_language IN (
         'rust', 'python', 'javascript', 'typescript', 'tsx',
         'go', 'c', 'cpp', 'java', 'csharp', 'ruby', 'php', 'bash',
-        'html', 'css', 'json', 'scala', 'haskell', 'ocaml', 'zig'
+        'html', 'css', 'json', 'scala', 'haskell', 'ocaml', 'zig', 'sql'
     )),
 
     status TEXT NOT NULL DEFAULT 'just_uploaded' CHECK (

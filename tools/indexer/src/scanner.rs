@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 pub enum Language {
     Rust, Python, JavaScript, TypeScript, Tsx,
     Go, C, Cpp, Java, CSharp, Ruby, Php,
-    Bash, Html, Css, Json, Scala, Haskell, Ocaml, Zig,
+    Bash, Html, Css, Json, Scala, Haskell, Ocaml, Zig, Sql,
 }
 
 impl Language {
@@ -33,6 +33,7 @@ impl Language {
             Language::Haskell    => "haskell",
             Language::Ocaml      => "ocaml",
             Language::Zig        => "zig",
+            Language::Sql        => "sql",
         }
     }
 }
@@ -59,6 +60,7 @@ fn detect_language(path: &Path) -> Option<Language> {
         "hs" | "lhs"                                  => Some(Language::Haskell),
         "ml" | "mli"                                  => Some(Language::Ocaml),
         "zig"                                         => Some(Language::Zig),
+        "sql"                                         => Some(Language::Sql),
         _                                             => None,
     }
 }
