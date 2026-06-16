@@ -27,7 +27,12 @@ pub enum SlicerError {
 pub struct SlicedChunk {
     /// Source text from the start of the node's line (includes leading whitespace) to end_byte.
     pub code: String,
+    // Only read by this module's own unit tests (to verify `code` lines up byte-for-byte
+    // with the source); production code never persists these, so cfg-gate them out of
+    // non-test builds rather than carry a permanent dead_code warning.
+    #[cfg(test)]
     pub start_byte: usize,
+    #[cfg(test)]
     pub end_byte: usize,
     pub start_line: usize,   // 1-indexed
     pub end_line: usize,     // 1-indexed
@@ -98,7 +103,9 @@ impl<'a> Slicer<'a> {
                             if is_pure_indent { line_start } else { node.start_byte() };
                         res.push(SlicedChunk {
                             code: code[code_start..node.end_byte()].into(),
+                            #[cfg(test)]
                             start_byte: node.start_byte(),
+                            #[cfg(test)]
                             end_byte: node.end_byte(),
                             start_line: node.start_position().row + 1,
                             end_line: node.end_position().row + 1,
