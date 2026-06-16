@@ -7,9 +7,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::backend::v0::models::UUIDv4;
-use crate::db::qdrant::{ChunkAsVector, collection_name, insert_batch};
+use crate::db::qdrant::collection_name;
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
-use crate::models::bge_m3::{BGEm3EmbedRequest, BGEm3EmbedResponse, BGEm3Model, BGEm3HttpClient, EncodeError};
+use crate::embed::{EmbedUpsertError, embed_and_upsert};
+use crate::models::bge_m3::BGEm3HttpClient;
 
 const MAX_RETRIES: i64 = 3;
 
@@ -93,26 +94,19 @@ pub async fn run(
             }
 
             let collection = collection_name(&project_guid);
-            let mut success = true;
 
-            'embed: for batch in chunks.chunks(64) {
-                let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-                let guids: Vec<UUIDv4> = batch
-                    .iter()
-                    .map(|(g, _)| UUIDv4(Uuid::parse_str(g).unwrap_or_default()))
-                    .collect();
+            // The chunk rows store qdrant_guid as text; parse back to UUIDv4 for upsert.
+            let to_embed: Vec<(UUIDv4, String)> = chunks
+                .into_iter()
+                .map(|(g, code)| (UUIDv4(Uuid::parse_str(&g).unwrap_or_default()), code))
+                .collect();
 
-                let BGEm3EmbedResponse {
-                    dense_vecs,
-                    sparse_vecs,
-                    colbert_vecs,
-                } = match model_client.encode(BGEm3EmbedRequest { texts }, token.clone()).await {
-                    Ok(r) => r,
-                    Err(EncodeError::Cancelled) => {
-                        success = false;
-                        break 'embed;
-                    }
-                    Err(EncodeError::Request(e)) => {
+            let success =
+                match embed_and_upsert(&*model_client, &qdrant, &collection, &to_embed, &token).await
+                {
+                    Ok(()) => true,
+                    Err(EmbedUpsertError::Cancelled) => false,
+                    Err(EmbedUpsertError::Embed(e)) => {
                         error!(
                             error = ?e,
                             project_guid,
@@ -120,39 +114,9 @@ pub async fn run(
                             "Retry worker: embedding request failed; leaving file 'failed'. \
                              Check the model server at --model-server is up."
                         );
-                        success = false;
-                        break 'embed;
+                        false
                     }
-                };
-
-                let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
-                for (i, ((dense, sparse), colbert)) in dense_vecs
-                    .into_iter()
-                    .zip(sparse_vecs.iter())
-                    .zip(colbert_vecs)
-                    .enumerate()
-                {
-                    // Single pass: split the thresholded sparse weights into the
-                    // parallel index/value arrays Qdrant expects.
-                    let mut sparse_indices: Vec<u32> = Vec::with_capacity(sparse.len());
-                    let mut sparse_values: Vec<f32> = Vec::with_capacity(sparse.len());
-                    for (k, w) in sparse.iter() {
-                        if *w > 1e-5 {
-                            sparse_indices.push(*k);
-                            sparse_values.push(*w);
-                        }
-                    }
-                    vector_batch.push(ChunkAsVector {
-                        guid: guids[i],
-                        dense,
-                        sparse_indices,
-                        sparse_values,
-                        colbert,
-                    });
-                }
-
-                for points_batch in vector_batch.chunks(256) {
-                    if let Err(e) = insert_batch(&qdrant, &collection, points_batch.to_vec()).await {
+                    Err(EmbedUpsertError::Store(e)) => {
                         error!(
                             error = ?e,
                             project_guid,
@@ -160,11 +124,9 @@ pub async fn run(
                             "Retry worker: Qdrant upsert failed; leaving file 'failed'. \
                              Check Qdrant is reachable at --qdrant-server."
                         );
-                        success = false;
-                        break 'embed;
+                        false
                     }
-                }
-            }
+                };
 
             set_status(
                 &db_pool,

@@ -16,6 +16,7 @@ use url::Url;
 
 mod backend;
 mod db;
+mod embed;
 mod models;
 mod slicing;
 mod worker;
