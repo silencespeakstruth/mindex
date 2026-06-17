@@ -34,7 +34,7 @@ src/
 scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
-tools/search/           mindex-search (bash) — single search frontend (flags + MINDEX_* env)
+tools/search/           mindex-search.sh (bash) — search frontend (flags + MINDEX_* env)
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
 
@@ -240,7 +240,7 @@ SQLite CHECK 500 → silently skipped file), so do the whole list:
 3. `tree-sitter-<lang>` in `Cargo.toml` (verify ≥ 0.23).
 4. Arm in `tree_sitter_language(pl)` (`handlers.rs`) — total match, missing arm = compile error.
 5. `detect_language` + `Language::name()` in `scanner.rs` (else the indexer silently skips the file).
-6. `VALID_LANGS` + `ext_to_lexer()` in `tools/search/mindex-search`.
+6. `VALID_LANGS` + `ext_to_lexer()` in `tools/search/mindex-search.sh`.
 7. Rebuild the image (`docker compose build mindex`) and, since the `CHECK` changed,
    drop the DB volume (`docker compose down && docker volume rm mindex_mindex_db && up -d`)
    — `CREATE TABLE IF NOT EXISTS` won't alter an existing table.
@@ -255,7 +255,7 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   indexing mindex itself** (the CLIs' `long_about` text pollutes results).
   `chunk_count == 0` in the response means "sliced to no chunks" (below 128 tokens),
   *not* unchanged — hash-unchanged files are skipped server-side and absent entirely.
-- **`tools/search/mindex-search` (bash)** — the single search frontend. POSTs search,
+- **`tools/search/mindex-search.sh` (bash)** — the single search frontend. POSTs search,
   renders with `pygmentize` if present (else plain). Results print **ascending by
   score** so the best match is last, right above the prompt. Every API status is
   handled distinctly (404 = no match, not an error; 499/503/500 mapped; curl
@@ -299,7 +299,7 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
 ## Linting (zero warnings everywhere — non-default flags matter)
 
 - Rust: `cargo clippy --bin mindex` and `cd tools/indexer && cargo clippy`.
-- Shell: `shellcheck scripts/entrypoint.sh`, `shellcheck --shell=bash tools/search/mindex-search`;
+- Shell: `shellcheck scripts/entrypoint.sh`, `shellcheck --shell=bash tools/search/mindex-search.sh`;
   format with `shfmt -i 4 -ci` (4-space + indented case — bare `shfmt` defaults to tabs).
 - Python (`tests/`): `ruff check`, `ruff format --check` **and** `black --check`
   (kept compatible — avoid the long `assert cond, "msg"` they format differently),

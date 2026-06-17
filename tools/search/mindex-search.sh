@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# mindex-search — terminal frontend for POST /v0/{project}/search.
+# mindex-search.sh — terminal frontend for POST /v0/{project}/search.
 #
 # Reads a (possibly multi-line) query from --query, $EDITOR (--edit), or stdin,
 # POSTs it to a mindex server, and prints matches with syntax-highlighted code,
