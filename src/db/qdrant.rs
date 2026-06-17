@@ -106,6 +106,10 @@ pub trait VectorStore: Send + Sync {
         qdrant_guids: Vec<String>,
     ) -> Result<(), VectorStoreError>;
 
+    /// Drops the whole collection. Idempotent: a missing collection is a no-op,
+    /// so a repeated project delete (or one racing the GC) does not error.
+    async fn delete_collection(&self, collection: &str) -> Result<(), VectorStoreError>;
+
     /// Hybrid search: dense + sparse prefetch → RRF fusion → ColBERT MaxSim rerank,
     /// restricted to `chunk_ids` via a `has_id` filter, returning the top `top_k`.
     #[allow(clippy::too_many_arguments)] // irreducible inputs of one hybrid query
@@ -174,6 +178,17 @@ impl VectorStore for Qdrant {
         self.delete_points(DeletePointsBuilder::new(collection).points(qdrant_guids))
             .await?;
 
+        Ok(())
+    }
+
+    async fn delete_collection(&self, collection: &str) -> Result<(), VectorStoreError> {
+        // Idempotent: skip if it never existed (e.g. a project deleted before any
+        // file was indexed, or a repeated DELETE). Qualified call avoids resolving
+        // back into this trait method.
+        if !self.collection_exists(collection).await? {
+            return Ok(());
+        }
+        Qdrant::delete_collection(self, collection).await?;
         Ok(())
     }
 

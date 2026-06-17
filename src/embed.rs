@@ -156,6 +156,9 @@ mod tests {
         async fn ensure_project(&self, _collection: &str) -> Result<(), VectorStoreError> {
             unreachable!()
         }
+        async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
         async fn delete_batch(
             &self,
             _collection: &str,

@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS project_files (
     )),
 
     status TEXT NOT NULL DEFAULT 'just_uploaded' CHECK (
-        status IN ('just_uploaded', 'indexing', 'indexed', 'cancelled', 'failed')
+        status IN ('just_uploaded', 'indexing', 'indexed', 'cancelled', 'failed', 'deleted')
     ),
     retry_count       INTEGER NOT NULL DEFAULT 0,
     status_updated_at INTEGER NOT NULL DEFAULT (unixepoch()),

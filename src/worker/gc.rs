@@ -26,16 +26,50 @@ pub async fn run(db_pool: Arc<SQLite3Pool>, store: Arc<dyn VectorStore>, token: 
         }
 
         info!("GC worker: starting sweep.");
-        sweep(&db_pool, &*store, &token).await;
+        let chunks = sweep(&db_pool, &*store, &token).await;
+        let files = prune_deleted_files(&db_pool, &token).await;
         prune_status_log(&db_pool, &token).await;
-        info!("GC worker: sweep complete.");
+        info!(chunks_removed = chunks, files_removed = files, "GC worker: sweep complete.");
+    }
+}
+
+/// Removes `project_files` rows that were marked `status='deleted'` (by
+/// `DELETE /files`) once they have no chunk rows left — i.e. after [`sweep`] has
+/// hard-deleted their (soft-deleted) chunks. The FK to chunks is RESTRICT, so this
+/// can only fire after the chunks are gone; running it after `sweep` in the same
+/// pass is what makes a delete eventually physical. Returns the rows removed.
+pub(crate) async fn prune_deleted_files(db_pool: &SQLite3Pool, token: &CancellationToken) -> usize {
+    let removed = db_pool
+        .transaction(token.clone(), move |tx| {
+            let n = tx.execute(
+                "DELETE FROM project_files
+                 WHERE status = 'deleted'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM project_file_chunks c
+                       WHERE c.project_guid = project_files.project_guid
+                         AND c.model_id     = project_files.model_id
+                         AND c.file_path    = project_files.path
+                   )",
+                [],
+            )?;
+            Ok(n)
+        })
+        .await;
+
+    match removed {
+        Ok(n) => n,
+        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(e) => {
+            error!(error = ?e, "GC worker: failed to prune deleted file rows.");
+            0
+        }
     }
 }
 
 /// Deletes `project_file_status_log` rows older than [`STATUS_LOG_RETENTION`].
 /// A single `DELETE` (SQLite has no `DELETE ... LIMIT` in the bundled build); the
 /// audit log is small relative to the chunk tables, so one statement is fine.
-async fn prune_status_log(db_pool: &SQLite3Pool, token: &CancellationToken) {
+pub(crate) async fn prune_status_log(db_pool: &SQLite3Pool, token: &CancellationToken) -> usize {
     let max_age_secs = STATUS_LOG_RETENTION.as_secs() as i64;
 
     let pruned = db_pool
@@ -49,18 +83,32 @@ async fn prune_status_log(db_pool: &SQLite3Pool, token: &CancellationToken) {
         .await;
 
     match pruned {
-        Ok(0) => {}
-        Ok(rows) => info!(
-            rows,
-            retention_days = STATUS_LOG_RETENTION.as_secs() / 86_400,
-            "GC worker: pruned old status-log rows."
-        ),
-        Err(SQLite3PoolError::Cancelled) => {}
-        Err(e) => error!(error = ?e, "GC worker: failed to prune the status log."),
+        Ok(0) => 0,
+        Ok(rows) => {
+            info!(
+                rows,
+                retention_days = STATUS_LOG_RETENTION.as_secs() / 86_400,
+                "GC worker: pruned old status-log rows."
+            );
+            rows
+        }
+        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(e) => {
+            error!(error = ?e, "GC worker: failed to prune the status log.");
+            0
+        }
     }
 }
 
-async fn sweep(db_pool: &SQLite3Pool, store: &dyn VectorStore, token: &CancellationToken) {
+/// Hard-deletes soft-deleted chunks whose Qdrant vectors have been confirmed
+/// removed. Returns the number of chunk rows deleted. Loops until no `deleted`
+/// chunks remain (or every collection's Qdrant delete fails this pass).
+pub(crate) async fn sweep(
+    db_pool: &SQLite3Pool,
+    store: &dyn VectorStore,
+    token: &CancellationToken,
+) -> usize {
+    let mut total_removed = 0usize;
     loop {
         if token.is_cancelled() {
             break;
@@ -131,7 +179,7 @@ async fn sweep(db_pool: &SQLite3Pool, store: &dyn VectorStore, token: &Cancellat
         }
 
         // Hard-delete only the rows whose vectors are confirmed gone from Qdrant.
-        let _ = db_pool
+        let removed = db_pool
             .transaction(token.clone(), move |tx| {
                 let placeholders = (1..=confirmed_deleted.len())
                     .map(|i| format!("?{i}"))
@@ -141,11 +189,23 @@ async fn sweep(db_pool: &SQLite3Pool, store: &dyn VectorStore, token: &Cancellat
                     "DELETE FROM project_file_chunks
                      WHERE status = 'deleted' AND qdrant_guid IN ({placeholders})"
                 );
-                tx.execute(&sql, rusqlite::params_from_iter(confirmed_deleted.iter()))?;
-                Ok(())
+                let n = tx.execute(&sql, rusqlite::params_from_iter(confirmed_deleted.iter()))?;
+                Ok(n)
             })
             .await;
+
+        match removed {
+            Ok(n) => total_removed += n,
+            Err(SQLite3PoolError::Cancelled) => break,
+            Err(e) => {
+                error!(error = ?e, "GC worker: failed to hard-delete swept chunk rows.");
+                // Vectors are already gone from Qdrant; the rows stay 'deleted' and a
+                // later sweep retries the SQLite delete. Avoid spinning on this batch.
+                break;
+            }
+        }
     }
+    total_removed
 }
 
 #[cfg(test)]
@@ -182,6 +242,9 @@ mod tests {
 
         async fn ensure_project(&self, _collection: &str) -> Result<(), VectorStoreError> {
             unreachable!("sweep does not call ensure_project")
+        }
+        async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            unreachable!("sweep does not call delete_collection")
         }
         async fn insert_batch(
             &self,
@@ -340,5 +403,85 @@ mod tests {
 
         // The 40- and 31-day rows are gone; the 1-day row remains.
         assert_eq!(status_log_count(&pool).await, 1);
+    }
+
+    async fn file_count(pool: &SQLite3Pool, guid: &str) -> i64 {
+        let g = guid.to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.query_row(
+                "SELECT COUNT(*) FROM project_files WHERE project_guid = ?1",
+                params![g],
+                |r| r.get(0),
+            )
+            .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_deleted_files_removes_only_emptied_deleted_files() {
+        let pool = migrated_pool().await;
+        let guid = "c".repeat(32);
+        let g = guid.clone();
+        let sha = "0".repeat(64);
+        let qg = Uuid::new_v4().simple().to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
+                params![g],
+            )?;
+            // (a) deleted file, no chunks → must be pruned.
+            tx.execute(
+                "INSERT INTO project_files (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, 'BAAI/bge-m3', 'gone.rs', ?2, 'rust', 'indexing')",
+                params![g, sha],
+            )?;
+            tx.execute(
+                "UPDATE project_files SET status='deleted' WHERE project_guid=?1 AND path='gone.rs'",
+                params![g],
+            )?;
+            // (b) indexed file with an active chunk → must remain (not 'deleted').
+            tx.execute(
+                "INSERT INTO project_files (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, 'BAAI/bge-m3', 'keep.rs', ?2, 'rust', 'indexing')",
+                params![g, sha],
+            )?;
+            tx.execute(
+                "UPDATE project_files SET status='indexed' WHERE project_guid=?1 AND path='keep.rs'",
+                params![g],
+            )?;
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid, start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'keep.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'active')",
+                params![g, qg],
+            )?;
+            // (c) deleted file that still has a (soft-deleted) chunk → must remain until
+            // sweep removes the chunk first (FK RESTRICT + the NOT EXISTS guard).
+            tx.execute(
+                "INSERT INTO project_files (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, 'BAAI/bge-m3', 'pending.rs', ?2, 'rust', 'indexing')",
+                params![g, sha],
+            )?;
+            tx.execute(
+                "UPDATE project_files SET status='deleted' WHERE project_guid=?1 AND path='pending.rs'",
+                params![g],
+            )?;
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid, start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'pending.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'deleted')",
+                params![g, Uuid::new_v4().simple().to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let removed = prune_deleted_files(&pool, &CancellationToken::new()).await;
+        assert_eq!(removed, 1, "only the emptied deleted file should be pruned");
+        // keep.rs (indexed) and pending.rs (deleted but still has a chunk) remain.
+        assert_eq!(file_count(&pool, &guid).await, 2);
     }
 }

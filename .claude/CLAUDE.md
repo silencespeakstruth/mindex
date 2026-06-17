@@ -58,14 +58,23 @@ collection's delete fails the rows stay `deleted` for the next sweep. Deleting t
 SQLite row before Qdrant confirms would orphan the vector forever (nothing tracks
 it). If every collection in a batch fails, the inner loop breaks rather than
 spinning. The same hourly GC tick also prunes `project_file_status_log` rows older
-than `STATUS_LOG_RETENTION` (30 days), logging the count removed.
+than `STATUS_LOG_RETENTION` (30 days), logging the count removed. After the chunk
+sweep it runs `prune_deleted_files`: deletes `project_files` rows in status
+`deleted` that have **no chunk rows left** (the chunk→file FK is RESTRICT, so this
+can only fire once the sweep removed their chunks). This ordering — sweep chunks,
+then drop emptied `deleted` files — is what makes a `DELETE /files` eventually
+physical. `gc::{sweep, prune_deleted_files, prune_status_log}` are `pub(crate)` and
+also driven synchronously by `POST /gc` (returns the three counts).
 
 **Status state machine** (`project_files.status`), enforced by SQLite triggers
 (`v0.2.0_status_machine.sql`), not just convention. Legal moves: **any → `indexing`**
-(start / reindex / retry) and **`indexing` → `indexed`|`cancelled`|`failed`** (a
-terminal is reachable only from in-progress work); a new row may only enter as
-`just_uploaded`/`indexing`. Anything else (e.g. `indexed→failed`, `failed→indexed`,
-`just_uploaded→indexed`) raises `SQLITE_CONSTRAINT_TRIGGER`. So the retry worker
+(start / reindex / retry), **any → `deleted`** (`DELETE /files`; GC then removes the
+emptied row), and **`indexing` → `indexed`|`cancelled`|`failed`** (a terminal is
+reachable only from in-progress work); a new row may only enter as
+`just_uploaded`/`indexing`. `deleted` is terminal **except** `deleted→indexing`
+(re-indexing a path pending deletion resurrects it — the any→`indexing` rule).
+Anything else (e.g. `indexed→failed`, `failed→indexed`, `just_uploaded→indexed`,
+`deleted→indexed`) raises `SQLITE_CONSTRAINT_TRIGGER`. So the retry worker
 moves `failed → indexing → {indexed|failed}` (never `failed→failed`). `indexing`
 is committed durably *before* heavy work (crash-recoverable; retry worker picks up
 files stuck in `indexing` longer than `--stuck-grace-mins`, default **30 min**).
@@ -86,6 +95,18 @@ exhausts `MAX_RETRIES` (3) stays `failed` and is never retried again — surface
 **sha256 skip / empty 404.** Re-indexing identical content is skipped by hash.
 `post_search` returns 404 immediately when the SQLite candidate set is empty (no
 active chunks), without calling Qdrant (avoids a 503 from a missing collection).
+
+**Management endpoints** (handlers in `handlers.rs`, routes in `http3::run`, *not*
+under `/v0`): `GET /projects/{guid}` aggregates `project_files` by status + chunks
+per language (active vs soft-deleted), 404 if unseen. `DELETE /projects/{guid}` is
+an **immediate hard delete** (chunks → files → project → status log, then drop the
+Qdrant collection last so a retry re-attempts it) and **idempotent** (always 204).
+`DELETE /projects/{guid}/files` is a **soft delete**: the glob/language selector
+(same `include`/`exclude` shape as search, sent in the **request body** since globs
+don't fit the path) marks matched files + their chunks `deleted`; GC purges them
+later. Returns 204 if nothing matched, else 200 with the file count; an empty
+selector is rejected (400) so it can't wipe the project. `POST /gc` runs one GC pass
+synchronously — integration tests call it to force physical removal before asserting.
 
 **FK is RESTRICT.** `project_file_chunks → project_files` is `ON DELETE RESTRICT`.
 Never delete a `project_files` row while chunks exist; mark chunks deleted (let GC
@@ -280,7 +301,9 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
 - **Integration** (`tests/integration/`, pytest in Docker): mock embedder returns
   deterministic vectors seeded by text hash (stable ranking assertions). `test_e2e.py`
   is the rust happy path; `test_filters_and_languages.py` covers non-rust languages
-  and include/exclude (language + path-GLOB) filters. Fresh project GUID per test.
+  and include/exclude (language + path-GLOB) filters; `test_management.py` covers the
+  stats / delete-project / delete-files / GC endpoints (each deletion test calls
+  `POST /gc` to confirm physical removal). Fresh project GUID per test.
 
 ## Linting (zero warnings everywhere — non-default flags matter)
 

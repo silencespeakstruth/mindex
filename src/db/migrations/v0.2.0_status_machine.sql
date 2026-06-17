@@ -4,10 +4,13 @@
 -- The status CHECK in v0.1.0 validates the *value*; these triggers validate the
 -- *transition*. Legal moves:
 --   * any → 'indexing'                              (start / reindex / retry)
+--   * any → 'deleted'                               (DELETE /files; GC then removes the row)
 --   * 'indexing' → 'indexed' | 'cancelled' | 'failed'   (terminal only from work)
 -- Everything else (e.g. indexed→failed, failed→indexed, just_uploaded→indexed)
 -- is rejected with SQLITE_CONSTRAINT_TRIGGER. Idempotent 'indexing'→'indexing'
--- is allowed (concurrent upserts); other self-loops are not.
+-- is allowed (concurrent upserts); other self-loops are not. 'deleted' is terminal
+-- except 'deleted'→'indexing' (re-indexing a path that is pending deletion resurrects
+-- it) — covered by the any→'indexing' rule.
 
 -- A brand-new row may only enter in a non-terminal state.
 CREATE TRIGGER IF NOT EXISTS project_files_status_insert_guard
@@ -22,6 +25,7 @@ CREATE TRIGGER IF NOT EXISTS project_files_status_update_guard
 BEFORE UPDATE OF status ON project_files
 WHEN NOT (
     NEW.status = 'indexing'
+    OR NEW.status = 'deleted'
     OR (OLD.status = 'indexing' AND NEW.status IN ('indexed', 'cancelled', 'failed'))
 )
 BEGIN

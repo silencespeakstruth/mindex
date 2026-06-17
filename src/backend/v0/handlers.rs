@@ -9,6 +9,13 @@ use crate::backend::http3::cancelled_499;
 use crate::backend::v0::models::Code;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::ProgrammingLanguage;
+use crate::backend::v0::models::ChunkCounts;
+use crate::backend::v0::models::DeleteFilesRequest;
+use crate::backend::v0::models::DeleteFilesResponse;
+use crate::backend::v0::models::FileStatusCounts;
+use crate::backend::v0::models::GcResponse;
+use crate::backend::v0::models::ProjectStats;
+use crate::backend::v0::models::SearchFilter;
 use crate::backend::v0::models::SearchRequest;
 use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
@@ -34,6 +41,8 @@ use axum::extract::Path;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::ErrorResponse;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use rusqlite::OptionalExtension;
 use rusqlite::ToSql;
@@ -785,6 +794,283 @@ pub async fn post_search(
     }
     .instrument(span)
     .await
+}
+
+// ─── Management endpoints ───────────────────────────────────────────────────
+
+/// `GET /projects/{guid}` — aggregate counts: `project_files` by status, and chunks
+/// per language split into active vs soft-deleted (pending GC). 404 if the project
+/// has never been seen.
+#[debug_handler]
+pub async fn get_project_stats(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+) -> Result<Json<ProjectStats>, ErrorResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+
+    let result = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let exists = tx
+                .query_row("SELECT 1 FROM projects WHERE guid = ?1", params![pg], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok(None);
+            }
+
+            let mut files = FileStatusCounts::default();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT status, COUNT(*) FROM project_files
+                     WHERE project_guid = ?1 GROUP BY status",
+                )?;
+                let rows = stmt
+                    .query_map(params![pg], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                for row in rows {
+                    let (status, n) = row?;
+                    files.set(&status, n as u64);
+                }
+            }
+
+            let mut chunks: HashMap<String, ChunkCounts> = HashMap::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT f.programming_language, c.status, COUNT(*)
+                     FROM project_file_chunks c
+                     JOIN project_files f
+                         ON c.project_guid = f.project_guid
+                         AND c.model_id = f.model_id
+                         AND c.file_path = f.path
+                     WHERE c.project_guid = ?1
+                     GROUP BY f.programming_language, c.status",
+                )?;
+                let rows = stmt.query_map(params![pg], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })?;
+                for row in rows {
+                    let (lang, status, n) = row?;
+                    let entry = chunks.entry(lang).or_default();
+                    match status.as_str() {
+                        "active" => entry.active = n as u64,
+                        "deleted" => entry.deleted = n as u64,
+                        _ => {}
+                    }
+                }
+            }
+
+            Ok(Some((files, chunks)))
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = ?e, project_guid = %pg.0, "Failed to query project stats from SQLite.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    match result {
+        Some((files, chunks)) => Ok(Json(ProjectStats { project_guid, files, chunks })),
+        None => Err(StatusCode::NOT_FOUND.into()),
+    }
+}
+
+/// `DELETE /projects/{guid}` — hard-deletes the project: all chunks, files, the
+/// project row, its status log, and the Qdrant collection. Idempotent: deleting a
+/// non-existent project (or re-deleting) is a 204. Chunks go first (the chunk→file
+/// FK is RESTRICT); the collection is dropped last so a retry re-attempts a failed
+/// drop even once the rows are gone.
+#[debug_handler]
+pub async fn delete_project(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+) -> Result<StatusCode, ErrorResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let collection = collection_for(project_guid);
+    let pg = project_guid;
+
+    s.db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            tx.execute("DELETE FROM project_file_chunks WHERE project_guid = ?1", params![pg])?;
+            tx.execute("DELETE FROM project_files WHERE project_guid = ?1", params![pg])?;
+            tx.execute("DELETE FROM projects WHERE guid = ?1", params![pg])?;
+            tx.execute("DELETE FROM project_file_status_log WHERE project_guid = ?1", params![pg])?;
+            Ok(())
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = ?e, project_guid = %pg.0, "Failed to hard-delete project rows from SQLite.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    s.qdrant.delete_collection(&collection).await.map_err(|e| {
+        error!(
+            error = %e,
+            collection = %collection,
+            "Failed to delete the Qdrant collection. Check Qdrant is reachable at --qdrant-server."
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Builds the `WHERE` body (without the keyword) and ordered binds selecting
+/// `project_files` for `DELETE /files`. Mirrors the search filter: language
+/// `IN`/`NOT IN` and path `GLOB` (ORed within a parenthesised group so OR cannot
+/// leak across the AND-joined clauses), pinned to the project and excluding files
+/// already `deleted`.
+fn build_file_filter(
+    project_guid: UUIDv4,
+    include: &Option<SearchFilter>,
+    exclude: &Option<SearchFilter>,
+) -> (String, Vec<Bind>) {
+    let mut n = 1usize;
+    let mut parts = vec![format!("project_guid = ?{n}"), "status != 'deleted'".to_string()];
+    n += 1;
+    let mut binds: Vec<Bind> = vec![Bind::Guid(project_guid)];
+
+    if let Some(inc) = include {
+        if let Some(pls) = inc.programming_languages.as_ref().filter(|v| !v.is_empty()) {
+            let ph: Vec<String> = pls.iter().map(|_| { let p = format!("?{n}"); n += 1; p }).collect();
+            parts.push(format!("programming_language IN ({})", ph.join(", ")));
+            binds.extend(pls.iter().map(|l| Bind::Lang(*l)));
+        }
+        if let Some(paths) = inc.paths.as_ref().filter(|v| !v.is_empty()) {
+            let cl: Vec<String> = paths.iter().map(|_| { let c = format!("path GLOB ?{n}"); n += 1; c }).collect();
+            parts.push(format!("({})", cl.join(" OR ")));
+            binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
+        }
+    }
+    if let Some(exc) = exclude {
+        if let Some(pls) = exc.programming_languages.as_ref().filter(|v| !v.is_empty()) {
+            let ph: Vec<String> = pls.iter().map(|_| { let p = format!("?{n}"); n += 1; p }).collect();
+            parts.push(format!("programming_language NOT IN ({})", ph.join(", ")));
+            binds.extend(pls.iter().map(|l| Bind::Lang(*l)));
+        }
+        if let Some(paths) = exc.paths.as_ref().filter(|v| !v.is_empty()) {
+            let cl: Vec<String> = paths.iter().map(|_| { let c = format!("path GLOB ?{n}"); n += 1; c }).collect();
+            parts.push(format!("NOT ({})", cl.join(" OR ")));
+            binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
+        }
+    }
+
+    (parts.join(" AND "), binds)
+}
+
+/// `DELETE /projects/{guid}/files` — soft-deletes files matching the selector:
+/// marks their active chunks `deleted` and the files `deleted`; the next GC pass
+/// (`POST /gc`, or the hourly worker) physically removes the vectors, the chunk
+/// rows, and finally the empty file rows. Returns 204 when nothing matched, else
+/// 200 with the count of files moved to `deleted`. A non-empty include/exclude is
+/// required so an empty body cannot wipe the whole project.
+#[debug_handler]
+pub async fn delete_files(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+    Json(req): Json<DeleteFilesRequest>,
+) -> Result<Response, ErrorResponse> {
+    let nonempty = |f: &Option<SearchFilter>| {
+        f.as_ref().is_some_and(|x| {
+            x.paths.as_ref().is_some_and(|p| !p.is_empty())
+                || x.programming_languages.as_ref().is_some_and(|l| !l.is_empty())
+        })
+    };
+    if !nonempty(&req.include) && !nonempty(&req.exclude) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "DELETE /files requires a non-empty include or exclude selector",
+        )
+            .into());
+    }
+
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+    let (where_sql, binds) = build_file_filter(pg, &req.include, &req.exclude);
+
+    // 1) Resolve matching file paths (path globs evaluated by SQLite GLOB, as in search).
+    let select_sql = format!("SELECT path FROM project_files WHERE {where_sql}");
+    let paths: Vec<String> = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let mut stmt = tx.prepare(&select_sql)?;
+            let rows = stmt.query_map(params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(SQLite3PoolError::from)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = ?e, project_guid = %pg.0, "Failed to select files for deletion.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if paths.is_empty() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    // 2) Soft-delete chunks + files, batched to stay under SQLite's bind-variable limit.
+    let mut deleted_files: u64 = 0;
+    for batch in paths.chunks(500) {
+        let batch: Vec<String> = batch.to_vec();
+        let n = s
+            .db_pool
+            .transaction(guard.0.child_token(), move |tx| {
+                let placeholders = (2..2 + batch.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut bs: Vec<Bind> = Vec::with_capacity(batch.len() + 1);
+                bs.push(Bind::Guid(pg));
+                bs.extend(batch.into_iter().map(Bind::Path));
+
+                tx.execute(
+                    &format!(
+                        "UPDATE project_file_chunks SET status = 'deleted'
+                         WHERE project_guid = ?1 AND status = 'active' AND file_path IN ({placeholders})"
+                    ),
+                    params_from_iter(bs.iter()),
+                )?;
+                let files = tx.execute(
+                    &format!(
+                        "UPDATE project_files SET status = 'deleted', status_updated_at = unixepoch()
+                         WHERE project_guid = ?1 AND status != 'deleted' AND path IN ({placeholders})"
+                    ),
+                    params_from_iter(bs.iter()),
+                )?;
+                Ok(files as u64)
+            })
+            .with_cancellation_token(&guard.0)
+            .await
+            .from_cancelled()
+            .map_err(|e| {
+                error!(error = ?e, project_guid = %pg.0, "Failed to soft-delete files.");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        deleted_files += n;
+    }
+
+    if deleted_files == 0 {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok((StatusCode::OK, Json(DeleteFilesResponse { deleted_files })).into_response())
+    }
+}
+
+/// `POST /gc` — runs a full GC pass synchronously and returns what it removed:
+/// hard-deletes soft-deleted chunks (whose vectors are confirmed gone from Qdrant),
+/// then the now-empty `deleted` file rows, then prunes the old status log. Blocking
+/// by design; the periodic worker runs the same steps hourly.
+#[debug_handler]
+pub async fn post_gc(State(s): State<RouterState>) -> Json<GcResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let chunks_removed = crate::worker::gc::sweep(&s.db_pool, &*s.qdrant, &guard.0).await;
+    let files_removed = crate::worker::gc::prune_deleted_files(&s.db_pool, &guard.0).await;
+    let status_log_pruned = crate::worker::gc::prune_status_log(&s.db_pool, &guard.0).await;
+    Json(GcResponse { chunks_removed, files_removed, status_log_pruned })
 }
 
 #[cfg(test)]

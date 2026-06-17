@@ -177,3 +177,69 @@ pub struct SearchResult {
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
+
+// ─── Management endpoints ───────────────────────────────────────────────────
+
+/// `DELETE /projects/{guid}/files` body — same selector shape as search, so the
+/// same globs/languages that surface files can also remove them. At least one of
+/// `include`/`exclude` must be non-empty (the handler rejects an empty body to
+/// avoid wiping the whole project).
+#[derive(Deserialize, Serialize, Debug, Default)]
+pub struct DeleteFilesRequest {
+    pub include: Option<SearchFilter>,
+    pub exclude: Option<SearchFilter>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct DeleteFilesResponse {
+    pub deleted_files: u64,
+}
+
+/// Per-status `project_files` counts. A fixed struct (not a sparse map) so the
+/// response schema is self-documenting and every status is always present.
+#[derive(Serialize, Debug, Default)]
+pub struct FileStatusCounts {
+    pub just_uploaded: u64,
+    pub indexing: u64,
+    pub indexed: u64,
+    pub cancelled: u64,
+    pub failed: u64,
+    pub deleted: u64,
+}
+
+impl FileStatusCounts {
+    pub fn set(&mut self, status: &str, count: u64) {
+        match status {
+            "just_uploaded" => self.just_uploaded = count,
+            "indexing" => self.indexing = count,
+            "indexed" => self.indexed = count,
+            "cancelled" => self.cancelled = count,
+            "failed" => self.failed = count,
+            "deleted" => self.deleted = count,
+            _ => {}
+        }
+    }
+}
+
+/// Active vs soft-deleted (pending GC) chunk counts for one language.
+#[derive(Serialize, Debug, Default)]
+pub struct ChunkCounts {
+    pub active: u64,
+    pub deleted: u64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ProjectStats {
+    pub project_guid: UUIDv4,
+    pub files: FileStatusCounts,
+    /// Keyed by programming language. `deleted` here is "soft-deleted but not yet
+    /// physically removed" (awaiting GC).
+    pub chunks: HashMap<String, ChunkCounts>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GcResponse {
+    pub chunks_removed: usize,
+    pub files_removed: usize,
+    pub status_log_pruned: usize,
+}

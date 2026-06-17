@@ -1,7 +1,7 @@
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{delete, get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -11,7 +11,9 @@ use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::backend::v0::handlers::{post_index, post_search};
+use crate::backend::v0::handlers::{
+    delete_files, delete_project, get_project_stats, post_gc, post_index, post_search,
+};
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::models::bge_m3::BGEm3Model;
@@ -58,6 +60,12 @@ pub async fn run(
     let router = Router::new()
         .route("/v0/{project_guid}/index", post(post_index))
         .route("/v0/{project_guid}/search", post(post_search))
+        .route(
+            "/projects/{project_guid}",
+            get(get_project_stats).delete(delete_project),
+        )
+        .route("/projects/{project_guid}/files", delete(delete_files))
+        .route("/gc", post(post_gc))
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         .with_state(state);
 

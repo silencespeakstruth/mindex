@@ -224,10 +224,35 @@ mod tests {
         let pool = migrated_pool().await;
         assert!(insert_file(&pool, "just_uploaded").await.is_ok());
 
-        for terminal in ["indexed", "cancelled", "failed"] {
+        for terminal in ["indexed", "cancelled", "failed", "deleted"] {
             let pool = migrated_pool().await;
             let res = insert_file(&pool, terminal).await;
             assert!(is_trigger_rejection(&res), "inserting initial {terminal} must be rejected, got {res:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_is_reachable_from_any_state_and_terminal() {
+        // any → deleted is legal (DELETE /files marks the file for GC).
+        let pool = pool_with_file("indexing").await;
+        transition(&pool, "indexed").await.unwrap();
+        assert!(transition(&pool, "deleted").await.is_ok(), "indexed→deleted must be legal");
+
+        let pool = pool_with_file("indexing").await;
+        transition(&pool, "failed").await.unwrap();
+        assert!(transition(&pool, "deleted").await.is_ok(), "failed→deleted must be legal");
+
+        // deleted → indexing is legal: re-indexing a path pending deletion resurrects it.
+        let pool = pool_with_file("indexing").await;
+        transition(&pool, "deleted").await.unwrap();
+        assert!(transition(&pool, "indexing").await.is_ok(), "deleted→indexing must be legal");
+
+        // deleted is otherwise terminal: no jump straight to a work-terminal.
+        for to in ["indexed", "failed", "cancelled"] {
+            let pool = pool_with_file("indexing").await;
+            transition(&pool, "deleted").await.unwrap();
+            let res = transition(&pool, to).await;
+            assert!(is_trigger_rejection(&res), "deleted→{to} must be rejected, got {res:?}");
         }
     }
 
