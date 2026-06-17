@@ -6,13 +6,6 @@ is *not done* or *deliberately constrained*.
 
 ## Known issues / limitations
 
-- **`post_search` loads the full `code` of every active chunk, not just the
-  top-k.** The candidate SQLite query selects `code` + line/column metadata for
-  all `status='active'` chunks matching the filters, then uses only the ~`top_k`
-  (default 5) winners Qdrant returns. On large projects this reads megabytes per
-  query, >99% discarded. **Fix:** two queries — (1) select only `qdrant_guid` for
-  the `has_id` filter, (2) after Qdrant returns top-k ids, fetch display rows for
-  just those. Deferred because it reshapes a tested core path. Top perf follow-up.
 - **The `has_id` filter grows linearly with a project's active-chunk count** (it
   lists every candidate GUID per query). Fine for moderate projects; very large
   collections may want a stored Qdrant payload field (`project_guid`) + a `match`

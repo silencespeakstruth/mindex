@@ -106,7 +106,10 @@ clean up), then delete the parent.
 
 Collection has three named vectors: `dense` (1024-d cosine), `sparse` (SPLADE-style),
 `colbert` (1024-d cosine, multivector MaxSim). Search: prefetch top-200 dense +
-top-200 sparse → RRF fusion → ColBERT MaxSim rerank → top-k. `post_search` then
+top-200 sparse → RRF fusion → ColBERT MaxSim rerank → top-k. `post_search` runs
+**two** SQLite queries around Qdrant — first the candidate `qdrant_guid`s for the
+`has_id` set, then `code`/metadata for *only* the top-k winners — never loading
+`code` for the whole active set (don't collapse these back into one query). It then
 **sorts results by score descending** before responding (don't rely on Qdrant's
 return order). Sparse weights `≤ 1e-5`
 are dropped before upsert. Batch sizes: `--embed-batch` chunks per `/encode` call

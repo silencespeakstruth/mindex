@@ -6,24 +6,24 @@ use crate::backend::http3;
 use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
 use crate::backend::http3::cancelled_499;
-use crate::backend::v0::models::Code;
-use crate::backend::v0::models::IndexResponse;
-use crate::backend::v0::models::ProgrammingLanguage;
 use crate::backend::v0::models::ChunkCounts;
+use crate::backend::v0::models::Code;
 use crate::backend::v0::models::DeleteFilesRequest;
 use crate::backend::v0::models::DeleteFilesResponse;
 use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
+use crate::backend::v0::models::IndexResponse;
+use crate::backend::v0::models::ProgrammingLanguage;
 use crate::backend::v0::models::ProjectStats;
 use crate::backend::v0::models::SearchFilter;
 use crate::backend::v0::models::SearchRequest;
 use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
 use crate::backend::v0::models::UUIDv4;
+use crate::db::files::set_file_status;
 use crate::db::qdrant::SearchHit;
 use crate::db::qdrant::VectorStore;
 use crate::db::qdrant::collection_for;
-use crate::db::files::set_file_status;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::db::sqlite3::SQLite3PoolError;
 use crate::embed::EmbedUpsertError;
@@ -51,6 +51,7 @@ use rusqlite::params_from_iter;
 use sha2::Sha256;
 use sha2::digest::FixedOutputReset;
 use sha2::digest::Update;
+use tokenizers::Tokenizer;
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -58,7 +59,6 @@ use tracing::error;
 use tracing::info;
 use tracing::info_span;
 use tracing::warn;
-use tokenizers::Tokenizer;
 use tree_sitter::Language;
 use uuid::Uuid;
 
@@ -111,7 +111,10 @@ impl ToSql for Bind {
     }
 }
 
-/// Builds the SQL and ordered bind values for `post_search`'s candidate query.
+/// Builds `post_search`'s candidate query: selects **only** `c.qdrant_guid` — the
+/// `has_id` set fed to Qdrant — never `code`/metadata, which `post_search` fetches
+/// separately for just the top-k winners (loading display columns for every active
+/// chunk would read megabytes per query and discard >99%).
 ///
 /// Pure and side-effect-free so the fragile `?N` parameter-numbering — which must
 /// stay in lock-step with the bind order — can be unit-tested in isolation. The
@@ -193,8 +196,7 @@ fn build_search_query(project_guid: UUIDv4, req: &SearchRequest) -> (String, Vec
 
     let sql = format!(
         "
-    SELECT c.qdrant_guid, c.file_path, c.code,
-           c.start_line, c.end_line, c.start_column, c.end_column
+    SELECT c.qdrant_guid
     FROM project_file_chunks c
     JOIN project_files f
         ON c.project_guid = f.project_guid
@@ -215,7 +217,9 @@ fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
         ProgrammingLanguage::Rust => Language::new(tree_sitter_rust::LANGUAGE),
         ProgrammingLanguage::Python => Language::new(tree_sitter_python::LANGUAGE),
         ProgrammingLanguage::JavaScript => Language::new(tree_sitter_javascript::LANGUAGE),
-        ProgrammingLanguage::TypeScript => Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
+        ProgrammingLanguage::TypeScript => {
+            Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT)
+        }
         ProgrammingLanguage::Tsx => Language::new(tree_sitter_typescript::LANGUAGE_TSX),
         ProgrammingLanguage::Go => Language::new(tree_sitter_go::LANGUAGE),
         ProgrammingLanguage::C => Language::new(tree_sitter_c::LANGUAGE),
@@ -444,8 +448,11 @@ impl FileIndexer<'_> {
     /// Phase 3 for one file: mark it `indexed` and record the new sha256.
     async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<(), ErrorResponse> {
         let project_guid = self.project_guid;
-        let (sha256_f, path_f, model_id_f) =
-            (sha256.to_string(), path.to_string(), self.model_id.to_string());
+        let (sha256_f, path_f, model_id_f) = (
+            sha256.to_string(),
+            path.to_string(),
+            self.model_id.to_string(),
+        );
         self.db_pool
             .transaction(self.token.child_token(), move |tx| {
                 tx.execute(
@@ -485,7 +492,12 @@ impl FileIndexer<'_> {
     /// Recovers every already-prepared file when the batch is aborted (a later
     /// file's prepare failed, or the shared embed failed) — they are still
     /// `indexing` with chunks inserted, so this hands them to the retry worker.
-    async fn recover_all(&self, prepared: &[Prepared], status: &'static str, increment_retry: bool) {
+    async fn recover_all(
+        &self,
+        prepared: &[Prepared],
+        status: &'static str,
+        increment_retry: bool,
+    ) {
         for p in prepared {
             self.recover(&p.path, status, increment_retry).await;
         }
@@ -501,54 +513,51 @@ pub async fn post_index(
     let span = info_span!("indexing", project_guid = %project_guid.0);
 
     async move {
-    let guard = http3::CancellationGuard(CancellationToken::new());
+        let guard = http3::CancellationGuard(CancellationToken::new());
 
-    let db_pool = s.db_pool;
-    let qdrant = s.qdrant;
-    let tokenizer = s.tokenizer;
-    let EmbeddingModel::BGEm3 { model_id, client } = s.model;
+        let db_pool = s.db_pool;
+        let qdrant = s.qdrant;
+        let tokenizer = s.tokenizer;
+        let EmbeddingModel::BGEm3 { model_id, client } = s.model;
 
-    let collection = collection_for(project_guid);
+        let collection = collection_for(project_guid);
 
-    // ── ensure project row ────────────────────────────────────────────────
-    {
-        let model_id = model_id.clone();
-        db_pool
-            .transaction(guard.0.child_token(), move |tx| {
-                let exists = tx
-                    .query_row(
-                        "SELECT 1 FROM projects WHERE guid = ?1 AND model_id = ?2",
-                        params![project_guid, model_id],
-                        |_| Ok(true),
-                    )
-                    .optional()?
-                    .is_some();
+        // ── ensure project row ────────────────────────────────────────────────
+        {
+            let model_id = model_id.clone();
+            db_pool
+                .transaction(guard.0.child_token(), move |tx| {
+                    let exists = tx
+                        .query_row(
+                            "SELECT 1 FROM projects WHERE guid = ?1 AND model_id = ?2",
+                            params![project_guid, model_id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .is_some();
 
-                if !exists {
-                    info!("Project does not exist. Creating a new one.");
-                    tx.execute(
-                        "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                        params![project_guid, model_id],
-                    )?;
-                } else {
-                    info!("Project already exists.");
-                }
-                Ok(())
-            })
-            .with_cancellation_token(&guard.0)
-            .await
-            .from_cancelled()
-            .map_err(|err| {
-                error!(error = ?err, "Failed to ensure the project row in SQLite.");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
+                    if !exists {
+                        info!("Project does not exist. Creating a new one.");
+                        tx.execute(
+                            "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                            params![project_guid, model_id],
+                        )?;
+                    } else {
+                        info!("Project already exists.");
+                    }
+                    Ok(())
+                })
+                .with_cancellation_token(&guard.0)
+                .await
+                .from_cancelled()
+                .map_err(|err| {
+                    error!(error = ?err, "Failed to ensure the project row in SQLite.");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
 
-    // ── ensure Qdrant collection ──────────────────────────────────────────
-    qdrant
-        .ensure_project(&collection)
-        .await
-        .map_err(|err| {
+        // ── ensure Qdrant collection ──────────────────────────────────────────
+        qdrant.ensure_project(&collection).await.map_err(|err| {
             error!(
                 error = ?err,
                 "Failed to ensure the Qdrant collection. \
@@ -557,84 +566,95 @@ pub async fn post_index(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let mut res = IndexResponse { files: HashMap::new() };
-    let mut sha256_hasher = Sha256::default();
+        let mut res = IndexResponse {
+            files: HashMap::new(),
+        };
+        let mut sha256_hasher = Sha256::default();
 
-    let indexer = FileIndexer {
-        db_pool: &db_pool,
-        store: &*qdrant,
-        tokenizer: &tokenizer,
-        embedder: &*client,
-        model_id: &model_id,
-        project_guid,
-        collection: &collection,
-        embed_batch: s.embed_batch,
-        token: &guard.0,
-    };
+        let indexer = FileIndexer {
+            db_pool: &db_pool,
+            store: &*qdrant,
+            tokenizer: &tokenizer,
+            embedder: &*client,
+            model_id: &model_id,
+            project_guid,
+            collection: &collection,
+            embed_batch: s.embed_batch,
+            token: &guard.0,
+        };
 
-    // ── Phase 1: prepare every file (hash-check, mark indexing, slice + insert).
-    let mut prepared: Vec<Prepared> = Vec::new();
-    for (pl, files) in payload.files.iter() {
-        let pl = *pl;
-        res.files.entry(pl).or_default();
+        // ── Phase 1: prepare every file (hash-check, mark indexing, slice + insert).
+        let mut prepared: Vec<Prepared> = Vec::new();
+        for (pl, files) in payload.files.iter() {
+            let pl = *pl;
+            res.files.entry(pl).or_default();
 
-        for (path, Code { code }) in files.iter() {
-            match indexer.prepare(pl, path, code, &mut sha256_hasher).await {
-                Ok(Some(p)) => prepared.push(p),
-                Ok(None) => {} // unchanged — skipped
-                Err(e) => {
-                    // A later file failed to prepare; recover the ones already prepared
-                    // (they're 'indexing' with chunks inserted) before bailing.
-                    indexer.recover_all(&prepared, "failed", true).await;
-                    return Err(e);
+            for (path, Code { code }) in files.iter() {
+                match indexer.prepare(pl, path, code, &mut sha256_hasher).await {
+                    Ok(Some(p)) => prepared.push(p),
+                    Ok(None) => {} // unchanged — skipped
+                    Err(e) => {
+                        // A later file failed to prepare; recover the ones already prepared
+                        // (they're 'indexing' with chunks inserted) before bailing.
+                        indexer.recover_all(&prepared, "failed", true).await;
+                        return Err(e);
+                    }
                 }
             }
         }
-    }
 
-    // ── Phase 2: embed + upsert every chunk across all files in one batched pass.
-    let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
-    let all_chunks: Vec<(UUIDv4, String)> =
-        prepared.iter_mut().flat_map(|p| std::mem::take(&mut p.chunks)).collect();
+        // ── Phase 2: embed + upsert every chunk across all files in one batched pass.
+        let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
+        let all_chunks: Vec<(UUIDv4, String)> = prepared
+            .iter_mut()
+            .flat_map(|p| std::mem::take(&mut p.chunks))
+            .collect();
 
-    info!(files = prepared.len(), chunks = all_chunks.len(), "Embedding request in batches.");
+        info!(
+            files = prepared.len(),
+            chunks = all_chunks.len(),
+            "Embedding request in batches."
+        );
 
-    match indexer.embed_all(&all_chunks).await {
-        Ok(()) => {}
-        Err(EmbedUpsertError::Cancelled) => {
-            indexer.recover_all(&prepared, "cancelled", false).await;
-            return Err(cancelled_499().into());
+        match indexer.embed_all(&all_chunks).await {
+            Ok(()) => {}
+            Err(EmbedUpsertError::Cancelled) => {
+                indexer.recover_all(&prepared, "cancelled", false).await;
+                return Err(cancelled_499().into());
+            }
+            Err(EmbedUpsertError::Embed(request_err)) => {
+                error!(
+                    error = ?request_err,
+                    "Embedding request failed; marking batch 'failed'. \
+                     Check the model server at --model-server is up and reachable \
+                     (from inside the container it must bind 0.0.0.0, not 127.0.0.1)."
+                );
+                indexer.recover_all(&prepared, "failed", true).await;
+                return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+            }
+            Err(EmbedUpsertError::Store(qdrant_err)) => {
+                error!(
+                    error = ?qdrant_err,
+                    "Qdrant upsert failed; marking batch 'failed'. \
+                     Check Qdrant is reachable at --qdrant-server."
+                );
+                indexer.recover_all(&prepared, "failed", true).await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+            }
         }
-        Err(EmbedUpsertError::Embed(request_err)) => {
-            error!(
-                error = ?request_err,
-                "Embedding request failed; marking batch 'failed'. \
-                 Check the model server at --model-server is up and reachable \
-                 (from inside the container it must bind 0.0.0.0, not 127.0.0.1)."
-            );
-            indexer.recover_all(&prepared, "failed", true).await;
-            return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+
+        // ── Phase 3: mark each prepared file 'indexed' and tally the response.
+        for (p, count) in prepared.iter().zip(counts) {
+            indexer.mark_indexed(&p.path, &p.sha256).await?;
+            *res.files
+                .entry(p.pl)
+                .or_default()
+                .entry(p.path.clone())
+                .or_insert(0) += count;
         }
-        Err(EmbedUpsertError::Store(qdrant_err)) => {
-            error!(
-                error = ?qdrant_err,
-                "Qdrant upsert failed; marking batch 'failed'. \
-                 Check Qdrant is reachable at --qdrant-server."
-            );
-            indexer.recover_all(&prepared, "failed", true).await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
-        }
-    }
 
-    // ── Phase 3: mark each prepared file 'indexed' and tally the response.
-    for (p, count) in prepared.iter().zip(counts) {
-        indexer.mark_indexed(&p.path, &p.sha256).await?;
-        *res.files.entry(p.pl).or_default().entry(p.path.clone()).or_insert(0) += count;
-    }
-
-    info!("All files processed.");
-    Ok(Json(res))
-
+        info!("All files processed.");
+        Ok(Json(res))
     }
     .instrument(span)
     .await
@@ -679,27 +699,15 @@ pub async fn post_search(
 
     let (sql, binds) = build_search_query(project_guid, &payload);
 
-    let chunks = state
+    // Query 1 (candidate set): only the `qdrant_guid`s feeding Qdrant's `has_id`
+    // filter — no `code`/metadata for the (potentially huge) full active set.
+    let candidate_ids: Vec<UUIDv4> = state
         .db_pool
         .transaction(guard.0.child_token(), move |tx| {
-            let chunks: std::collections::HashMap<UUIDv4, (String, String, i64, i64, i64, i64)> = tx
-                .prepare(&sql)?
-                .query_map(params_from_iter(binds), |row| {
-                    Ok((
-                        row.get::<_, UUIDv4>(0)?,
-                        (
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                        ),
-                    ))
-                })?
-                .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
-
-            Ok(chunks)
+            tx.prepare(&sql)?
+                .query_map(params_from_iter(binds), |row| row.get::<_, UUIDv4>(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
         })
         .with_cancellation_token(&guard.0)
         .await
@@ -713,7 +721,7 @@ pub async fn post_search(
             }
         })?;
 
-    if chunks.is_empty() {
+    if candidate_ids.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -734,7 +742,7 @@ pub async fn post_search(
         .qdrant
         .search(
             &collection_for(project_guid),
-            chunks.keys().copied().collect(),
+            candidate_ids,
             dense,
             sparse.keys().copied().collect(),
             sparse.values().copied().collect(),
@@ -751,29 +759,72 @@ pub async fn post_search(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    if search_hits.is_empty() {
+    // Winners as (id, score), keeping Qdrant's order (we re-sort after the fetch).
+    let scored: Vec<(UUIDv4, f32)> = search_hits
+        .iter()
+        .filter_map(|SearchHit { id, score }| match &id.point_id_options {
+            Some(PointIdOptions::Uuid(uuid)) => match Uuid::parse_str(uuid) {
+                Ok(uuid) => Some((UUIDv4(uuid), *score)),
+                Err(err) => {
+                    warn!(error = ?err, point_id = %uuid, "Qdrant returned a point id that is not a valid UUID; skipping it.");
+                    None
+                }
+            },
+            _ => None,
+        })
+        .collect();
+
+    if scored.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let mut results: Vec<SearchResult> = search_hits
+    // Query 2 (display): fetch `code`/metadata for *only* the top-k winners.
+    let winner_ids: Vec<UUIDv4> = scored.iter().map(|(uuid, _)| *uuid).collect();
+    let display = state
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let placeholders = (1..=winner_ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT qdrant_guid, file_path, code, start_line, end_line, start_column, end_column
+                 FROM project_file_chunks
+                 WHERE status = 'active' AND qdrant_guid IN ({placeholders})"
+            );
+            tx.prepare(&sql)?
+                .query_map(params_from_iter(winner_ids.iter()), |row| {
+                    Ok((
+                        row.get::<_, UUIDv4>(0)?,
+                        (
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ),
+                    ))
+                })?
+                .collect::<Result<std::collections::HashMap<UUIDv4, (String, String, i64, i64, i64, i64)>, _>>()
+                .map_err(SQLite3PoolError::from)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|err| match err {
+            SQLite3PoolError::Cancelled => cancelled_499(),
+            err => {
+                error!(error = %err, "Failed to fetch result rows from SQLite.");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+
+    let mut results: Vec<SearchResult> = scored
         .iter()
-        .filter_map(|SearchHit { id, score }| {
-            let uuid = match &id.point_id_options {
-                Some(PointIdOptions::Uuid(uuid)) => uuid,
-                _ => return None,
-            };
-
-            let uuid = match Uuid::parse_str(uuid) {
-                Ok(uuid) => UUIDv4(uuid),
-                Err(err) => {
-                    warn!(error = ?err, point_id = %uuid, "Qdrant returned a point id that is not a valid UUID; skipping it.");
-                    return None;
-                }
-            };
-
+        .filter_map(|(uuid, score)| {
             let (path, code, start_line, end_line, start_column, end_column) =
-                chunks.get(&uuid)?;
-
+                display.get(uuid)?;
             Some(SearchResult {
                 score: *score,
                 path: path.clone(),
@@ -813,7 +864,11 @@ pub async fn get_project_stats(
         .db_pool
         .transaction(guard.0.child_token(), move |tx| {
             let exists = tx
-                .query_row("SELECT 1 FROM projects WHERE guid = ?1", params![pg], |_| Ok(()))
+                .query_row(
+                    "SELECT 1 FROM projects WHERE guid = ?1",
+                    params![pg],
+                    |_| Ok(()),
+                )
                 .optional()?
                 .is_some();
             if !exists {
@@ -826,8 +881,9 @@ pub async fn get_project_stats(
                     "SELECT status, COUNT(*) FROM project_files
                      WHERE project_guid = ?1 GROUP BY status",
                 )?;
-                let rows = stmt
-                    .query_map(params![pg], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let rows = stmt.query_map(params![pg], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })?;
                 for row in rows {
                     let (status, n) = row?;
                     files.set(&status, n as u64);
@@ -847,7 +903,11 @@ pub async fn get_project_stats(
                      GROUP BY f.programming_language, c.status",
                 )?;
                 let rows = stmt.query_map(params![pg], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?;
                 for row in rows {
                     let (lang, status, n) = row?;
@@ -871,7 +931,11 @@ pub async fn get_project_stats(
         })?;
 
     match result {
-        Some((files, chunks)) => Ok(Json(ProjectStats { project_guid, files, chunks })),
+        Some((files, chunks)) => Ok(Json(ProjectStats {
+            project_guid,
+            files,
+            chunks,
+        })),
         None => Err(StatusCode::NOT_FOUND.into()),
     }
 }
@@ -929,30 +993,61 @@ fn build_file_filter(
     exclude: &Option<SearchFilter>,
 ) -> (String, Vec<Bind>) {
     let mut n = 1usize;
-    let mut parts = vec![format!("project_guid = ?{n}"), "status != 'deleted'".to_string()];
+    let mut parts = vec![
+        format!("project_guid = ?{n}"),
+        "status != 'deleted'".to_string(),
+    ];
     n += 1;
     let mut binds: Vec<Bind> = vec![Bind::Guid(project_guid)];
 
     if let Some(inc) = include {
         if let Some(pls) = inc.programming_languages.as_ref().filter(|v| !v.is_empty()) {
-            let ph: Vec<String> = pls.iter().map(|_| { let p = format!("?{n}"); n += 1; p }).collect();
+            let ph: Vec<String> = pls
+                .iter()
+                .map(|_| {
+                    let p = format!("?{n}");
+                    n += 1;
+                    p
+                })
+                .collect();
             parts.push(format!("programming_language IN ({})", ph.join(", ")));
             binds.extend(pls.iter().map(|l| Bind::Lang(*l)));
         }
         if let Some(paths) = inc.paths.as_ref().filter(|v| !v.is_empty()) {
-            let cl: Vec<String> = paths.iter().map(|_| { let c = format!("path GLOB ?{n}"); n += 1; c }).collect();
+            let cl: Vec<String> = paths
+                .iter()
+                .map(|_| {
+                    let c = format!("path GLOB ?{n}");
+                    n += 1;
+                    c
+                })
+                .collect();
             parts.push(format!("({})", cl.join(" OR ")));
             binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
         }
     }
     if let Some(exc) = exclude {
         if let Some(pls) = exc.programming_languages.as_ref().filter(|v| !v.is_empty()) {
-            let ph: Vec<String> = pls.iter().map(|_| { let p = format!("?{n}"); n += 1; p }).collect();
+            let ph: Vec<String> = pls
+                .iter()
+                .map(|_| {
+                    let p = format!("?{n}");
+                    n += 1;
+                    p
+                })
+                .collect();
             parts.push(format!("programming_language NOT IN ({})", ph.join(", ")));
             binds.extend(pls.iter().map(|l| Bind::Lang(*l)));
         }
         if let Some(paths) = exc.paths.as_ref().filter(|v| !v.is_empty()) {
-            let cl: Vec<String> = paths.iter().map(|_| { let c = format!("path GLOB ?{n}"); n += 1; c }).collect();
+            let cl: Vec<String> = paths
+                .iter()
+                .map(|_| {
+                    let c = format!("path GLOB ?{n}");
+                    n += 1;
+                    c
+                })
+                .collect();
             parts.push(format!("NOT ({})", cl.join(" OR ")));
             binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
         }
@@ -976,7 +1071,9 @@ pub async fn delete_files(
     let nonempty = |f: &Option<SearchFilter>| {
         f.as_ref().is_some_and(|x| {
             x.paths.as_ref().is_some_and(|p| !p.is_empty())
-                || x.programming_languages.as_ref().is_some_and(|l| !l.is_empty())
+                || x.programming_languages
+                    .as_ref()
+                    .is_some_and(|l| !l.is_empty())
         })
     };
     if !nonempty(&req.include) && !nonempty(&req.exclude) {
@@ -998,7 +1095,8 @@ pub async fn delete_files(
         .transaction(guard.0.child_token(), move |tx| {
             let mut stmt = tx.prepare(&select_sql)?;
             let rows = stmt.query_map(params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(SQLite3PoolError::from)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
         })
         .with_cancellation_token(&guard.0)
         .await
@@ -1070,7 +1168,11 @@ pub async fn post_gc(State(s): State<RouterState>) -> Json<GcResponse> {
     let chunks_removed = crate::worker::gc::sweep(&s.db_pool, &*s.qdrant, &guard.0).await;
     let files_removed = crate::worker::gc::prune_deleted_files(&s.db_pool, &guard.0).await;
     let status_log_pruned = crate::worker::gc::prune_status_log(&s.db_pool, &guard.0).await;
-    Json(GcResponse { chunks_removed, files_removed, status_log_pruned })
+    Json(GcResponse {
+        chunks_removed,
+        files_removed,
+        status_log_pruned,
+    })
 }
 
 #[cfg(test)]
@@ -1089,11 +1191,19 @@ mod tests {
     }
 
     fn req(include: Option<SearchFilter>, exclude: Option<SearchFilter>) -> SearchRequest {
-        SearchRequest { query: "q".into(), top_k: None, include, exclude }
+        SearchRequest {
+            query: "q".into(),
+            top_k: None,
+            include,
+            exclude,
+        }
     }
 
     fn langs(v: Vec<ProgrammingLanguage>) -> SearchFilter {
-        SearchFilter { paths: None, programming_languages: Some(v) }
+        SearchFilter {
+            paths: None,
+            programming_languages: Some(v),
+        }
     }
 
     fn paths(v: &[&str]) -> SearchFilter {
@@ -1118,9 +1228,18 @@ mod tests {
     fn include_languages_numbered_from_two() {
         let (sql, binds) = build_search_query(
             guid(),
-            &req(Some(langs(vec![ProgrammingLanguage::Rust, ProgrammingLanguage::Python])), None),
+            &req(
+                Some(langs(vec![
+                    ProgrammingLanguage::Rust,
+                    ProgrammingLanguage::Python,
+                ])),
+                None,
+            ),
         );
-        assert!(sql.contains("f.programming_language IN (?2, ?3)"), "sql was: {sql}");
+        assert!(
+            sql.contains("f.programming_language IN (?2, ?3)"),
+            "sql was: {sql}"
+        );
         assert_eq!(
             binds,
             vec![
@@ -1133,7 +1252,8 @@ mod tests {
 
     #[test]
     fn include_paths_use_glob_or() {
-        let (sql, binds) = build_search_query(guid(), &req(Some(paths(&["src/**", "tests/**"])), None));
+        let (sql, binds) =
+            build_search_query(guid(), &req(Some(paths(&["src/**", "tests/**"])), None));
         assert!(
             sql.contains("c.file_path GLOB ?2 OR c.file_path GLOB ?3"),
             "sql was: {sql}"
@@ -1156,8 +1276,14 @@ mod tests {
             programming_languages: Some(vec![ProgrammingLanguage::Go, ProgrammingLanguage::Sql]),
         };
         let (sql, binds) = build_search_query(guid(), &req(Some(inc), None));
-        assert!(sql.contains("f.programming_language IN (?2, ?3)"), "sql was: {sql}");
-        assert!(sql.contains("c.file_path GLOB ?4 OR c.file_path GLOB ?5"), "sql was: {sql}");
+        assert!(
+            sql.contains("f.programming_language IN (?2, ?3)"),
+            "sql was: {sql}"
+        );
+        assert!(
+            sql.contains("c.file_path GLOB ?4 OR c.file_path GLOB ?5"),
+            "sql was: {sql}"
+        );
         assert_eq!(
             binds,
             vec![
@@ -1172,16 +1298,24 @@ mod tests {
 
     #[test]
     fn exclude_languages_use_not_in() {
-        let (sql, _) =
-            build_search_query(guid(), &req(None, Some(langs(vec![ProgrammingLanguage::Json]))));
-        assert!(sql.contains("f.programming_language NOT IN (?2)"), "sql was: {sql}");
+        let (sql, _) = build_search_query(
+            guid(),
+            &req(None, Some(langs(vec![ProgrammingLanguage::Json]))),
+        );
+        assert!(
+            sql.contains("f.programming_language NOT IN (?2)"),
+            "sql was: {sql}"
+        );
     }
 
     #[test]
     fn exclude_paths_are_negated() {
         let (sql, binds) = build_search_query(guid(), &req(None, Some(paths(&["vendor/**"]))));
         assert!(sql.contains("NOT (c.file_path GLOB ?2)"), "sql was: {sql}");
-        assert_eq!(binds, vec![Bind::Guid(guid()), Bind::Path("vendor/**".into())]);
+        assert_eq!(
+            binds,
+            vec![Bind::Guid(guid()), Bind::Path("vendor/**".into())]
+        );
     }
 
     #[test]
@@ -1194,7 +1328,10 @@ mod tests {
                 Some(paths(&["target/**"])),
             ),
         );
-        assert!(sql.contains("f.programming_language IN (?2)"), "sql was: {sql}");
+        assert!(
+            sql.contains("f.programming_language IN (?2)"),
+            "sql was: {sql}"
+        );
         assert!(sql.contains("NOT (c.file_path GLOB ?3)"), "sql was: {sql}");
         assert_eq!(
             binds,
