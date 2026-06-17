@@ -29,6 +29,13 @@ is *not done* or *deliberately constrained*.
 
 ## Future work
 
+- **Performance benchmarks for large-codebase indexing.** The "fast indexing"
+  claim is so far unmeasured — no reproducible benchmark suite exists. Needed
+  before quoting any numbers.
+- **Cloud-GPU deployment template for the embedder.** Running `embedder/` on a
+  remote GPU (and pointing mindex at it via `--model-server`) is a supported use
+  case for machines without a local GPU, but there is no ready-made template
+  (Dockerfile / deployment manifest) for it yet.
 - **Languages awaiting upstream `tree-sitter ≥ 0.23` grammar crates** (older
   crates cause a native `links` conflict and cannot be added yet): `yaml`,
   `toml`, `kotlin`, `lua`, `elixir`, `nix`, `erlang`, `swift`. Add via the
