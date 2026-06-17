@@ -58,6 +58,7 @@ background GC. Project isolation is one Qdrant collection per project plus a SQL
 | **mindex-index** (`tools/indexer/`) | CLI that walks a directory tree and uploads files for indexing (`--concurrency`, glob include/exclude, live progress). |
 | **mindex-search.sh** (`tools/search/`) | Terminal search frontend: a query in, syntax-highlighted matches out. Configurable by flags or `MINDEX_*` env vars. |
 | **mindex-mcp** (`tools/mcp/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/README.md`](tools/mcp/README.md). |
+| **mindex-digest** (`tools/digest/`) | Second MCP server: a **token-saving** layer over the same search API. The agent sends a few decomposed sub-queries, a local LLM reads the chunks and returns only a compact summary + `file:line` pointers, so raw code never enters the agent's context — roughly an order-of-magnitude less context than raw search on a survey. Orient with `digest`, then follow its pointers with raw `search` for exact code. See [`tools/digest/README.md`](tools/digest/README.md). |
 
 ## Running
 

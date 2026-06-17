@@ -36,6 +36,7 @@ tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tes
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
 tools/search/           mindex-search.sh (bash) — search frontend (flags + MINDEX_* env)
 tools/mcp/              mindex-mcp (Python/Poetry) — MCP stdio server; search + live-index for a coding agent
+tools/digest/           mindex-digest (Python/Poetry) — MCP stdio server; token-saving digest (decomposed queries → local-LLM summary)
 embedder/               vendored BGE-M3 server (3 heads); host-run + GPU, NOT in the image — see embedder/README.md
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
@@ -272,14 +273,26 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   over its variable. (The old `mindex-search-edit` POSIX-sh wrapper was folded in.)
 - **`tools/mcp/` (`mindex-mcp`, Python/Poetry)** — MCP stdio server (sibling of the
   CLIs; hits the same HTTP API). The **intended primary way an agent drives mindex**:
-  `search` to understand code cheaply (top-5 cap fixed in the adapter — the model
-  can't raise it), `index_files`/`delete_files` to keep the index live as it edits.
+  `search` for precise code to read or edit (top-5 cap fixed in the adapter — the
+  model can't raise it), `index_files`/`delete_files` to keep the index live as it
+  edits.
   Live reindex is meant to be called freely — unchanged files are hash-skipped
   server-side — but `index_files` carries full bodies, so it is **only** for the few
   files just touched, passed **verbatim**; a *bulk* (re)index or path-exclude job goes
   through `mindex-index`, not a loop of `index_files`. Reads the project GUID from a
   repo-root `.mindex` file (gitignored). No network at handshake (connects even with
   mindex down). See `tools/mcp/README.md`.
+- **`tools/digest/` (`mindex-digest`, Python/Poetry)** — second MCP server, a
+  **token-economy** layer in front of the same `/search` API: the agent sends 2-4
+  decomposed sub-queries, a local LLM (Ollama, default `qwen2.5:14b`) reads the
+  matching chunks and returns only a compact summary + `[path:start-end]` pointers,
+  so raw code never enters the agent's context (roughly an order-of-magnitude context
+  saving on a survey). It's the **cheap-breadth half**; `mindex-mcp`'s raw `search`
+  is the **paid-precision half** — orient with `digest`, then follow its pointers with
+  `search` for exact code. Recall is governed by `DIGEST_MAX_CHUNKS`/`DIGEST_NUM_CTX`,
+  which **must move together**: too small a `num_ctx` silently truncates the digester's
+  prompt and drops the lowest-scored long-tail chunks. mindex is untouched and the
+  layer is fully removable. See `tools/digest/README.md`.
 
 ## Docker & CI
 

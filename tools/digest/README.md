@@ -28,7 +28,21 @@ your decomposed queries  →  concurrent mindex /search  →  dedup + glue (Pyth
 This is the inverse of `tools/mcp`'s raw `search`: that returns verbatim chunks (for
 code you intend to *edit*); `digest` returns a briefing (for *understanding*). Use
 `digest` to orient, then follow its `sources` with raw `search` when you need exact
-code.
+code. In practice this is roughly an **order-of-magnitude context saving** on a
+survey — e.g. orienting in a multi-file mechanism through one `digest` returns a
+short briefing + pointers instead of the ~20 full code chunks several raw searches
+would dump into the agent's window.
+
+### Two regimes (from real use)
+
+- **Orientation** ("how does X work", "where is Y") — one `digest` usually suffices;
+  this is where the order-of-magnitude saving lands.
+- **Implementation** (you must touch a *complete* set of call-sites and copy exact
+  patterns) — treat the digest as a *map, not the answer*. The score-capped glue can
+  drop a long-tail must-have chunk and the cheap model can misattribute a pattern, so
+  escalate raw `search` for anything the summary doesn't explicitly cover — and when
+  it admits a chunk "isn't shown", take that as a precise escalation cue. Recall here
+  is governed by `DIGEST_MAX_CHUNKS` / `DIGEST_NUM_CTX` (raise them together).
 
 ## The `digest` tool
 
@@ -88,8 +102,9 @@ Digest side:
 | ---------------------- | ------------------------ | ------------------------------------------------------------ |
 | `OLLAMA_HOST`          | `http://localhost:11434` | Ollama base URL                                              |
 | `DIGEST_MODEL`         | `qwen2.5:14b`            | model used to summarise (must be pulled in Ollama)           |
-| `DIGEST_PER_QUERY_K`   | `6`                      | chunks pulled from mindex per sub-query (raw, unseen by you) |
-| `DIGEST_MAX_CHUNKS`    | `12`                     | cap after dedup, before the local LLM (bounds its context)   |
+| `DIGEST_PER_QUERY_K`   | `6`                      | chunks pulled from mindex per sub-query (raw, unseen by you); raise it (e.g. `10`) so a wider cap can actually be filled |
+| `DIGEST_MAX_CHUNKS`    | `32`                     | cap after dedup, before the local LLM. Higher = better recall (keeps long-tail must-have chunks) at the cost of a bigger local prompt — **must be matched by `DIGEST_NUM_CTX`** |
+| `DIGEST_NUM_CTX`       | `24576`                  | Ollama context for the digest pass. Must hold `DIGEST_MAX_CHUNKS` chunks (each ≤512 tok) or Ollama **silently truncates** the prompt, dropping the lowest-scored long-tail chunks. ≈ `MAX_CHUNKS × 540 + 1.5k`; for 64 chunks use ~`32768` |
 
 Set **one** of `MINDEX_NO_VERIFY=1` or `MINDEX_CACERT` (mindex serves a self-signed cert).
 

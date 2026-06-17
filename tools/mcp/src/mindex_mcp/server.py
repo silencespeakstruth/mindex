@@ -94,6 +94,11 @@ def search(project_guid: str, query: str) -> list[dict]:
     line range, and score. Prefer several focused queries over one broad one,
     and refine follow-up queries based on what earlier ones surfaced.
 
+    This is the precision half of the workflow — exact code to reason about, to
+    edit, or to complete a `mindex-digest` briefing. For broad "how does X work"
+    understanding, prefer the `mindex-digest` tool: it offloads the bulk reading
+    to a local model and spends roughly an order of magnitude fewer of your tokens.
+
     Args:
         project_guid: The project's mindex GUID (e.g. from a repo-root .mindex file).
         query: What to look for, in natural language or code terms.

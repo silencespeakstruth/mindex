@@ -44,7 +44,14 @@ DIGEST_MODEL = os.environ.get("DIGEST_MODEL", "qwen2.5:14b")
 PER_QUERY_K = int(os.environ.get("DIGEST_PER_QUERY_K", "6"))
 # ...then capped (after dedup, by score) before going to the local LLM, so a wide
 # decomposition can't blow the digester's context or stall generation.
-MAX_CHUNKS = int(os.environ.get("DIGEST_MAX_CHUNKS", "12"))
+MAX_CHUNKS = int(os.environ.get("DIGEST_MAX_CHUNKS", "32"))
+# Ollama context window for the digest pass. It MUST hold MAX_CHUNKS chunks (each
+# ≤512 tokens by the slicer) plus system/query/answer overhead, or Ollama silently
+# truncates the prompt — and truncation drops the *lowest-scored* chunks, exactly
+# the long-tail must-haves that raising MAX_CHUNKS was meant to keep. Budget rule:
+# ≈ MAX_CHUNKS × ~540 + ~1.5k headroom (32 → ~24k). Larger = more RAM/VRAM and
+# slower generation (markedly so on CPU). For MAX_CHUNKS=64, raise this to ~32768.
+NUM_CTX = int(os.environ.get("DIGEST_NUM_CTX", "24576"))
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -121,7 +128,9 @@ async def _ollama_digest(prompt: str) -> str:
         ],
         "stream": False,
         # Low temperature: this is extraction/summarisation, not creative writing.
-        "options": {"temperature": 0.1},
+        # num_ctx must fit MAX_CHUNKS worth of code or Ollama truncates the prompt
+        # (silently dropping the lowest-scored, long-tail chunks).
+        "options": {"temperature": 0.1, "num_ctx": NUM_CTX},
     }
     # Generation on a 14B local model is the slow leg — be generous.
     try:
@@ -137,30 +146,35 @@ async def _ollama_digest(prompt: str) -> str:
 
 
 _INSTRUCTIONS = """\
-mindex-digest is a TOKEN-ECONOMY optimisation. Its entire purpose is to let you
+mindex-digest is a TOKEN-ECONOMY optimisation. Its whole purpose is to let you
 understand parts of a codebase while spending as few of your own (expensive) tokens
 as possible: you send a few short sub-queries, a cheap local LLM reads the matching
 code for you, and only a compact summary plus `file:line` pointers come back. The
-raw code never enters your context — that is where the saving comes from.
+raw code never enters your context — that is where the saving comes from. In typical
+use this offload cuts the context spent on a survey by roughly an order of magnitude
+versus pulling the equivalent raw chunks.
 
-You are the orchestrator. The cost/quality trade-off is YOUR call to make on every
-question, not a fixed rule:
-  - Reach for `digest` first when the goal is orientation or breadth — "how does X
-    work", "where is Y configured", "what touches Z", surveying an unfamiliar area.
-    You pay for crumbs in and a digest out; the bulk reading runs free on local
-    hardware.
-  - Escalate to verbatim detail only where it earns the tokens. The digest cites
-    `[path:start-end]` sources; when you actually need exact code to reason about or
-    EDIT, follow those pointers with the raw `search` tool — and pull in only the
-    specific chunks that matter, not the whole area.
-Treat it as a funnel: digest broad and cheap to locate what matters, then spend
-real tokens narrowly. A vague digest is a signal to refine your sub-queries, not to
-immediately fall back to reading raw files.
+You are the orchestrator; the cost/quality call is YOURS. Two regimes, from real use:
 
-Use it IN TANDEM with the mindex `search` tool — they are two halves of one
-workflow, and the token saving only materialises when you actually route the cheap,
-broad part here instead of reading raw chunks by reflex. `digest` = cheap breadth;
-raw `search` = paid precision.
+  - ORIENTATION / BREADTH — "how does X work", "where is Y configured", "what touches
+    Z", surveying unfamiliar code. Reach for `digest` first; this is where it pays off
+    most and usually needs no follow-up. Crumbs in, one briefing out, bulk reading
+    free on local hardware.
+
+  - IMPLEMENTATION / EDIT — you must hit a *complete* set of call-sites and copy exact
+    patterns. Digest first to map the area, but do NOT treat the summary as complete:
+    the score-capped glue can drop a long-tail must-have chunk, and the cheap model
+    can misattribute (e.g. cite a test helper as the production pattern). So escalate
+    raw `search` for every required aspect the summary did not explicitly cover; treat
+    a "the chunks don't cover X" admission as a precise escalation cue, not noise; and
+    never copy code structure from the digest prose — confirm exact code with raw
+    `search` before editing.
+
+Treat it as a funnel: digest broad and cheap to locate what matters, then spend real
+tokens narrowly via raw `search`. digest = cheap breadth; raw `search` = paid
+precision — two halves of one workflow. The saving only materialises when you route
+the broad part here instead of reading raw chunks by reflex. A vague digest means
+refine your sub-queries, not fall back to raw files wholesale.
 
 How to call it: break your intent into 2-4 short natural-language sub-queries (query
 decomposition — the cheap part, which you are good at) and pass them as `queries`.
@@ -182,6 +196,12 @@ async def digest(project_guid: str, queries: list[str]) -> dict:
     the tokens, follow the cited `sources` with the raw `search` tool for verbatim
     code (e.g. before editing). digest = cheap breadth; raw search = paid precision;
     use the two together. You decide the cost/quality balance per question.
+
+    For pure understanding one digest usually suffices. For an edit/implementation
+    task treat the summary as a map, not the full answer: it can omit a long-tail
+    must-have chunk or misattribute a pattern, so escalate raw `search` for any
+    required detail it doesn't explicitly cover (a "not shown" admission is a cue),
+    and confirm exact code before copying it.
 
     Pass 2-4 short sub-queries (your decomposition of one intent). The server
     searches mindex for each concurrently, dedups and glues the raw chunks in a
