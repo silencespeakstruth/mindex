@@ -92,6 +92,24 @@ def test_stats_404_for_unknown_project(client: httpx.Client, project: str) -> No
     assert stats(client, project).status_code == 404
 
 
+def test_projects_list_includes_indexed_project(
+    client: httpx.Client, project: str
+) -> None:
+    # Absent before indexing (other tests' projects may be present — assert on ours).
+    before = client.get(f"{MINDEX_URL}/projects").json()["projects"]
+    assert all(p["project_guid"] != project for p in before)
+
+    index_files(client, project, {"rust": {"a.rs": RUST_V1}})
+
+    after = {
+        p["project_guid"]: p
+        for p in client.get(f"{MINDEX_URL}/projects").json()["projects"]
+    }
+    assert project in after, after
+    assert after[project]["files"] >= 1
+    assert after[project]["active_chunks"] >= 1
+
+
 def test_reindex_shows_deleted_chunks_until_gc(
     client: httpx.Client, project: str
 ) -> None:

@@ -41,6 +41,10 @@ services:
       - --model-server=http://host.docker.internal:11211
       # Chunks per /encode call — the GPU-batch lever; match the embedder's --batch.
       - --embed-batch=1024
+      # Connection pool: the indexer's --concurrency must stay <= this (the pool
+      # errors when exhausted, it doesn't block). 10 leaves headroom over 8 indexer
+      # workers for the GC/retry background workers.
+      - --db-pool-size=10
     depends_on:
       - qdrant
     restart: unless-stopped

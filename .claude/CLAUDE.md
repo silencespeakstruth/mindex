@@ -96,8 +96,10 @@ collection last so a retry re-attempts it), idempotent 204. `DELETE
 /projects/{guid}/files` is a **soft delete** — its search `include`/`exclude`
 selector goes in the **request body** (globs don't fit the path); it marks
 files+chunks `deleted` for GC, returns 204 if none matched else 200+count, and
-rejects an empty selector (400) so it can't wipe the project. `GET /projects/{guid}`
-(stats) and `POST /gc` (one synchronous GC pass) round it out.
+rejects an empty selector (400) so it can't wipe the project. `GET /projects` (list
+all, summary counts), `GET /projects/{guid}` (per-language stats), `POST /gc` (one
+synchronous GC pass), `GET /health` (pings SQLite + Qdrant + embedder, reports files
+indexing) and `GET /version` round it out.
 
 **FK is RESTRICT.** `project_file_chunks → project_files` is `ON DELETE RESTRICT`.
 Never delete a `project_files` row while chunks exist; mark chunks deleted (let GC

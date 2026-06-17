@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::backend::v0::handlers::{
-    delete_files, delete_project, get_health, get_project_stats, get_version, post_gc, post_index,
-    post_search,
+    delete_files, delete_project, get_health, get_project_stats, get_projects, get_version, post_gc,
+    post_index, post_search,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -61,6 +61,7 @@ pub async fn run(
     let router = Router::new()
         .route("/v0/{project_guid}/index", post(post_index))
         .route("/v0/{project_guid}/search", post(post_search))
+        .route("/projects", get(get_projects))
         .route(
             "/projects/{project_guid}",
             get(get_project_stats).delete(delete_project),

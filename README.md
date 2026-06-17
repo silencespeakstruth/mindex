@@ -115,6 +115,7 @@ All endpoints are HTTPS. TLS is the only transport security — there is **no AP
 |---------------|---------|
 | `POST /v0/{project}/index` | Index/reindex files (JSON: `{files: {lang: {path: {code}}}}`). |
 | `POST /v0/{project}/search` | Hybrid search; returns top-k chunks with scores. |
+| `GET /projects` | List all projects with summary counts. |
 | `GET /projects/{project}` | Stats: files by status, chunks per language. |
 | `DELETE /projects/{project}` | Hard-delete a project (rows + Qdrant collection). |
 | `DELETE /projects/{project}/files` | Soft-delete files by an include/exclude selector (body). |

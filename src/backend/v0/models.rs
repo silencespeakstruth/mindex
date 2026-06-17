@@ -237,6 +237,21 @@ pub struct ProjectStats {
     pub chunks: HashMap<String, ChunkCounts>,
 }
 
+/// One row of `GET /projects` — a compact per-project summary (full per-language
+/// breakdown is `GET /projects/{guid}`).
+#[derive(Serialize, Debug)]
+pub struct ProjectSummary {
+    pub project_guid: String,
+    pub files: i64,
+    pub indexing: i64,
+    pub active_chunks: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ProjectSummary>,
+}
+
 #[derive(Serialize, Debug)]
 pub struct GcResponse {
     pub chunks_removed: usize,

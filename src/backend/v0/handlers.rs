@@ -14,6 +14,8 @@ use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
 use crate::backend::v0::models::HealthChecks;
 use crate::backend::v0::models::HealthResponse;
+use crate::backend::v0::models::ProjectListResponse;
+use crate::backend::v0::models::ProjectSummary;
 use crate::backend::v0::models::VersionResponse;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::ProgrammingLanguage;
@@ -851,6 +853,51 @@ pub async fn post_search(
 }
 
 // ─── Management endpoints ───────────────────────────────────────────────────
+
+/// `GET /projects` — every known project with a compact summary (file count, files
+/// currently indexing, active chunks). Empty list when nothing has been indexed.
+#[debug_handler]
+pub async fn get_projects(
+    State(s): State<RouterState>,
+) -> Result<Json<ProjectListResponse>, ErrorResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+
+    let projects = s
+        .db_pool
+        .transaction(guard.0.child_token(), |tx| {
+            let mut stmt = tx.prepare(
+                "SELECT p.guid,
+                        (SELECT COUNT(*) FROM project_files f
+                          WHERE f.project_guid = p.guid) AS files,
+                        (SELECT COUNT(*) FROM project_files f
+                          WHERE f.project_guid = p.guid AND f.status = 'indexing') AS indexing,
+                        (SELECT COUNT(*) FROM project_file_chunks c
+                          WHERE c.project_guid = p.guid AND c.status = 'active') AS active_chunks
+                 FROM projects p
+                 GROUP BY p.guid
+                 ORDER BY p.guid",
+            )?;
+            stmt.query_map([], |r| {
+                Ok(ProjectSummary {
+                    project_guid: r.get::<_, String>(0)?,
+                    files: r.get::<_, i64>(1)?,
+                    indexing: r.get::<_, i64>(2)?,
+                    active_chunks: r.get::<_, i64>(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SQLite3PoolError::from)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = %e, "Failed to list projects from SQLite.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(ProjectListResponse { projects }))
+}
 
 /// `GET /projects/{guid}` — aggregate counts: `project_files` by status, and chunks
 /// per language split into active vs soft-deleted (pending GC). 404 if the project
