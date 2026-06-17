@@ -9,6 +9,8 @@ __pycache__/
 
 *.db*
 
+.mindex
+
 certs/
 
 .claude/settings.local.json
