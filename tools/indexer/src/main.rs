@@ -7,11 +7,13 @@ use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use client::{Code, IndexRequest, IndexResponse, upload_batch};
-use scanner::{Language, ScanResult, scan};
+use scanner::{FileEntry, Language, ScanResult, scan};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -25,7 +27,13 @@ Walk a directory tree, detect source-code files by extension, and stream them\n\
 to a mindex server in batches. Files whose content has not changed since the\n\
 last index run are skipped automatically (server-side hash check).\n\
 \n\
-Cancellation: press Ctrl+C at any time. The in-flight batch request is dropped\n\
+With --concurrency > 1 the files are split across independent worker streams\n\
+that upload in parallel, each shown as its own progress bar. While one stream\n\
+waits on the server's GPU-bound embedding, the others keep its CPU-bound slicer\n\
+busy — so the wall time drops toward the slowest single stream instead of the\n\
+sum of all of them.\n\
+\n\
+Cancellation: press Ctrl+C at any time. In-flight batch requests are dropped\n\
 immediately; the server cancels the corresponding work and returns HTTP 499."
 )]
 struct Cli {
@@ -64,9 +72,49 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     batch_size: usize,
 
+    /// Number of parallel upload streams. Files are split evenly across this
+    /// many workers, each uploading one batch at a time and drawn as its own
+    /// progress bar. Parallelism overlaps the server's CPU-bound slicing of one
+    /// stream with the GPU-bound embedding of another, so it speeds up indexing
+    /// even though the embedder itself processes batches one at a time.
+    ///
+    /// Default: the machine's logical CPU count, capped at 4.
+    ///
+    /// Ceiling — keep this at or below the server's --db-pool-size (default 4):
+    /// the connection pool does not block when exhausted, it errors, and it is
+    /// shared with the server's background workers. Each stream holds at most
+    /// one connection at a time, so streams ≤ pool size fit; setting it higher
+    /// makes batches fail with PoolEmpty and get retried, which is slower, not
+    /// faster. To go above 4, raise the server's --db-pool-size to match.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
+
     /// Print one line per file showing chunk count or "unchanged"
     #[arg(short, long)]
     verbose: bool,
+}
+
+fn default_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(1)
+}
+
+// ─── Shared progress state (atomics, read by the footer ticker) ─────────────────
+
+#[derive(Default)]
+struct Shared {
+    files_done: AtomicU64,
+    chunks: AtomicU64,
+    errors: AtomicU64,
+    active: AtomicUsize,
+}
+
+#[derive(Default)]
+struct WorkerStats {
+    new_chunks: u64,
+    too_short: u64,
+    errors: usize,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -74,6 +122,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let concurrency = cli.concurrency.unwrap_or_else(default_concurrency).max(1);
 
     // Wire Ctrl+C to a CancellationToken so in-flight requests are dropped cleanly.
     let cancel = CancellationToken::new();
@@ -81,7 +130,6 @@ async fn main() -> Result<()> {
         let c = cancel.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            // Print a blank line so the progress bar is not overwritten by ^C.
             eprintln!();
             c.cancel();
         });
@@ -92,11 +140,15 @@ async fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot access root: {}", cli.root.display()))?;
 
-    // ── Header ──────────────────────────────────────────────────────────────
+    // ── Header (table-aligned: labels padded to a common width) ───────────────
     eprintln!();
-    eprintln!("  {}    {}", style("server").dim(), style(&cli.server).cyan());
-    eprintln!("  {}   {}", style("project").dim(), style(&cli.project).cyan());
-    eprintln!("  {}      {}", style("root").dim(), style(root.display()).cyan());
+    let row = |label: &str, value: String| {
+        eprintln!("  {}  {}", style(format!("{label:<7}")).dim(), style(value).cyan());
+    };
+    row("server", cli.server.clone());
+    row("project", cli.project.clone());
+    row("root", root.display().to_string());
+    row("threads", concurrency.to_string());
     eprintln!();
 
     // ── Scan ────────────────────────────────────────────────────────────────
@@ -120,30 +172,167 @@ async fn main() -> Result<()> {
 
     print_scan_summary(&scan);
 
-    // ── HTTP client ─────────────────────────────────────────────────────────
-    let http = reqwest::ClientBuilder::new()
-        .danger_accept_invalid_certs(cli.no_verify)
-        .build()
-        .context("failed to build HTTP client")?;
+    // ── HTTP client (shared by every worker) ──────────────────────────────────
+    let http = Arc::new(
+        reqwest::ClientBuilder::new()
+            .danger_accept_invalid_certs(cli.no_verify)
+            .build()
+            .context("failed to build HTTP client")?,
+    );
 
-    // ── Upload batches ───────────────────────────────────────────────────────
     let total = scan.files.len();
-    let pb = progress_bar(total as u64);
+
+    // ── Warm-up: create the project row + Qdrant collection once, before fan-out.
+    // post_index ensures both before it looks at the file map, so an empty request
+    // has no side effects beyond that — this removes the create-collection race
+    // that concurrent first requests would otherwise hit.
+    if !cancel.is_cancelled() {
+        upload_batch(
+            &http,
+            &cli.server,
+            &cli.protocol,
+            &cli.project,
+            IndexRequest { files: HashMap::new() },
+            &cancel,
+        )
+        .await
+        .context("warm-up request failed (server unreachable, bad project GUID, or TLS?)")?;
+    }
+
+    // ── Shard files round-robin across workers (even file counts) ──────────────
+    let n_workers = concurrency.min(total).max(1);
+    let mut shards: Vec<Vec<FileEntry>> = (0..n_workers).map(|_| Vec::new()).collect();
+    for (i, f) in scan.files.into_iter().enumerate() {
+        shards[i % n_workers].push(f);
+    }
+
+    // ── One unified progress bar for the whole job. Workers are homogeneous
+    // (each just drains its shard), so per-worker bars are noise — a single
+    // bar (green = done, red = remaining) plus a compact status message in it
+    // carries everything that matters. Workers only bump the shared counters;
+    // the ticker below turns those into the bar's position + message. ─────────
+    let shared = Arc::new(Shared::default());
     let t0 = Instant::now();
+    let bar = aggregate_bar(total as u64);
 
-    let mut new_chunks: u64 = 0;
-    let mut n_no_chunks: u64 = 0;
-    let mut n_errors: usize = 0;
-    let mut n_done: usize = 0;
+    let mut handles = Vec::with_capacity(n_workers);
+    for shard in shards {
+        let bar = bar.clone();
+        let http = http.clone();
+        let shared = shared.clone();
+        let cancel = cancel.clone();
+        let server = cli.server.clone();
+        let protocol = cli.protocol.clone();
+        let project = cli.project.clone();
+        let batch_size = cli.batch_size;
+        let verbose = cli.verbose;
+        handles.push(tokio::spawn(async move {
+            run_worker(
+                shard, bar, http, server, protocol, project, batch_size, verbose, cancel, shared,
+            )
+            .await
+        }));
+    }
 
-    'batches: for batch in scan.files.chunks(cli.batch_size) {
+    // ── Drive the bar from the shared counters. Position updates every tick;
+    // the speed line is the cumulative average (total chunks / elapsed) rather
+    // than a windowed rate, so it stays stable instead of collapsing to zero
+    // during the prepare-heavy gaps between embed bursts. ETA uses the same
+    // cumulative file rate. ────────────────────────────────────────────────────
+    let total_files = total as u64;
+    let tick_stop = CancellationToken::new();
+    let ticker = {
+        let bar = bar.clone();
+        let shared = shared.clone();
+        let stop = tick_stop.clone();
+        tokio::spawn(async move {
+            loop {
+                let done = shared.files_done.load(Ordering::Relaxed);
+                let chunks = shared.chunks.load(Ordering::Relaxed);
+                let active = shared.active.load(Ordering::Relaxed);
+                let errs = shared.errors.load(Ordering::Relaxed);
+
+                bar.set_position(done);
+
+                let elapsed = t0.elapsed().as_secs_f64();
+                let chunks_per_s = if elapsed > 0.0 { chunks as f64 / elapsed } else { 0.0 };
+                let files_per_s = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let remaining = total_files.saturating_sub(done);
+                let eta = if files_per_s > 0.0 {
+                    remaining as f64 / files_per_s
+                } else {
+                    f64::INFINITY
+                };
+                bar.set_message(format!(
+                    "{chunks_per_s:.0} chunks/s · ETA {} · {chunks} chunks · {active} active{}",
+                    fmt_eta(eta),
+                    if errs > 0 { format!(" · {errs} err") } else { String::new() },
+                ));
+
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                }
+            }
+        })
+    };
+
+    // ── Join workers, sum stats ────────────────────────────────────────────────
+    let mut totals = WorkerStats::default();
+    for h in handles {
+        if let Ok(s) = h.await {
+            totals.new_chunks += s.new_chunks;
+            totals.too_short += s.too_short;
+            totals.errors += s.errors;
+        }
+    }
+    tick_stop.cancel();
+    let _ = ticker.await;
+    bar.finish_and_clear();
+
+    // ── Summary ──────────────────────────────────────────────────────────────
+    print_summary(
+        t0.elapsed(),
+        total,
+        totals.new_chunks,
+        totals.too_short,
+        totals.errors,
+        cancel.is_cancelled(),
+    );
+
+    if cancel.is_cancelled() || totals.errors > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ─── Worker ─────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)] // a worker just needs all the request inputs
+async fn run_worker(
+    shard: Vec<FileEntry>,
+    bar: ProgressBar,
+    http: Arc<reqwest::Client>,
+    server: String,
+    protocol: String,
+    project: String,
+    batch_size: usize,
+    verbose: bool,
+    cancel: CancellationToken,
+    shared: Arc<Shared>,
+) -> WorkerStats {
+    shared.active.fetch_add(1, Ordering::Relaxed);
+    let mut stats = WorkerStats::default();
+
+    'batches: for batch in shard.chunks(batch_size.max(1)) {
         if cancel.is_cancelled() {
             break;
         }
 
         // ── Read files (skip binary / unreadable) ────────────────────────
         let mut req_files: HashMap<String, HashMap<String, Code>> = HashMap::new();
-        let mut readable: usize = 0;
+        let mut readable: u64 = 0;
 
         for f in batch {
             match tokio::fs::read_to_string(&f.abs_path).await {
@@ -155,11 +344,11 @@ async fn main() -> Result<()> {
                     readable += 1;
                 }
                 Err(err) => {
-                    n_errors += 1;
-                    n_done += 1;
-                    pb.inc(1);
-                    if cli.verbose {
-                        pb.println(format!(
+                    stats.errors += 1;
+                    shared.errors.fetch_add(1, Ordering::Relaxed);
+                    shared.files_done.fetch_add(1, Ordering::Relaxed);
+                    if verbose {
+                        bar.println(format!(
                             "  {} {}  {}",
                             style("✗").red(),
                             f.rel_path,
@@ -174,29 +363,32 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // ── Upload ───────────────────────────────────────────────────────
         match upload_batch(
             &http,
-            &cli.server,
-            &cli.protocol,
-            &cli.project,
+            &server,
+            &protocol,
+            &project,
             IndexRequest { files: req_files },
             &cancel,
         )
         .await
         {
             Ok(resp) => {
-                tally_response(&resp, &mut new_chunks, &mut n_no_chunks);
-                if cli.verbose {
-                    print_verbose(&pb, &resp);
+                let (chunks, too_short) = tally_response(&resp);
+                stats.new_chunks += chunks;
+                stats.too_short += too_short;
+                shared.chunks.fetch_add(chunks, Ordering::Relaxed);
+                if verbose {
+                    print_verbose(&bar, &resp);
                 }
             }
             Err(e) => {
                 if cancel.is_cancelled() {
                     break 'batches;
                 }
-                n_errors += readable;
-                pb.println(format!(
+                stats.errors += readable as usize;
+                shared.errors.fetch_add(readable, Ordering::Relaxed);
+                bar.println(format!(
                     "  {} batch error: {}",
                     style("✗").red(),
                     style(e.to_string()).red().dim(),
@@ -204,21 +396,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        n_done += readable;
-        pb.set_position(n_done as u64);
-        pb.set_message(format!("{new_chunks} chunks"));
+        shared.files_done.fetch_add(readable, Ordering::Relaxed);
     }
 
-    pb.finish_and_clear();
-
-    // ── Summary ──────────────────────────────────────────────────────────────
-    print_summary(t0.elapsed(), total, new_chunks, n_no_chunks, n_errors, cancel.is_cancelled());
-
-    if cancel.is_cancelled() || n_errors > 0 {
-        std::process::exit(1);
-    }
-
-    Ok(())
+    shared.active.fetch_sub(1, Ordering::Relaxed);
+    stats
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -235,15 +417,31 @@ fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-fn progress_bar(total: u64) -> ProgressBar {
+fn aggregate_bar(total: u64) -> ProgressBar {
     let pb = ProgressBar::new(total);
+    // Full terminal width via {wide_bar}; the file count rides at the end of the
+    // bar line, the live speed/ETA on a second line.
     pb.set_style(
-        ProgressStyle::with_template("  [{bar:44.green/white}] {pos}/{len}  {msg}")
+        ProgressStyle::with_template("  [{wide_bar:.green/red}] {pos}/{len} files\n  {msg}")
             .unwrap()
             .progress_chars("█░"),
     );
-    pb.set_message("0 chunks");
+    pb.set_message("starting…");
     pb
+}
+
+/// Formats a seconds estimate as `m:ss` (or `h:mm:ss`); `—` when unknown.
+fn fmt_eta(secs: f64) -> String {
+    if !secs.is_finite() || secs > 359_999.0 {
+        return "—".to_string();
+    }
+    let s = secs.round() as u64;
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
+    }
 }
 
 fn print_scan_summary(scan: &ScanResult) {
@@ -254,23 +452,27 @@ fn print_scan_summary(scan: &ScanResult) {
     let mut counts: Vec<(Language, usize)> = by_lang.into_iter().collect();
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name().cmp(b.0.name())));
 
-    eprint!("  {} files", style(scan.files.len()).bold());
+    eprintln!("  {} files total:", style(scan.files.len()).bold());
     for (lang, n) in &counts {
-        eprint!("  {}:{}", style(lang.name()).cyan().dim(), n);
+        eprintln!("\t{}: {}", style(lang.name()).cyan().dim(), n);
     }
-    eprintln!("\n");
+    eprintln!();
 }
 
-fn tally_response(resp: &IndexResponse, new_chunks: &mut u64, n_no_chunks: &mut u64) {
+/// Returns (new_chunks, files_with_zero_chunks).
+fn tally_response(resp: &IndexResponse) -> (u64, u64) {
+    let mut new_chunks = 0u64;
+    let mut too_short = 0u64;
     for paths in resp.files.values() {
         for &count in paths.values() {
             if count == 0 {
-                *n_no_chunks += 1;
+                too_short += 1;
             } else {
-                *new_chunks += count;
+                new_chunks += count;
             }
         }
     }
+    (new_chunks, too_short)
 }
 
 fn print_verbose(pb: &ProgressBar, resp: &IndexResponse) {
