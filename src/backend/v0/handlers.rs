@@ -746,38 +746,42 @@ pub async fn post_search(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    Ok(Json(SearchResponse {
-        results: search_hits
-            .iter()
-            .filter_map(|SearchHit { id, score }| {
-                let uuid = match &id.point_id_options {
-                    Some(PointIdOptions::Uuid(uuid)) => uuid,
-                    _ => return None,
-                };
+    let mut results: Vec<SearchResult> = search_hits
+        .iter()
+        .filter_map(|SearchHit { id, score }| {
+            let uuid = match &id.point_id_options {
+                Some(PointIdOptions::Uuid(uuid)) => uuid,
+                _ => return None,
+            };
 
-                let uuid = match Uuid::parse_str(uuid) {
-                    Ok(uuid) => UUIDv4(uuid),
-                    Err(err) => {
-                        warn!(error = ?err, point_id = %uuid, "Qdrant returned a point id that is not a valid UUID; skipping it.");
-                        return None;
-                    }
-                };
+            let uuid = match Uuid::parse_str(uuid) {
+                Ok(uuid) => UUIDv4(uuid),
+                Err(err) => {
+                    warn!(error = ?err, point_id = %uuid, "Qdrant returned a point id that is not a valid UUID; skipping it.");
+                    return None;
+                }
+            };
 
-                let (path, code, start_line, end_line, start_column, end_column) =
-                    chunks.get(&uuid)?;
+            let (path, code, start_line, end_line, start_column, end_column) =
+                chunks.get(&uuid)?;
 
-                Some(SearchResult {
-                    score: *score,
-                    path: path.clone(),
-                    code: code.clone(),
-                    start_line: *start_line as usize,
-                    end_line: *end_line as usize,
-                    start_column: *start_column as usize,
-                    end_column: *end_column as usize,
-                })
+            Some(SearchResult {
+                score: *score,
+                path: path.clone(),
+                code: code.clone(),
+                start_line: *start_line as usize,
+                end_line: *end_line as usize,
+                start_column: *start_column as usize,
+                end_column: *end_column as usize,
             })
-            .collect(),
-    }))
+        })
+        .collect();
+
+    // Guarantee the response is sorted by score (descending), independent of the
+    // order Qdrant's fusion/rerank happens to return.
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    Ok(Json(SearchResponse { results }))
     }
     .instrument(span)
     .await

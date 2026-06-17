@@ -134,6 +134,16 @@ def test_search_finds_python_content(client: httpx.Client, project: str) -> None
     assert any("process_records" in r["code"] for r in results)
 
 
+def test_search_results_sorted_by_score_desc(client: httpx.Client, project: str) -> None:
+    index_files(
+        client, project, {"rust": {"a.rs": RUST_V1, "b.rs": RUST_V2}, "python": {"c.py": PYTHON_SRC}}
+    )
+    resp = search(client, project, "process records batch", top_k=10)
+    assert resp.status_code == 200
+    scores = [r["score"] for r in resp.json()["results"]]
+    assert scores == sorted(scores, reverse=True), scores
+
+
 def test_multi_language_single_request(client: httpx.Client, project: str) -> None:
     resp = index_files(
         client,

@@ -53,6 +53,7 @@ pub async fn run(
     model_client: Arc<dyn BGEm3Model>,
     model_id: String,
     embed_batch: usize,
+    stuck_grace_secs: i64,
     token: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -80,17 +81,21 @@ pub async fn run(
             .transaction(token.clone(), {
                 let model_id = model_id.clone();
                 move |tx| {
+                // The `indexing` grace must exceed the longest legitimate in-flight
+                // request, otherwise the worker races a live batch (which holds its
+                // files in 'indexing' for the whole embed pass) — re-embedding them
+                // one-by-one and tripping illegal status transitions.
                 tx.prepare(
                     "SELECT project_guid, path, model_id
                      FROM project_files
                      WHERE model_id = ?2
                        AND ((status IN ('just_uploaded', 'indexing')
-                             AND status_updated_at < unixepoch() - 300)
+                             AND status_updated_at < unixepoch() - ?3)
                          OR (status = 'failed'
                              AND retry_count < ?1
                              AND status_updated_at < unixepoch() - 60))",
                 )?
-                .query_map(rusqlite::params![MAX_RETRIES, model_id], |row| {
+                .query_map(rusqlite::params![MAX_RETRIES, model_id, stuck_grace_secs], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -158,8 +163,11 @@ async fn retry_file(
         .unwrap_or_default();
 
     if chunks.is_empty() {
-        warn!(%project_guid, %path, "Retry worker: no active chunks found for stuck file; marking 'failed'.");
-        set_file_status(db_pool, project_guid, path, model_id, "failed", true, token.clone()).await;
+        // No active chunks → the file sliced to nothing (too short). The worker can't
+        // re-slice, so mark it 'indexed' (0 chunks) rather than looping it to 'failed'
+        // forever — 'failed'→'indexed' is illegal, so a wrong 'failed' here would trap it.
+        info!(%project_guid, %path, "Retry worker: no active chunks (too short); marking 'indexed'.");
+        set_file_status(db_pool, project_guid, path, model_id, "indexed", false, token.clone()).await;
         return;
     }
 
@@ -371,13 +379,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_with_no_active_chunks_marks_failed() {
+    async fn retry_with_no_active_chunks_marks_indexed() {
         let pool = pool_with_failed_file(0).await;
         let store = Store { fail_upsert: false };
 
         retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
 
-        // indexing → failed (no chunks); retry_count bumped to 2.
-        assert_eq!(current(&pool).await, ("failed".to_string(), 2));
+        // No chunks (too short) → indexing → indexed, retry_count reset. Must NOT be
+        // 'failed' (that would trap it: failed→indexed is an illegal transition).
+        assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
     }
 }

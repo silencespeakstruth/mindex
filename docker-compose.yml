@@ -33,6 +33,8 @@ services:
       - --key-path=/certs/key.pem
       - --qdrant-server=http://qdrant:6334
       - --model-server=http://host.docker.internal:11211
+      # Chunks per /encode call — the GPU-batch lever; match the embedder's --batch.
+      - --embed-batch=1024
     depends_on:
       - qdrant
     restart: unless-stopped

@@ -84,6 +84,12 @@ struct Args {
     /// axum's default is only 2 MB).
     #[arg(long, default_value = "256")]
     max_body_mb: usize,
+
+    /// Minutes a file may sit in 'indexing' before the retry worker treats it as
+    /// crash-orphaned. Must exceed the longest legitimate in-flight request, or the
+    /// worker races live batches. Raise it for very large --batch-size.
+    #[arg(long, default_value = "30")]
+    stuck_grace_mins: i64,
 }
 
 #[tokio::main]
@@ -170,6 +176,7 @@ async fn main() -> Result<(), BoxError> {
         embed_client.clone(),
         model_id.to_string(),
         args.embed_batch,
+        args.stuck_grace_mins * 60,
         retry_token,
     ));
 

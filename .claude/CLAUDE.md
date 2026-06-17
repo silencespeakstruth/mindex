@@ -68,8 +68,15 @@ terminal is reachable only from in-progress work); a new row may only enter as
 `just_uploaded→indexed`) raises `SQLITE_CONSTRAINT_TRIGGER`. So the retry worker
 moves `failed → indexing → {indexed|failed}` (never `failed→failed`). `indexing`
 is committed durably *before* heavy work (crash-recoverable; retry worker picks up
-files stuck ≥5 min). `sha256` is written only when reaching `indexed`; `retry_count`
-resets to 0 there and bumps on each `→failed`. Any status write sets
+files stuck in `indexing` longer than `--stuck-grace-mins`, default **30 min**).
+That grace **must exceed the longest legitimate in-flight request** — cross-file
+batching holds a whole batch's files in `indexing` for the entire embed pass, so a
+too-short grace makes the worker race a live batch (re-embedding its files one by
+one and tripping illegal `indexing→indexed` transitions on the handler's side). A
+stuck file with **no active chunks** (too short → 0 chunks) is marked `indexed`,
+not `failed` (a wrong `failed` would trap it, since `failed→indexed` is illegal).
+`sha256` is written only when reaching `indexed`; `retry_count` resets to 0 there
+and bumps on each `→failed`. Any status write sets
 `status_updated_at = unixepoch()` — use `db::files::set_file_status`, which also
 logs a WARN if the transition is rejected. Every transition is recorded in
 `project_file_status_log` by AFTER-triggers (durable audit trail). A file that
@@ -88,7 +95,9 @@ clean up), then delete the parent.
 
 Collection has three named vectors: `dense` (1024-d cosine), `sparse` (SPLADE-style),
 `colbert` (1024-d cosine, multivector MaxSim). Search: prefetch top-200 dense +
-top-200 sparse → RRF fusion → ColBERT MaxSim rerank → top-k. Sparse weights `≤ 1e-5`
+top-200 sparse → RRF fusion → ColBERT MaxSim rerank → top-k. `post_search` then
+**sorts results by score descending** before responding (don't rely on Qdrant's
+return order). Sparse weights `≤ 1e-5`
 are dropped before upsert. Batch sizes: `--embed-batch` chunks per `/encode` call
 (default 256 — the GPU-load lever, paired with the embedder's own `--batch`), 256
 points per Qdrant upsert/delete (`embed.rs`). Embed-response vector lists are
