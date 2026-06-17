@@ -203,24 +203,35 @@ impl VectorStore for Qdrant {
         let sparse_query: Vec<(u32, f32)> =
             sparse_indices.into_iter().zip(sparse_values).collect();
 
+        // Two-stage retrieval, expressed as a *nested* prefetch — this nesting is
+        // load-bearing. `QueryPointsBuilder` has a single `query` field, so two flat
+        // `.query()` calls would make the second silently overwrite the first; the
+        // RRF fusion would vanish and only the ColBERT rerank would run. Instead the
+        // inner prefetch fuses dense+sparse (RRF) into a 200-candidate pool, and the
+        // outer query reranks that pool with ColBERT MaxSim.
+        let fusion_prefetch = PrefetchQueryBuilder::default()
+            .prefetch(vec![
+                PrefetchQueryBuilder::default()
+                    .query(dense)
+                    .using("dense")
+                    .limit(200u32)
+                    .filter(filter.clone())
+                    .build(),
+                PrefetchQueryBuilder::default()
+                    .query(Query::from(sparse_query))
+                    .using("sparse")
+                    .limit(200u32)
+                    .filter(filter.clone())
+                    .build(),
+            ])
+            .query(Query::new_fusion(Fusion::Rrf))
+            .limit(200u32)
+            .build();
+
         let response = self
             .query(
                 QueryPointsBuilder::new(collection)
-                    .prefetch(vec![
-                        PrefetchQueryBuilder::default()
-                            .query(dense)
-                            .using("dense")
-                            .limit(200u32)
-                            .filter(filter.clone())
-                            .build(),
-                        PrefetchQueryBuilder::default()
-                            .query(Query::from(sparse_query))
-                            .using("sparse")
-                            .limit(200u32)
-                            .filter(filter.clone())
-                            .build(),
-                    ])
-                    .query(Query::new_fusion(Fusion::Rrf))
+                    .prefetch(vec![fusion_prefetch])
                     .query(colbert)
                     .using("colbert")
                     .limit(top_k)
