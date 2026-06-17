@@ -4,6 +4,12 @@ services:
     image: qdrant/qdrant:v1.14.1
     volumes:
       - qdrant_data:/qdrant/storage
+    # Dashboard/REST (6333) + gRPC (6334) published to loopback only — the service
+    # has no auth, so it must not be exposed on all interfaces. mindex itself
+    # reaches Qdrant over the internal compose network, not these host ports.
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     restart: unless-stopped
 
   mindex:
