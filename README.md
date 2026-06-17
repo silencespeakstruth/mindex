@@ -4,13 +4,24 @@ A local-first semantic code search engine built around **[BAAI/bge-m3](https://h
 
 mindex is purpose-built for BGE-M3 and uses **all three of its heads as-is** — dense
 embeddings, SPLADE-style sparse lexical weights, and ColBERT multi-vectors — to do
-true hybrid retrieval (RRF fusion + ColBERT reranking) over your codebase. It is aimed
-at **local use**, including cutting **token and context cost for expensive coding
-agents**: hand the agent the few chunks that actually matter instead of stuffing whole
-files into the prompt.
+true hybrid retrieval (RRF fusion + ColBERT reranking) over your codebase.
+
+**Its primary, first-class mode is as a coding agent's code-search tool over [MCP](https://modelcontextprotocol.io).**
+The point is to let an agent like **Claude Code understand a codebase cheaply**: it
+queries the index and gets back the handful of chunks that actually matter, instead of
+reading whole files into its context window and burning tokens. Semantic search becomes
+the agent's default way to navigate the repo, and keeping the index live (reindex on
+edit) is a deliberately cheap, routine operation. This is the intended way to run
+mindex — not an add-on. **Setup: [`tools/mcp/README.md`](tools/mcp/README.md).** The
+same engine also drives a plain terminal search frontend (`mindex-search.sh`) for
+humans.
 
 ## Highlights
 
+- **Agent-native (MCP), by design.** The headline use case: a coding agent (Claude Code)
+  searches your codebase over MCP and reads only the chunks that matter — cutting token
+  and context cost. Keeping the index live as the agent edits is intentionally cheap.
+  See [`tools/mcp/README.md`](tools/mcp/README.md).
 - **Three-head hybrid retrieval, no compromise.** Dense + sparse + ColBERT are combined
   exactly as BGE-M3 produces them — not just cosine over dense vectors.
 - **Your code never leaves your machine.** Vectors live in a local Qdrant, metadata in
@@ -46,6 +57,7 @@ background GC. Project isolation is one Qdrant collection per project plus a SQL
 | **embedder** (`embedder/`) | The BGE-M3 model server exposing all three heads over `/encode` + `/health`. Runs on the host (GPU) or in the cloud — see below. |
 | **mindex-index** (`tools/indexer/`) | CLI that walks a directory tree and uploads files for indexing (`--concurrency`, glob include/exclude, live progress). |
 | **mindex-search.sh** (`tools/search/`) | Terminal search frontend: a query in, syntax-highlighted matches out. Configurable by flags or `MINDEX_*` env vars. |
+| **mindex-mcp** (`tools/mcp/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/README.md`](tools/mcp/README.md). |
 
 ## Running
 
@@ -105,6 +117,11 @@ echo 'where do we validate the auth token?' \
 # or open $EDITOR for a multi-line query:
 MINDEX_PROJECT="$PROJECT" tools/search/mindex-search.sh --no-verify --edit
 ```
+
+**6 — Wire it into a coding agent (the intended mode).** Save the project GUID in a
+`.mindex` file at the repo root and register the MCP server, so an agent (e.g. Claude
+Code) searches the index itself — reading only the chunks that matter — and keeps it
+live as it edits. Full setup in **[`tools/mcp/README.md`](tools/mcp/README.md)**.
 
 ## HTTP API
 

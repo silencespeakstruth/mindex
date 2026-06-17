@@ -67,6 +67,16 @@ files, call `delete_files` with the OLD paths (for a rename, also `index_files`
 the new path). Paths must be repo-root-relative with forward slashes, exactly as
 originally indexed — a different spelling creates a duplicate instead of updating.
 
+Reindexing is deliberately cheap — the server skips unchanged files by hash — so
+call `index_files` freely, without preamble: do NOT investigate first (no
+`project_stats`, no file-count reconciliation) and never read a file back just to
+reindex it. Pass only `code` you already have in context from writing the file,
+and pass it VERBATIM — never paraphrase, truncate, or placeholder it, which
+overwrites the indexed copy with broken content. Use `index_files` only for the
+files you touched this turn; to (re)index a whole tree, or to apply path excludes,
+run the `tools/indexer` CLI instead — it walks the tree and hash-skips server-side
+without sending file bodies through the model.
+
 Availability: this server stays up even if mindex itself is stopped. If any tool
 returns a connection error, mindex is unreachable — call `health()` to confirm,
 then STOP issuing calls and tell the user, rather than retrying blindly. Don't
@@ -114,7 +124,10 @@ def index_files(project_guid: str, files: list[dict]) -> list[dict]:
     Call this after you create or modify files in an already-indexed project
     (this is part of keeping the index live as you work). Unchanged content is
     skipped server-side by hash, so reindexing an untouched file is cheap and
-    safe.
+    safe — call it freely, but only with content already in your context and
+    passed VERBATIM (a paraphrased or truncated ``code`` overwrites the indexed
+    file with broken content). For bulk (re)indexing of a whole tree, use the
+    ``tools/indexer`` CLI, not a loop of these calls.
 
     Each entry in ``files`` is an object:
         - ``path``: repo-root-relative path, forward slashes, EXACTLY as it was

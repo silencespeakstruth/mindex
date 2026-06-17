@@ -35,6 +35,7 @@ scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
 tools/search/           mindex-search.sh (bash) — search frontend (flags + MINDEX_* env)
+tools/mcp/              mindex-mcp (Python/Poetry) — MCP stdio server; search + live-index for a coding agent
 embedder/               vendored BGE-M3 server (3 heads); host-run + GPU, NOT in the image — see embedder/README.md
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
@@ -269,6 +270,16 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   `$EDITOR` (`--edit`), then stdin. Every option has a `MINDEX_*` env-var fallback
   (so it can run fully env-driven, e.g. an alias or CI job); an explicit flag wins
   over its variable. (The old `mindex-search-edit` POSIX-sh wrapper was folded in.)
+- **`tools/mcp/` (`mindex-mcp`, Python/Poetry)** — MCP stdio server (sibling of the
+  CLIs; hits the same HTTP API). The **intended primary way an agent drives mindex**:
+  `search` to understand code cheaply (top-5 cap fixed in the adapter — the model
+  can't raise it), `index_files`/`delete_files` to keep the index live as it edits.
+  Live reindex is meant to be called freely — unchanged files are hash-skipped
+  server-side — but `index_files` carries full bodies, so it is **only** for the few
+  files just touched, passed **verbatim**; a *bulk* (re)index or path-exclude job goes
+  through `mindex-index`, not a loop of `index_files`. Reads the project GUID from a
+  repo-root `.mindex` file (gitignored). No network at handshake (connects even with
+  mindex down). See `tools/mcp/README.md`.
 
 ## Docker & CI
 
