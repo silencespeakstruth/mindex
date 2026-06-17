@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "mindex-digest"
+version = "0.1.0"
+description = "MCP-сервер: разложенные запросы → поиск в mindex → выжимка локальной LLM (Ollama)"
+authors = ["Silence Speaks Truth <dev@null.local>"]
+packages = [{include = "mindex_digest", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.13,<3.14"
+mcp = ">=1.2"
+httpx = ">=0.27"
+
+[tool.poetry.scripts]
+mindex-digest = "mindex_digest.server:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
