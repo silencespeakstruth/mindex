@@ -44,6 +44,11 @@ def _colbert(text: str) -> list[list[float]]:
     return [_dense(f"{text}\x00{i}\x00{tok}") for i, tok in enumerate(tokens)]
 
 
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.post("/encode")
 async def encode(payload: dict[str, Any]) -> dict[str, Any]:
     texts: list[str] = payload["texts"]

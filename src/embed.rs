@@ -128,6 +128,9 @@ mod tests {
                 colbert_vecs: vec![vec![vec![0.1; 4]]; n],
             })
         }
+        async fn health(&self) -> Result<(), EncodeError> {
+            unreachable!("embed_and_upsert does not call health")
+        }
     }
 
     /// Store fake: records the guids it was asked to upsert, or fails when configured.
@@ -157,6 +160,9 @@ mod tests {
             unreachable!()
         }
         async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn health(&self) -> Result<(), VectorStoreError> {
             unreachable!()
         }
         async fn delete_batch(

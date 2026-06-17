@@ -246,6 +246,9 @@ mod tests {
         async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
             unreachable!("sweep does not call delete_collection")
         }
+        async fn health(&self) -> Result<(), VectorStoreError> {
+            unreachable!("sweep does not call health")
+        }
         async fn insert_batch(
             &self,
             _collection: &str,

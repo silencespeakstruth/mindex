@@ -203,3 +203,25 @@ def test_gc_returns_counts(client: httpx.Client, project: str) -> None:
     body = resp.json()
     assert body["chunks_removed"] >= 1
     assert body["files_removed"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# GET /version and GET /health
+# ---------------------------------------------------------------------------
+
+
+def test_version_reports_a_version(client: httpx.Client) -> None:
+    resp = client.get(f"{MINDEX_URL}/version")
+    assert resp.status_code == 200
+    assert isinstance(resp.json()["version"], str)
+    assert resp.json()["version"]
+
+
+def test_health_checks_all_dependencies(client: httpx.Client) -> None:
+    resp = client.get(f"{MINDEX_URL}/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    # All three dependencies are up in the test stack (SQLite, Qdrant, mock embedder).
+    assert body["status"] == "ok", body
+    assert body["checks"] == {"sqlite": "ok", "qdrant": "ok", "embedder": "ok"}, body
+    assert isinstance(body["indexing_files"], int)

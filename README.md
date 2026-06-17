@@ -49,10 +49,14 @@ background GC. Project isolation is one Qdrant collection per project plus a SQL
 
 ## Running
 
-Three pieces talk to each other: **Qdrant**, the **embedder**, and the **mindex server**.
-`docker-compose.yml` wires Qdrant + mindex together and is the **canonical reference for
-the server's flags** — read it for the exact values. It is meant as an illustration more
-than a prescription; you don't have to run mindex this way.
+**The shape of it.** Three services and two host-side CLI tools. The dependency order
+is bottom-up: **Qdrant** (vectors) and the **embedder** (BGE-M3) come up first; the
+**mindex server** connects to both and serves the HTTPS API; then the **`mindex-index`**
+and **`mindex-search.sh`** tools — which run on your machine — drive that API over HTTPS.
+So you start the two backends, start mindex pointed at them, then build the tools once and
+use them. `docker-compose.yml` wires Qdrant + mindex together and is the **canonical
+reference for the server's flags** — read it for the exact values; treat it as an
+illustration, not a prescription (you don't have to run mindex this way).
 
 **1 — Start the embedder** (it is *not* in any image: torch alone is ~8 GB and it needs
 direct GPU access, so it runs separately):
@@ -77,7 +81,14 @@ docker compose up -d --build
 mindex listens on `https://localhost:11111` (a self-signed cert is generated on first
 start; mount real certs at `/certs` to override).
 
-**3 — Index a codebase:**
+**3 — Build the host tools** (once). The indexer is a small Rust crate; the search tool
+is a shell script needing `curl` + `jq` (plus `pygmentize` for color):
+
+```sh
+( cd tools/indexer && cargo build --release )   # → tools/indexer/target/release/mindex-index
+```
+
+**4 — Index a codebase:**
 
 ```sh
 PROJECT=$(uuidgen | tr -d -)
@@ -86,7 +97,7 @@ tools/indexer/target/release/mindex-index \
     --include 'src/**/*.rs' --exclude '**/target/**'
 ```
 
-**4 — Search:**
+**5 — Search:**
 
 ```sh
 echo 'where do we validate the auth token?' \
@@ -108,6 +119,8 @@ All endpoints are HTTPS. TLS is the only transport security — there is **no AP
 | `DELETE /projects/{project}` | Hard-delete a project (rows + Qdrant collection). |
 | `DELETE /projects/{project}/files` | Soft-delete files by an include/exclude selector (body). |
 | `POST /gc` | Run garbage collection synchronously. |
+| `GET /health` | Readiness: pings SQLite + Qdrant + the embedder, reports files currently indexing. |
+| `GET /version` | Running mindex version. |
 
 ## Key configuration
 

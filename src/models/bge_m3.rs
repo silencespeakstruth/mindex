@@ -44,6 +44,11 @@ pub trait BGEm3Model: Send + Sync {
         req: BGEm3EmbedRequest,
         token: CancellationToken,
     ) -> Result<BGEm3EmbedResponse, EncodeError>;
+
+    /// Liveness ping of the embedder's own `/health` — confirms reachability
+    /// without loading the model. Bounded by a short timeout so `/health` on the
+    /// mindex side can't hang on a wedged embedder.
+    async fn health(&self) -> Result<(), EncodeError>;
 }
 
 pub struct BGEm3HttpClient {
@@ -110,6 +115,17 @@ impl BGEm3Model for BGEm3HttpClient {
             };
             return Ok(body);
         }
+    }
+
+    async fn health(&self) -> Result<(), EncodeError> {
+        let url = self.base_url.join("health").unwrap(); // join of a literal cannot fail
+        self.client
+            .get(url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }
 

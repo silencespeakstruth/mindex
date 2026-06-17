@@ -248,6 +248,9 @@ mod tests {
                 colbert_vecs: vec![vec![vec![0.1; 4]]; n],
             })
         }
+        async fn health(&self) -> Result<(), EncodeError> {
+            unreachable!("the retry worker does not call health")
+        }
     }
 
     /// `VectorStore` fake whose `insert_batch` succeeds or fails on demand.
@@ -271,6 +274,9 @@ mod tests {
             unreachable!()
         }
         async fn delete_collection(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn health(&self) -> Result<(), VectorStoreError> {
             unreachable!()
         }
         async fn delete_batch(&self, _c: &str, _g: Vec<String>) -> Result<(), VectorStoreError> {

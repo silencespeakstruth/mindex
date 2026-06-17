@@ -243,3 +243,26 @@ pub struct GcResponse {
     pub files_removed: usize,
     pub status_log_pruned: usize,
 }
+
+#[derive(Serialize, Debug)]
+pub struct VersionResponse {
+    pub version: &'static str,
+}
+
+/// One dependency's liveness: `"ok"` or `"error: <reason>"`.
+#[derive(Serialize, Debug)]
+pub struct HealthChecks {
+    pub sqlite: String,
+    pub qdrant: String,
+    pub embedder: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct HealthResponse {
+    /// `"ok"` only when all three dependency checks pass, else `"degraded"`.
+    pub status: &'static str,
+    pub version: &'static str,
+    /// Files in `status='indexing'` across *all* projects right now.
+    pub indexing_files: i64,
+    pub checks: HealthChecks,
+}

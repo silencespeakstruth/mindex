@@ -1,7 +1,8 @@
 [package]
 name = "mindex"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
+license = "Unlicense"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["json", "macros"] }

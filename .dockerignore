@@ -4,3 +4,5 @@ target/
 tests/
 docker-compose*.yml
 *.md
+.mypy_cache
+.ruff_cache

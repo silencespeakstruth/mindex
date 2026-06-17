@@ -33,6 +33,11 @@ Useful flags (`python -m bge_m3_api --help`): `--device` (`cuda`, `cuda:0`, `cpu
 `--batch`, `--max-inflight` (429 beyond this), `--idle-timeout` (unload the model
 after N idle seconds).
 
+> The Python range in `pyproject.toml` is pinned narrowly (3.13 only) **on purpose**:
+> the ROCm torch builds this targets are finicky on flagship/Pro-class AMD cards, and
+> a wider range pulls wheels that don't work there. Don't widen it without testing on
+> your GPU.
+
 > Bind `0.0.0.0` (the default host), **not** `127.0.0.1`: a Dockerised mindex
 > reaches a host-run server through the bridge gateway, which `127.0.0.1` excludes.
 

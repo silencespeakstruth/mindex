@@ -12,3 +12,6 @@ __pycache__/
 certs/
 
 .claude/settings.local.json
+
+.mypy_cache
+.ruff_cache

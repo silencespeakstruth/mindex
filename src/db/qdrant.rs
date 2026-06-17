@@ -110,6 +110,9 @@ pub trait VectorStore: Send + Sync {
     /// so a repeated project delete (or one racing the GC) does not error.
     async fn delete_collection(&self, collection: &str) -> Result<(), VectorStoreError>;
 
+    /// Liveness ping of Qdrant itself (used by the mindex `/health` endpoint).
+    async fn health(&self) -> Result<(), VectorStoreError>;
+
     /// Hybrid search: dense + sparse prefetch → RRF fusion → ColBERT MaxSim rerank,
     /// restricted to `chunk_ids` via a `has_id` filter, returning the top `top_k`.
     #[allow(clippy::too_many_arguments)] // irreducible inputs of one hybrid query
@@ -189,6 +192,11 @@ impl VectorStore for Qdrant {
             return Ok(());
         }
         Qdrant::delete_collection(self, collection).await?;
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<(), VectorStoreError> {
+        self.health_check().await?;
         Ok(())
     }
 

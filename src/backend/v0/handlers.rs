@@ -12,6 +12,9 @@ use crate::backend::v0::models::DeleteFilesRequest;
 use crate::backend::v0::models::DeleteFilesResponse;
 use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
+use crate::backend::v0::models::HealthChecks;
+use crate::backend::v0::models::HealthResponse;
+use crate::backend::v0::models::VersionResponse;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::ProgrammingLanguage;
 use crate::backend::v0::models::ProjectStats;
@@ -1172,6 +1175,63 @@ pub async fn post_gc(State(s): State<RouterState>) -> Json<GcResponse> {
         chunks_removed,
         files_removed,
         status_log_pruned,
+    })
+}
+
+/// `GET /version` — the running mindex version (also a trivial liveness ping).
+#[debug_handler]
+pub async fn get_version() -> Json<VersionResponse> {
+    Json(VersionResponse { version: env!("CARGO_PKG_VERSION") })
+}
+
+/// `GET /health` — a *smart* readiness check: confirms both stores (SQLite +
+/// Qdrant) and the embedder are reachable, and reports how many files are indexing
+/// globally. `status` is `"ok"` only if all three checks pass. Each check is
+/// best-effort and independent, so one dead dependency is pinpointed rather than
+/// collapsing the whole response.
+#[debug_handler]
+pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+
+    // SQLite: the global indexing-file count doubles as the liveness query.
+    let (sqlite, indexing_files) = match s
+        .db_pool
+        .transaction(guard.0.child_token(), |tx| {
+            tx.query_row(
+                "SELECT COUNT(*) FROM project_files WHERE status = 'indexing'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(SQLite3PoolError::from)
+        })
+        .await
+    {
+        Ok(n) => ("ok".to_string(), n),
+        Err(e) => (format!("error: {e}"), -1),
+    };
+
+    let qdrant = match s.qdrant.health().await {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("error: {e}"),
+    };
+
+    let EmbeddingModel::BGEm3 { client, .. } = &s.model;
+    let embedder = match client.health().await {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("error: {e:?}"),
+    };
+
+    let status = if sqlite == "ok" && qdrant == "ok" && embedder == "ok" {
+        "ok"
+    } else {
+        "degraded"
+    };
+
+    Json(HealthResponse {
+        status,
+        version: env!("CARGO_PKG_VERSION"),
+        indexing_files,
+        checks: HealthChecks { sqlite, qdrant, embedder },
     })
 }
 
