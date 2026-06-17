@@ -186,7 +186,7 @@ mod tests {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 collect_rs(root, &path, out);
-            } else if path.extension().map_or(false, |e| e == "rs") {
+            } else if path.extension().is_some_and(|e| e == "rs") {
                 let name = path.strip_prefix(root).unwrap().display().to_string();
                 let code = std::fs::read_to_string(&path).unwrap();
                 out.push((name, code));

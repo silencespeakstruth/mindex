@@ -18,9 +18,14 @@ is *not done* or *deliberately constrained*.
   collections may want a stored Qdrant payload field (`project_guid`) + a `match`
   filter instead.
 - **After `MAX_RETRIES` (3) failures a file stays `status='failed'`** and needs
-  manual re-indexing (re-push). Surfaced now via a WARN at startup and hourly
-  (`worker::retry::warn_permanently_failed`); a real dead-letter view / metric /
-  alert is still future work.
+  manual re-indexing (re-push). Surfaced via a WARN at startup and hourly
+  (`worker::retry::warn_permanently_failed`) and now via `GET /projects/{guid}`
+  (per-project `failed` count); a real dead-letter view / metric / alert is still
+  future work.
+- **Deleting all of a project's files leaves the project row + an empty Qdrant
+  collection.** `DELETE /files` is scoped to files (the project persists so it can
+  be re-indexed), so matching everything still leaves an empty collection behind.
+  Use `DELETE /projects/{guid}` to remove the project and drop its collection.
 - **`cancelled` files are never retried** by the worker (by design — the client
   gave up). They only revive on an explicit re-push (`cancelled → indexing` via the
   handler). A cancelled file never re-pushed keeps no vectors.

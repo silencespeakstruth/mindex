@@ -2,40 +2,58 @@
 #
 # mindex-search — terminal frontend for POST /v0/{project}/search.
 #
-# Pipe a query into it (e.g. from an $EDITOR temp file) and it prints matches
-# with syntax-highlighted code, line numbers, and score. Results are printed
-# in ascending score order, so the best match ends up at the bottom of the
-# scrollback, right above the prompt.
+# Reads a (possibly multi-line) query from --query, $EDITOR (--edit), or stdin,
+# POSTs it to a mindex server, and prints matches with syntax-highlighted code,
+# line numbers, and score — in ascending score order, so the best match ends up
+# at the bottom of the scrollback, right above the prompt.
 #
-# Typical pipe usage:
-#   tmp=$(mktemp); "${EDITOR:-vim}" "$tmp"
-#   mindex-search --project "$PROJECT" < "$tmp"
-#   rm -f "$tmp"
+# Every option also has a MINDEX_* environment-variable fallback (see --help), so
+# the tool can be driven entirely from the environment (an alias, a CI job, …);
+# an explicit flag always wins over the corresponding variable.
 #
-# Or let it drive the editor itself:
-#   mindex-search --project "$PROJECT" --edit
+# Typical usage:
+#   mindex-search --project "$PROJECT" --edit         # type the query in $EDITOR
+#   mindex-search --project "$PROJECT" < query.txt    # pipe a query in
+#   echo 'parse a config file' | mindex-search --project "$PROJECT"
+#   MINDEX_PROJECT=$PROJECT MINDEX_QUERY='…' mindex-search   # fully env-driven
 #
 # Requires: bash, curl, jq. Optional: pygmentize (syntax highlighting).
 
 set -euo pipefail
 
-# ─── Defaults ───────────────────────────────────────────────────────────────
+# ─── Defaults (overridable by MINDEX_* env vars, then by flags) ───────────────
 
-SERVER="https://127.0.0.1:11111"
-PROTOCOL="v0"
-PROJECT=""
-NO_VERIFY=0
-TOP_K=""
+truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1 | true | yes | on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+SERVER="${MINDEX_SERVER:-https://127.0.0.1:11111}"
+PROTOCOL="${MINDEX_PROTOCOL:-v0}"
+PROJECT="${MINDEX_PROJECT:-}"
+TOP_K="${MINDEX_TOP_K:-}"
 EDIT=0
-QUERY=""
-THEME="monokai"
-COLOR="auto"
-VERBOSE=0
+QUERY="${MINDEX_QUERY:-}"
+THEME="${MINDEX_THEME:-monokai}"
+COLOR="${MINDEX_COLOR:-auto}"
 
+NO_VERIFY=0
+VERBOSE=0
+if truthy "${MINDEX_NO_VERIFY:-}"; then NO_VERIFY=1; fi
+if truthy "${MINDEX_VERBOSE:-}"; then VERBOSE=1; fi
+
+# Space-separated env lists seed the (repeatable) flag arrays; later --include-*/
+# --exclude-* flags append to them. `read -ra` word-splits without glob-expanding.
 INC_LANGS=()
 INC_PATHS=()
 EXC_LANGS=()
 EXC_PATHS=()
+[[ -n "${MINDEX_INCLUDE_LANG:-}" ]] && read -ra INC_LANGS <<<"$MINDEX_INCLUDE_LANG"
+[[ -n "${MINDEX_INCLUDE_PATH:-}" ]] && read -ra INC_PATHS <<<"$MINDEX_INCLUDE_PATH"
+[[ -n "${MINDEX_EXCLUDE_LANG:-}" ]] && read -ra EXC_LANGS <<<"$MINDEX_EXCLUDE_LANG"
+[[ -n "${MINDEX_EXCLUDE_PATH:-}" ]] && read -ra EXC_PATHS <<<"$MINDEX_EXCLUDE_PATH"
 
 VALID_LANGS=(rust python javascript typescript tsx go c cpp java csharp ruby php bash html css json scala haskell ocaml zig sql)
 
@@ -48,14 +66,19 @@ die() {
     exit 1
 }
 
+warn() {
+    printf '%s\n' "$*" >&2
+}
+
 usage() {
     cat <<EOF
 Usage: $prog --project GUID [options] < query.txt
        $prog --project GUID --edit
+       MINDEX_PROJECT=GUID MINDEX_QUERY='…' $prog
 
-Reads a (possibly multi-line) query from stdin and POSTs it to a mindex
-server's search endpoint, printing matches in ascending score order
-(best match last, at the bottom of the screen).
+POSTs a (possibly multi-line) query to a mindex server's search endpoint and
+prints matches in ascending score order (best match last, at the bottom of the
+screen). The query comes from --query, then \$EDITOR (--edit), then stdin.
 
 Options:
   --server URL            mindex server URL (default: $SERVER)
@@ -73,6 +96,17 @@ Options:
   --color always|auto|never   colorize output (default: auto)
   -v, --verbose           print the outgoing request JSON to stderr
   -h, --help              show this help
+
+Environment (every option has a fallback; an explicit flag always wins):
+  MINDEX_SERVER, MINDEX_PROJECT, MINDEX_PROTOCOL, MINDEX_TOP_K,
+  MINDEX_THEME, MINDEX_COLOR                 — same as the flags above
+  MINDEX_NO_VERIFY, MINDEX_VERBOSE           — truthy: 1/true/yes/on
+  MINDEX_INCLUDE_LANG, MINDEX_INCLUDE_PATH,
+  MINDEX_EXCLUDE_LANG, MINDEX_EXCLUDE_PATH   — space-separated lists (merged
+                                               with any matching flags)
+  MINDEX_QUERY                               — query text; skips \$EDITOR/stdin
+  EDITOR                                     — editor for --edit (default: vi;
+                                               may carry args, e.g. "code --wait")
 
 Valid LANG values: ${VALID_LANGS[*]}
 EOF
@@ -191,7 +225,10 @@ if [[ -n "$QUERY" ]]; then
 elif [[ "$EDIT" -eq 1 ]]; then
     tmp_edit=$(mktemp)
     trap 'rm -f "$tmp_edit"' EXIT
-    "${EDITOR:-vi}" "$tmp_edit"
+    [[ -t 0 && -t 1 ]] || warn "stdin/stdout is not a terminal; \$EDITOR may not behave — consider MINDEX_QUERY."
+    # $EDITOR may carry arguments (e.g. "code --wait"); intentional word-splitting.
+    # shellcheck disable=SC2086
+    ${EDITOR:-vi} "$tmp_edit" || die "editor exited non-zero (\$EDITOR='${EDITOR:-vi}'); aborting"
     QUERY=$(cat "$tmp_edit")
 else
     if [[ -t 0 ]]; then

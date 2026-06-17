@@ -34,7 +34,7 @@ src/
 scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
-tools/search/           mindex-search (bash) + mindex-search-edit (POSIX sh)
+tools/search/           mindex-search (bash) — single search frontend (flags + MINDEX_* env)
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
 
@@ -57,14 +57,11 @@ deletes from SQLite *only* chunks whose Qdrant `delete_batch` succeeded; if a
 collection's delete fails the rows stay `deleted` for the next sweep. Deleting the
 SQLite row before Qdrant confirms would orphan the vector forever (nothing tracks
 it). If every collection in a batch fails, the inner loop breaks rather than
-spinning. The same hourly GC tick also prunes `project_file_status_log` rows older
-than `STATUS_LOG_RETENTION` (30 days), logging the count removed. After the chunk
-sweep it runs `prune_deleted_files`: deletes `project_files` rows in status
-`deleted` that have **no chunk rows left** (the chunk→file FK is RESTRICT, so this
-can only fire once the sweep removed their chunks). This ordering — sweep chunks,
-then drop emptied `deleted` files — is what makes a `DELETE /files` eventually
-physical. `gc::{sweep, prune_deleted_files, prune_status_log}` are `pub(crate)` and
-also driven synchronously by `POST /gc` (returns the three counts).
+spinning. The same pass prunes `project_file_status_log` past `STATUS_LOG_RETENTION`
+(30 days) and runs `prune_deleted_files` — drops `deleted` `project_files` rows once
+their chunks are gone (chunk→file FK is RESTRICT, so only after the sweep). That
+sweep-then-drop ordering is what makes `DELETE /files` eventually physical; `POST /gc`
+runs the same pass synchronously.
 
 **Status state machine** (`project_files.status`), enforced by SQLite triggers
 (`v0.2.0_status_machine.sql`), not just convention. Legal moves: **any → `indexing`**
@@ -73,40 +70,33 @@ emptied row), and **`indexing` → `indexed`|`cancelled`|`failed`** (a terminal 
 reachable only from in-progress work); a new row may only enter as
 `just_uploaded`/`indexing`. `deleted` is terminal **except** `deleted→indexing`
 (re-indexing a path pending deletion resurrects it — the any→`indexing` rule).
-Anything else (e.g. `indexed→failed`, `failed→indexed`, `just_uploaded→indexed`,
-`deleted→indexed`) raises `SQLITE_CONSTRAINT_TRIGGER`. So the retry worker
-moves `failed → indexing → {indexed|failed}` (never `failed→failed`). `indexing`
-is committed durably *before* heavy work (crash-recoverable; retry worker picks up
-files stuck in `indexing` longer than `--stuck-grace-mins`, default **30 min**).
-That grace **must exceed the longest legitimate in-flight request** — cross-file
-batching holds a whole batch's files in `indexing` for the entire embed pass, so a
-too-short grace makes the worker race a live batch (re-embedding its files one by
-one and tripping illegal `indexing→indexed` transitions on the handler's side). A
-stuck file with **no active chunks** (too short → 0 chunks) is marked `indexed`,
-not `failed` (a wrong `failed` would trap it, since `failed→indexed` is illegal).
-`sha256` is written only when reaching `indexed`; `retry_count` resets to 0 there
-and bumps on each `→failed`. Any status write sets
-`status_updated_at = unixepoch()` — use `db::files::set_file_status`, which also
-logs a WARN if the transition is rejected. Every transition is recorded in
-`project_file_status_log` by AFTER-triggers (durable audit trail). A file that
-exhausts `MAX_RETRIES` (3) stays `failed` and is never retried again — surfaced by
-`worker::retry::warn_permanently_failed` at startup and hourly.
+Anything else (e.g. `failed→indexed`, `just_uploaded→indexed`) raises
+`SQLITE_CONSTRAINT_TRIGGER`. `indexing` is committed durably *before* heavy work
+(crash-recoverable; the retry worker picks up files stuck in `indexing` longer than
+`--stuck-grace-mins`, default **30 min**). That grace **must exceed the longest
+legitimate in-flight request**: cross-file batching holds a whole batch in `indexing`
+through the embed pass, so a too-short grace lets the worker race a live batch
+(re-embedding its files and tripping illegal transitions). A stuck file with **no
+active chunks** (too short → 0 chunks) is marked `indexed`, not `failed` (a wrong
+`failed` would trap it, since `failed→indexed` is illegal). `sha256` and the
+`retry_count` reset land only on `indexed`. Status writes go through
+`db::files::set_file_status` (stamps `status_updated_at`, WARNs on a rejected
+transition); every transition is logged to `project_file_status_log` by AFTER-triggers.
+A file that exhausts `MAX_RETRIES` (3) stays `failed` and is never retried again
+(`worker::retry::warn_permanently_failed` surfaces it at startup and hourly).
 
 **sha256 skip / empty 404.** Re-indexing identical content is skipped by hash.
 `post_search` returns 404 immediately when the SQLite candidate set is empty (no
 active chunks), without calling Qdrant (avoids a 503 from a missing collection).
 
-**Management endpoints** (handlers in `handlers.rs`, routes in `http3::run`, *not*
-under `/v0`): `GET /projects/{guid}` aggregates `project_files` by status + chunks
-per language (active vs soft-deleted), 404 if unseen. `DELETE /projects/{guid}` is
-an **immediate hard delete** (chunks → files → project → status log, then drop the
-Qdrant collection last so a retry re-attempts it) and **idempotent** (always 204).
-`DELETE /projects/{guid}/files` is a **soft delete**: the glob/language selector
-(same `include`/`exclude` shape as search, sent in the **request body** since globs
-don't fit the path) marks matched files + their chunks `deleted`; GC purges them
-later. Returns 204 if nothing matched, else 200 with the file count; an empty
-selector is rejected (400) so it can't wipe the project. `POST /gc` runs one GC pass
-synchronously — integration tests call it to force physical removal before asserting.
+**Management endpoints** (`handlers.rs`, routed in `http3::run`, *not* under `/v0`).
+`DELETE /projects/{guid}` is an **immediate hard delete** (rows, then drop the
+collection last so a retry re-attempts it), idempotent 204. `DELETE
+/projects/{guid}/files` is a **soft delete** — its search `include`/`exclude`
+selector goes in the **request body** (globs don't fit the path); it marks
+files+chunks `deleted` for GC, returns 204 if none matched else 200+count, and
+rejects an empty selector (400) so it can't wipe the project. `GET /projects/{guid}`
+(stats) and `POST /gc` (one synchronous GC pass) round it out.
 
 **FK is RESTRICT.** `project_file_chunks → project_files` is `ON DELETE RESTRICT`.
 Never delete a `project_files` row while chunks exist; mark chunks deleted (let GC
@@ -265,13 +255,14 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   indexing mindex itself** (the CLIs' `long_about` text pollutes results).
   `chunk_count == 0` in the response means "sliced to no chunks" (below 128 tokens),
   *not* unchanged — hash-unchanged files are skipped server-side and absent entirely.
-- **`tools/search/mindex-search` (bash)** — POSTs search, renders with `pygmentize`
-  if present (else plain). Results print **ascending by score** so the best match is
-  last, right above the prompt. Every API status is handled distinctly (404 = no
-  match, not an error; 499/503/500 mapped; curl transport failure reported
-  separately). `mindex-search-edit` (POSIX sh, no bashisms) is the
-  `$EDITOR → pipe → render` wrapper, configured entirely via `MINDEX_*` env vars;
-  CLI args forwarded to `mindex-search` win over env (last-one-wins).
+- **`tools/search/mindex-search` (bash)** — the single search frontend. POSTs search,
+  renders with `pygmentize` if present (else plain). Results print **ascending by
+  score** so the best match is last, right above the prompt. Every API status is
+  handled distinctly (404 = no match, not an error; 499/503/500 mapped; curl
+  transport failure reported separately). The query comes from `--query`, then
+  `$EDITOR` (`--edit`), then stdin. Every option has a `MINDEX_*` env-var fallback
+  (so it can run fully env-driven, e.g. an alias or CI job); an explicit flag wins
+  over its variable. (The old `mindex-search-edit` POSIX-sh wrapper was folded in.)
 
 ## Docker & CI
 
@@ -308,9 +299,8 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
 ## Linting (zero warnings everywhere — non-default flags matter)
 
 - Rust: `cargo clippy --bin mindex` and `cd tools/indexer && cargo clippy`.
-- Shell: `shellcheck scripts/entrypoint.sh`, `shellcheck --shell=bash tools/search/mindex-search`,
-  `shellcheck --shell=sh tools/search/mindex-search-edit`; format with
-  `shfmt -i 4 -ci` (4-space + indented case — bare `shfmt` defaults to tabs).
+- Shell: `shellcheck scripts/entrypoint.sh`, `shellcheck --shell=bash tools/search/mindex-search`;
+  format with `shfmt -i 4 -ci` (4-space + indented case — bare `shfmt` defaults to tabs).
 - Python (`tests/`): `ruff check`, `ruff format --check` **and** `black --check`
   (kept compatible — avoid the long `assert cond, "msg"` they format differently),
   `mypy` (`fastapi` is `# type: ignore` — its stubs live only in the mock's image).
@@ -327,9 +317,9 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
 3. New endpoints register in `backend::http3::run`, use `RouterState`, `{param}` route syntax, `#[debug_handler]`.
 4. Reach Qdrant only via `VectorStore`; derive collection names from `collection_for`.
 5. Any search path's SQLite query must include `AND c.status = 'active'`.
-6. Status writes set `status_updated_at = unixepoch()` (use `set_file_status`) and
-   must be a legal transition (triggers enforce it; only `any→indexing` and
-   `indexing→terminal`). New status-changing code paths need a transition test.
+6. Status writes use `set_file_status` (stamps `status_updated_at`) and must be a
+   legal transition (triggers enforce it — see the state machine). New
+   status-changing paths need a transition test.
 7. Adding a language → the full checklist under **Languages**.
 8. Schema change → new migration file in the `MIGRATIONS` slice; the DB is
    droppable (no upgrade path).
