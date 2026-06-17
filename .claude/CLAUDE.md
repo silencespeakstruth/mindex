@@ -35,6 +35,7 @@ scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
 tools/search/           mindex-search.sh (bash) — search frontend (flags + MINDEX_* env)
+embedder/               vendored BGE-M3 server (3 heads); host-run + GPU, NOT in the image — see embedder/README.md
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
 
@@ -278,7 +279,10 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   volume on first start.
 - **Prod compose** (`docker-compose.yml`): `qdrant` + `mindex`;
   `extra_hosts: host.docker.internal:host-gateway` lets the container reach a
-  host-run embedder.
+  host-run embedder. The embedder source is vendored in `embedder/` but is
+  deliberately *not* built or composed here — its heavy GPU deps (~8 GB torch) keep
+  it on the host; it's a temporary wrapper until an off-the-shelf server emits all
+  three BGE-M3 heads.
 - **Test compose** (`docker-compose.test.yml`, doesn't extend base): qdrant +
   mock-embedder + mindex + test-runner. Run:
   `docker compose -f docker-compose.test.yml up --build --exit-code-from test-runner --abort-on-container-exit`.
