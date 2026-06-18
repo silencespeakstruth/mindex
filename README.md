@@ -12,7 +12,7 @@ queries the index and gets back the handful of chunks that actually matter, inst
 reading whole files into its context window and burning tokens. Semantic search becomes
 the agent's default way to navigate the repo, and keeping the index live (reindex on
 edit) is a deliberately cheap, routine operation. This is the intended way to run
-mindex — not an add-on. **Setup: [`tools/mcp/README.md`](tools/mcp/README.md).** The
+mindex — not an add-on. **Setup: [`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md).** The
 same engine also drives a plain terminal search frontend (`mindex-search.sh`) for
 humans.
 
@@ -21,7 +21,7 @@ humans.
 - **Agent-native (MCP), by design.** The headline use case: a coding agent (Claude Code)
   searches your codebase over MCP and reads only the chunks that matter — cutting token
   and context cost. Keeping the index live as the agent edits is intentionally cheap.
-  See [`tools/mcp/README.md`](tools/mcp/README.md).
+  See [`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md).
 - **Three-head hybrid retrieval, no compromise.** Dense + sparse + ColBERT are combined
   exactly as BGE-M3 produces them — not just cosine over dense vectors.
 - **Your code never leaves your machine.** Vectors live in a local Qdrant, metadata in
@@ -57,8 +57,8 @@ background GC. Project isolation is one Qdrant collection per project plus a SQL
 | **embedder** (`embedder/`) | The BGE-M3 model server exposing all three heads over `/encode` + `/health`. Runs on the host (GPU) or in the cloud — see below. |
 | **mindex-index** (`tools/indexer/`) | CLI that walks a directory tree and uploads files for indexing (`--concurrency`, glob include/exclude, live progress). |
 | **mindex-search.sh** (`tools/search/`) | Terminal search frontend: a query in, syntax-highlighted matches out. Configurable by flags or `MINDEX_*` env vars. |
-| **mindex-mcp** (`tools/mcp/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/README.md`](tools/mcp/README.md). |
-| **mindex-digest** (`tools/digest/`) | Second MCP server: a **token-saving** layer over the same search API. The agent sends a few decomposed sub-queries, a local LLM reads the chunks and returns only a compact summary + `file:line` pointers, so raw code never enters the agent's context — roughly an order-of-magnitude less context than raw search on a survey. Orient with `digest`, then follow its pointers with raw `search` for exact code. See [`tools/digest/README.md`](tools/digest/README.md). |
+| **mindex** (`tools/mcp/mindex/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md). |
+| **scout** (`tools/mcp/scout/`) | Second MCP server: a **token-saving** layer over the same search API. The agent sends a few decomposed sub-queries, a local LLM reads the chunks and returns only a compact summary + `file:line` pointers, so raw code never enters the agent's context — roughly an order-of-magnitude less context than raw search on a survey. Orient with its `digest` tool, then follow its pointers with raw `search` for exact code. See [`tools/mcp/scout/README.md`](tools/mcp/scout/README.md). |
 
 ## Running
 
@@ -122,7 +122,7 @@ MINDEX_PROJECT="$PROJECT" tools/search/mindex-search.sh --no-verify --edit
 **6 — Wire it into a coding agent (the intended mode).** Save the project GUID in a
 `.mindex` file at the repo root and register the MCP server, so an agent (e.g. Claude
 Code) searches the index itself — reading only the chunks that matter — and keeps it
-live as it edits. Full setup in **[`tools/mcp/README.md`](tools/mcp/README.md)**.
+live as it edits. Full setup in **[`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md)**.
 
 ## HTTP API
 

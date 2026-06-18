@@ -1,4 +1,4 @@
-# mindex-mcp — MCP server for mindex search
+# mindex — MCP server for mindex search
 
 A thin [MCP](https://modelcontextprotocol.io) stdio server that exposes mindex
 semantic code search to an MCP client (e.g. Claude Code). It is a sibling tool
@@ -16,7 +16,7 @@ Tools exposed:
 
 | Tool                                  | mindex endpoint                  | Notes                                                        |
 | ------------------------------------- | -------------------------------- | ------------------------------------------------------------ |
-| `search(project_guid, query)`         | `POST /v0/{guid}/search`         | Up to **5** ranked chunks. The top-5 cap (`TOP_K`) is the context budget; the model can't raise it. |
+| `search(project_guid, query, include?, exclude?)` | `POST /v0/{guid}/search` | Up to **5** ranked chunks. The top-5 cap (`TOP_K`) is the context budget; the model can't raise it. Optional `include`/`exclude` scope the search by path glob / language (see [Scoping](#scoping-search-includeexclude)). |
 | `index_files(project_guid, files)`    | `POST /v0/{guid}/index`          | Reindex changed files on the fly; `files` = `[{path, language, code}]`. |
 | `delete_files(project_guid, paths)`   | `DELETE /projects/{guid}/files`  | Soft-delete stale chunks for removed/renamed files.          |
 | `list_projects()`                     | `GET /projects`                  | Summary counts per project (GUID-only identity).             |
@@ -66,18 +66,18 @@ ask you for the GUID rather than guess.
 **2 — Install the server** (Poetry, like `embedder/`):
 
 ```sh
-cd tools/mcp
+cd tools/mcp/mindex
 poetry install
 ```
 
 **3 — Register it with your MCP client.** For Claude Code, `claude mcp add` wraps the
 launch command; run it through Poetry so it uses this project's venv, and use an
-absolute path to `tools/mcp`:
+absolute path to `tools/mcp/mindex`:
 
 ```sh
 claude mcp add mindex \
   --env MINDEX_NO_VERIFY=1 \
-  -- poetry -C /data/silencespeakstruth/Projects/mindex/tools/mcp run mindex-mcp
+  -- poetry -C /data/silencespeakstruth/Projects/mindex/tools/mcp/mindex run mindex
 ```
 
 **4 — Verify.** `claude mcp list` should show `mindex` connected. In a session the
@@ -86,8 +86,9 @@ it with each query.
 
 ## The `.mindex` file
 
-- **One line:** the project's GUID in the simple, un-hyphenated form the indexer
-  stores (`uuidgen | tr -d '\n-'`).
+- **First non-comment, non-blank line:** the project's GUID in the simple,
+  un-hyphenated form the indexer stores (`uuidgen | tr -d '\n-'`). `#`-comment and
+  blank lines are ignored.
 - **At the repo root**, and **gitignored** — it ties *this checkout* to *its mindex
   project*, which is environment-specific, not shared.
 - The GUID in `.mindex` **must equal** the one passed to `tools/indexer --project`.
@@ -95,6 +96,31 @@ it with each query.
   silently returns nothing.
 - It is the single source of truth for identity: every MCP tool call takes the GUID
   from here.
+- **Optional standing scope** (lines after the GUID), read by the client and passed as
+  `include`/`exclude` on each `search` call:
+
+  ```
+  c2d7e2c1316542f593660ff1492b4bab
+  exclude_paths: tools/**
+  include_paths: src/**, embedder/**
+  languages:     rust
+  ```
+
+  `exclude_paths`/`include_paths` are comma-separated globs; `languages` are
+  comma-separated mindex language ids. All are optional — a bare GUID file behaves
+  exactly as before.
+
+## Scoping search (`include`/`exclude`)
+
+`search` (and `scout`'s `digest`) take optional `include`/`exclude` filters,
+each a `{"paths": [...], "programming_languages": [...]}` object passed straight
+through to mindex's `/search`:
+
+- `include={"programming_languages": ["rust"]}` — only Rust chunks.
+- `exclude={"paths": ["tools/**"]}` — skip the CLI/tooling tree.
+
+They're optional and additive to the query, so omitting them searches the whole
+project. The natural home for project-standing scope is the `.mindex` file above.
 
 ## Configuration (env vars)
 

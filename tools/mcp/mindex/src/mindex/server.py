@@ -43,7 +43,9 @@ def _verify() -> bool | str:
     return True
 
 
-def _request(method: str, path: str, *, json: Any = None, timeout: float = 30.0) -> httpx.Response:
+def _request(
+    method: str, path: str, *, json: Any = None, timeout: float = 30.0
+) -> httpx.Response:
     """Single HTTP round trip to mindex. The only place that touches the network."""
     url = f"{SERVER}{path}"
     try:
@@ -52,6 +54,23 @@ def _request(method: str, path: str, *, json: Any = None, timeout: float = 30.0)
         raise RuntimeError(
             f"mindex {method} {url} failed ({e}) — is the server reachable?"
         ) from e
+
+
+def _filters(
+    include: dict[str, Any] | None, exclude: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Build the optional ``include``/``exclude`` portion of a ``/search`` body.
+
+    Each is a SearchFilter dict — ``{"paths": [...], "programming_languages": [...]}``
+    — passed straight through to mindex, whose ``/search`` already supports both. A
+    filter is sent only when truthy, so a bare search is byte-for-byte unchanged and
+    empty dicts are dropped."""
+    out: dict[str, Any] = {}
+    if include:
+        out["include"] = include
+    if exclude:
+        out["exclude"] = exclude
+    return out
 
 
 _INSTRUCTIONS = """\
@@ -87,7 +106,12 @@ mcp = FastMCP("mindex", instructions=_INSTRUCTIONS)
 
 
 @mcp.tool()
-def search(project_guid: str, query: str) -> list[dict]:
+def search(
+    project_guid: str,
+    query: str,
+    include: dict[str, Any] | None = None,
+    exclude: dict[str, Any] | None = None,
+) -> list[dict]:
     """Semantic code search over an indexed mindex project.
 
     Returns up to 5 code chunks ranked by relevance, each with its file path,
@@ -95,16 +119,25 @@ def search(project_guid: str, query: str) -> list[dict]:
     and refine follow-up queries based on what earlier ones surfaced.
 
     This is the precision half of the workflow — exact code to reason about, to
-    edit, or to complete a `mindex-digest` briefing. For broad "how does X work"
-    understanding, prefer the `mindex-digest` tool: it offloads the bulk reading
+    edit, or to complete a `scout` briefing. For broad "how does X work"
+    understanding, prefer `scout`'s `digest` tool: it offloads the bulk reading
     to a local model and spends roughly an order of magnitude fewer of your tokens.
 
     Args:
         project_guid: The project's mindex GUID (e.g. from a repo-root .mindex file).
         query: What to look for, in natural language or code terms.
+        include: Optional scope to KEEP, as
+            ``{"paths": ["src/**", ...], "programming_languages": ["rust", ...]}``;
+            either key may be omitted. Standing scope can live in the repo-root
+            `.mindex` file. Omit entirely (the default) to search the whole project.
+        exclude: Optional scope to DROP, same shape as ``include`` (e.g.
+            ``{"paths": ["tools/**"]}``).
     """
-    resp = _request("POST", f"/{PROTOCOL}/{project_guid}/search",
-                    json={"query": query, "top_k": TOP_K})
+    resp = _request(
+        "POST",
+        f"/{PROTOCOL}/{project_guid}/search",
+        json={"query": query, "top_k": TOP_K, **_filters(include, exclude)},
+    )
     # 404 = empty candidate set (no active chunks match) — a normal "no results".
     if resp.status_code == 404:
         return []
@@ -154,7 +187,9 @@ def index_files(project_guid: str, files: list[dict]) -> list[dict]:
     for f in files:
         payload["files"].setdefault(f["language"], {})[f["path"]] = {"code": f["code"]}
     # Embedding runs on the GPU and can take a while for a batch — generous timeout.
-    resp = _request("POST", f"/{PROTOCOL}/{project_guid}/index", json=payload, timeout=300.0)
+    resp = _request(
+        "POST", f"/{PROTOCOL}/{project_guid}/index", json=payload, timeout=300.0
+    )
     resp.raise_for_status()
     out: list[dict] = []
     for _lang, paths in resp.json().get("files", {}).items():
@@ -183,8 +218,9 @@ def delete_files(project_guid: str, paths: list[str]) -> dict:
     """
     if not paths:
         return {"deleted_files": 0}
-    resp = _request("DELETE", f"/projects/{project_guid}/files",
-                    json={"include": {"paths": paths}})
+    resp = _request(
+        "DELETE", f"/projects/{project_guid}/files", json={"include": {"paths": paths}}
+    )
     if resp.status_code == 204:  # selector matched nothing
         return {"deleted_files": 0}
     resp.raise_for_status()

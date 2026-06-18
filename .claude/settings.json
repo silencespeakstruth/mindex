@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(docker compose -f docker-compose.test.yml *)",
+      "Bash(shellcheck *)",
+      "Bash(shfmt *)",
+      "Bash(ruff *)",
+      "Bash(black *)",
+      "Bash(mypy *)",
+      "Bash(sqlfluff *)",
+      "Bash(poetry run *)",
+      "mcp__mindex__search"
+    ]
+  }
+}

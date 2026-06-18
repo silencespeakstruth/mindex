@@ -1,8 +1,8 @@
-# mindex-digest — MCP server for cheap, compressed codebase orientation
+# scout — MCP server for cheap, compressed codebase orientation
 
 A thin [MCP](https://modelcontextprotocol.io) stdio server with a **single tool,
 `digest`**, that lets a coding agent understand part of a codebase *without pulling
-raw code into its context window*. It is a sibling of `tools/mcp` (raw search) and
+raw code into its context window*. It is a sibling of `tools/mcp/mindex` (raw search) and
 `tools/indexer` — it does **not** touch the Rust service; it only consumes mindex's
 existing HTTP `/search` API and a local LLM via [Ollama](https://ollama.com).
 
@@ -25,7 +25,7 @@ your decomposed queries  →  concurrent mindex /search  →  dedup + glue (Pyth
   `qwen2.5:14b`) does the reading/summarising; the strong model only plans the
   retrieval and reads the digest.
 
-This is the inverse of `tools/mcp`'s raw `search`: that returns verbatim chunks (for
+This is the inverse of `tools/mcp/mindex`'s raw `search`: that returns verbatim chunks (for
 code you intend to *edit*); `digest` returns a briefing (for *understanding*). Use
 `digest` to orient, then follow its `sources` with raw `search` when you need exact
 code. In practice this is roughly an **order-of-magnitude context saving** on a
@@ -47,12 +47,19 @@ would dump into the agent's window.
 ## The `digest` tool
 
 ```
-digest(project_guid: str, queries: list[str]) -> dict
+digest(project_guid, queries, include=None, exclude=None) -> dict
 ```
 
 - `project_guid` — from the repo-root `.mindex` file (same identity contract as the
   other mindex tools).
 - `queries` — 2-4 short natural-language sub-queries.
+- `include` / `exclude` — optional scope applied to **every** sub-query, each a
+  `{"paths": [...], "programming_languages": [...]}` object passed straight through to
+  mindex's `/search` (e.g. `exclude={"paths": ["tools/**"]}`,
+  `include={"programming_languages": ["rust"]}`). Omit them to survey the whole
+  project; project-standing scope can live in the `.mindex` file (see
+  `tools/mcp/mindex/README.md → The .mindex file`). Scoping sharpens recall and eases the
+  `DIGEST_NUM_CTX` budget by keeping irrelevant chunks out of the local prompt.
 
 Returns `{"summary", "sources": [{path, start_line, end_line, score}], "queries"}`.
 `summary` is `""` and `sources` is `[]` when nothing matched.
@@ -60,7 +67,7 @@ Returns `{"summary", "sources": [{path, start_line, end_line, score}], "queries"
 ## Prerequisites
 
 1. **mindex is up and the project is indexed** (see the root README and
-   `tools/mcp/README.md`). This server reuses the same `MINDEX_*` config.
+   `tools/mcp/mindex/README.md`). This server reuses the same `MINDEX_*` config.
 2. **Ollama is running** with the digest model pulled:
    ```sh
    ollama pull qwen2.5:14b      # or set DIGEST_MODEL to one you have
@@ -69,25 +76,25 @@ Returns `{"summary", "sources": [{path, start_line, end_line, score}], "queries"
 ## Setup
 
 ```sh
-cd tools/digest
+cd tools/mcp/scout
 poetry install
 ```
 
 Register with Claude Code (run through Poetry so it uses this venv; absolute path):
 
 ```sh
-claude mcp add mindex-digest \
+claude mcp add scout \
   --env MINDEX_NO_VERIFY=1 \
-  -- poetry -C /data/silencespeakstruth/Projects/mindex/tools/digest run mindex-digest
+  -- poetry -C /data/silencespeakstruth/Projects/mindex/tools/mcp/scout run scout
 ```
 
-`claude mcp list` should then show `mindex-digest` connected. As with `tools/mcp`,
+`claude mcp list` should then show `scout` connected. As with `tools/mcp/mindex`,
 there is **no network at handshake** — the server lists its tool even if mindex or
 Ollama are down; a call made while a dependency is down returns a clean error.
 
 ## Configuration (env vars)
 
-mindex side mirrors `tools/mcp` / `tools/search/mindex-search.sh`:
+mindex side mirrors `tools/mcp/mindex` / `tools/search/mindex-search.sh`:
 
 | Variable             | Default                   | Meaning                                          |
 | -------------------- | ------------------------- | ------------------------------------------------ |

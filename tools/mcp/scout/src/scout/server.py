@@ -1,4 +1,4 @@
-"""mindex-digest MCP server — one tool, ``digest``, that keeps raw code off the
+"""scout MCP server — one tool, ``digest``, that keeps raw code off the
 caller's context window.
 
 The caller (a strong model) does the cheap part — **query decomposition**: it
@@ -15,7 +15,7 @@ a compact digest out, while the slow/large work runs on local hardware for free.
 
 Division of labour: the strong model *plans* the retrieval (decomposition); the
 cheap local model *digests* the mass. This server is deliberately a sibling of
-``tools/mcp`` (raw search) — it does not replace it. When the caller needs exact
+``tools/mcp/mindex`` (raw search) — it does not replace it. When the caller needs exact
 code to *edit*, it should use the raw ``search`` tool; ``digest`` is for cheap
 orientation ("how does X work / where does Y live"), and its source pointers are
 the path back to ground truth.
@@ -32,7 +32,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-# ── mindex (search source) — same MINDEX_* conventions as tools/mcp & search.sh ──
+# ── mindex (search source) — same MINDEX_* conventions as tools/mcp/mindex & search.sh ──
 SERVER = os.environ.get("MINDEX_SERVER", "https://127.0.0.1:11111").rstrip("/")
 PROTOCOL = os.environ.get("MINDEX_PROTOCOL", "v0")
 
@@ -57,7 +57,7 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 
 def _verify() -> bool | str:
-    """TLS verification for mindex, mirroring tools/mcp: a CA-bundle path if
+    """TLS verification for mindex, mirroring tools/mcp/mindex: a CA-bundle path if
     ``MINDEX_CACERT`` is set, else off when ``MINDEX_NO_VERIFY`` is truthy (the
     self-signed cert), else on. (Ollama is plain HTTP, so this only affects mindex.)"""
     cacert = os.environ.get("MINDEX_CACERT")
@@ -68,13 +68,35 @@ def _verify() -> bool | str:
     return True
 
 
-async def _search_one(client: httpx.AsyncClient, project_guid: str, query: str) -> list[dict]:
+def _filters(
+    include: dict[str, Any] | None, exclude: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Build the optional ``include``/``exclude`` portion of a ``/search`` body.
+
+    Each is a SearchFilter dict — ``{"paths": [...], "programming_languages": [...]}``
+    — passed straight through to mindex (the backend already supports both). Sent only
+    when truthy, so an unscoped digest is byte-for-byte unchanged."""
+    out: dict[str, Any] = {}
+    if include:
+        out["include"] = include
+    if exclude:
+        out["exclude"] = exclude
+    return out
+
+
+async def _search_one(
+    client: httpx.AsyncClient, project_guid: str, query: str, filters: dict[str, Any]
+) -> list[dict]:
     """One mindex search. 404 = empty candidate set (a normal 'no results')."""
     url = f"{SERVER}/{PROTOCOL}/{project_guid}/search"
     try:
-        resp = await client.post(url, json={"query": query, "top_k": PER_QUERY_K})
+        resp = await client.post(
+            url, json={"query": query, "top_k": PER_QUERY_K, **filters}
+        )
     except httpx.RequestError as e:
-        raise RuntimeError(f"mindex search {url} failed ({e}) — is mindex reachable?") from e
+        raise RuntimeError(
+            f"mindex search {url} failed ({e}) — is mindex reachable?"
+        ) from e
     if resp.status_code == 404:
         return []
     resp.raise_for_status()
@@ -146,7 +168,7 @@ async def _ollama_digest(prompt: str) -> str:
 
 
 _INSTRUCTIONS = """\
-mindex-digest is a TOKEN-ECONOMY optimisation. Its whole purpose is to let you
+scout is a TOKEN-ECONOMY optimisation. Its whole purpose is to let you
 understand parts of a codebase while spending as few of your own (expensive) tokens
 as possible: you send a few short sub-queries, a cheap local LLM reads the matching
 code for you, and only a compact summary plus `file:line` pointers come back. The
@@ -183,11 +205,16 @@ tools. If a call returns a connection error, a dependency (mindex or Ollama) is
 down — report it and stop, don't retry blindly.
 """
 
-mcp = FastMCP("mindex-digest", instructions=_INSTRUCTIONS)
+mcp = FastMCP("scout", instructions=_INSTRUCTIONS)
 
 
 @mcp.tool()
-async def digest(project_guid: str, queries: list[str]) -> dict:
+async def digest(
+    project_guid: str,
+    queries: list[str],
+    include: dict[str, Any] | None = None,
+    exclude: dict[str, Any] | None = None,
+) -> dict:
     """Cheap codebase orientation — spend a few tokens instead of many.
 
     A TOKEN-SAVING optimisation: a local LLM reads the matching code for you and
@@ -210,6 +237,12 @@ async def digest(project_guid: str, queries: list[str]) -> dict:
     Args:
         project_guid: The project's mindex GUID (from the repo-root .mindex file).
         queries: A few short natural-language sub-queries (your query decomposition).
+        include: Optional scope to KEEP, applied to every sub-query, as
+            ``{"paths": ["src/**", ...], "programming_languages": ["rust", ...]}``;
+            either key may be omitted. Standing scope can live in the repo-root
+            `.mindex` file. Omit entirely (the default) to survey the whole project.
+        exclude: Optional scope to DROP, same shape as ``include`` (e.g.
+            ``{"paths": ["tools/**"]}``).
 
     Returns ``{"summary", "sources": [{path, start_line, end_line, score}], "queries"}``.
     ``summary`` is empty and ``sources`` is ``[]`` when nothing matched.
@@ -218,9 +251,10 @@ async def digest(project_guid: str, queries: list[str]) -> dict:
     if not clean:
         raise ValueError("queries must contain at least one non-empty string")
 
+    filters = _filters(include, exclude)
     async with httpx.AsyncClient(verify=_verify(), timeout=60.0) as client:
         groups = await asyncio.gather(
-            *(_search_one(client, project_guid, q) for q in clean)
+            *(_search_one(client, project_guid, q, filters) for q in clean)
         )
 
     chunks = _dedup(groups)

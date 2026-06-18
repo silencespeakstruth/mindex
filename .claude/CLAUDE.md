@@ -35,8 +35,8 @@ scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
 tools/search/           mindex-search.sh (bash) — search frontend (flags + MINDEX_* env)
-tools/mcp/              mindex-mcp (Python/Poetry) — MCP stdio server; search + live-index for a coding agent
-tools/digest/           mindex-digest (Python/Poetry) — MCP stdio server; token-saving digest (decomposed queries → local-LLM summary)
+tools/mcp/mindex/       mindex (Python/Poetry) — MCP stdio server; search + live-index for a coding agent
+tools/mcp/scout/        scout (Python/Poetry) — MCP stdio server; token-saving digest (decomposed queries → local-LLM summary)
 embedder/               vendored BGE-M3 server (3 heads); host-run + GPU, NOT in the image — see embedder/README.md
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
@@ -271,7 +271,7 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   `$EDITOR` (`--edit`), then stdin. Every option has a `MINDEX_*` env-var fallback
   (so it can run fully env-driven, e.g. an alias or CI job); an explicit flag wins
   over its variable. (The old `mindex-search-edit` POSIX-sh wrapper was folded in.)
-- **`tools/mcp/` (`mindex-mcp`, Python/Poetry)** — MCP stdio server (sibling of the
+- **`tools/mcp/mindex/` (`mindex`, Python/Poetry)** — MCP stdio server (sibling of the
   CLIs; hits the same HTTP API). The **intended primary way an agent drives mindex**:
   `search` for precise code to read or edit (top-5 cap fixed in the adapter — the
   model can't raise it), `index_files`/`delete_files` to keep the index live as it
@@ -281,18 +281,29 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   files just touched, passed **verbatim**; a *bulk* (re)index or path-exclude job goes
   through `mindex-index`, not a loop of `index_files`. Reads the project GUID from a
   repo-root `.mindex` file (gitignored). No network at handshake (connects even with
-  mindex down). See `tools/mcp/README.md`.
-- **`tools/digest/` (`mindex-digest`, Python/Poetry)** — second MCP server, a
+  mindex down). `search` takes optional `include`/`exclude` filters
+  (`{paths, programming_languages}`) passed straight through to `/search` — the only
+  filtered MCP path (the tools otherwise expose just GUID+query); the backend already
+  supported them, the adapter just plumbs them. See `tools/mcp/mindex/README.md`.
+- **`tools/mcp/scout/` (`scout`, Python/Poetry)** — second MCP server, a
   **token-economy** layer in front of the same `/search` API: the agent sends 2-4
   decomposed sub-queries, a local LLM (Ollama, default `qwen2.5:14b`) reads the
   matching chunks and returns only a compact summary + `[path:start-end]` pointers,
   so raw code never enters the agent's context (roughly an order-of-magnitude context
-  saving on a survey). It's the **cheap-breadth half**; `mindex-mcp`'s raw `search`
-  is the **paid-precision half** — orient with `digest`, then follow its pointers with
-  `search` for exact code. Recall is governed by `DIGEST_MAX_CHUNKS`/`DIGEST_NUM_CTX`,
-  which **must move together**: too small a `num_ctx` silently truncates the digester's
-  prompt and drops the lowest-scored long-tail chunks. mindex is untouched and the
-  layer is fully removable. See `tools/digest/README.md`.
+  saving on a survey). It's the **cheap-breadth half** (server `scout`, tool `digest`);
+  `mindex`'s raw `search` is the **paid-precision half** — orient with `digest`, then
+  follow its pointers with `search` for exact code. Recall is governed by
+  `DIGEST_MAX_CHUNKS`/`DIGEST_NUM_CTX`, which **must move together**: too small a
+  `num_ctx` silently truncates the digester's prompt and drops the lowest-scored
+  long-tail chunks. `digest` also takes optional `include`/`exclude` (same shape as
+  `search`), applied to every sub-query. mindex is untouched and the layer is fully
+  removable. See `tools/mcp/scout/README.md`.
+
+The `.mindex` file (repo-root, gitignored) is **GUID on the first non-comment line**;
+optional `exclude_paths:` / `include_paths:` / `languages:` lines below it carry
+project-standing search scope that the `digest` agent reads and passes as the
+`include`/`exclude` filters above (the MCP servers themselves don't parse `.mindex` —
+they take the GUID + filters as call args).
 
 ## Docker & CI
 
