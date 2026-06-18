@@ -34,20 +34,66 @@ humans.
 
 ## How it works
 
-```
-            ┌─────────────┐   tree-sitter      ┌──────────────┐   3 heads     ┌──────────┐
-  source ──▶│  mindex API │──► AST chunking ──▶ │  BGE-M3       │ ───────────▶ │  Qdrant  │  vectors
-   files    │  (Rust,     │   (128–512 tok)    │  embedder     │  dense/      │          │
-            │   HTTPS)    │                    │  (/encode)    │  sparse/     └──────────┘
-            └─────────────┘                    └──────────────┘  colbert      ┌──────────┐
-                  │                                                            │  SQLite  │  metadata
-                  └──────── search: prefetch dense+sparse → RRF → ColBERT ────▶│          │
-                                                              rerank → top-k   └──────────┘
+```mermaid
+flowchart LR
+    src["source files"]
+    api["mindex API<br/>(Rust, HTTPS)"]
+    emb["BGE-M3 embedder<br/>(/encode)"]
+    qd[("Qdrant<br/>vectors")]
+    db[("SQLite<br/>metadata")]
+    query["search query"]
+
+    src -->|"POST /index"| api
+    api -->|"tree-sitter AST chunking (128–512 tok)"| emb
+    emb -->|"dense / sparse / colbert (3 heads)"| qd
+    api -->|"chunk metadata"| db
+    query -->|"POST /search"| api
+    api -->|"prefetch dense+sparse → RRF fusion → ColBERT rerank → top-k"| query
 ```
 
 Indexing is append-only; reindexed/deleted chunks are soft-deleted and swept by a
 background GC. Project isolation is one Qdrant collection per project plus a SQLite-built
 `has_id` filter.
+
+### File status state machine
+
+Each indexed file has a `status` in SQLite, guarded by triggers (not just convention):
+a row may only **enter** as `just_uploaded` or `indexing`; from there the only legal moves
+are `any → indexing` (start / reindex / retry), `any → deleted` (soft delete, then GC),
+and `indexing → {indexed | cancelled | failed}` (a terminal is reachable only from
+in-flight work). Anything else (e.g. `failed → indexed`, `just_uploaded → indexed`) is
+rejected. Retry therefore loops back through `indexing`, never straight to `indexed`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> indexing : POST /index (new file)
+    [*] --> just_uploaded : initial upload
+
+    just_uploaded --> indexing : index / reindex / retry
+    indexing --> indexing : idempotent upsert
+
+    indexing --> indexed : work succeeds
+    indexing --> failed : work fails
+    indexing --> cancelled : POST /cancel (mid-flight)
+
+    indexed --> indexing : reindex (sha256 mismatch)
+    failed --> indexing : retry worker (retry_count < MAX_RETRIES)
+    cancelled --> indexing : reindex resurrects
+    deleted --> indexing : reindex resurrects
+
+    just_uploaded --> deleted : DELETE /files
+    indexing --> deleted : DELETE /files
+    indexed --> deleted : DELETE /files
+    failed --> deleted : DELETE /files
+    cancelled --> deleted : DELETE /files
+
+    deleted --> [*] : GC removes emptied row
+```
+
+`POST /cancel` moves matched in-flight files `indexing → cancelled` (it does **not** delete
+the file row); a file that exhausts `MAX_RETRIES` stays `failed` and is never retried again.
+`deleted` is terminal except for `deleted → indexing` (re-indexing a path pending deletion
+resurrects it).
 
 ## Components
 

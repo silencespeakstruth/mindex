@@ -88,6 +88,37 @@ transition); every transition is logged to `project_file_status_log` by AFTER-tr
 A file that exhausts `MAX_RETRIES` (3) stays `failed` and is never retried again
 (`worker::retry::warn_permanently_failed` surfaces it at startup and hourly).
 
+```mermaid
+stateDiagram-v2
+    [*] --> indexing : POST /index (new file)
+    [*] --> just_uploaded : initial upload
+
+    just_uploaded --> indexing : index / reindex / retry
+    indexing --> indexing : idempotent upsert
+
+    indexing --> indexed : work succeeds
+    indexing --> failed : work fails
+    indexing --> cancelled : POST /cancel (mid-flight)
+
+    indexed --> indexing : reindex (sha256 mismatch)
+    failed --> indexing : retry worker (retry_count < MAX_RETRIES)
+    cancelled --> indexing : reindex resurrects
+    deleted --> indexing : reindex resurrects
+
+    just_uploaded --> deleted : DELETE /files
+    indexing --> deleted : DELETE /files
+    indexed --> deleted : DELETE /files
+    failed --> deleted : DELETE /files
+    cancelled --> deleted : DELETE /files
+
+    deleted --> [*] : GC removes emptied row
+```
+
+Note the missing edges are the point: `failed → indexed` is **illegal** (retry loops back
+through `indexing`), and a row may only *enter* at `just_uploaded`/`indexing` — never
+straight into a terminal. `POST /cancel` is `indexing → cancelled` (the file row is **not**
+deleted). The same diagram lives in the root `README.md`.
+
 **sha256 skip / empty 404.** Re-indexing identical content is skipped by hash.
 `post_search` returns 404 immediately when the SQLite candidate set is empty (no
 active chunks), without calling Qdrant (avoids a 503 from a missing collection).
