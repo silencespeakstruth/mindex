@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use client::{Code, IndexRequest, IndexResponse, upload_batch};
+use sha2::{Digest, Sha256};
+
+use client::{Code, DriftRequest, IndexRequest, IndexResponse, check_drift, upload_batch};
 use scanner::{FileEntry, Language, ScanResult, scan};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -92,6 +94,18 @@ struct Cli {
     /// Print one line per file showing chunk count or "unchanged"
     #[arg(short, long)]
     verbose: bool,
+
+    /// Drift check: walk + hash the tree, compare against the index, and report
+    /// what diverged (stale / missing / orphaned / indexing) WITHOUT uploading.
+    /// Exits non-zero if any actionable drift (stale/missing/orphaned) is found;
+    /// the informational `indexing` bucket does not affect the exit code.
+    #[arg(long)]
+    check: bool,
+
+    /// With --check, print the raw drift JSON instead of the human-readable report
+    /// (for scripts / the MCP `drift` tool).
+    #[arg(long)]
+    json: bool,
 }
 
 fn default_concurrency() -> usize {
@@ -156,7 +170,9 @@ async fn main() -> Result<()> {
     let scan = scan(&root, &cli.includes, &cli.excludes).context("file scan failed")?;
     spin.finish_and_clear();
 
-    if scan.files.is_empty() {
+    // An empty tree still matters to --check: everything indexed is then orphaned,
+    // so only short-circuit on empty when we're actually about to index.
+    if scan.files.is_empty() && !cli.check {
         eprintln!(
             "  {} No source files found.{}",
             style("—").dim(),
@@ -181,6 +197,17 @@ async fn main() -> Result<()> {
     );
 
     let total = scan.files.len();
+
+    // ── Drift check: hash the tree, ask the server what diverged, report, exit.
+    // No uploads, no warm-up (read-only against an existing project).
+    if cli.check {
+        let actionable =
+            run_check(&http, &cli.server, &cli.project, scan.files, &cancel, cli.json).await?;
+        if cancel.is_cancelled() || actionable {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // ── Warm-up: create the project row + Qdrant collection once, before fan-out.
     // post_index ensures both before it looks at the file map, so an empty request
@@ -401,6 +428,99 @@ async fn run_worker(
 
     shared.active.fetch_sub(1, Ordering::Relaxed);
     stats
+}
+
+// ─── Drift check ──────────────────────────────────────────────────────────────
+
+/// Hash every scanned file (the SAME bytes `upload_batch` would send, so the digest
+/// matches the server's `sha256`), POST the manifest to `/drift`, and report the
+/// divergence. Returns `true` if there is **actionable** drift (stale/missing/orphaned).
+async fn run_check(
+    http: &reqwest::Client,
+    server: &str,
+    project: &str,
+    files: Vec<FileEntry>,
+    cancel: &CancellationToken,
+    json: bool,
+) -> Result<bool> {
+    let spin = spinner("Hashing…");
+    let mut manifest: HashMap<String, String> = HashMap::new();
+    for f in &files {
+        if cancel.is_cancelled() {
+            break;
+        }
+        match tokio::fs::read_to_string(&f.abs_path).await {
+            // Hash the exact uploaded bytes: server hashes `code.as_bytes()`.
+            Ok(content) => {
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                manifest.insert(f.rel_path.clone(), hex::encode(hasher.finalize()));
+            }
+            Err(err) => {
+                // Unreadable/binary files are simply not part of the index, so omit
+                // them from the manifest (they'd otherwise look "missing" forever).
+                eprintln!(
+                    "  {} {}  {}",
+                    style("✗").red(),
+                    f.rel_path,
+                    style(format!("unreadable: {err}")).red().dim(),
+                );
+            }
+        }
+    }
+    spin.finish_and_clear();
+
+    let drift = check_drift(http, server, project, DriftRequest { files: manifest }, cancel)
+        .await
+        .context("drift check request failed (server unreachable, bad project GUID, or TLS?)")?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "stale": drift.stale,
+            "missing": drift.missing,
+            "orphaned": drift.orphaned,
+            "indexing": drift.indexing,
+        }))?);
+    } else {
+        print_drift(&drift);
+    }
+
+    Ok(!drift.stale.is_empty() || !drift.missing.is_empty() || !drift.orphaned.is_empty())
+}
+
+/// Human-readable drift report. Each non-empty bucket is a labelled, sorted block;
+/// a fully in-sync tree prints a single "in sync" line.
+fn print_drift(d: &client::DriftResponse) {
+    let block = |label: &str, color: console::Color, paths: &[String]| {
+        if paths.is_empty() {
+            return;
+        }
+        eprintln!("  {}", style(format!("{label} ({})", paths.len())).fg(color).bold());
+        for p in paths {
+            eprintln!("    {}", style(p).fg(color).dim());
+        }
+    };
+
+    block("STALE", console::Color::Yellow, &d.stale);
+    block("MISSING", console::Color::Red, &d.missing);
+    block("ORPHANED", console::Color::Magenta, &d.orphaned);
+    block("INDEXING", console::Color::Cyan, &d.indexing);
+
+    if d.stale.is_empty() && d.missing.is_empty() && d.orphaned.is_empty() {
+        let note = if d.indexing.is_empty() {
+            String::new()
+        } else {
+            format!("  ({} file(s) currently indexing)", d.indexing.len())
+        };
+        eprintln!("  {} index in sync{}", style("✓").green(), style(note).dim());
+    } else {
+        eprintln!();
+        eprintln!(
+            "  {} index out of sync — run mindex-index (or delete orphaned paths) to refresh",
+            style("⚠").yellow(),
+        );
+    }
+    eprintln!();
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

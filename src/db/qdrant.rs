@@ -150,12 +150,25 @@ impl VectorStore for Qdrant {
 
         sparse_config.add_named_vector_params("sparse", SparseVectorParamsBuilder::default());
 
-        self.create_collection(
-            CreateCollectionBuilder::new(collection)
-                .vectors_config(vectors_config)
-                .sparse_vectors_config(sparse_config),
-        )
-        .await?;
+        // `collection_exists` + `create_collection` is not atomic: two concurrent
+        // first-time `/index` calls for the same new project can both see "absent" and
+        // both create, the loser getting "already exists". Treat that as success — the
+        // collection we wanted is there. (This guard sits *before* the per-file claim,
+        // so the claim can't serialize it.) Matched on the rendered message because the
+        // client surfaces no typed "already exists" variant.
+        if let Err(e) = self
+            .create_collection(
+                CreateCollectionBuilder::new(collection)
+                    .vectors_config(vectors_config)
+                    .sparse_vectors_config(sparse_config),
+            )
+            .await
+        {
+            let err: VectorStoreError = e.into();
+            if !err.0.contains("already exists") {
+                return Err(err);
+            }
+        }
 
         Ok(())
     }

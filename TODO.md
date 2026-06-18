@@ -22,6 +22,14 @@ is *not done* or *deliberately constrained*.
 - **`cancelled` files are never retried** by the worker (by design — the client
   gave up). They only revive on an explicit re-push (`cancelled → indexing` via the
   handler). A cancelled file never re-pushed keeps no vectors.
+- **In-flight indexing cannot be aborted (no cancellation of committed work).** The
+  hot path is append-only: once a file is `indexing`, a batch already in progress
+  runs to completion even if the file changed again meanwhile — there is no way to
+  abort the stale in-flight index and restart on the fresh content. Drift detection
+  *surfaces* this (the `indexing` bucket — no action, wait for it to settle), it
+  does not fix it. **Wanted (important):** an abort mechanism so a superseded
+  in-flight index can be cancelled and immediately re-run on the latest content,
+  instead of waiting a full batch and then reindexing.
 - **No API authentication** (by design — internal service, TLS only). Revisit if
   ever exposed beyond a trusted network.
 - **HTTP/3 is not implemented.** `run()` is HTTP/1.1 + HTTP/2; the `http3.rs`
@@ -42,11 +50,35 @@ is *not done* or *deliberately constrained*.
   language-extensibility checklist in CLAUDE.md once the crates update.
 - **Terminal search frontend (`tools/search/`) copy-to-clipboard buttons** for
   selecting result segments — left as a future iteration.
+- **Multi-instance-safe indexing claim.** Concurrent same-file work is serialized by
+  an *in-process* keyed lock (`IndexClaim` + `indexing_lock_key` in `handlers.rs`,
+  keyed on `{guid}\0{model_id}\0{path}`): the `/index` handler claims a file for its
+  whole prepare→embed→mark_indexed pipeline (contention → 429), **and the retry worker
+  claims it too** before a sweep (skips if a live `/index` holds it). So the
+  handler↔handler and handler↔worker races are both lock invariants, not merely a
+  consequence of `--stuck-grace-mins` exceeding the longest request. That assumes a
+  single mindex process (see Assumptions). To run more than one mindex process against
+  one DB, replace the in-process set with a DB-level compare-and-swap claim — e.g. a
+  conditional `… → indexing` update plus an epoch column checked at `mark_indexed`, so
+  a superseded writer abandons rather than clobbering. Requires a schema migration.
+- **A claim collision penalizes innocent files in the same batch.** When a multi-file
+  `/index` batch hits 429 on *one* contended file, `post_index` recovers every
+  already-prepared file in that batch to `failed` with `retry_count += 1` (it can't
+  tell a contention 429 from a genuine prepare error — `prepare` returns an opaque
+  `ErrorResponse`). No corruption (the retry worker re-indexes them), but repeated
+  collisions on the same co-batched file could burn its 3 retries and strand it in
+  `failed`. Fix: have `prepare` signal contention distinctly (e.g. a `Contended`
+  variant) so the batch recovers those files **without** incrementing retry, or simply
+  leaves them `indexing` for the worker.
 
 ## Assumptions
 
 - **One embedding model at runtime** (`--model`, default `BAAI/bge-m3`). The
   `EmbeddingModel` enum is the extension point for more.
+- **A single mindex process per database.** The per-file indexing mutual-exclusion
+  (`IndexClaim`) is an in-process set in `RouterState`, so it only serializes
+  same-file `/index` requests within one process. Running multiple mindex processes
+  on one SQLite/Qdrant would need the DB-level claim noted in Future work.
 - **The DB can be dropped and recreated freely** — no migration upgrade path is
   maintained. Schema changes are new files in the `MIGRATIONS` slice; a changed
   `CHECK` constraint requires dropping the `mindex_mindex_db` volume.

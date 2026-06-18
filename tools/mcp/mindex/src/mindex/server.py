@@ -15,7 +15,10 @@ instead of updating in place.
 
 from __future__ import annotations
 
+import json as _json
 import os
+import shutil
+import subprocess
 from typing import Any
 
 import httpx
@@ -95,6 +98,11 @@ overwrites the indexed copy with broken content. Use `index_files` only for the
 files you touched this turn; to (re)index a whole tree, or to apply path excludes,
 run the `tools/indexer` CLI instead — it walks the tree and hash-skips server-side
 without sending file bodies through the model.
+
+Trusting search: if you suspect the index is out of date (files changed outside
+this session, or you're starting a task and want to be sure), call `drift` — it
+reports which files are stale/missing/orphaned vs the working tree. Act only on
+stale/missing/orphaned; files reported `indexing` are in flight, so leave them.
 
 Availability: this server stays up even if mindex itself is stopped. If any tool
 returns a connection error, mindex is unreachable — call `health()` to confirm,
@@ -252,6 +260,85 @@ def project_stats(project_guid: str) -> dict:
     resp = _request("GET", f"/projects/{project_guid}")
     resp.raise_for_status()
     return resp.json()
+
+
+@mcp.tool()
+def drift(
+    project_guid: str,
+    root: str = ".",
+    include: dict[str, Any] | None = None,
+    exclude: dict[str, Any] | None = None,
+) -> dict:
+    """Report whether the indexed copy has drifted from the working tree on disk.
+
+    Use this to know if mindex search results can be trusted before you rely on
+    them — e.g. at the start of a task, or after files changed outside this session.
+    It walks the local tree, hashes each file, and compares against the index,
+    returning four buckets:
+
+        - ``stale``:    indexed but the file changed (search returns old code) →
+                        reindex via ``index_files`` (or the ``tools/indexer`` CLI).
+        - ``missing``:  on disk but not indexed → index it.
+        - ``orphaned``: indexed but gone from disk → ``delete_files`` the path.
+        - ``indexing``: being indexed right now → **do nothing**, re-check later
+                        (re-triggering it races the in-flight job; there is no
+                        cancellation). Act only on stale/missing/orphaned.
+
+    This shells out to the ``mindex-index`` CLI (``--check``), which is the single
+    implementation of the walk+hash, so it must be on ``PATH``. The ``paths`` in
+    ``include``/``exclude`` scope the walk and **must match how the project was
+    indexed** (e.g. the same ``exclude_paths`` from the repo-root ``.mindex``),
+    otherwise correctly-indexed files look orphaned. ``programming_languages`` in a
+    filter is ignored here (the CLI detects language by extension).
+
+    Args:
+        project_guid: The project's mindex GUID (from the repo-root .mindex file).
+        root: Repo root to walk (default the current directory).
+        include: Optional ``{"paths": ["src/**", ...]}`` to KEEP.
+        exclude: Optional ``{"paths": ["tools/**", ...]}`` to DROP.
+    """
+    binary = shutil.which("mindex-index")
+    if binary is None:
+        raise RuntimeError(
+            "the `mindex-index` CLI is not on PATH — build tools/indexer and add it "
+            "to PATH to use drift (search/index_files do not need it)."
+        )
+
+    cmd = [
+        binary,
+        "--check",
+        "--json",
+        "--project",
+        project_guid,
+        "--root",
+        root,
+        "--server",
+        SERVER,
+    ]
+    if _verify() is False:
+        cmd.append("--no-verify")
+    for glob in (include or {}).get("paths") or []:
+        cmd += ["--include", glob]
+    for glob in (exclude or {}).get("paths") or []:
+        cmd += ["--exclude", glob]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("drift check timed out after 120s") from e
+
+    # `--check` exits non-zero when it finds actionable drift, which is NOT an
+    # error — so trust stdout: valid JSON means success regardless of exit code;
+    # absent/garbage stdout means a real failure (use stderr for the reason).
+    out = proc.stdout.strip()
+    if not out:
+        reason = proc.stderr.strip() or f"exit code {proc.returncode}"
+        raise RuntimeError(f"drift check failed: {reason}")
+    try:
+        return _json.loads(out)  # type: ignore[no-any-return]
+    except _json.JSONDecodeError as e:
+        reason = proc.stderr.strip() or out[:200]
+        raise RuntimeError(f"drift check produced unparseable output: {reason}") from e
 
 
 @mcp.tool()

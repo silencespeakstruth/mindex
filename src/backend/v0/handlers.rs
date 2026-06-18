@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::models::IndexRequest;
 use crate::backend::http3;
@@ -10,6 +12,8 @@ use crate::backend::v0::models::ChunkCounts;
 use crate::backend::v0::models::Code;
 use crate::backend::v0::models::DeleteFilesRequest;
 use crate::backend::v0::models::DeleteFilesResponse;
+use crate::backend::v0::models::DriftRequest;
+use crate::backend::v0::models::DriftResponse;
 use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
 use crate::backend::v0::models::HealthChecks;
@@ -245,14 +249,64 @@ fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
     }
 }
 
+/// In-process mutual exclusion for indexing a single `(project, model, path)`.
+///
+/// `post_index`'s pipeline is several independent transactions (hash-check →
+/// mark `indexing` → slice+insert → embed → `mark_indexed`), not one atomic unit.
+/// Two concurrent `/index` requests for the *same* file would interleave at those
+/// boundaries: the second `prepare` marks the first's freshly-inserted chunks
+/// `deleted` (so the first embeds orphan vectors), and the second `mark_indexed`
+/// hits an illegal `indexed→indexed` transition — possibly leaving `sha256`
+/// describing a different chunk set than is `active` (silent staleness on the next
+/// hash-skip). This claim serializes the whole per-file pipeline within one process
+/// (mindex is single-instance). A multi-instance deployment would need a DB-level
+/// CAS claim instead — see TODO.md.
+/// The per-file mutual-exclusion key: `{guid_simple}\0{model_id}\0{path}`. The NUL
+/// separators can't appear in any component, so the join is unambiguous. Built
+/// identically by the indexing handler and the retry worker so a claim taken by a
+/// live `/index` is visible to the worker (and vice versa) — they share one lock
+/// table. `guid_simple` must be the 32-char hyphen-less form (`Uuid::simple`), which
+/// is exactly how the guid is stored in SQLite (see `UUIDv4`'s `ToSql`).
+pub(crate) fn indexing_lock_key(guid_simple: &str, model_id: &str, path: &str) -> String {
+    format!("{guid_simple}\u{0}{model_id}\u{0}{path}")
+}
+
+pub(crate) struct IndexClaim {
+    locks: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl IndexClaim {
+    /// `Some(claim)` if the slot was free, `None` if another request holds it.
+    pub(crate) fn try_acquire(locks: &Arc<Mutex<HashSet<String>>>, key: String) -> Option<Self> {
+        // Recover from a poisoned mutex rather than panic: the set is a plain
+        // membership table, no invariant is broken by a panicked holder.
+        let mut set = locks.lock().unwrap_or_else(|e| e.into_inner());
+        if set.insert(key.clone()) {
+            Some(IndexClaim { locks: Arc::clone(locks), key })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for IndexClaim {
+    fn drop(&mut self) {
+        let mut set = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.key);
+    }
+}
+
 /// A file that has been hash-checked, marked `indexing`, sliced, and had its
 /// chunks inserted — awaiting the shared embed pass. `chunks` is drained into the
-/// cross-file batch before `mark_indexed`.
+/// cross-file batch before `mark_indexed`. `_claim` holds the per-file lock for the
+/// whole pipeline; it releases on drop (end of `post_index`, after `mark_indexed`).
 struct Prepared {
     pl: ProgrammingLanguage,
     path: String,
     sha256: String,
     chunks: Vec<(UUIDv4, String)>,
+    _claim: IndexClaim,
 }
 
 /// Borrowed view of everything indexing needs. `post_index` drives it in two
@@ -270,6 +324,9 @@ struct FileIndexer<'a> {
     embed_batch: usize,
     /// Request-scoped cancellation token (the handler's `CancellationGuard`).
     token: &'a CancellationToken,
+    /// Shared set of `(project, model, path)` keys currently being indexed — the
+    /// per-file mutual-exclusion table (see `IndexClaim`).
+    indexing_locks: &'a Arc<Mutex<HashSet<String>>>,
 }
 
 impl FileIndexer<'_> {
@@ -287,6 +344,27 @@ impl FileIndexer<'_> {
         let span = info_span!("indexing_file", ?pl, path);
         async move {
             let project_guid = self.project_guid;
+
+            // ── claim the per-file slot (serialize concurrent same-file indexing) ─
+            // Held across the whole pipeline via `Prepared._claim`; released on any
+            // early return below (unchanged / error) when this local drops.
+            let claim = {
+                let key = indexing_lock_key(
+                    &project_guid.0.as_simple().to_string(),
+                    self.model_id,
+                    path,
+                );
+                match IndexClaim::try_acquire(self.indexing_locks, key) {
+                    Some(c) => c,
+                    None => {
+                        info!(
+                            "The file is already being indexed by another in-flight \
+                             request; returning 429 so the caller retries."
+                        );
+                        return Err(StatusCode::TOO_MANY_REQUESTS.into());
+                    }
+                }
+            };
 
             hasher.update(code.as_bytes());
             let sha256 = hex::encode(hasher.finalize_fixed_reset());
@@ -430,7 +508,7 @@ impl FileIndexer<'_> {
                 }
             };
 
-            Ok(Some(Prepared { pl, path: path.to_string(), sha256, chunks }))
+            Ok(Some(Prepared { pl, path: path.to_string(), sha256, chunks, _claim: claim }))
         }
         .instrument(span)
         .await
@@ -523,6 +601,7 @@ pub async fn post_index(
         let db_pool = s.db_pool;
         let qdrant = s.qdrant;
         let tokenizer = s.tokenizer;
+        let indexing_locks = s.indexing_locks;
         let EmbeddingModel::BGEm3 { model_id, client } = s.model;
 
         let collection = collection_for(project_guid);
@@ -532,21 +611,19 @@ pub async fn post_index(
             let model_id = model_id.clone();
             db_pool
                 .transaction(guard.0.child_token(), move |tx| {
-                    let exists = tx
-                        .query_row(
-                            "SELECT 1 FROM projects WHERE guid = ?1 AND model_id = ?2",
-                            params![project_guid, model_id],
-                            |_| Ok(true),
-                        )
-                        .optional()?
-                        .is_some();
-
-                    if !exists {
-                        info!("Project does not exist. Creating a new one.");
-                        tx.execute(
-                            "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                            params![project_guid, model_id],
-                        )?;
+                    // Idempotent and concurrency-safe: two parallel first-time /index
+                    // calls for the same new project both reach here. A SELECT-then-
+                    // INSERT would let both pass the check and the second trip the
+                    // (guid, model_id) PK, failing an otherwise-valid request with 500.
+                    // ON CONFLICT DO NOTHING makes the loser a no-op instead. This is
+                    // *before* the per-file claim, so the claim can't cover it.
+                    let inserted = tx.execute(
+                        "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)
+                         ON CONFLICT (guid, model_id) DO NOTHING",
+                        params![project_guid, model_id],
+                    )?;
+                    if inserted > 0 {
+                        info!("Created a new project.");
                     } else {
                         info!("Project already exists.");
                     }
@@ -586,6 +663,7 @@ pub async fn post_index(
             collection: &collection,
             embed_batch: s.embed_batch,
             token: &guard.0,
+            indexing_locks: &indexing_locks,
         };
 
         // ── Phase 1: prepare every file (hash-check, mark indexing, slice + insert).
@@ -663,6 +741,109 @@ pub async fn post_index(
     }
     .instrument(span)
     .await
+}
+
+/// Pure drift computation: classify each working-tree path against the server's
+/// view. Kept separate from the handler so it is unit-testable without a DB.
+///
+/// `in_flight` is checked **first**: a file currently being indexed is reported
+/// `indexing` and never `stale`/`missing`, because its stored `sha256` is the
+/// *previous* value (updated only at `mark_indexed`), so a hash comparison would be
+/// meaningless and re-triggering it would race the live batch.
+fn compute_drift(
+    indexed: &HashMap<String, String>,
+    in_flight: &HashSet<String>,
+    local: &HashMap<String, String>,
+) -> DriftResponse {
+    let mut out = DriftResponse::default();
+
+    for (path, local_sha) in local {
+        if in_flight.contains(path) {
+            out.indexing.push(path.clone());
+        } else if let Some(indexed_sha) = indexed.get(path) {
+            if indexed_sha != local_sha {
+                out.stale.push(path.clone());
+            }
+        } else {
+            out.missing.push(path.clone());
+        }
+    }
+
+    // Indexed but gone from the working tree — but an in-flight file absent locally
+    // is left to settle, not called orphaned.
+    for path in indexed.keys() {
+        if !local.contains_key(path) && !in_flight.contains(path) {
+            out.orphaned.push(path.clone());
+        }
+    }
+
+    out.stale.sort();
+    out.missing.sort();
+    out.orphaned.sort();
+    out.indexing.sort();
+    out
+}
+
+/// Read the drift baseline from SQLite: `(indexed path→sha256, in-flight paths)`.
+/// `failed`/`deleted` rows are excluded so their paths fall into `missing` (they do
+/// need indexing); `indexed` carries a trustworthy hash, everything else is in flight.
+async fn read_drift_baseline(
+    s: &RouterState,
+    token: &CancellationToken,
+    project_guid: UUIDv4,
+) -> Result<(HashMap<String, String>, HashSet<String>), ErrorResponse> {
+    let rows: Vec<(String, String, String)> = s
+        .db_pool
+        .transaction(token.child_token(), move |tx| {
+            let mut stmt = tx.prepare(
+                "SELECT path, sha256, status FROM project_files
+                 WHERE project_guid = ?1
+                   AND status IN ('indexed', 'indexing', 'just_uploaded')",
+            )?;
+            let rows = stmt
+                .query_map(params![project_guid], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .with_cancellation_token(token)
+        .await
+        .from_cancelled()
+        .map_err(|err| {
+            error!(
+                error = ?err,
+                project_guid = %project_guid.0,
+                "Failed to read the project manifest for drift. Check the DB is writable."
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut indexed: HashMap<String, String> = HashMap::new();
+    let mut in_flight: HashSet<String> = HashSet::new();
+    for (path, sha256, status) in rows {
+        if status == "indexed" {
+            indexed.insert(path, sha256);
+        } else {
+            in_flight.insert(path);
+        }
+    }
+    Ok((indexed, in_flight))
+}
+
+/// `POST /projects/{guid}/drift` — compare the posted working-tree `path → sha256`
+/// map against the index and return the divergence. Filesystem-agnostic: the client
+/// walked and hashed; this only reads stored hashes. Unlike `post_search`, an empty
+/// project is not a 404 — it just means every posted file is `missing`.
+#[debug_handler]
+pub async fn post_drift(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+    Json(payload): Json<DriftRequest>,
+) -> Result<Json<DriftResponse>, ErrorResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let (indexed, in_flight) = read_drift_baseline(&s, &guard.0, project_guid).await?;
+    Ok(Json(compute_drift(&indexed, &in_flight, &payload.files)))
 }
 
 #[debug_handler]
@@ -1447,6 +1628,84 @@ mod tests {
                 Bind::Lang(ProgrammingLanguage::Rust),
                 Bind::Path("target/**".into()),
             ]
+        );
+    }
+
+    // ── drift ────────────────────────────────────────────────────────────────
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(p, s)| (p.to_string(), s.to_string())).collect()
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn drift_classifies_all_four_buckets() {
+        let indexed = map(&[("same.rs", "h1"), ("changed.rs", "h2"), ("gone.rs", "h3")]);
+        let in_flight = set(&["busy.rs"]);
+        let local = map(&[
+            ("same.rs", "h1"),     // in sync → omitted
+            ("changed.rs", "hX"),  // hash differs → stale
+            ("new.rs", "h9"),      // not indexed → missing
+            ("busy.rs", "hY"),     // in flight → indexing
+            // gone.rs absent locally → orphaned
+        ]);
+
+        let d = compute_drift(&indexed, &in_flight, &local);
+
+        assert_eq!(d.stale, vec!["changed.rs"]);
+        assert_eq!(d.missing, vec!["new.rs"]);
+        assert_eq!(d.orphaned, vec!["gone.rs"]);
+        assert_eq!(d.indexing, vec!["busy.rs"]);
+    }
+
+    #[test]
+    fn drift_empty_baseline_makes_everything_missing() {
+        let d = compute_drift(&map(&[]), &set(&[]), &map(&[("a.rs", "h"), ("b.rs", "h")]));
+        assert_eq!(d.missing, vec!["a.rs", "b.rs"]);
+        assert!(d.stale.is_empty() && d.orphaned.is_empty() && d.indexing.is_empty());
+    }
+
+    #[test]
+    fn drift_in_flight_never_stale_or_missing_even_when_hash_differs() {
+        // An indexing row's stored sha256 is the *old* value, so a hash mismatch on
+        // an in-flight file must NOT surface as stale/missing — only `indexing`.
+        let indexed = map(&[("f.rs", "old_hash")]);
+        let in_flight = set(&["f.rs"]);
+        let local = map(&[("f.rs", "new_hash")]);
+
+        let d = compute_drift(&indexed, &in_flight, &local);
+
+        assert_eq!(d.indexing, vec!["f.rs"]);
+        assert!(d.stale.is_empty());
+        assert!(d.missing.is_empty());
+        assert!(d.orphaned.is_empty(), "in-flight file must not be called orphaned");
+    }
+
+    // ── keyed indexing claim ─────────────────────────────────────────────────
+
+    #[test]
+    fn index_claim_is_exclusive_and_releases_on_drop() {
+        let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let key = "guid\u{0}model\u{0}path".to_string();
+
+        let first = IndexClaim::try_acquire(&locks, key.clone());
+        assert!(first.is_some(), "first claim should succeed");
+
+        // A second claim on the same key is refused while the first is held.
+        assert!(
+            IndexClaim::try_acquire(&locks, key.clone()).is_none(),
+            "concurrent claim on the same key must be refused"
+        );
+
+        drop(first); // release
+
+        // After release the key is claimable again.
+        assert!(
+            IndexClaim::try_acquire(&locks, key).is_some(),
+            "key should be claimable again after the holder drops"
         );
     }
 }

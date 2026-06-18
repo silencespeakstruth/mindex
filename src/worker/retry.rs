@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::backend::v0::handlers::{IndexClaim, indexing_lock_key};
 use crate::backend::v0::models::UUIDv4;
 use crate::db::files::set_file_status;
 use crate::db::qdrant::{VectorStore, collection_name};
@@ -47,6 +49,41 @@ pub(crate) async fn warn_permanently_failed(db_pool: &SQLite3Pool, token: Cancel
     }
 }
 
+/// Logs a WARN if any files were left mid-flight (`status IN ('indexing',
+/// 'just_uploaded')`) by a previous run — a crash or unclean shutdown. Called once at
+/// startup, where the in-memory claim table is empty and no batch is live, so any such
+/// row is definitively orphaned (not a live request). They are **not** force-failed:
+/// the retry worker re-embeds their already-inserted chunks back to `indexed` (losing
+/// no work), which is strictly better than dropping them to `failed` (that would burn
+/// retry budget and risk trapping a 0-chunk file). This warning only surfaces them so
+/// the operator knows recovery is pending — it happens within one `stuck_grace_mins`
+/// window plus a sweep.
+pub(crate) async fn warn_orphaned_indexing(db_pool: &SQLite3Pool, token: CancellationToken) {
+    let count: i64 = db_pool
+        .transaction(token, |tx| {
+            tx.query_row(
+                "SELECT COUNT(*) FROM project_files
+                 WHERE status IN ('indexing', 'just_uploaded')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .unwrap_or(0);
+
+    if count > 0 {
+        warn!(
+            count,
+            "Files were left mid-indexing by a previous run (crash or unclean shutdown). \
+             The retry worker will re-index them automatically (no work is lost); they are \
+             not force-failed. If they linger, check the model server (--model-server) and \
+             Qdrant (--qdrant-server) are reachable."
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // irreducible worker deps (db, store, embedder, model_id, batch, grace, locks, token)
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     store: Arc<dyn VectorStore>,
@@ -54,6 +91,7 @@ pub async fn run(
     model_id: String,
     embed_batch: usize,
     stuck_grace_secs: i64,
+    indexing_locks: Arc<Mutex<HashSet<String>>>,
     token: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -81,10 +119,12 @@ pub async fn run(
             .transaction(token.clone(), {
                 let model_id = model_id.clone();
                 move |tx| {
-                // The `indexing` grace must exceed the longest legitimate in-flight
-                // request, otherwise the worker races a live batch (which holds its
-                // files in 'indexing' for the whole embed pass) — re-embedding them
-                // one-by-one and tripping illegal status transitions.
+                // `stuck_grace_secs` only decides *when* a mid-flight row looks
+                // abandoned; the actual guard against racing a still-live batch is the
+                // per-file claim taken in `retry_file` (a live `/index` holds it for the
+                // whole embed pass, so the worker skips). A too-short grace therefore no
+                // longer corrupts — it just makes the worker try (and harmlessly skip)
+                // sooner. The query still filters by grace to avoid churning fresh rows.
                 tx.prepare(
                     "SELECT project_guid, path, model_id
                      FROM project_files
@@ -113,10 +153,9 @@ pub async fn run(
                 break;
             }
 
-            info!(%project_guid, %path, "Retry worker: retrying stuck file.");
             retry_file(
                 &db_pool, &*store, &*model_client, &project_guid, &path, &file_model_id,
-                embed_batch, &token,
+                embed_batch, &indexing_locks, &token,
             )
             .await;
         }
@@ -126,7 +165,7 @@ pub async fn run(
 /// Re-indexes one stuck/failed file: `*→indexing → {indexed | failed}`. Extracted
 /// from the `run` loop so it can be unit-tested with a fake `VectorStore` +
 /// `BGEm3Model` (no live Qdrant or model server).
-#[allow(clippy::too_many_arguments)] // irreducible per-file deps (db, store, embedder, ids, batch, token)
+#[allow(clippy::too_many_arguments)] // irreducible per-file deps (db, store, embedder, ids, batch, locks, token)
 async fn retry_file(
     db_pool: &SQLite3Pool,
     store: &dyn VectorStore,
@@ -135,8 +174,20 @@ async fn retry_file(
     path: &str,
     model_id: &str,
     embed_batch: usize,
+    indexing_locks: &Arc<Mutex<HashSet<String>>>,
     token: &CancellationToken,
 ) {
+    // Claim the per-file slot before touching it. A live `/index` request working this
+    // same file holds the claim through its whole pipeline, so `None` means "in flight
+    // right now" — skip and let the next sweep try. This makes the worker↔handler race
+    // a lock invariant, not merely a consequence of `stuck_grace_secs` exceeding the
+    // longest request. Held (as `_claim`) for the whole retry; released on return.
+    let key = indexing_lock_key(project_guid, model_id, path);
+    let Some(_claim) = IndexClaim::try_acquire(indexing_locks, key) else {
+        info!(%project_guid, %path, "Retry worker: file is being indexed live; skipping this sweep.");
+        return;
+    };
+
     // Move to 'indexing' first so the whole attempt is a clean
     // {failed,indexing,…}→indexing→{indexed,failed} path through the state machine
     // (the triggers forbid failed→failed / failed→indexed directly).
@@ -364,7 +415,8 @@ mod tests {
         let pool = pool_with_failed_file(2).await;
         let store = Store { fail_upsert: false };
 
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
 
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
         // The transition log proves the path went through 'indexing', never failed→indexed.
@@ -378,7 +430,8 @@ mod tests {
         let pool = pool_with_failed_file(2).await;
         let store = Store { fail_upsert: true };
 
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
 
         // Was failed(1) → indexing → failed(2).
         assert_eq!(current(&pool).await, ("failed".to_string(), 2));
@@ -392,10 +445,32 @@ mod tests {
         let pool = pool_with_failed_file(0).await;
         let store = Store { fail_upsert: false };
 
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &CancellationToken::new()).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
 
         // No chunks (too short) → indexing → indexed, retry_count reset. Must NOT be
         // 'failed' (that would trap it: failed→indexed is an illegal transition).
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
+    }
+
+    /// If a live `/index` request already holds the file's claim, the worker must NOT
+    /// touch it — no status change, no transition logged. This is the worker↔handler
+    /// race guard (the key here is built exactly as the handler builds it).
+    #[tokio::test]
+    async fn retry_skips_when_file_claim_is_held() {
+        let pool = pool_with_failed_file(2).await;
+        let store = Store { fail_upsert: true }; // would fail loudly if it ran
+
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        // Simulate a live `/index` holding the slot.
+        let key = indexing_lock_key(PG, MODEL, PATH);
+        let _held = IndexClaim::try_acquire(&locks, key).expect("slot starts free");
+
+        let log_before = log_pairs(&pool).await.len();
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+
+        // Untouched: still failed(1), and not a single new transition was logged.
+        assert_eq!(current(&pool).await, ("failed".to_string(), 1));
+        assert_eq!(log_pairs(&pool).await.len(), log_before, "retry must log nothing when the claim is held");
     }
 }

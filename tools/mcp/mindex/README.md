@@ -19,6 +19,7 @@ Tools exposed:
 | `search(project_guid, query, include?, exclude?)` | `POST /v0/{guid}/search` | Up to **5** ranked chunks. The top-5 cap (`TOP_K`) is the context budget; the model can't raise it. Optional `include`/`exclude` scope the search by path glob / language (see [Scoping](#scoping-search-includeexclude)). |
 | `index_files(project_guid, files)`    | `POST /v0/{guid}/index`          | Reindex changed files on the fly; `files` = `[{path, language, code}]`. |
 | `delete_files(project_guid, paths)`   | `DELETE /projects/{guid}/files`  | Soft-delete stale chunks for removed/renamed files.          |
+| `drift(project_guid, root?, include?, exclude?)` | `POST /projects/{guid}/drift` (via the `mindex-index` CLI) | Is the index in sync with disk? Returns `stale`/`missing`/`orphaned`/`indexing` (see [Drift](#drift-is-the-index-in-sync)). Needs `mindex-index` on `PATH`. |
 | `list_projects()`                     | `GET /projects`                  | Summary counts per project (GUID-only identity).             |
 | `project_stats(project_guid)`         | `GET /projects/{guid}`           | Per-language file/chunk stats.                               |
 | `health()`                            | `GET /health`                    | On-demand liveness check; errors if mindex is unreachable.   |
@@ -121,6 +122,31 @@ through to mindex's `/search`:
 
 They're optional and additive to the query, so omitting them searches the whole
 project. The natural home for project-standing scope is the `.mindex` file above.
+
+## Drift: is the index in sync?
+
+`drift(project_guid, root?, include?, exclude?)` answers "can I trust search right
+now?" — it walks the working tree, hashes each file, and compares against the index,
+returning four buckets:
+
+- **`stale`** — indexed but the file changed (search returns old code) → reindex.
+- **`missing`** — on disk but not indexed → index it.
+- **`orphaned`** — indexed but gone from disk → `delete_files` the path.
+- **`indexing`** — being indexed right now → **do nothing**, re-check later. The
+  index is append-only with no cancellation, so re-triggering an in-flight file just
+  races the live job. Act only on the first three buckets.
+
+Unlike the other tools, `drift` shells out to the **`mindex-index` CLI** (`--check`),
+which is the single implementation of the tree walk + hashing (so the MCP server never
+re-implements globbing/hashing in Python). That means `mindex-index` must be on the
+launch environment's `PATH` — e.g. `cargo install --path tools/indexer` or symlink the
+release binary. If it is absent, `drift` returns a clear error and the other tools keep
+working.
+
+The `paths` in `include`/`exclude` scope the walk and **must match how the project was
+indexed** (typically the `exclude_paths`/`include_paths` from `.mindex`) — otherwise
+correctly-indexed files show up as `orphaned`. `programming_languages` in a filter is
+ignored here (the CLI detects language by file extension).
 
 ## Configuration (env vars)
 

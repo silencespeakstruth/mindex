@@ -3,17 +3,19 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum_server::tls_rustls::RustlsConfig;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokenizers::Tokenizer;
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::backend::v0::handlers::{
-    delete_files, delete_project, get_health, get_project_stats, get_projects, get_version, post_gc,
-    post_index, post_search,
+    delete_files, delete_project, get_health, get_project_stats, get_projects, get_version, post_drift,
+    post_gc, post_index, post_search,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -35,6 +37,10 @@ pub struct RouterState {
     pub model: EmbeddingModel,
     /// Chunks per `/encode` call during indexing (GPU batch lever).
     pub embed_batch: usize,
+    /// Per-file indexing mutual-exclusion table: the set of
+    /// `(project, model, path)` keys currently being indexed. Serializes
+    /// concurrent same-file `/index` requests (see `IndexClaim` in handlers).
+    pub indexing_locks: Arc<Mutex<HashSet<String>>>,
 }
 
 pub struct CancellationGuard(pub CancellationToken);
@@ -67,6 +73,7 @@ pub async fn run(
             get(get_project_stats).delete(delete_project),
         )
         .route("/projects/{project_guid}/files", delete(delete_files))
+        .route("/projects/{project_guid}/drift", post(post_drift))
         .route("/gc", post(post_gc))
         .route("/health", get(get_health))
         .route("/version", get(get_version))

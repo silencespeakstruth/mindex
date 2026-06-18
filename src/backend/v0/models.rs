@@ -252,6 +252,27 @@ pub struct ProjectListResponse {
     pub projects: Vec<ProjectSummary>,
 }
 
+/// `POST /projects/{guid}/drift` body: the working tree's `path → sha256` map.
+/// The server stays filesystem-agnostic — the client walks + hashes; the server
+/// only compares this against what it already stored.
+#[derive(Deserialize, Debug)]
+pub struct DriftRequest {
+    pub files: HashMap<String, String>,
+}
+
+/// Divergence of the working tree from the index, in four buckets:
+/// - `stale`: indexed but the content hash differs (needs reindex),
+/// - `missing`: present locally but not indexed (`failed`/never-indexed),
+/// - `orphaned`: indexed but absent locally (should be deleted from the index),
+/// - `indexing`: currently being indexed — **no action**, it will settle.
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+pub struct DriftResponse {
+    pub stale: Vec<String>,
+    pub missing: Vec<String>,
+    pub orphaned: Vec<String>,
+    pub indexing: Vec<String>,
+}
+
 #[derive(Serialize, Debug)]
 pub struct GcResponse {
     pub chunks_removed: usize,

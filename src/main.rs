@@ -153,6 +153,14 @@ async fn main() -> Result<(), BoxError> {
     // touching them, so without this they are silently stuck in 'failed'.
     worker::retry::warn_permanently_failed(&db_pool, sigterm_token.child_token()).await;
 
+    // Surface files left mid-indexing by a previous run (crash / unclean shutdown).
+    // They are not force-failed — the retry worker re-embeds them back to 'indexed'.
+    worker::retry::warn_orphaned_indexing(&db_pool, sigterm_token.child_token()).await;
+
+    // The per-file indexing claim table, shared by the HTTP handlers (in `RouterState`)
+    // and the retry worker so a file held by a live `/index` is never raced by a sweep.
+    let indexing_locks = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
     let qdrant_client: Arc<dyn VectorStore> =
         Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
 
@@ -177,6 +185,7 @@ async fn main() -> Result<(), BoxError> {
         model_id.to_string(),
         args.embed_batch,
         args.stuck_grace_mins * 60,
+        indexing_locks.clone(),
         retry_token,
     ));
 
@@ -195,6 +204,7 @@ async fn main() -> Result<(), BoxError> {
                     client: embed_client.clone(),
                 },
                 embed_batch: args.embed_batch,
+                indexing_locks: indexing_locks.clone(),
             },
             args.max_body_mb * 1024 * 1024,
             sigterm_token.child_token()) => {

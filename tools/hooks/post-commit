@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# mindex post-commit hook (opt-in) — keep the index live as you commit.
+#
+# After each commit it reindexes the files that commit changed (added/modified)
+# and soft-deletes the ones it removed, so mindex search keeps matching the tree
+# without a manual reindex. It is best-effort: a post-commit hook cannot fail the
+# commit (it already happened), so every error is a warning, never fatal.
+#
+# This hook is OFF by default — other contributors are unaffected unless they
+# install it themselves. To enable, from the repo root pick ONE:
+#     ln -s ../../tools/hooks/post-commit .git/hooks/post-commit   # symlink
+#     git config core.hooksPath tools/hooks                        # whole dir
+# (core.hooksPath replaces the entire hooks directory, so only use it if you
+# don't have other .git/hooks scripts.)
+#
+# Requirements:
+#   - `mindex-index` on PATH (cargo install --path tools/indexer, or symlink it).
+#   - a repo-root `.mindex` file (GUID on the first non-comment line; optional
+#     `exclude_paths:` line scopes the reindex the same way the initial index was).
+#   - mindex running and reachable at $MINDEX_SERVER.
+#
+# Config (same MINDEX_* conventions as tools/search and the MCP servers):
+#   MINDEX_SERVER     mindex URL (default https://127.0.0.1:11111)
+#   MINDEX_NO_VERIFY  truthy → skip TLS verification (self-signed cert)
+
+set -u
+
+SERVER="${MINDEX_SERVER:-https://127.0.0.1:11111}"
+
+warn() {
+    printf '  [mindex] %s\n' "$1" >&2
+}
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    warn "not in a git repo; skipping"
+    exit 0
+}
+cd "$repo_root" || exit 0
+
+mindex_file="$repo_root/.mindex"
+if [[ ! -f $mindex_file ]]; then
+    warn ".mindex not found at repo root; skipping (nothing to keep in sync)"
+    exit 0
+fi
+
+if ! command -v mindex-index >/dev/null 2>&1; then
+    warn "mindex-index not on PATH; skipping (cargo install --path tools/indexer)"
+    exit 0
+fi
+
+# GUID = first non-comment, non-blank line; exclude_paths = optional scope line.
+guid="$(grep -vE '^[[:space:]]*(#|$)' "$mindex_file" | head -1 | tr -d '[:space:]')"
+if [[ -z $guid ]]; then
+    warn ".mindex has no GUID; skipping"
+    exit 0
+fi
+excludes_line="$(grep -E '^[[:space:]]*exclude_paths:' "$mindex_file" | head -1 | sed 's/^[^:]*://')"
+
+# TLS + verify flags shared by the CLI (reindex) and curl (delete).
+index_flags=(--server "$SERVER" --project "$guid")
+curl_flags=(--silent --show-error)
+case "${MINDEX_NO_VERIFY:-}" in
+    1 | true | yes | on | TRUE | YES | ON)
+        index_flags+=(--no-verify)
+        curl_flags+=(--insecure)
+        ;;
+esac
+
+# Apply the project's standing path excludes to the reindex (comma-separated globs).
+exclude_flags=()
+if [[ -n $excludes_line ]]; then
+    IFS=',' read -ra _globs <<<"$excludes_line"
+    for g in "${_globs[@]}"; do
+        g="$(printf '%s' "$g" | tr -d '[:space:]')"
+        [[ -n $g ]] && exclude_flags+=(--exclude "$g")
+    done
+fi
+
+# Partition this commit's changes. name-status with -r yields one record per file:
+#   A<TAB>path | M<TAB>path | D<TAB>path | R<score><TAB>old<TAB>new
+# Renames touch both sides: index the new path, delete the old.
+changed=()
+deleted=()
+while IFS=$'\t' read -r status p1 p2; do
+    case "$status" in
+        A* | M*) changed+=("$p1") ;;
+        D*) deleted+=("$p1") ;;
+        R* | C*)
+            changed+=("$p2")
+            [[ "$status" == R* ]] && deleted+=("$p1")
+            ;;
+    esac
+done < <(git diff-tree --no-commit-id --name-status -r HEAD)
+
+# ── Reindex added/modified files (mindex-index hash-skips unchanged ones) ──────
+if ((${#changed[@]} > 0)); then
+    include_flags=()
+    for p in "${changed[@]}"; do
+        include_flags+=(--include "$p")
+    done
+    if ! mindex-index "${index_flags[@]}" --root . \
+        "${include_flags[@]}" "${exclude_flags[@]}" >/dev/null 2>&1; then
+        warn "reindex of ${#changed[@]} changed file(s) failed (is mindex up?)"
+    fi
+fi
+
+# ── Soft-delete removed files via the existing delete-files endpoint ───────────
+if ((${#deleted[@]} > 0)); then
+    # Build {"include":{"paths":["a","b",...]}} — source paths don't contain quotes.
+    json_paths=""
+    for p in "${deleted[@]}"; do
+        json_paths+="\"$p\","
+    done
+    json_paths="${json_paths%,}"
+    body="{\"include\":{\"paths\":[$json_paths]}}"
+    if ! curl "${curl_flags[@]}" -X DELETE \
+        -H 'Content-Type: application/json' \
+        -d "$body" \
+        "$SERVER/projects/$guid/files" >/dev/null 2>&1; then
+        warn "soft-delete of ${#deleted[@]} removed file(s) failed (is mindex up?)"
+    fi
+fi
+
+exit 0
