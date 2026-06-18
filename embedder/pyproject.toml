@@ -12,13 +12,10 @@ uvicorn = {extras = ["standard"], version = "^0.48.0"}
 FlagEmbedding = "^1.4.0"
 transformers = ">=4.40.0"
 accelerate = ">=0.30.0"
-torch = ">=2.12.0"
 orjson = "^3.11.9"
-
-[[tool.poetry.source]]
-name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.2" # ROCm 6.2 более стабилен, чем 7.2.3
-priority = "supplemental"
+# NOTE: torch is intentionally NOT declared here. It arrives transitively via
+# FlagEmbedding as a build-agnostic default; pick the accelerator build (ROCm /
+# CUDA / CPU) yourself after `poetry install` — see README ("GPU / torch build").
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]

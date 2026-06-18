@@ -29,6 +29,36 @@ poetry install
 poetry run python -m bge_m3_api --port 11211
 ```
 
+### GPU / torch build (one extra step)
+
+`pyproject.toml` does **not** pin a torch build, so `poetry install` pulls
+whatever PyPI serves by default (a CUDA wheel on Linux). That's deliberate: the
+right accelerator build is per-machine (AMD ROCm vs NVIDIA CUDA vs CPU), so each
+user installs it **into the venv** after `poetry install` — this never touches the
+tracked `pyproject.toml`/`poetry.lock`, so your local choice stays uncommitted.
+
+Because torch is already present after `poetry install`, you must **uninstall it
+first** — `pip install` alone would report "Requirement already satisfied" and skip
+the swap. For AMD ROCm 7.2 (nightly — note the `--pre`):
+
+```
+poetry run pip uninstall -y torch
+poetry run pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+```
+
+(Optional: also `pip uninstall` the leftover `nvidia-*` / `triton` wheels the
+default CUDA torch dragged in — unused under ROCm.) Verify:
+
+```
+poetry run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+ROCm exposes the GPU through the `cuda` device API, so `torch.cuda.is_available()`
+returning `True` (and `--device cuda`) is correct on AMD too.
+
+> A later `poetry install` (e.g. after a dependency bump) re-pulls the default
+> torch and reverts this — just re-run the two commands above.
+
 Useful flags (`python -m bge_m3_api --help`): `--device` (`cuda`, `cuda:0`, `cpu`),
 `--batch`, `--max-inflight` (429 beyond this), `--idle-timeout` (unload the model
 after N idle seconds).
