@@ -102,7 +102,10 @@ without sending file bodies through the model.
 Trusting search: if you suspect the index is out of date (files changed outside
 this session, or you're starting a task and want to be sure), call `drift` — it
 reports which files are stale/missing/orphaned vs the working tree. Act only on
-stale/missing/orphaned; files reported `indexing` are in flight, so leave them.
+stale/missing/orphaned; files reported `indexing` are in flight, so leave them —
+unless one is a file you no longer want indexed, in which case call
+`cancel_indexing` with a selector to abort that in-flight work (best-effort: a
+file that already finished is left as-is).
 
 Availability: this server stays up even if mindex itself is stopped. If any tool
 returns a connection error, mindex is unreachable — call `health()` to confirm,
@@ -236,6 +239,42 @@ def delete_files(project_guid: str, paths: list[str]) -> dict:
 
 
 @mcp.tool()
+def cancel_indexing(
+    project_guid: str,
+    include: dict[str, Any] | None = None,
+    exclude: dict[str, Any] | None = None,
+) -> dict:
+    """Cancel in-flight indexing for the files matching a selector (best-effort).
+
+    Use this when a file you no longer want is being indexed *right now* — e.g.
+    ``drift`` reports it in the ``indexing`` bucket but it should be excluded. Only
+    files currently in ``indexing`` are affected: their chunks are dropped and the
+    file is marked ``cancelled`` (GC reclaims any vectors). A file that already
+    finished indexing is left untouched, so a cancellation that arrives too late is
+    simply a no-op — there is no way to un-index a completed file (use
+    ``delete_files`` for that).
+
+    The selector is the same shape as ``search``/``drift``; at least one of
+    ``include``/``exclude`` must be non-empty (an empty body is rejected so it can't
+    blanket-cancel the whole project).
+
+    Args:
+        project_guid: The project's mindex GUID.
+        include: Optional scope to KEEP, e.g. ``{"paths": ["src/**", ...]}``.
+        exclude: Optional scope to DROP, e.g. ``{"paths": ["tools/**", ...]}``.
+
+    Returns ``{"cancelled_files": n}``.
+    """
+    resp = _request(
+        "POST", f"/projects/{project_guid}/cancel", json=_filters(include, exclude)
+    )
+    if resp.status_code == 204:  # nothing was indexing under the selector
+        return {"cancelled_files": 0}
+    resp.raise_for_status()
+    return {"cancelled_files": resp.json().get("cancelled_files", 0)}
+
+
+@mcp.tool()
 def list_projects() -> list[dict]:
     """List all indexed projects with summary counts.
 
@@ -281,8 +320,10 @@ def drift(
         - ``missing``:  on disk but not indexed → index it.
         - ``orphaned``: indexed but gone from disk → ``delete_files`` the path.
         - ``indexing``: being indexed right now → **do nothing**, re-check later
-                        (re-triggering it races the in-flight job; there is no
-                        cancellation). Act only on stale/missing/orphaned.
+                        (re-triggering it races the in-flight job). The exception:
+                        if the file is one you no longer want indexed, call
+                        ``cancel_indexing`` with a selector to abort it. Otherwise
+                        act only on stale/missing/orphaned.
 
     This shells out to the ``mindex-index`` CLI (``--check``), which is the single
     implementation of the walk+hash, so it must be on ``PATH``. The ``paths`` in

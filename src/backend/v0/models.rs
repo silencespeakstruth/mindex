@@ -195,6 +195,21 @@ pub struct DeleteFilesResponse {
     pub deleted_files: u64,
 }
 
+/// `POST /projects/{guid}/cancel` body — same selector shape as `DeleteFilesRequest`,
+/// so the same globs/languages that surface files can also cancel their in-flight
+/// indexing. At least one of `include`/`exclude` must be non-empty (the handler
+/// rejects an empty body so it can't blanket-cancel the whole project).
+#[derive(Deserialize, Serialize, Debug, Default)]
+pub struct CancelRequest {
+    pub include: Option<SearchFilter>,
+    pub exclude: Option<SearchFilter>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct CancelResponse {
+    pub cancelled_files: u64,
+}
+
 /// Per-status `project_files` counts. A fixed struct (not a sparse map) so the
 /// response schema is self-documenting and every status is always present.
 #[derive(Serialize, Debug, Default)]

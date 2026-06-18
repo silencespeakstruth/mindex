@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::backend::v0::handlers::{
-    delete_files, delete_project, get_health, get_project_stats, get_projects, get_version, post_drift,
-    post_gc, post_index, post_search,
+    delete_files, delete_project, get_health, get_project_stats, get_projects, get_version,
+    post_cancel, post_drift, post_gc, post_index, post_search,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -73,6 +73,7 @@ pub async fn run(
             get(get_project_stats).delete(delete_project),
         )
         .route("/projects/{project_guid}/files", delete(delete_files))
+        .route("/projects/{project_guid}/cancel", post(post_cancel))
         .route("/projects/{project_guid}/drift", post(post_drift))
         .route("/gc", post(post_gc))
         .route("/health", get(get_health))

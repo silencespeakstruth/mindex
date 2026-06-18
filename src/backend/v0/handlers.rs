@@ -8,6 +8,8 @@ use crate::backend::http3;
 use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
 use crate::backend::http3::cancelled_499;
+use crate::backend::v0::models::CancelRequest;
+use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChunkCounts;
 use crate::backend::v0::models::Code;
 use crate::backend::v0::models::DeleteFilesRequest;
@@ -528,7 +530,12 @@ impl FileIndexer<'_> {
         .await
     }
 
-    /// Phase 3 for one file: mark it `indexed` and record the new sha256.
+    /// Phase 3 for one file: mark it `indexed` and record the new sha256. The
+    /// `AND status = 'indexing'` guard makes this a no-op (matching 0 rows, so no
+    /// trigger fires) if a concurrent `POST /cancel` moved the file to `cancelled`
+    /// since it was prepared — without it the raw `cancelled → indexed` UPDATE would
+    /// trip the state-machine trigger and error the whole batch, leaving sibling
+    /// files stuck in `indexing`.
     async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<(), ErrorResponse> {
         let project_guid = self.project_guid;
         let (sha256_f, path_f, model_id_f) = (
@@ -542,7 +549,8 @@ impl FileIndexer<'_> {
                     "UPDATE project_files
                      SET status = 'indexed', sha256 = ?1, retry_count = 0,
                          status_updated_at = unixepoch()
-                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4",
+                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4
+                       AND status = 'indexing'",
                     params![sha256_f, project_guid, path_f, model_id_f],
                 )?;
                 Ok(())
@@ -584,6 +592,78 @@ impl FileIndexer<'_> {
         for p in prepared {
             self.recover(&p.path, status, increment_retry).await;
         }
+    }
+
+    /// Reconciliation between Phase 1 and Phase 2: drop any prepared file that a
+    /// concurrent `POST /cancel` (or `DELETE /files`) flipped out of `indexing`
+    /// since it was prepared. `/cancel` deliberately does not take the per-file
+    /// claim (so it can interrupt a held one), so the live request must check for
+    /// itself before the expensive embed. Cancelled files' just-inserted `active`
+    /// chunks are marked `deleted` so GC reclaims them — this also closes the race
+    /// where `/cancel` landed after `status='indexing'` but before the chunks
+    /// existed (the `/cancel` UPDATE then matched no chunks). Best-effort: a query
+    /// failure leaves the set whole (worst case is a wasted embed; the still-
+    /// `cancelled` file's `mark_indexed` is rejected and its chunks GC'd anyway).
+    async fn drop_cancelled(&self, prepared: Vec<Prepared>) -> Vec<Prepared> {
+        if prepared.is_empty() {
+            return prepared;
+        }
+        let project_guid = self.project_guid;
+        let paths: Vec<String> = prepared.iter().map(|p| p.path.clone()).collect();
+        let model_id = self.model_id.to_string();
+
+        let cancelled: HashSet<String> = self
+            .db_pool
+            .transaction(self.token.child_token(), move |tx| {
+                let placeholders = (3..3 + paths.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut binds: Vec<Bind> = Vec::with_capacity(paths.len() + 2);
+                binds.push(Bind::Guid(project_guid));
+                binds.push(Bind::Path(model_id));
+                binds.extend(paths.into_iter().map(Bind::Path));
+                tx.prepare(&format!(
+                    "SELECT path FROM project_files
+                     WHERE project_guid = ?1 AND model_id = ?2 AND status != 'indexing'
+                       AND path IN ({placeholders})"
+                ))?
+                .query_map(params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(SQLite3PoolError::from)
+            })
+            .with_cancellation_token(self.token)
+            .await
+            .from_cancelled()
+            .unwrap_or_default();
+
+        if cancelled.is_empty() {
+            return prepared;
+        }
+
+        for path in &cancelled {
+            let (pg, p, m) = (project_guid, path.clone(), self.model_id.to_string());
+            let _ = self
+                .db_pool
+                .transaction(self.token.child_token(), move |tx| {
+                    tx.execute(
+                        "UPDATE project_file_chunks SET status = 'deleted'
+                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
+                           AND status = 'active'",
+                        params![pg, p, m],
+                    )?;
+                    Ok(())
+                })
+                .with_cancellation_token(self.token)
+                .await
+                .from_cancelled();
+            info!(%path, "Indexing cancelled mid-flight; skipping the embed pass for this file.");
+        }
+
+        prepared
+            .into_iter()
+            .filter(|p| !cancelled.contains(&p.path))
+            .collect()
     }
 }
 
@@ -685,6 +765,10 @@ pub async fn post_index(
                 }
             }
         }
+
+        // ── Reconcile against concurrent cancellation before the expensive embed pass:
+        //    drop any file a `POST /cancel` flipped to 'cancelled' since it was prepared.
+        let mut prepared = indexer.drop_cancelled(prepared).await;
 
         // ── Phase 2: embed + upsert every chunk across all files in one batched pass.
         let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
@@ -1386,6 +1470,121 @@ pub async fn delete_files(
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         Ok((StatusCode::OK, Json(DeleteFilesResponse { deleted_files })).into_response())
+    }
+}
+
+/// `POST /projects/{guid}/cancel` — best-effort cancel of in-flight indexing for the
+/// files matching the selector. Only files in `status = 'indexing'` are touched: each
+/// matched file's active chunks are marked `deleted` (the next GC pass removes any
+/// vectors a racing embed already upserted) and the file moves `indexing → cancelled`
+/// (a legal state-machine transition). Files already `indexed`/`failed`/etc. never
+/// match, so their status is preserved — a cancellation that arrives after indexing
+/// finished is a no-op. The live `/index` request reconciles against this at its
+/// prepare→embed boundary, and the retry worker re-checks status after claiming, so a
+/// cancelled file is neither re-embedded nor resurrected. Returns 204 when nothing
+/// matched, else 200 with the count of files moved to `cancelled`. A non-empty
+/// include/exclude is required so an empty body cannot blanket-cancel the project.
+#[debug_handler]
+pub async fn post_cancel(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+    Json(req): Json<CancelRequest>,
+) -> Result<Response, ErrorResponse> {
+    let nonempty = |f: &Option<SearchFilter>| {
+        f.as_ref().is_some_and(|x| {
+            x.paths.as_ref().is_some_and(|p| !p.is_empty())
+                || x.programming_languages
+                    .as_ref()
+                    .is_some_and(|l| !l.is_empty())
+        })
+    };
+    if !nonempty(&req.include) && !nonempty(&req.exclude) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "POST /cancel requires a non-empty include or exclude selector",
+        )
+            .into());
+    }
+
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+    let (where_sql, binds) = build_file_filter(pg, &req.include, &req.exclude);
+
+    // 1) Resolve matching file paths, restricted to those being indexed *right now*.
+    //    `build_file_filter` already constrains `status != 'deleted'`; appending a
+    //    constant predicate keeps the existing bind numbering intact (no new bind).
+    let select_sql =
+        format!("SELECT path FROM project_files WHERE {where_sql} AND status = 'indexing'");
+    let paths: Vec<String> = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let mut stmt = tx.prepare(&select_sql)?;
+            let rows = stmt.query_map(params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = ?e, project_guid = %pg.0, "Failed to select files to cancel.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if paths.is_empty() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    // 2) Soft-delete the active chunks + move the files 'indexing'→'cancelled', batched
+    //    to stay under SQLite's bind-variable limit. Re-asserting status='indexing' in
+    //    the file UPDATE makes it a no-op for any row that raced to 'indexed' between
+    //    the SELECT and here (the trigger would reject cancelled→… otherwise).
+    let mut cancelled_files: u64 = 0;
+    for batch in paths.chunks(500) {
+        let batch: Vec<String> = batch.to_vec();
+        let n = s
+            .db_pool
+            .transaction(guard.0.child_token(), move |tx| {
+                let placeholders = (2..2 + batch.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut bs: Vec<Bind> = Vec::with_capacity(batch.len() + 1);
+                bs.push(Bind::Guid(pg));
+                bs.extend(batch.into_iter().map(Bind::Path));
+
+                tx.execute(
+                    &format!(
+                        "UPDATE project_file_chunks SET status = 'deleted'
+                         WHERE project_guid = ?1 AND status = 'active' AND file_path IN ({placeholders})"
+                    ),
+                    params_from_iter(bs.iter()),
+                )?;
+                let files = tx.execute(
+                    &format!(
+                        "UPDATE project_files SET status = 'cancelled', status_updated_at = unixepoch()
+                         WHERE project_guid = ?1 AND status = 'indexing' AND path IN ({placeholders})"
+                    ),
+                    params_from_iter(bs.iter()),
+                )?;
+                Ok(files as u64)
+            })
+            .with_cancellation_token(&guard.0)
+            .await
+            .from_cancelled()
+            .map_err(|e| {
+                error!(error = ?e, project_guid = %pg.0, "Failed to cancel indexing files.");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        cancelled_files += n;
+    }
+
+    info!(project_guid = %pg.0, cancelled_files, "Cancelled in-flight indexing for matched files.");
+
+    if cancelled_files == 0 {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok((StatusCode::OK, Json(CancelResponse { cancelled_files })).into_response())
     }
 }
 

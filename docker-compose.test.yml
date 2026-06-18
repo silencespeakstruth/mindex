@@ -44,6 +44,7 @@ services:
       context: tests/integration
     environment:
       MINDEX_URL: https://mindex:11111
+      MOCK_EMBEDDER_URL: http://mock-embedder:11211
     depends_on:
       - mindex
 

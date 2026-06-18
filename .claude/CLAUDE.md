@@ -98,7 +98,20 @@ collection last so a retry re-attempts it), idempotent 204. `DELETE
 /projects/{guid}/files` is a **soft delete** — its search `include`/`exclude`
 selector goes in the **request body** (globs don't fit the path); it marks
 files+chunks `deleted` for GC, returns 204 if none matched else 200+count, and
-rejects an empty selector (400) so it can't wipe the project. `GET /projects` (list
+rejects an empty selector (400) so it can't wipe the project. `POST
+/projects/{guid}/cancel` is a **best-effort, transactional index-cancel** — same
+body selector as the soft delete, same empty-selector 400 — but it matches **only
+`status='indexing'`** files (so an already-`indexed`/`failed` file is never touched:
+a too-late cancel is a no-op), marks their chunks `deleted` and moves the files
+`indexing → cancelled`. It deliberately does **not** take the per-file `IndexClaim`
+(so it can interrupt a held one); correctness against a live `/index` rests on two
+re-reads, not a lock: `post_index` calls `drop_cancelled` between Phase 1 and Phase 2
+(re-reads prepared files' status, drops + chunk-soft-deletes any now-`cancelled` one
+before the embed — this also closes the prepare race where cancel lands before the
+chunks exist), and the **retry worker re-checks status after acquiring the claim**
+(else `cancelled → indexing`, a legal move, would resurrect it). A cancel that lands
+mid-embed lets that pass finish; `mark_indexed`'s `cancelled → indexed` is then
+trigger-rejected and GC reclaims the orphaned vectors. `GET /projects` (list
 all, summary counts), `GET /projects/{guid}` (per-language stats), `POST /gc` (one
 synchronous GC pass), `GET /health` (pings SQLite + Qdrant + embedder, reports files
 indexing) and `GET /version` round it out.

@@ -7,6 +7,7 @@ This is sufficient for asserting that indexed content is found in search and
 that re-indexed (changed) content replaces the old content.
 """
 
+import asyncio
 import hashlib
 import math
 import random
@@ -21,6 +22,12 @@ app = FastAPI()
 DENSE_DIM = 1024
 MAX_SPARSE_TOKENS = 16
 MAX_COLBERT_TOKENS = 8
+
+# Per-process artificial delay (seconds) injected into every /encode call. Tests set
+# it via POST /config to widen the window a file stays 'indexing', so an /index
+# request can be caught mid-flight (e.g. to exercise POST /cancel). Defaults to 0 so
+# the rest of the suite is unaffected.
+_config: dict[str, float] = {"encode_delay_secs": 0.0}
 
 
 def _dense(text: str) -> list[float]:
@@ -49,8 +56,19 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/config")
+async def config(payload: dict[str, Any]) -> dict[str, float]:
+    """Test-only knob: set ``encode_delay_secs`` to slow every subsequent /encode."""
+    if "encode_delay_secs" in payload:
+        _config["encode_delay_secs"] = float(payload["encode_delay_secs"])
+    return dict(_config)
+
+
 @app.post("/encode")
 async def encode(payload: dict[str, Any]) -> dict[str, Any]:
+    delay = _config["encode_delay_secs"]
+    if delay > 0:
+        await asyncio.sleep(delay)
     texts: list[str] = payload["texts"]
     return {
         "dense_vecs": [_dense(t) for t in texts],

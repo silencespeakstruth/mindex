@@ -22,14 +22,16 @@ is *not done* or *deliberately constrained*.
 - **`cancelled` files are never retried** by the worker (by design — the client
   gave up). They only revive on an explicit re-push (`cancelled → indexing` via the
   handler). A cancelled file never re-pushed keeps no vectors.
-- **In-flight indexing cannot be aborted (no cancellation of committed work).** The
-  hot path is append-only: once a file is `indexing`, a batch already in progress
-  runs to completion even if the file changed again meanwhile — there is no way to
-  abort the stale in-flight index and restart on the fresh content. Drift detection
-  *surfaces* this (the `indexing` bucket — no action, wait for it to settle), it
-  does not fix it. **Wanted (important):** an abort mechanism so a superseded
-  in-flight index can be cancelled and immediately re-run on the latest content,
-  instead of waiting a full batch and then reindexing.
+- **No *automatic* supersede-and-restart of a stale in-flight index.** `POST
+  /projects/{guid}/cancel` (and the MCP `cancel_indexing` tool) now lets a client
+  abort in-flight indexing for selected files — best-effort, transactional, moving
+  matched `indexing` files to `cancelled` so the retry worker won't revive them — and
+  the file can then be re-pushed on fresh content. What is *not* automated: detecting
+  that an in-flight index has been superseded by a newer edit and restarting it
+  without an explicit cancel+reindex from the client. The embed pass itself is still
+  append-only (a cancel that lands mid-embed lets that pass finish wastefully; GC
+  reclaims the result), so cancellation is a control-plane signal, not a hard abort of
+  GPU work in progress.
 - **No API authentication** (by design — internal service, TLS only). Revisit if
   ever exposed beyond a trusted network.
 - **HTTP/3 is not implemented.** `run()` is HTTP/1.1 + HTTP/2; the `http3.rs`

@@ -19,6 +19,7 @@ Tools exposed:
 | `search(project_guid, query, include?, exclude?)` | `POST /v0/{guid}/search` | Up to **5** ranked chunks. The top-5 cap (`TOP_K`) is the context budget; the model can't raise it. Optional `include`/`exclude` scope the search by path glob / language (see [Scoping](#scoping-search-includeexclude)). |
 | `index_files(project_guid, files)`    | `POST /v0/{guid}/index`          | Reindex changed files on the fly; `files` = `[{path, language, code}]`. |
 | `delete_files(project_guid, paths)`   | `DELETE /projects/{guid}/files`  | Soft-delete stale chunks for removed/renamed files.          |
+| `cancel_indexing(project_guid, include?, exclude?)` | `POST /projects/{guid}/cancel` | Best-effort cancel of **in-flight** indexing for files matching the selector (only `indexing` files; already-indexed files are left as-is). Same selector shape as `search`. |
 | `drift(project_guid, root?, include?, exclude?)` | `POST /projects/{guid}/drift` (via the `mindex-index` CLI) | Is the index in sync with disk? Returns `stale`/`missing`/`orphaned`/`indexing` (see [Drift](#drift-is-the-index-in-sync)). Needs `mindex-index` on `PATH`. |
 | `list_projects()`                     | `GET /projects`                  | Summary counts per project (GUID-only identity).             |
 | `project_stats(project_guid)`         | `GET /projects/{guid}`           | Per-language file/chunk stats.                               |
@@ -132,9 +133,18 @@ returning four buckets:
 - **`stale`** — indexed but the file changed (search returns old code) → reindex.
 - **`missing`** — on disk but not indexed → index it.
 - **`orphaned`** — indexed but gone from disk → `delete_files` the path.
-- **`indexing`** — being indexed right now → **do nothing**, re-check later. The
-  index is append-only with no cancellation, so re-triggering an in-flight file just
-  races the live job. Act only on the first three buckets.
+- **`indexing`** — being indexed right now → **do nothing**, re-check later;
+  re-triggering an in-flight file just races the live job. The one exception: if an
+  `indexing` file is one you no longer want indexed, call `cancel_indexing` with a
+  selector to abort that in-flight work. Otherwise act only on the first three buckets.
+
+`cancel_indexing(project_guid, include?, exclude?)` is best-effort and only touches
+files currently in `indexing`: it drops their chunks and marks the file `cancelled`
+(GC reclaims any vectors). A file that already finished indexing is left untouched, so
+a too-late cancel is a no-op — use `delete_files` to remove a completed file. The live
+`/index` request reconciles against the cancel before its embed pass, and the retry
+worker re-checks status before re-driving a file, so a cancelled file is neither
+re-embedded nor resurrected.
 
 Unlike the other tools, `drift` shells out to the **`mindex-index` CLI** (`--check`),
 which is the single implementation of the tree walk + hashing (so the MCP server never
@@ -181,6 +191,11 @@ The whole point is cheap understanding, so the workflow is:
   "(re)index the whole tree". For a full (re)index, or to apply path excludes (e.g.
   `--exclude 'tools/**'`), use the `tools/indexer` CLI, which walks the tree and
   hash-skips server-side without sending file bodies through the model.
+- **Cancel indexing you no longer want.** If `drift` reports a file as `indexing` but
+  you've decided it shouldn't be indexed (e.g. it just landed under an exclude), call
+  `cancel_indexing` with a selector to abort that in-flight work. It's best-effort and
+  only touches files still `indexing`; a file that already finished is left as-is (use
+  `delete_files` to remove a completed one).
 
 The top-5 result cap (`TOP_K`) is fixed in the adapter — it is the context budget and
 the model cannot raise it; prefer several focused queries over one broad one.

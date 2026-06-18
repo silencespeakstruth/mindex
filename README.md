@@ -137,6 +137,7 @@ All endpoints are HTTPS. TLS is the only transport security — there is **no AP
 | `GET /projects/{project}` | Stats: files by status, chunks per language. |
 | `DELETE /projects/{project}` | Hard-delete a project (rows + Qdrant collection). |
 | `DELETE /projects/{project}/files` | Soft-delete files by an include/exclude selector (body). |
+| `POST /projects/{project}/cancel` | Best-effort cancel of in-flight indexing for files matching an include/exclude selector (body); only `indexing` files are affected. |
 | `POST /gc` | Run garbage collection synchronously. |
 | `GET /health` | Readiness: pings SQLite + Qdrant + the embedder, reports files currently indexing. |
 | `GET /version` | Running mindex version. |

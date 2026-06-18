@@ -1,12 +1,13 @@
 import os
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import httpx
 import pytest
 
 MINDEX_URL = os.environ.get("MINDEX_URL", "https://localhost:11111")
+MOCK_EMBEDDER_URL = os.environ.get("MOCK_EMBEDDER_URL", "http://localhost:11211")
 STARTUP_TIMEOUT = 120  # seconds
 
 
@@ -45,3 +46,24 @@ def client() -> Iterator[httpx.Client]:
 def project(client: httpx.Client) -> str:
     """Return a fresh project GUID (32-char hex, no hyphens) for each test."""
     return uuid.uuid4().hex
+
+
+@pytest.fixture
+def embed_delay() -> Iterator[Callable[[float], None]]:
+    """Set the mock embedder's per-/encode delay, always resetting it to 0 after.
+
+    Lets a test widen the window a file stays 'indexing' so an /index request can be
+    caught in-flight. Yields a setter ``set(secs)``.
+    """
+
+    def set_delay(secs: float) -> None:
+        httpx.post(
+            f"{MOCK_EMBEDDER_URL}/config",
+            json={"encode_delay_secs": secs},
+            timeout=5.0,
+        ).raise_for_status()
+
+    try:
+        yield set_delay
+    finally:
+        set_delay(0.0)

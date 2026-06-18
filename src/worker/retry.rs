@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rusqlite::OptionalExtension;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -187,6 +188,38 @@ async fn retry_file(
         info!(%project_guid, %path, "Retry worker: file is being indexed live; skipping this sweep.");
         return;
     };
+
+    // Re-check status under the claim: the sweep's SELECT excluded 'cancelled', but a
+    // `POST /cancel` could have landed in the window between that SELECT and this claim.
+    // `cancelled → indexing` is a legal transition, so without this guard the worker
+    // would resurrect a just-cancelled file. Only proceed if it's still in a retryable
+    // state ('indexing' stuck, 'just_uploaded', or 'failed'); otherwise leave it be.
+    let current_status: Option<String> = db_pool
+        .transaction(token.clone(), {
+            let (pg, p, m) = (project_guid.to_string(), path.to_string(), model_id.to_string());
+            move |tx| {
+                tx.query_row(
+                    "SELECT status FROM project_files
+                     WHERE project_guid = ?1 AND path = ?2 AND model_id = ?3",
+                    rusqlite::params![pg, p, m],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(SQLite3PoolError::from)
+            }
+        })
+        .await
+        .unwrap_or_default();
+    if !matches!(
+        current_status.as_deref(),
+        Some("indexing" | "just_uploaded" | "failed")
+    ) {
+        info!(
+            %project_guid, %path, status = ?current_status,
+            "Retry worker: file is no longer retryable (cancelled/deleted since the sweep); skipping."
+        );
+        return;
+    }
 
     // Move to 'indexing' first so the whole attempt is a clean
     // {failed,indexing,…}→indexing→{indexed,failed} path through the state machine
@@ -472,5 +505,31 @@ mod tests {
         // Untouched: still failed(1), and not a single new transition was logged.
         assert_eq!(current(&pool).await, ("failed".to_string(), 1));
         assert_eq!(log_pairs(&pool).await.len(), log_before, "retry must log nothing when the claim is held");
+    }
+
+    /// If a `POST /cancel` flipped the file to `cancelled` in the window between the
+    /// sweep's SELECT and the per-file claim, the worker must NOT resurrect it —
+    /// `cancelled → indexing` is a legal transition, so only the status re-check
+    /// under the claim prevents the worker from re-driving a just-cancelled file.
+    #[tokio::test]
+    async fn retry_skips_when_file_was_cancelled_since_the_sweep() {
+        // Reuse the failed-file fixture, then legally move indexing→...→cancelled.
+        let pool = pool_with_failed_file(2).await;
+        // failed→indexing (re-push) →cancelled, the state a concurrent /cancel leaves.
+        set_file_status(&pool, PG, PATH, MODEL, "indexing", false, CancellationToken::new()).await;
+        set_file_status(&pool, PG, PATH, MODEL, "cancelled", false, CancellationToken::new()).await;
+        let log_before = log_pairs(&pool).await.len();
+
+        let store = Store { fail_upsert: true }; // would fail loudly if it ran
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+
+        // Untouched: still 'cancelled', no new transition logged (not re-driven).
+        assert_eq!(current(&pool).await.0, "cancelled");
+        assert_eq!(
+            log_pairs(&pool).await.len(),
+            log_before,
+            "retry must not resurrect a cancelled file"
+        );
     }
 }
