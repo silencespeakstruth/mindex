@@ -331,6 +331,32 @@ struct FileIndexer<'a> {
     indexing_locks: &'a Arc<Mutex<HashSet<String>>>,
 }
 
+/// True iff this file is already **successfully indexed** with this exact content:
+/// a row exists with `status = 'indexed'` and a matching `sha256`. Only an
+/// `indexed` row counts — the `sha256` is written at `indexing` time (the column
+/// is `NOT NULL`), so a file that was sliced but never embedded (e.g. the embedder
+/// was down, leaving it `failed`/`indexing`) carries the right hash without having
+/// any vectors. Gating the skip on `status = 'indexed'` is what lets a later
+/// re-index pick such a file back up instead of treating it as unchanged forever.
+fn file_already_indexed(
+    tx: &rusqlite::Transaction,
+    project_guid: UUIDv4,
+    path: &str,
+    model_id: &str,
+    sha256: &str,
+) -> Result<bool, SQLite3PoolError> {
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT sha256 FROM project_files
+             WHERE project_guid = ?1 AND path = ?2 AND model_id = ?3
+               AND status = 'indexed'",
+            params![project_guid, path, model_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(existing.as_deref() == Some(sha256))
+}
+
 impl FileIndexer<'_> {
     /// Phase 1 for one file: hash-check → mark `indexing` → mark old chunks deleted,
     /// slice, insert new chunks. Returns `Ok(None)` if unchanged (skipped),
@@ -378,15 +404,7 @@ impl FileIndexer<'_> {
                 let unchanged = self
                     .db_pool
                     .transaction(self.token.child_token(), move |tx| {
-                        let existing: Option<String> = tx
-                            .query_row(
-                                "SELECT sha256 FROM project_files
-                                 WHERE project_guid = ?1 AND path = ?2 AND model_id = ?3",
-                                params![project_guid, path_c, model_id_c],
-                                |r| r.get(0),
-                            )
-                            .optional()?;
-                        Ok(existing.as_deref() == Some(sha256_c.as_str()))
+                        file_already_indexed(tx, project_guid, &path_c, &model_id_c, &sha256_c)
                     })
                     .with_cancellation_token(self.token)
                     .await
@@ -1698,6 +1716,92 @@ mod tests {
             paths: Some(v.iter().map(|s| glob(s)).collect()),
             programming_languages: None,
         }
+    }
+
+    // ── hash-skip gating (regression) ───────────────────────────────────
+    // The sha256 is written at `indexing` time (the column is NOT NULL), so a
+    // file that was sliced but never embedded (embedder down → `failed`) carries
+    // the correct hash without any vectors. The unchanged-skip must therefore key
+    // on `status = 'indexed'`, not the hash alone — otherwise such a file is
+    // skipped on every later re-index and never gets embedded.
+    use crate::db::sqlite3::SQLite3Pool;
+    use std::path::Path as FsPath;
+    use tokio_util::sync::CancellationToken;
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    async fn pool_with_file(status: &'static str, sha: &'static str) -> SQLite3Pool {
+        // Pool size 1: the single ":memory:" connection is reused, so the row
+        // inserted below is visible to the later hash-check transaction.
+        let p = SQLite3Pool::new(FsPath::new(":memory:"), 1);
+        p.transaction(CancellationToken::new(), move |tx| {
+            tx.execute_batch(
+                "CREATE TABLE project_files (
+                     project_guid TEXT NOT NULL,
+                     path         TEXT NOT NULL,
+                     model_id     TEXT NOT NULL,
+                     sha256       TEXT NOT NULL,
+                     status       TEXT NOT NULL
+                 );",
+            )?;
+            tx.execute(
+                "INSERT INTO project_files
+                     (project_guid, path, model_id, sha256, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![guid(), "src/a.py", "m", sha, status],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        p
+    }
+
+    async fn already_indexed(p: &SQLite3Pool, sha: &'static str) -> bool {
+        p.transaction(CancellationToken::new(), move |tx| {
+            file_already_indexed(tx, guid(), "src/a.py", "m", sha)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_file_with_matching_hash_is_not_skipped() {
+        // A file left `failed` (embedder was down) keeps its content hash but has
+        // no vectors — it must be re-indexed, not treated as unchanged.
+        let p = pool_with_file("failed", SHA).await;
+        assert!(
+            !already_indexed(&p, SHA).await,
+            "a `failed` file with a matching hash must NOT be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexing_file_with_matching_hash_is_not_skipped() {
+        let p = pool_with_file("indexing", SHA).await;
+        assert!(
+            !already_indexed(&p, SHA).await,
+            "an in-flight `indexing` file must NOT be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_file_with_matching_hash_is_skipped() {
+        let p = pool_with_file("indexed", SHA).await;
+        assert!(
+            already_indexed(&p, SHA).await,
+            "a successfully `indexed` file with a matching hash should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_file_with_changed_hash_is_not_skipped() {
+        let p = pool_with_file("indexed", SHA).await;
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(
+            !already_indexed(&p, other).await,
+            "changed content must be re-indexed"
+        );
     }
 
     #[test]
