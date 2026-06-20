@@ -33,6 +33,12 @@ services:
       - --key-path=/certs/key.pem
       - --qdrant-server=http://qdrant:6334
       - --model-server=http://mock-embedder:11211
+      # The concurrency tests fire several simultaneous /index requests; each takes a
+      # pool connection for its first (project-row) transaction before the per-file
+      # claim, so the pool must comfortably exceed test concurrency. The default (4)
+      # is a deployment tuning knob, not a correctness boundary — with too few
+      # connections the pool returns PoolEmpty (→ 500) rather than queueing.
+      - --db-pool-size=16
     depends_on:
       qdrant:
         condition: service_healthy

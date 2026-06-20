@@ -67,3 +67,24 @@ def embed_delay() -> Iterator[Callable[[float], None]]:
         yield set_delay
     finally:
         set_delay(0.0)
+
+
+@pytest.fixture
+def embed_fail() -> Iterator[Callable[[int], None]]:
+    """Make the next ``n`` /encode calls fail with 503, always resetting to 0 after.
+
+    Lets a test drive a file to 'failed' (embed failure) and then observe recovery
+    (reindex, or the retry worker). Yields a setter ``fail(n)``.
+    """
+
+    def set_fail(n: int) -> None:
+        httpx.post(
+            f"{MOCK_EMBEDDER_URL}/config",
+            json={"fail_next_encodes": n},
+            timeout=5.0,
+        ).raise_for_status()
+
+    try:
+        yield set_fail
+    finally:
+        set_fail(0)

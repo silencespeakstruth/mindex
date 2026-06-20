@@ -2011,4 +2011,42 @@ mod tests {
             "key should be claimable again after the holder drops"
         );
     }
+
+    #[test]
+    fn claim_lifetime_is_bound_to_prepared_for_the_whole_pipeline() {
+        // Regression guard for the "stale recover clobbers a later index" race:
+        // the per-file claim is owned by `Prepared._claim`, and `post_index` keeps
+        // the `Vec<Prepared>` in scope through embed_all AND mark_indexed/recover_all.
+        // So a request that goes on to *fail* still holds the lock while it recovers
+        // to `failed`; no second request for the same file can start (it gets 429)
+        // until the first fully terminates. This is what makes the interleaving
+        // "req1 releases → req3 reindexes → req1's late `failed` lands" impossible:
+        // req1 never releases mid-pipeline.
+        let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let key = indexing_lock_key("guid", "model", "f.rs");
+
+        let claim = IndexClaim::try_acquire(&locks, key.clone()).expect("first acquires");
+        let prepared = Prepared {
+            pl: ProgrammingLanguage::Rust,
+            path: "f.rs".to_string(),
+            sha256: "h".to_string(),
+            chunks: Vec::new(),
+            _claim: claim,
+        };
+
+        // While the first request's `Prepared` is alive — anywhere from slice through
+        // embed through recover — every other same-file request is refused.
+        assert!(
+            IndexClaim::try_acquire(&locks, key.clone()).is_none(),
+            "same-file claim must be refused for the whole pipeline, not just until slicing"
+        );
+
+        // Only when the pipeline ends (the `Prepared`, hence the claim, drops) does
+        // the slot free up — at which point any next request sees the terminal state.
+        drop(prepared);
+        assert!(
+            IndexClaim::try_acquire(&locks, key).is_some(),
+            "slot must free up once the holding Prepared drops at end of post_index"
+        );
+    }
 }

@@ -15,7 +15,7 @@ from typing import Any
 
 # fastapi is only present inside this component's Docker image, never alongside
 # the local/CI mypy run, so its stubs are legitimately unresolvable here.
-from fastapi import FastAPI  # type: ignore[import-not-found]
+from fastapi import FastAPI, HTTPException  # type: ignore[import-not-found]
 
 app = FastAPI()
 
@@ -23,11 +23,15 @@ DENSE_DIM = 1024
 MAX_SPARSE_TOKENS = 16
 MAX_COLBERT_TOKENS = 8
 
-# Per-process artificial delay (seconds) injected into every /encode call. Tests set
-# it via POST /config to widen the window a file stays 'indexing', so an /index
-# request can be caught mid-flight (e.g. to exercise POST /cancel). Defaults to 0 so
-# the rest of the suite is unaffected.
-_config: dict[str, float] = {"encode_delay_secs": 0.0}
+# Per-process test knobs, set via POST /config. Defaults leave the rest of the suite
+# unaffected.
+#   encode_delay_secs  — artificial delay injected into every /encode, to widen the
+#                        window a file stays 'indexing' so a request can be caught
+#                        mid-flight (POST /cancel, concurrent /index collisions).
+#   fail_next_encodes  — number of subsequent /encode calls to fail with HTTP 503
+#                        before serving normally again; lets a test drive a file to
+#                        'failed' (embed failure) and then watch it recover.
+_config: dict[str, float] = {"encode_delay_secs": 0.0, "fail_next_encodes": 0.0}
 
 
 def _dense(text: str) -> list[float]:
@@ -58,9 +62,12 @@ async def health() -> dict[str, str]:
 
 @app.post("/config")
 async def config(payload: dict[str, Any]) -> dict[str, float]:
-    """Test-only knob: set ``encode_delay_secs`` to slow every subsequent /encode."""
+    """Test-only knobs: ``encode_delay_secs`` slows every /encode;
+    ``fail_next_encodes`` fails that many subsequent /encode calls with 503."""
     if "encode_delay_secs" in payload:
         _config["encode_delay_secs"] = float(payload["encode_delay_secs"])
+    if "fail_next_encodes" in payload:
+        _config["fail_next_encodes"] = float(payload["fail_next_encodes"])
     return dict(_config)
 
 
@@ -69,6 +76,11 @@ async def encode(payload: dict[str, Any]) -> dict[str, Any]:
     delay = _config["encode_delay_secs"]
     if delay > 0:
         await asyncio.sleep(delay)
+    # Inject an embed failure (503) so a test can drive a file to 'failed'. The delay
+    # above runs first so the file is observably 'indexing' before the failure lands.
+    if _config["fail_next_encodes"] > 0:
+        _config["fail_next_encodes"] -= 1
+        raise HTTPException(status_code=503, detail="injected embed failure")
     texts: list[str] = payload["texts"]
     return {
         "dense_vecs": [_dense(t) for t in texts],
