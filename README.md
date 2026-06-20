@@ -122,8 +122,8 @@ direct GPU access, so it runs separately):
 
 ```sh
 cd embedder
-poetry install
-poetry run python -m bge_m3_api --port 11211      # binds 0.0.0.0; ~4–6 GB VRAM, or CPU
+uv sync                                           # then supply torch — see embedder/README.md
+uv run python -m bge_m3_api --port 11211          # binds 0.0.0.0; ~4–6 GB VRAM, or CPU
 ```
 
 > **No local GPU?** The embedder is a standalone HTTP service, so a natural use case is to

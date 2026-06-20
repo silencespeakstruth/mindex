@@ -25,39 +25,53 @@ inside — the container; mindex reaches it over `host.docker.internal`. The in-
 
 ```
 cd embedder
-poetry install
-poetry run python -m bge_m3_api --port 11211
+uv sync
+uv run python -m bge_m3_api --port 11211
 ```
 
-### GPU / torch build (one extra step)
+### GPU / torch build (supply torch out-of-band)
 
-`pyproject.toml` does **not** pin a torch build, so `poetry install` pulls
-whatever PyPI serves by default (a CUDA wheel on Linux). That's deliberate: the
-right accelerator build is per-machine (AMD ROCm vs NVIDIA CUDA vs CPU), so each
-user installs it **into the venv** after `poetry install` — this never touches the
-tracked `pyproject.toml`/`poetry.lock`, so your local choice stays uncommitted.
+`pyproject.toml` does **not** let uv manage torch at all: a never-true override
+marker (`[tool.uv] override-dependencies`) drops it from the resolution, so `uv
+sync` installs everything **except** torch (and never pulls the default CUDA wheel
+with its multi-GB `nvidia-*` libs). The right accelerator build is per-machine (AMD
+ROCm vs NVIDIA CUDA vs CPU), so you supply torch into `.venv` yourself — your choice
+stays uncommitted, and because uv doesn't track torch, **`uv sync` never reverts
+it** (no re-run gotcha). torch's pure-python runtime deps (`sympy`, `networkx`,
+`jinja2`, `filelock`, `fsspec`) *are* declared in `pyproject.toml` so the external
+torch can import (`torch._dynamo`, which `transformers` triggers, needs `sympy`).
 
-Because torch is already present after `poetry install`, you must **uninstall it
-first** — `pip install` alone would report "Requirement already satisfied" and skip
-the swap. For AMD ROCm 7.2 (nightly — note the `--pre`):
-
-```
-poetry run pip uninstall -y torch
-poetry run pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.2
-```
-
-(Optional: also `pip uninstall` the leftover `nvidia-*` / `triton` wheels the
-default CUDA torch dragged in — unused under ROCm.) Verify:
+This machine (AMD Radeon AI PRO R9700, `gfx1201`) keeps **one** ROCm 7.2 torch in a
+neutral, project-independent home and references it from every venv — so the ~14 GB
+is on disk once and no single project "owns" it:
 
 ```
-poetry run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+CANON=/data/silencespeakstruth/Shared/rocm-torch-py313   # the single source of truth
+DST=.venv/lib/python3.13/site-packages
+for d in torch functorch torchgen torch-*.dist-info triton triton_rocm-*.dist-info; do
+    ln -sfn "$CANON/$(basename $CANON/$d)" "$DST/$(basename $d)"
+done
+```
+
+(`$CANON` must be the **same Python minor** — 3.13 — as this venv for the compiled
+extensions to load; `/opt/rocm` is system-wide, so torch finds its ROCm libs
+regardless of which venv imports it.) Every other project — ComfyUI included —
+symlinks the same `$CANON`; to seed the home the first time, `mv` an existing ROCm
+torch install there and symlink the origin back. If you'd rather install a fresh
+ROCm torch into `.venv` instead of symlinking (nightly — note `--pre`):
+
+```
+uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+```
+
+Verify:
+
+```
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
 ROCm exposes the GPU through the `cuda` device API, so `torch.cuda.is_available()`
 returning `True` (and `--device cuda`) is correct on AMD too.
-
-> A later `poetry install` (e.g. after a dependency bump) re-pulls the default
-> torch and reverts this — just re-run the two commands above.
 
 Useful flags (`python -m bge_m3_api --help`): `--device` (`cuda`, `cuda:0`, `cpu`),
 `--batch`, `--max-inflight` (429 beyond this), `--idle-timeout` (unload the model
