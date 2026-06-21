@@ -1,0 +1,9 @@
+# Fetched corpus + clone cache (rebuilt by corpus/fetch.sh).
+corpus/data/
+corpus/.clones/
+
+# Benchmark output (one CSV per run, named by timestamp+config) — kept for
+# comparison, never committed.
+results/
+results.csv
+plots/

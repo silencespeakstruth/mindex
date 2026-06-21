@@ -1,0 +1,22 @@
+# Corpus manifest for the mindex perf harness.
+#
+# One repo per line:   <git-url>  <ref>  [subdir ...]
+#   <ref>     a commit SHA (preferred — fully reproducible) or a tag/branch.
+#   [subdir]  optional space-separated subdirectories to walk (relative to the repo
+#             root). Omit to walk the whole tree. Use this to skip vendored/test
+#             trees and keep the corpus to real source.
+#
+# Blank lines and #-comments are ignored. The SHAs below are pinned (resolved from
+# release tags via `git ls-remote <url> refs/tags/<tag>^{}`), so reruns are
+# byte-stable. The trailing comment on each line records the tag the SHA came from.
+# Together these produce a large, multi-language corpus (Rust / Python / C / Go).
+#
+# To re-pin or add a repo, resolve its tag to a commit:
+#   git ls-remote https://github.com/<owner>/<repo>.git 'refs/tags/<tag>^{}'
+#
+# url                                          ref(SHA)                                  subdirs
+https://github.com/BurntSushi/ripgrep.git      e50df40a1967708b9781486b1c017e48040bceb0  crates                      # 14.1.0  (rust)
+https://github.com/tokio-rs/tokio.git          ea6d652a102dee3f22b490db70545b7f66a23fb7  tokio tokio-util            # tokio-1.40.0  (rust)
+https://github.com/django/django.git           373cb3037fe4e67adbac9ac43340391e859aa957  django                      # 5.1  (python)
+https://github.com/redis/redis.git             c9d29f6a918c335bc1778d9f68e521c1bbb36a0f  src                         # 7.4.0  (c)
+https://github.com/gohugoio/hugo.git           77df7bbbff8ce6b56ed693270088de973a87d5ce                              # v0.134.0  (go)
