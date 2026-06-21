@@ -427,7 +427,15 @@ they take the GUID + filters as call args).
 
 1. New loops touching Qdrant/SQLite/model-server must respect the `CancellationToken`.
 2. Multi-row DB writes go inside a `transaction`.
-3. New endpoints register in `backend::http3::run`, use `RouterState`, `{param}` route syntax, `#[debug_handler]`.
+3. New endpoints register in `backend::http3::run`, use `RouterState`, `{param}` route
+   syntax, `#[debug_handler]`. They also need a `#[utoipa::path(...)]` annotation (tag =
+   one of the existing groups, documented responses, a `**Concurrency:**` note) **and**
+   an entry in `backend::openapi.rs`'s `paths(...)` (+ any new body/response type in
+   `schemas(...)`) — a handler missing there is silently absent from Swagger, not a
+   compile error; the `openapi_spec_is_complete_and_versioned` test guards the path count.
+   Swagger UI is served at `/swagger-ui`, the raw spec at `/api-docs/openapi.json`; the
+   UI assets are vendored into the binary (`utoipa-swagger-ui` `vendored` feature) so no
+   network fetch happens at build or runtime.
 4. Reach Qdrant only via `VectorStore`; derive collection names from `collection_for`.
 5. Any search path's SQLite query must include `AND c.status = 'active'`.
 6. Status writes use `set_file_status` (stamps `status_updated_at`) and must be a

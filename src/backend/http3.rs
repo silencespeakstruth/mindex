@@ -12,7 +12,9 @@ use tokenizers::Tokenizer;
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use utoipa_swagger_ui::SwaggerUi;
 
+use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
     delete_files, delete_project, get_config, get_files, get_health, get_project_stats,
     get_projects, get_status, get_version, post_cancel, post_drift, post_gc, post_index,
@@ -95,10 +97,14 @@ pub async fn run(
         .route("/config", get(get_config))
         .route("/health", get(get_health))
         .route("/version", get(get_version))
+        // Interactive API docs at /swagger-ui, raw spec at /api-docs/openapi.json.
+        // The UI assets are vendored into the binary (no network fetch at runtime),
+        // and the route carries no state so it merges cleanly before `.with_state`.
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api_doc()))
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         .with_state(state);
 
-    info!(?addr, body_limit_bytes, "The HTTP server is ready.");
+    info!(?addr, body_limit_bytes, "The HTTP server is ready. Swagger UI at /swagger-ui.");
 
     let (cert, key) = pem_files;
     axum_server::bind_rustls(addr, RustlsConfig::from_pem_file(cert, key).await?)

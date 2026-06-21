@@ -5,14 +5,21 @@ use rusqlite::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-#[derive(Deserialize, Serialize, Debug)]
+/// One source file's contents, keyed by path inside the language map of an
+/// `IndexRequest`.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct Code {
+    /// The full UTF-8 source text. Sliced server-side into 128–512-token chunks.
     pub code: String,
 }
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+/// A language mindex can chunk. Serialized as its lowercase name (e.g. `"rust"`,
+/// `"cpp"`, `"csharp"`); the same set is returned by `GET /config`.
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Hash, Clone, Copy, ToSchema)]
+#[schema(rename_all = "lowercase")]
 pub enum ProgrammingLanguage {
     #[serde(rename = "rust")]       Rust,
     #[serde(rename = "python")]     Python,
@@ -147,16 +154,26 @@ impl FromSql for UUIDv4 {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// `POST /v0/{project_guid}/index` body. Files grouped by language, then by path —
+/// one HTTP call can carry many files of many languages. Unchanged files (matching
+/// stored sha256) are skipped server-side and absent from the response.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct IndexRequest {
+    /// `language → (path → {code})`. Paths are repo-relative Unix paths.
     pub files: HashMap<ProgrammingLanguage, HashMap<UnixPath, Code>>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// `POST /v0/{project_guid}/index` response: per indexed file, the number of chunks
+/// produced. `0` means the file sliced to no chunks (shorter than 128 tokens), **not**
+/// "unchanged" — hash-unchanged files are skipped and omitted entirely.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct IndexResponse {
+    /// `language → (path → chunk_count)`, covering only files actually (re)indexed.
     pub files: HashMap<ProgrammingLanguage, HashMap<UnixPath, u64>>,
 }
 
+/// A shell-style glob (e.g. `src/**`, `*.rs`) evaluated by SQLite `GLOB`. Serialized
+/// as the raw pattern string.
 #[derive(Debug)]
 pub struct GlobPattern(pub Pattern);
 
@@ -181,24 +198,40 @@ impl Serialize for GlobPattern {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// A match selector reused by search and the management endpoints. `paths` and
+/// `programming_languages` combine with AND; within each, entries combine with OR.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct SearchFilter {
+    /// Glob patterns over repo-relative paths (e.g. `["src/**", "tests/**"]`).
+    #[schema(value_type = Option<Vec<String>>, example = json!(["src/**"]))]
     pub paths: Option<Vec<GlobPattern>>,
+    /// Restrict to (or, in `exclude`, drop) these languages.
     pub programming_languages: Option<Vec<ProgrammingLanguage>>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// `POST /v0/{project_guid}/search` body. Hybrid retrieval: dense + sparse prefetch →
+/// RRF fusion → ColBERT MaxSim rerank → top-k.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct SearchRequest {
+    /// Natural-language or code query; embedded with the same BGE-M3 model.
     pub query: String,
+    /// Max results to return. Defaults to 5 when omitted.
+    #[schema(default = 5, example = 5)]
     pub top_k: Option<usize>,
+    /// Keep only chunks matching this selector.
     pub include: Option<SearchFilter>,
+    /// Drop chunks matching this selector (applied after `include`).
     pub exclude: Option<SearchFilter>,
 }
 
-#[derive(Serialize, Debug)]
+/// One ranked hit: the chunk's code plus its byte-accurate source span. Responses are
+/// sorted by `score` descending.
+#[derive(Serialize, Debug, ToSchema)]
 pub struct SearchResult {
+    /// Fusion/rerank score; higher is more relevant. Not normalized to any range.
     pub score: f32,
     pub path: UnixPath,
+    /// The chunk's source text.
     pub code: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -206,7 +239,7 @@ pub struct SearchResult {
     pub end_column: usize,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
@@ -217,14 +250,15 @@ pub struct SearchResponse {
 /// same globs/languages that surface files can also remove them. At least one of
 /// `include`/`exclude` must be non-empty (the handler rejects an empty body to
 /// avoid wiping the whole project).
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, ToSchema)]
 pub struct DeleteFilesRequest {
     pub include: Option<SearchFilter>,
     pub exclude: Option<SearchFilter>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct DeleteFilesResponse {
+    /// Number of files moved to `deleted` (their vectors are reclaimed by the next GC pass).
     pub deleted_files: u64,
 }
 
@@ -232,20 +266,22 @@ pub struct DeleteFilesResponse {
 /// so the same globs/languages that surface files can also cancel their in-flight
 /// indexing. At least one of `include`/`exclude` must be non-empty (the handler
 /// rejects an empty body so it can't blanket-cancel the whole project).
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, ToSchema)]
 pub struct CancelRequest {
     pub include: Option<SearchFilter>,
     pub exclude: Option<SearchFilter>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct CancelResponse {
+    /// Number of files moved `indexing → cancelled`. Files already `indexed`/`failed`
+    /// are never matched, so a too-late cancel reports `0`.
     pub cancelled_files: u64,
 }
 
 /// Per-status `project_files` counts. A fixed struct (not a sparse map) so the
 /// response schema is self-documenting and every status is always present.
-#[derive(Serialize, Debug, Default)]
+#[derive(Serialize, Debug, Default, ToSchema)]
 pub struct FileStatusCounts {
     pub just_uploaded: u64,
     pub indexing: u64,
@@ -270,14 +306,15 @@ impl FileStatusCounts {
 }
 
 /// Active vs soft-deleted (pending GC) chunk counts for one language.
-#[derive(Serialize, Debug, Default)]
+#[derive(Serialize, Debug, Default, ToSchema)]
 pub struct ChunkCounts {
     pub active: u64,
     pub deleted: u64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct ProjectStats {
+    #[schema(value_type = String, example = "550e8400e29b41d4a716446655440000")]
     pub project_guid: UUIDv4,
     pub files: FileStatusCounts,
     /// Keyed by programming language. `deleted` here is "soft-deleted but not yet
@@ -287,15 +324,18 @@ pub struct ProjectStats {
 
 /// One row of `GET /projects` — a compact per-project summary (full per-language
 /// breakdown is `GET /projects/{guid}`).
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct ProjectSummary {
     pub project_guid: String,
+    /// Total files tracked for the project (any status).
     pub files: i64,
+    /// Files currently in `status='indexing'`.
     pub indexing: i64,
+    /// Active (non-soft-deleted) chunks across the project.
     pub active_chunks: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct ProjectListResponse {
     pub projects: Vec<ProjectSummary>,
 }
@@ -303,8 +343,10 @@ pub struct ProjectListResponse {
 /// `POST /projects/{guid}/drift` body: the working tree's `path → sha256` map.
 /// The server stays filesystem-agnostic — the client walks + hashes; the server
 /// only compares this against what it already stored.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, ToSchema)]
 pub struct DriftRequest {
+    /// `path → sha256` of the working tree. The client walks + hashes; the server only
+    /// compares against what it stored.
     pub files: HashMap<String, String>,
 }
 
@@ -313,35 +355,42 @@ pub struct DriftRequest {
 /// - `missing`: present locally but not indexed (`failed`/never-indexed),
 /// - `orphaned`: indexed but absent locally (should be deleted from the index),
 /// - `indexing`: currently being indexed — **no action**, it will settle.
-#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Debug, Default, PartialEq, Eq, ToSchema)]
 pub struct DriftResponse {
+    /// Indexed but content hash differs — needs reindex.
     pub stale: Vec<String>,
+    /// Present locally but not indexed (`failed`/never-indexed).
     pub missing: Vec<String>,
+    /// Indexed but absent locally — should be deleted from the index.
     pub orphaned: Vec<String>,
+    /// Currently being indexed — no action, it will settle.
     pub indexing: Vec<String>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct GcResponse {
+    /// Soft-deleted chunks physically removed (vectors confirmed gone from Qdrant first).
     pub chunks_removed: usize,
+    /// Emptied `deleted` file rows dropped.
     pub files_removed: usize,
+    /// `project_file_status_log` rows pruned past the retention window.
     pub status_log_pruned: usize,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct VersionResponse {
     pub version: &'static str,
 }
 
 /// One dependency's liveness: `"ok"` or `"error: <reason>"`.
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct HealthChecks {
     pub sqlite: String,
     pub qdrant: String,
     pub embedder: String,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct HealthResponse {
     /// `"ok"` only when all three dependency checks pass, else `"degraded"`.
     pub status: &'static str,
@@ -353,26 +402,34 @@ pub struct HealthResponse {
 
 /// `GET /projects/{guid}/files` query string — optional filters. `language`
 /// deserializes from its lowercase wire name (e.g. `?language=rust`).
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct FileListQuery {
+    /// Filter by file status, e.g. `indexed`, `failed` (the dead-letter view), `indexing`.
     pub status: Option<String>,
+    /// Filter by language (lowercase name, e.g. `rust`).
     pub language: Option<ProgrammingLanguage>,
 }
 
 /// One file in `GET /projects/{guid}/files`. `chunk_count` counts only `active`
 /// chunks (soft-deleted ones awaiting GC are excluded).
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct FileInfo {
     pub path: UnixPath,
     pub programming_language: ProgrammingLanguage,
+    /// Current state-machine status (`indexed`, `indexing`, `failed`, …).
     pub status: String,
+    /// Content hash recorded at the last `indexing` start.
     pub sha256: String,
+    /// Active (non-soft-deleted) chunk count for this file.
     pub chunk_count: u64,
+    /// Times the retry worker has re-attempted this file (reset to 0 on success).
     pub retry_count: i64,
+    /// Unix epoch seconds of the last status change.
     pub status_updated_at: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct FileListResponse {
     pub files: Vec<FileInfo>,
 }
@@ -382,21 +439,22 @@ pub struct FileListResponse {
 /// file". Retry is non-destructive (it only resets the retry counter so the worker
 /// re-attempts the file), so a blanket requeue is the useful dead-letter-recovery
 /// default rather than a footgun to guard against.
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, ToSchema)]
 pub struct RetryRequest {
     pub include: Option<SearchFilter>,
     pub exclude: Option<SearchFilter>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct RetryResponse {
+    /// Number of `failed` files whose retry counter was reset for the retry worker.
     pub requeued_files: u64,
 }
 
 /// `GET /status` — live runtime/concurrency state (cheap to compute; for diagnosing
 /// 429/409/503 and stuck work). Distinct from `GET /config` (static knobs) and
 /// `GET /health` (dependency liveness).
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct StatusResponse {
     /// Per-file `(project, model, path)` indexing claims held right now — the size of
     /// the in-process mutual-exclusion table (contention here is what returns 429).
@@ -415,7 +473,7 @@ pub struct StatusResponse {
 
 /// `GET /config` — static server capabilities and tuning knobs. `languages` is the
 /// canonical supported-language list (derived from the `ProgrammingLanguage` enum).
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, ToSchema)]
 pub struct ConfigResponse {
     pub version: &'static str,
     pub model_id: String,

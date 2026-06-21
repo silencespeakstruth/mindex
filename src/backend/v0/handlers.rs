@@ -693,6 +693,37 @@ impl FileIndexer<'_> {
     }
 }
 
+/// Index (or reindex) a batch of files for a project.
+///
+/// Files are grouped by language → path. The pipeline runs in two phases so the GPU
+/// sees large batches: every file is hashed, marked `indexing`, sliced into 128–512
+/// token chunks and its chunks inserted; then **all** files' chunks are embedded in
+/// one batched pass and upserted to Qdrant; finally each file is marked `indexed`.
+/// Re-indexing identical content (matching sha256) is skipped server-side and omitted
+/// from the response. The project and its Qdrant collection are created on first use.
+///
+/// Reindex is append-only: old chunks are soft-deleted (reclaimed later by GC), never
+/// deleted inline, so indexing latency is decoupled from Qdrant delete latency.
+///
+/// **Concurrency:** safe. Each `(project, model, path)` is serialized by an in-process
+/// claim — a second in-flight request for the *same* file gets **429** (retry later);
+/// different files proceed in parallel. A concurrent `POST /cancel` is reconciled
+/// before the embed pass. On any failure the whole batch is recovered to
+/// `failed`/`cancelled` and the retry worker re-attempts it.
+#[utoipa::path(
+    post,
+    path = "/v0/{project_guid}/index",
+    tag = "Indexing",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = IndexRequest,
+    responses(
+        (status = 200, description = "Per-file chunk counts for the files actually (re)indexed.", body = IndexResponse),
+        (status = 429, description = "The same file is already being indexed by another in-flight request — retry."),
+        (status = 499, description = "Client closed the connection; indexing was cancelled (nginx convention)."),
+        (status = 500, description = "SQLite, slicer, or Qdrant upsert failure; the batch was marked `failed` for the retry worker."),
+        (status = 503, description = "The embedder is unreachable or returned persistent backpressure; the batch was marked `failed`."),
+    ),
+)]
 #[debug_handler]
 pub async fn post_index(
     Path(project_guid): Path<UUIDv4>,
@@ -945,6 +976,21 @@ async fn read_drift_baseline(
 /// map against the index and return the divergence. Filesystem-agnostic: the client
 /// walked and hashed; this only reads stored hashes. Unlike `post_search`, an empty
 /// project is not a 404 — it just means every posted file is `missing`.
+///
+/// **Concurrency:** safe — pure read, takes no locks. In-flight files are reported as
+/// `indexing` (never `stale`/`missing`) since their stored hash is the previous value.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_guid}/drift",
+    tag = "Indexing",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = DriftRequest,
+    responses(
+        (status = 200, description = "Working-tree divergence in four buckets (stale/missing/orphaned/indexing).", body = DriftResponse),
+        (status = 499, description = "Client closed the connection."),
+        (status = 500, description = "SQLite read failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn post_drift(
     Path(project_guid): Path<UUIDv4>,
@@ -956,6 +1002,33 @@ pub async fn post_drift(
     Ok(Json(compute_drift(&indexed, &in_flight, &payload.files)))
 }
 
+/// Hybrid semantic + lexical code search within one project.
+///
+/// The query is embedded with BGE-M3 (dense + sparse + ColBERT). Candidate chunks are
+/// the project's `active` chunks matching the optional `include`/`exclude` selector
+/// (project isolation + soft-delete exclusion happen here, in SQLite). Qdrant then
+/// prefetches top-200 dense + top-200 sparse, fuses with RRF, reranks with ColBERT
+/// MaxSim, and returns the top-k. Results are sorted by score descending.
+///
+/// An empty candidate set (nothing indexed, or filtered to nothing) returns **404**
+/// immediately without touching Qdrant.
+///
+/// **Concurrency:** safe — read-only, takes no locks; never blocks or is blocked by
+/// indexing/GC. Honors client cancellation (**499**).
+#[utoipa::path(
+    post,
+    path = "/v0/{project_guid}/search",
+    tag = "Search",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = SearchRequest,
+    responses(
+        (status = 200, description = "Ranked matches, sorted by score descending.", body = SearchResponse),
+        (status = 404, description = "No active chunks match (empty project or over-narrow filter)."),
+        (status = 499, description = "Client closed the connection."),
+        (status = 500, description = "SQLite failure while building the candidate set or fetching display rows."),
+        (status = 503, description = "The embedder or Qdrant is unreachable."),
+    ),
+)]
 #[debug_handler]
 pub async fn post_search(
     Path(project_guid): Path<UUIDv4>,
@@ -1145,8 +1218,21 @@ pub async fn post_search(
 
 // ─── Management endpoints ───────────────────────────────────────────────────
 
-/// `GET /projects` — every known project with a compact summary (file count, files
-/// currently indexing, active chunks). Empty list when nothing has been indexed.
+/// List every known project with a compact summary.
+///
+/// Returns file count, files currently indexing, and active-chunk count per project.
+/// Empty list when nothing has been indexed yet.
+///
+/// **Concurrency:** safe — read-only, takes no locks.
+#[utoipa::path(
+    get,
+    path = "/projects",
+    tag = "Projects",
+    responses(
+        (status = 200, description = "All projects with summary counts.", body = ProjectListResponse),
+        (status = 500, description = "SQLite read failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn get_projects(
     State(s): State<RouterState>,
@@ -1190,9 +1276,23 @@ pub async fn get_projects(
     Ok(Json(ProjectListResponse { projects }))
 }
 
-/// `GET /projects/{guid}` — aggregate counts: `project_files` by status, and chunks
-/// per language split into active vs soft-deleted (pending GC). 404 if the project
-/// has never been seen.
+/// Aggregate statistics for one project.
+///
+/// `project_files` counted by status, plus chunks per language split into active vs
+/// soft-deleted (pending GC).
+///
+/// **Concurrency:** safe — read-only, takes no locks.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_guid}",
+    tag = "Projects",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    responses(
+        (status = 200, description = "Per-status file counts and per-language chunk counts.", body = ProjectStats),
+        (status = 404, description = "The project has never been seen."),
+        (status = 500, description = "SQLite read failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn get_project_stats(
     Path(project_guid): Path<UUIDv4>,
@@ -1281,11 +1381,25 @@ pub async fn get_project_stats(
     }
 }
 
-/// `DELETE /projects/{guid}` — hard-deletes the project: all chunks, files, the
-/// project row, its status log, and the Qdrant collection. Idempotent: deleting a
-/// non-existent project (or re-deleting) is a 204. Chunks go first (the chunk→file
-/// FK is RESTRICT); the collection is dropped last so a retry re-attempts a failed
-/// drop even once the rows are gone.
+/// Hard-delete an entire project (immediate, not soft).
+///
+/// Removes all chunks, files, the project row, its status log, and finally drops the
+/// Qdrant collection (last, so a retry re-attempts a failed drop even once the rows
+/// are gone). Idempotent: deleting a non-existent project (or re-deleting) is a 204.
+///
+/// **Concurrency:** safe but destructive — unlike `DELETE /files` this is *not* a soft
+/// delete and does not wait for GC. Avoid issuing it against a project with live
+/// `/index` requests in flight.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_guid}",
+    tag = "Projects",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    responses(
+        (status = 204, description = "Project deleted (or did not exist) — idempotent."),
+        (status = 500, description = "SQLite delete or Qdrant collection-drop failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn delete_project(
     Path(project_guid): Path<UUIDv4>,
@@ -1403,6 +1517,23 @@ fn build_file_filter(
 /// rows, and finally the empty file rows. Returns 204 when nothing matched, else
 /// 200 with the count of files moved to `deleted`. A non-empty include/exclude is
 /// required so an empty body cannot wipe the whole project.
+///
+/// **Concurrency:** safe — a soft delete (status flip), so it never races a live
+/// `/index`/search the way an inline Qdrant delete would; physical removal is deferred
+/// to GC. The empty-selector guard (**400**) prevents an accidental whole-project wipe.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_guid}/files",
+    tag = "Indexing",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = DeleteFilesRequest,
+    responses(
+        (status = 200, description = "Files matched and soft-deleted.", body = DeleteFilesResponse),
+        (status = 204, description = "The selector matched no files — nothing changed."),
+        (status = 400, description = "Empty selector: at least one non-empty `include`/`exclude` is required."),
+        (status = 500, description = "SQLite failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn delete_files(
     Path(project_guid): Path<UUIDv4>,
@@ -1510,6 +1641,24 @@ pub async fn delete_files(
 /// cancelled file is neither re-embedded nor resurrected. Returns 204 when nothing
 /// matched, else 200 with the count of files moved to `cancelled`. A non-empty
 /// include/exclude is required so an empty body cannot blanket-cancel the project.
+///
+/// **Concurrency:** safe and intentionally lock-free — it deliberately does *not* take
+/// the per-file indexing claim, so it can interrupt a held one. Correctness against a
+/// live `/index` rests on re-reads (the indexer drops cancelled files before embedding;
+/// the retry worker re-checks status after claiming), not a lock.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_guid}/cancel",
+    tag = "Indexing",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = CancelRequest,
+    responses(
+        (status = 200, description = "In-flight indexing cancelled for the matched files.", body = CancelResponse),
+        (status = 204, description = "No `indexing` files matched (e.g. already finished) — nothing changed."),
+        (status = 400, description = "Empty selector: at least one non-empty `include`/`exclude` is required."),
+        (status = 500, description = "SQLite failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn post_cancel(
     Path(project_guid): Path<UUIDv4>,
@@ -1620,6 +1769,22 @@ pub async fn post_cancel(
 /// `?status=failed` is the dead-letter view). 404 if the project has never been seen
 /// (mirrors `get_project_stats`); an empty file set on a known project is `200` with
 /// `files: []`. Pure read — cancellation-safe, takes no locks.
+///
+/// **Concurrency:** safe — read-only. `?status=failed` is the dead-letter view.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_guid}/files",
+    tag = "Projects",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        FileListQuery,
+    ),
+    responses(
+        (status = 200, description = "Per-file listing (status / language / hash / chunk & retry counts).", body = FileListResponse),
+        (status = 404, description = "The project has never been seen."),
+        (status = 500, description = "SQLite read failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn get_files(
     Path(project_guid): Path<UUIDv4>,
@@ -1711,6 +1876,22 @@ pub async fn get_files(
 /// bumping it would add a needless 60s delay. It races benignly with that worker,
 /// which re-checks status under its own claim. Returns 204 when nothing matched, else
 /// 200 with the count of files requeued.
+///
+/// **Concurrency:** safe — a metadata-only write (`retry_count = 0`) that skips the
+/// state-machine triggers and takes no claim. It races benignly with the retry worker.
+/// An empty body requeues *every* `failed` file (retry is non-destructive).
+#[utoipa::path(
+    post,
+    path = "/projects/{project_guid}/retry",
+    tag = "Indexing",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = RetryRequest,
+    responses(
+        (status = 200, description = "Matched `failed` files requeued for the retry worker.", body = RetryResponse),
+        (status = 204, description = "No `failed` files matched — nothing changed."),
+        (status = 500, description = "SQLite failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn post_retry(
     Path(project_guid): Path<UUIDv4>,
@@ -1753,6 +1934,18 @@ pub async fn post_retry(
 /// pool headroom, and global `project_files` counts by status. Cheap — one grouped
 /// SQLite read plus two in-memory reads. Distinct from `GET /health` (dependency
 /// liveness) and `GET /config` (static knobs).
+///
+/// **Concurrency:** safe — read-only. This is the endpoint to inspect *why* you saw a
+/// 429 (held indexing claims), a 409 (`gc_running`), or a 500 (`pool_available` at 0).
+#[utoipa::path(
+    get,
+    path = "/status",
+    tag = "Observability",
+    responses(
+        (status = 200, description = "Live runtime/concurrency snapshot.", body = StatusResponse),
+        (status = 500, description = "SQLite read failure."),
+    ),
+)]
 #[debug_handler]
 pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusResponse>, StatusCode> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -1802,6 +1995,16 @@ pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusRespo
 /// the embedding model, the canonical supported-language list, and the CLI-set
 /// concurrency knobs). The `languages` array is the single source of truth clients
 /// (e.g. the search frontend) read instead of hardcoding their own copy.
+///
+/// **Concurrency:** safe — returns static, in-memory values; no I/O, no locks.
+#[utoipa::path(
+    get,
+    path = "/config",
+    tag = "Config",
+    responses(
+        (status = 200, description = "Static capabilities and tuning knobs, incl. the canonical language list.", body = ConfigResponse),
+    ),
+)]
 #[debug_handler]
 pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
@@ -1822,6 +2025,20 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
 /// by design; the periodic worker runs the same steps hourly. GC is global, so a
 /// pass is serialized process-wide by `GcGuard`: a `POST /gc` arriving while one is
 /// already running (a concurrent call or the hourly worker's tick) returns 409.
+///
+/// **Concurrency:** safe but globally serialized — GC is process-wide, so only one pass
+/// runs at a time; a concurrent request (or one racing the hourly worker) gets **409**.
+/// It only hard-deletes chunks whose Qdrant vectors are confirmed gone, so it never
+/// orphans a vector. Synchronous: the response returns when the pass completes.
+#[utoipa::path(
+    post,
+    path = "/gc",
+    tag = "Garbage Collection",
+    responses(
+        (status = 200, description = "GC pass completed; counts of what was physically removed.", body = GcResponse),
+        (status = 409, description = "A GC pass is already running (manual or the hourly worker) — retry later."),
+    ),
+)]
 #[debug_handler]
 pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, StatusCode> {
     let Some(_guard) = crate::worker::gc::GcGuard::try_acquire(&s.gc_flag) else {
@@ -1838,7 +2055,15 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, S
     }))
 }
 
-/// `GET /version` — the running mindex version (also a trivial liveness ping).
+/// Running mindex version (also a trivial liveness ping).
+///
+/// **Concurrency:** safe — constant, no I/O.
+#[utoipa::path(
+    get,
+    path = "/version",
+    tag = "Observability",
+    responses((status = 200, description = "The running mindex version.", body = VersionResponse)),
+)]
 #[debug_handler]
 pub async fn get_version() -> Json<VersionResponse> {
     Json(VersionResponse { version: env!("CARGO_PKG_VERSION") })
@@ -1849,6 +2074,15 @@ pub async fn get_version() -> Json<VersionResponse> {
 /// globally. `status` is `"ok"` only if all three checks pass. Each check is
 /// best-effort and independent, so one dead dependency is pinpointed rather than
 /// collapsing the whole response.
+///
+/// **Concurrency:** safe — read-only probes. Always returns **200** at the HTTP level;
+/// inspect the `status` field (`"ok"` vs `"degraded"`) and per-dependency `checks`.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Observability",
+    responses((status = 200, description = "Dependency liveness; `status` is `ok` only if all three checks pass.", body = HealthResponse)),
+)]
 #[debug_handler]
 pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
     let guard = http3::CancellationGuard(CancellationToken::new());

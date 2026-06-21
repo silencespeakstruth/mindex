@@ -175,6 +175,12 @@ live as it edits. Full setup in **[`tools/mcp/mindex/README.md`](tools/mcp/minde
 All endpoints are HTTPS. TLS is the only transport security — there is **no API auth**
 (mindex is meant for a trusted local network).
 
+Interactive, always-current docs for every endpoint below (request/response schemas,
+status codes, behavior and concurrency notes, grouped by Indexing / Search / Projects /
+Garbage Collection / Observability / Config) are served as **Swagger UI at
+`https://localhost:11111/swagger-ui`**; the raw OpenAPI spec is at
+`/api-docs/openapi.json`.
+
 | Method & path | Purpose |
 |---------------|---------|
 | `POST /v0/{project}/index` | Index/reindex files (JSON: `{files: {lang: {path: {code}}}}`). |
