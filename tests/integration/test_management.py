@@ -10,6 +10,8 @@ Deletions are soft (mark + GC), so every deletion test calls POST /gc explicitly
 and asserts the data is then physically gone (stats / search).
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 import httpx
 
 from test_e2e import RUST_V1, RUST_V2
@@ -221,6 +223,33 @@ def test_gc_returns_counts(client: httpx.Client, project: str) -> None:
     body = resp.json()
     assert body["chunks_removed"] >= 1
     assert body["files_removed"] >= 1
+
+
+def test_concurrent_gc_is_serialized(client: httpx.Client, project: str) -> None:
+    """GC is global, so a pass is serialized process-wide by GcGuard: of N
+    concurrent POST /gc, exactly the ones that win the flag return 200+counts and
+    the rest get 409 — never a 5xx, never overlapping sweeps. The race may resolve
+    so fast that all serialize cleanly (all 200), so we don't *require* a 409; we
+    pin the invariant that every response is 200-or-409 and the 200s carry a body.
+    (The strict win/lose semantics are unit-tested in `gc_guard_serializes_and_releases`.)
+    """
+    index_files(client, project, {"rust": {"a.rs": RUST_V1}})
+    delete_files(client, project, include={"paths": ["**"]})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = [
+            r.result() for r in [pool.submit(run_gc, client) for _ in range(8)]
+        ]
+
+    assert all(r.status_code in (200, 409) for r in responses)
+    assert any(r.status_code == 200 for r in responses)
+    for r in responses:
+        if r.status_code == 200:
+            assert set(r.json()) == {
+                "chunks_removed",
+                "files_removed",
+                "status_log_pruned",
+            }
 
 
 # ---------------------------------------------------------------------------

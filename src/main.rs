@@ -161,6 +161,10 @@ async fn main() -> Result<(), BoxError> {
     // and the retry worker so a file held by a live `/index` is never raced by a sweep.
     let indexing_locks = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
+    // Process-wide GC flag, shared by the GC worker and the `POST /gc` handler so a
+    // manual sweep and the hourly tick never run concurrently (GC is global).
+    let gc_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let qdrant_client: Arc<dyn VectorStore> =
         Arc::new(Qdrant::from_url(args.qdrant_server.as_str()).build()?);
 
@@ -175,6 +179,7 @@ async fn main() -> Result<(), BoxError> {
     tokio::spawn(worker::gc::run(
         db_pool.clone(),
         qdrant_client.clone(),
+        gc_flag.clone(),
         gc_token,
     ));
 
@@ -205,6 +210,7 @@ async fn main() -> Result<(), BoxError> {
                 },
                 embed_batch: args.embed_batch,
                 indexing_locks: indexing_locks.clone(),
+                gc_flag: gc_flag.clone(),
             },
             args.max_body_mb * 1024 * 1024,
             sigterm_token.child_token()) => {

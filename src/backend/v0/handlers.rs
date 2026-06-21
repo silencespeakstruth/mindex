@@ -1609,18 +1609,23 @@ pub async fn post_cancel(
 /// `POST /gc` — runs a full GC pass synchronously and returns what it removed:
 /// hard-deletes soft-deleted chunks (whose vectors are confirmed gone from Qdrant),
 /// then the now-empty `deleted` file rows, then prunes the old status log. Blocking
-/// by design; the periodic worker runs the same steps hourly.
+/// by design; the periodic worker runs the same steps hourly. GC is global, so a
+/// pass is serialized process-wide by `GcGuard`: a `POST /gc` arriving while one is
+/// already running (a concurrent call or the hourly worker's tick) returns 409.
 #[debug_handler]
-pub async fn post_gc(State(s): State<RouterState>) -> Json<GcResponse> {
-    let guard = http3::CancellationGuard(CancellationToken::new());
-    let chunks_removed = crate::worker::gc::sweep(&s.db_pool, &*s.qdrant, &guard.0).await;
-    let files_removed = crate::worker::gc::prune_deleted_files(&s.db_pool, &guard.0).await;
-    let status_log_pruned = crate::worker::gc::prune_status_log(&s.db_pool, &guard.0).await;
-    Json(GcResponse {
+pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, StatusCode> {
+    let Some(_guard) = crate::worker::gc::GcGuard::try_acquire(&s.gc_flag) else {
+        info!("POST /gc rejected: a garbage-collection pass is already running.");
+        return Err(StatusCode::CONFLICT);
+    };
+    let cg = http3::CancellationGuard(CancellationToken::new());
+    let (chunks_removed, files_removed, status_log_pruned) =
+        crate::worker::gc::collect(&s.db_pool, &*s.qdrant, &cg.0).await;
+    Ok(Json(GcResponse {
         chunks_removed,
         files_removed,
         status_log_pruned,
-    })
+    }))
 }
 
 /// `GET /version` — the running mindex version (also a trivial liveness ping).

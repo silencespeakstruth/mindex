@@ -64,7 +64,12 @@ spinning. The same pass prunes `project_file_status_log` past `STATUS_LOG_RETENT
 (30 days) and runs `prune_deleted_files` — drops `deleted` `project_files` rows once
 their chunks are gone (chunk→file FK is RESTRICT, so only after the sweep). That
 sweep-then-drop ordering is what makes `DELETE /files` eventually physical; `POST /gc`
-runs the same pass synchronously.
+runs the same pass (`gc::collect`) synchronously. GC is **global** (not per-project),
+so a pass is serialized process-wide by a single `Arc<AtomicBool>` flag via `GcGuard`
+(`worker/gc.rs`) shared between the handler and the hourly worker: a `POST /gc`
+arriving while a pass is already running returns **409**, and the worker **skips its
+tick** if a manual pass holds the flag (it retries an hour later). The guard frees the
+flag on `Drop`, so a panic/early-return can't wedge GC off.
 
 **Status state machine** (`project_files.status`), enforced by SQLite triggers
 (`v0.2.0_status_machine.sql`), not just convention. Legal moves: **any → `indexing`**

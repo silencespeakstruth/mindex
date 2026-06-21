@@ -41,6 +41,10 @@ pub struct RouterState {
     /// `(project, model, path)` keys currently being indexed. Serializes
     /// concurrent same-file `/index` requests (see `IndexClaim` in handlers).
     pub indexing_locks: Arc<Mutex<HashSet<String>>>,
+    /// Process-wide GC flag: `true` while a GC pass is running. GC is global, so
+    /// a single bool serializes `POST /gc` against itself and the hourly worker
+    /// (see `GcGuard` in `worker::gc`). A concurrent `POST /gc` gets 409.
+    pub gc_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct CancellationGuard(pub CancellationToken);

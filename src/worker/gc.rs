@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -12,7 +13,51 @@ use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 /// one row per status change, so it is pruned alongside the chunk sweep.
 const STATUS_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600); // 30 days
 
-pub async fn run(db_pool: Arc<SQLite3Pool>, store: Arc<dyn VectorStore>, token: CancellationToken) {
+/// Process-wide GC mutual exclusion. GC is global (not per-project), so a single
+/// flag serializes the whole pass. Mirrors `IndexClaim` but with one slot, so a
+/// plain `AtomicBool` suffices instead of a keyed set. Shared by the HTTP handler
+/// (`POST /gc`) and the hourly worker so a manual sweep and a tick never race —
+/// the loser of the race rejects (handler → 409) or skips its tick (worker).
+pub(crate) struct GcGuard(Arc<AtomicBool>);
+
+impl GcGuard {
+    /// `Some(guard)` if no GC was running, `None` if one already holds the flag.
+    pub(crate) fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| GcGuard(Arc::clone(flag)))
+    }
+}
+
+impl Drop for GcGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// One full GC pass: hard-delete confirmed-removed chunks, then drop now-empty
+/// `deleted` file rows, then prune the old status log. The step order is the
+/// invariant (chunks before files, since the chunk→file FK is RESTRICT), so it
+/// lives in one place shared by the worker and `POST /gc`. Returns
+/// `(chunks_removed, files_removed, status_log_pruned)`. Callers serialize this
+/// behind [`GcGuard`].
+pub(crate) async fn collect(
+    db_pool: &SQLite3Pool,
+    store: &dyn VectorStore,
+    token: &CancellationToken,
+) -> (usize, usize, usize) {
+    let chunks = sweep(db_pool, store, token).await;
+    let files = prune_deleted_files(db_pool, token).await;
+    let log = prune_status_log(db_pool, token).await;
+    (chunks, files, log)
+}
+
+pub async fn run(
+    db_pool: Arc<SQLite3Pool>,
+    store: Arc<dyn VectorStore>,
+    gc_flag: Arc<AtomicBool>,
+    token: CancellationToken,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -25,10 +70,16 @@ pub async fn run(db_pool: Arc<SQLite3Pool>, store: Arc<dyn VectorStore>, token: 
             }
         }
 
+        // A manual `POST /gc` may be mid-pass; skip this tick rather than race it
+        // (the next tick is an hour away, well within the deleted-row backlog's
+        // tolerance). The guard frees the flag at the end of the iteration.
+        let Some(_guard) = GcGuard::try_acquire(&gc_flag) else {
+            info!("GC worker: a manual GC pass is in progress, skipping this tick.");
+            continue;
+        };
+
         info!("GC worker: starting sweep.");
-        let chunks = sweep(&db_pool, &*store, &token).await;
-        let files = prune_deleted_files(&db_pool, &token).await;
-        prune_status_log(&db_pool, &token).await;
+        let (chunks, files, _log) = collect(&db_pool, &*store, &token).await;
         info!(chunks_removed = chunks, files_removed = files, "GC worker: sweep complete.");
     }
 }
@@ -370,6 +421,19 @@ mod tests {
         let store = FakeStore { fail: HashSet::new() };
         // No deleted chunks at all: must return promptly without error.
         sweep(&pool, &store, &CancellationToken::new()).await;
+    }
+
+    #[test]
+    fn gc_guard_serializes_and_releases() {
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let guard = GcGuard::try_acquire(&flag).expect("free flag is acquirable");
+        // A second acquire while the first is held must fail (serialization).
+        assert!(GcGuard::try_acquire(&flag).is_none(), "held flag rejects a second guard");
+
+        drop(guard);
+        // After the guard drops the flag is free again.
+        assert!(GcGuard::try_acquire(&flag).is_some(), "dropped guard frees the flag");
     }
 
     async fn status_log_count(pool: &SQLite3Pool) -> i64 {
