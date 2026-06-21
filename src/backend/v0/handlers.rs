@@ -856,6 +856,16 @@ pub async fn post_index(
                 indexer.recover_all(&prepared, "failed", true).await;
                 return Err(StatusCode::SERVICE_UNAVAILABLE.into());
             }
+            Err(EmbedUpsertError::Decode(decode_err)) => {
+                error!(
+                    error = %decode_err,
+                    "Embedder response decode failed; marking batch 'failed'. \
+                     The embedder and mindex binary wire formats disagree — \
+                     redeploy them from the same revision."
+                );
+                indexer.recover_all(&prepared, "failed", true).await;
+                return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+            }
             Err(EmbedUpsertError::Store(qdrant_err)) => {
                 error!(
                     error = ?qdrant_err,
@@ -1061,6 +1071,15 @@ pub async fn post_search(
                 error = ?request_err,
                 "Failed to embed the search query. \
                  Check the model server at --model-server is up and reachable."
+            );
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        Err(EncodeError::Decode(decode_err)) => {
+            error!(
+                error = %decode_err,
+                "Failed to decode the embedder's response for the search query. \
+                 The embedder and mindex binary wire formats disagree — \
+                 redeploy them from the same revision."
             );
             Err(StatusCode::SERVICE_UNAVAILABLE)
         }

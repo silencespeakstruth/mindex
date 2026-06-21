@@ -25,16 +25,140 @@ pub struct BGEm3EmbedResponse {
     pub colbert_vecs: Vec<Vec<Vec<f32>>>,
 }
 
+/// `/encode` replies with a little-endian binary stream, not JSON: the ColBERT
+/// head is a multivector (one 1024-d vector *per token*), so a JSON body ran to
+/// hundreds of MB and the embedder spent ~70% of each request boxing it into
+/// Python floats + serializing. The heads have fixed shapes, so a length-prefixed
+/// binary needs no schema library. Layout (mirrors `pack_encode` in
+/// `embedder/src/bge_m3_api/__main__.py` — keep the two in lockstep):
+///
+/// ```text
+/// magic   b"BM3\x01"                       (4 bytes)
+/// n       u32                              chunk count
+/// dim     u32                              dense/colbert width (1024)
+/// dense   n * dim * f32                    one row per chunk
+/// sparse  per chunk: count u32, count*u32 token-ids, count*f32 weights
+/// colbert per chunk: tokens u32, tokens * dim * f32
+/// ```
+const ENCODE_MAGIC: &[u8; 4] = b"BM3\x01";
+
 #[derive(Debug)]
 pub enum EncodeError {
     Cancelled,
     Request(reqwest::Error),
+    /// The embedder's binary body didn't match the wire format (truncated, bad
+    /// magic, or trailing bytes) — a client/embedder version skew.
+    Decode(String),
 }
 
 impl From<reqwest::Error> for EncodeError {
     fn from(err: reqwest::Error) -> Self {
         Self::Request(err)
     }
+}
+
+/// Forward-only cursor over the binary `/encode` body, with bounds checks so a
+/// short or malformed body yields `EncodeError::Decode` instead of a panic.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], EncodeError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|e| *e <= self.buf.len())
+            .ok_or_else(|| {
+                EncodeError::Decode(format!(
+                    "truncated /encode body: need {n} bytes at offset {}, body is {} bytes",
+                    self.pos,
+                    self.buf.len()
+                ))
+            })?;
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, EncodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_f32s(&mut self, count: usize) -> Result<Vec<f32>, EncodeError> {
+        Ok(self
+            .take(count * 4)?
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    fn read_u32s(&mut self, count: usize) -> Result<Vec<u32>, EncodeError> {
+        Ok(self
+            .take(count * 4)?
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+}
+
+/// Parse the binary `/encode` body into the same shape the rest of the code
+/// already consumes. The per-token ColBERT vectors and dense rows become `Vec`s
+/// (native, no JSON tokenizing), so downstream `embed.rs` is unchanged.
+fn parse_encode_response(buf: &[u8]) -> Result<BGEm3EmbedResponse, EncodeError> {
+    let mut r = Reader::new(buf);
+    if r.take(4)? != ENCODE_MAGIC {
+        return Err(EncodeError::Decode(
+            "bad magic in /encode body; embedder and client wire formats disagree".into(),
+        ));
+    }
+    let n = r.read_u32()? as usize;
+    let dim = r.read_u32()? as usize;
+
+    let mut dense_vecs = Vec::with_capacity(n);
+    for _ in 0..n {
+        dense_vecs.push(r.read_f32s(dim)?);
+    }
+
+    let mut sparse_vecs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let count = r.read_u32()? as usize;
+        let ids = r.read_u32s(count)?;
+        let weights = r.read_f32s(count)?;
+        sparse_vecs.push(ids.into_iter().zip(weights).collect());
+    }
+
+    let mut colbert_vecs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let tokens = r.read_u32()? as usize;
+        let mut chunk = Vec::with_capacity(tokens);
+        for _ in 0..tokens {
+            chunk.push(r.read_f32s(dim)?);
+        }
+        colbert_vecs.push(chunk);
+    }
+
+    if r.remaining() != 0 {
+        return Err(EncodeError::Decode(format!(
+            "{} trailing bytes after /encode body; wire-format mismatch",
+            r.remaining()
+        )));
+    }
+    Ok(BGEm3EmbedResponse {
+        dense_vecs,
+        sparse_vecs,
+        colbert_vecs,
+    })
 }
 
 #[async_trait]
@@ -109,11 +233,11 @@ impl BGEm3Model for BGEm3HttpClient {
             // Final attempt, or a non-429 status: turn any non-2xx (including a
             // persistent 429) into an error, otherwise parse the body.
             let response = response.error_for_status()?;
-            let body = tokio::select! {
+            let bytes = tokio::select! {
                 _ = token.cancelled() => return Err(EncodeError::Cancelled),
-                body = response.json::<BGEm3EmbedResponse>() => body?,
+                body = response.bytes() => body?,
             };
-            return Ok(body);
+            return parse_encode_response(&bytes);
         }
     }
 
@@ -155,12 +279,11 @@ mod tests {
                         if n < fail_first {
                             (StatusCode::TOO_MANY_REQUESTS, "busy").into_response()
                         } else {
-                            axum::Json(serde_json::json!({
-                                "dense_vecs": [],
-                                "sparse_vecs": [],
-                                "colbert_vecs": []
-                            }))
-                            .into_response()
+                            // Empty-but-valid binary body: magic + n=0 + dim=1024.
+                            let mut body = ENCODE_MAGIC.to_vec();
+                            body.extend_from_slice(&0u32.to_le_bytes());
+                            body.extend_from_slice(&1024u32.to_le_bytes());
+                            body.into_response()
                         }
                     }
                 }
@@ -209,5 +332,87 @@ mod tests {
         token.cancel();
         let res = client.encode(req(), token).await;
         assert!(matches!(res, Err(EncodeError::Cancelled)));
+    }
+
+    /// Build a wire-format body by hand (the encoding side `pack_encode` lives in
+    /// Python; this mirrors it byte-for-byte to guard the Rust parser).
+    fn pack(
+        dim: u32,
+        dense: &[Vec<f32>],
+        sparse: &[Vec<(u32, f32)>],
+        colbert: &[Vec<Vec<f32>>],
+    ) -> Vec<u8> {
+        let n = dense.len() as u32;
+        let mut b = ENCODE_MAGIC.to_vec();
+        b.extend_from_slice(&n.to_le_bytes());
+        b.extend_from_slice(&dim.to_le_bytes());
+        for row in dense {
+            for v in row {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for chunk in sparse {
+            b.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            for (id, _) in chunk {
+                b.extend_from_slice(&id.to_le_bytes());
+            }
+            for (_, w) in chunk {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        for chunk in colbert {
+            b.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            for tok in chunk {
+                for v in tok {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn parses_binary_roundtrip_with_ragged_colbert() {
+        // 2 chunks, dim=2; ragged ColBERT (1 token vs 3) and varied sparse counts.
+        let dense = vec![vec![0.5_f32, -0.5], vec![1.0, 2.0]];
+        let sparse = vec![vec![(7_u32, 0.25_f32)], vec![(3, 0.1), (9, 0.9)]];
+        let colbert = vec![
+            vec![vec![1.0_f32, 1.0]],
+            vec![vec![0.0, 1.0], vec![2.0, 2.0], vec![3.0, -3.0]],
+        ];
+        let buf = pack(2, &dense, &sparse, &colbert);
+
+        let out = parse_encode_response(&buf).expect("valid body should parse");
+        assert_eq!(out.dense_vecs, dense);
+        assert_eq!(out.colbert_vecs, colbert);
+        assert_eq!(out.sparse_vecs[0][&7], 0.25);
+        assert_eq!(out.sparse_vecs[1][&9], 0.9);
+        assert_eq!(out.sparse_vecs[1].len(), 2);
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_truncation() {
+        let good = pack(2, &[vec![1.0_f32, 2.0]], &[vec![]], &[vec![]]);
+
+        let mut bad_magic = good.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            parse_encode_response(&bad_magic),
+            Err(EncodeError::Decode(_))
+        ));
+
+        // Drop the last 4 bytes → the final dense float is now missing.
+        assert!(matches!(
+            parse_encode_response(&good[..good.len() - 4]),
+            Err(EncodeError::Decode(_))
+        ));
+
+        // Extra trailing byte → wire-format mismatch.
+        let mut trailing = good;
+        trailing.push(0);
+        assert!(matches!(
+            parse_encode_response(&trailing),
+            Err(EncodeError::Decode(_))
+        ));
     }
 }

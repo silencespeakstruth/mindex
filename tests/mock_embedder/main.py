@@ -11,13 +11,21 @@ import asyncio
 import hashlib
 import math
 import random
+import struct
 from typing import Any
 
 # fastapi is only present inside this component's Docker image, never alongside
 # the local/CI mypy run, so its stubs are legitimately unresolvable here.
-from fastapi import FastAPI, HTTPException  # type: ignore[import-not-found]
+from fastapi import FastAPI, HTTPException, Response  # type: ignore[import-not-found]
 
 app = FastAPI()
+
+# Binary /encode wire format, mirroring embedder/src/bge_m3_api/__main__.py and the
+# Rust parser in src/models/bge_m3.rs — keep all three in lockstep. Little-endian:
+#   magic b"BM3\x01" | n u32 | dim u32 | dense n*dim f32 |
+#   sparse per chunk: count u32, count*u32 ids, count*f32 weights |
+#   colbert per chunk: tokens u32, tokens*dim f32
+_MAGIC = b"BM3\x01"
 
 DENSE_DIM = 1024
 MAX_SPARSE_TOKENS = 16
@@ -55,6 +63,26 @@ def _colbert(text: str) -> list[list[float]]:
     return [_dense(f"{text}\x00{i}\x00{tok}") for i, tok in enumerate(tokens)]
 
 
+def _pack(
+    dense: list[list[float]],
+    sparse: list[dict[int, float]],
+    colbert: list[list[list[float]]],
+) -> bytes:
+    parts: list[bytes] = [_MAGIC, struct.pack("<II", len(dense), DENSE_DIM)]
+    for row in dense:
+        parts.append(struct.pack(f"<{len(row)}f", *row))
+    for d in sparse:
+        items = list(d.items())
+        parts.append(struct.pack("<I", len(items)))
+        parts.append(struct.pack(f"<{len(items)}I", *(k for k, _ in items)))
+        parts.append(struct.pack(f"<{len(items)}f", *(v for _, v in items)))
+    for chunk in colbert:
+        parts.append(struct.pack("<I", len(chunk)))
+        for tok in chunk:
+            parts.append(struct.pack(f"<{len(tok)}f", *tok))
+    return b"".join(parts)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -72,7 +100,7 @@ async def config(payload: dict[str, Any]) -> dict[str, float]:
 
 
 @app.post("/encode")
-async def encode(payload: dict[str, Any]) -> dict[str, Any]:
+async def encode(payload: dict[str, Any]) -> Response:
     delay = _config["encode_delay_secs"]
     if delay > 0:
         await asyncio.sleep(delay)
@@ -82,8 +110,9 @@ async def encode(payload: dict[str, Any]) -> dict[str, Any]:
         _config["fail_next_encodes"] -= 1
         raise HTTPException(status_code=503, detail="injected embed failure")
     texts: list[str] = payload["texts"]
-    return {
-        "dense_vecs": [_dense(t) for t in texts],
-        "sparse_vecs": [_sparse(t) for t in texts],
-        "colbert_vecs": [_colbert(t) for t in texts],
-    }
+    blob = _pack(
+        [_dense(t) for t in texts],
+        [_sparse(t) for t in texts],
+        [_colbert(t) for t in texts],
+    )
+    return Response(content=blob, media_type="application/octet-stream")

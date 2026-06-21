@@ -214,8 +214,15 @@ context):
 General-purpose model servers (vLLM, Ollama, …) return **only dense** embeddings — none
 expose BGE-M3's sparse lexical weights and ColBERT token vectors together, which the
 hybrid pipeline needs. `embedder/` exists **solely** to bridge that gap and is intended
-to be **removed** once an off-the-shelf server emits all three heads. See
-[`embedder/README.md`](embedder/README.md).
+to be **removed** once an off-the-shelf server emits all three heads.
+
+It is **tuned for indexing throughput**, not just correctness: `/encode` replies over a
+compact **binary protocol** (not JSON — ColBERT is a 1024-d-per-token multivector, so a
+JSON body ran to hundreds of MB and serialization dominated each request), and it calls
+BGE-M3's three-head GPU forward **directly, once per batch**, bypassing FlagEmbedding's
+discard-and-retry double forward. Together these multiplied indexing throughput several
+times over; see [`embedder/README.md`](embedder/README.md) and
+[`perf/README.md`](perf/README.md) for the full investigation.
 
 ## Status & roadmap
 

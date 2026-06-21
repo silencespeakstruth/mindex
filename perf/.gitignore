@@ -7,3 +7,6 @@ corpus/.clones/
 results/
 results.csv
 plots/
+
+# Jupyter autosave snapshots of analyze.ipynb.
+.ipynb_checkpoints/

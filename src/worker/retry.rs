@@ -278,6 +278,16 @@ async fn retry_file(
             );
             false
         }
+        Err(EmbedUpsertError::Decode(e)) => {
+            error!(
+                error = %e,
+                %project_guid,
+                %path,
+                "Retry worker: embedder response decode failed; leaving file 'failed'. \
+                 Embedder/mindex binary wire formats disagree — redeploy same revision."
+            );
+            false
+        }
         Err(EmbedUpsertError::Store(e)) => {
             error!(
                 error = ?e,

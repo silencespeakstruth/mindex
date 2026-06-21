@@ -26,25 +26,31 @@ services:
       #     -subj "/CN=mindex"
       - mindex_certs:/certs
     environment:
-      RUST_LOG: info
+      RUST_LOG: ${MINDEX_RUST_LOG:-info}
     # Allows the container to reach the embedder running on the host.
     # host-gateway resolves to the Docker host IP on Linux.
     # On Docker Desktop (Mac/Windows) this mapping is not needed but is harmless.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # The perf-tunable flags read from the environment (see .env.example and
+    # perf/env/*.env). Swap a profile with:  docker compose --env-file <file> up -d
+    # NOTE: the embedder runs on the HOST (not in compose), so its --batch /
+    # --max-inflight / --maxlen are NOT set here — restart the host embedder to change
+    # them. .env only covers the mindex side of the matrix.
     command:
       - --bind=0.0.0.0:11111
       - --db-path=/data/mindex.db
       - --cert-path=/certs/cert.pem
       - --key-path=/certs/key.pem
       - --qdrant-server=http://qdrant:6334
-      - --model-server=http://host.docker.internal:11211
-      # Chunks per /encode call — the GPU-batch lever; match the embedder's --batch.
-      - --embed-batch=1024
+      - --model-server=${MINDEX_MODEL_SERVER:-http://host.docker.internal:11211}
+      # Chunks per /encode call — the GPU-batch lever; keep >= the embedder's --batch.
+      - --embed-batch=${MINDEX_EMBED_BATCH:-1024}
       # Connection pool: the indexer's --concurrency must stay <= this (the pool
-      # errors when exhausted, it doesn't block). 10 leaves headroom over 8 indexer
-      # workers for the GC/retry background workers.
-      - --db-pool-size=10
+      # errors when exhausted, it doesn't block).
+      - --db-pool-size=${MINDEX_DB_POOL_SIZE:-32}
+      - --max-body-mb=${MINDEX_MAX_BODY_MB:-256}
+      - --stuck-grace-mins=${MINDEX_STUCK_GRACE_MINS:-30}
     depends_on:
       - qdrant
     restart: unless-stopped

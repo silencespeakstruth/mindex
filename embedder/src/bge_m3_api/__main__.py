@@ -21,14 +21,18 @@ import asyncio
 import functools
 import gc
 import logging
+import struct
+import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Callable, Iterator, List
 
+import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
 from FlagEmbedding import BGEM3FlagModel
@@ -39,6 +43,176 @@ logging.basicConfig(
 log = logging.getLogger("bge_m3_api")
 
 MODEL_NAME = "BAAI/bge-m3"
+
+# ─── Binary wire format ──────────────────────────────────────────────────────
+# /encode replies with a raw little-endian byte stream instead of JSON. The old
+# JSON path spent ~70% of each request on `.tolist()` (materializing the ColBERT
+# multivector — one 1024-d vector PER TOKEN — into millions of Python floats) plus
+# orjson.dumps of a ~300 MB text payload, all on the single GPU worker thread. The
+# heads have fixed shapes, so a length-prefixed binary needs no schema library and
+# is built with numpy `.tobytes()` (one C-level memcpy, zero Python-float boxing):
+#
+#   magic   b"BM3\x01"                       (4 bytes)
+#   n       u32                              chunk count
+#   dim     u32                              dense/colbert width (1024)
+#   dense   n * dim * f32                    one row per chunk, contiguous
+#   sparse  per chunk: count u32, then count*u32 token-ids, then count*f32 weights
+#   colbert per chunk: tokens u32, then tokens * dim * f32
+#
+# The Rust client (src/models/bge_m3.rs) mirrors this byte-for-byte; keep the two
+# in lockstep. f32 throughout (dense/colbert are cosine-normalized — f16 would
+# halve traffic later, but f32 keeps the format trivial and lossless for now).
+_MAGIC = b"BM3\x01"
+DENSE_DIM = 1024
+
+
+def pack_encode(res: dict) -> bytes:
+    """Serialize FlagEmbedding's encode() output to the binary wire format above.
+
+    Cheap on purpose: each head becomes a numpy `.tobytes()` (a single contiguous
+    copy), joined once. No per-element Python objects, so it stays fast enough to
+    run inline on the GPU worker thread — no separate serialization thread needed.
+    """
+    dense_arr = np.ascontiguousarray(res["dense_vecs"], dtype=np.float32)
+    n = dense_arr.shape[0]
+    dim = dense_arr.shape[1] if n else DENSE_DIM
+
+    parts: list[bytes] = [_MAGIC, struct.pack("<II", n, dim), dense_arr.tobytes()]
+
+    for d in res["lexical_weights"]:
+        ids = np.fromiter((int(k) for k in d), dtype=np.uint32, count=len(d))
+        wts = np.fromiter(d.values(), dtype=np.float32, count=len(d))
+        parts.append(struct.pack("<I", ids.shape[0]))
+        parts.append(ids.tobytes())
+        parts.append(wts.tobytes())
+
+    for v in res["colbert_vecs"]:
+        arr = np.ascontiguousarray(v, dtype=np.float32).reshape(-1, dim)
+        parts.append(struct.pack("<I", arr.shape[0]))
+        parts.append(arr.tobytes())
+
+    return b"".join(parts)
+
+
+# ─── Direct forward fast path ────────────────────────────────────────────────
+# We call BGE-M3's GPU head forward ourselves instead of BGEM3FlagModel.encode().
+# FlagEmbedding's encode_single_device runs an extra full forward pass on the first
+# batch purely to probe for OOM (its "adjust batch size" loop), discards it, then
+# forwards the same data again. Since mindex sends one batch per /encode, that
+# DOUBLES the GPU work (~87 vs ~174 chunks/s at batch 252). The heads themselves are
+# already computed on-GPU by EncoderOnlyEmbedderM3ModelForInference.forward — we
+# reuse it as-is and only replace the wasteful orchestration. The dense/sparse/
+# colbert post-processing below mirrors M3Embedder verbatim so retrieval is
+# byte-identical to the old path.
+
+
+def _unused_token_ids(tokenizer) -> set:
+    """The special tokens excluded from the sparse lexical weights (cls/eos/pad/unk),
+    matching FlagEmbedding M3Embedder._process_token_weights."""
+    unused: set = set()
+    for name in ("cls_token", "eos_token", "pad_token", "unk_token"):
+        if name in tokenizer.special_tokens_map:
+            unused.add(
+                tokenizer.convert_tokens_to_ids(tokenizer.special_tokens_map[name])
+            )
+    return unused
+
+
+def _token_weights_to_dict(token_weights, input_ids: list, unused: set) -> dict:
+    """Per-chunk sparse weights → {token_id: weight}, dedup by max, drop special
+    tokens and non-positive weights. Mirrors _process_token_weights (keys left as
+    int — pack_encode emits them as u32 either way)."""
+    result: dict = defaultdict(float)
+    for w, idx in zip(token_weights, input_ids):
+        if idx not in unused and w > 0 and w > result[idx]:
+            result[idx] = w
+    return result
+
+
+@torch.no_grad()
+def encode_direct(
+    flag_model: BGEM3FlagModel, texts: List[str], batch: int, maxlen: int
+) -> dict:
+    """Single-forward replacement for BGEM3FlagModel.encode() — returns the same
+    {dense_vecs, lexical_weights, colbert_vecs} dict shape pack_encode expects."""
+    if not texts:
+        return {"dense_vecs": [], "lexical_weights": [], "colbert_vecs": []}
+
+    model = flag_model.model
+    tokenizer = flag_model.tokenizer
+    device = str(getattr(flag_model, "target_devices", [None])[0] or "cpu")
+    # BGEM3FlagModel keeps the model on CPU until its own encode() moves it; we
+    # bypass that, so place it ourselves. Idempotent (a no-op once resident), so
+    # cheap to call per request.
+    model.to(device)
+    model.eval()
+    unused = _unused_token_ids(tokenizer)
+
+    # Tokenize once (no padding), then sort long→short so each padded sub-batch
+    # wastes little padding — the one good idea from FlagEmbedding's path, kept
+    # without its discarded probe forward.
+    enc = tokenizer(
+        texts, truncation=True, max_length=maxlen, return_token_type_ids=False
+    )
+    items = [{k: enc[k][i] for k in enc} for i in range(len(texts))]
+    order = np.argsort([-len(x["input_ids"]) for x in items])
+    items_sorted = [items[i] for i in order]
+
+    dense_s: list = []
+    lexical_s: list = []
+    colbert_s: list = []
+
+    i = 0
+    bs = max(1, batch)
+    while i < len(items_sorted):
+        window = items_sorted[i : i + bs]
+        try:
+            feats = tokenizer.pad(window, padding=True, return_tensors="pt").to(device)
+            out = model(
+                feats,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=True,
+            )
+            dense = out["dense_vecs"].float().cpu().numpy()
+            sparse_w = out["sparse_vecs"].squeeze(-1).float().cpu().numpy()
+            colbert = out["colbert_vecs"].float().cpu().numpy()
+            ids = feats["input_ids"].cpu().numpy()
+            mask = feats["attention_mask"].cpu().numpy()
+        except RuntimeError as e:
+            # On OOM, shrink the sub-batch and retry the same window (what upstream's
+            # probe loop did, minus the wasted full-size forward). Re-raise anything
+            # that isn't an out-of-memory condition.
+            is_oom = (
+                isinstance(e, torch.cuda.OutOfMemoryError)
+                or "out of memory" in str(e).lower()
+            )
+            if not is_oom or bs == 1:
+                raise
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+            bs = max(1, bs * 3 // 4)
+            continue
+
+        for j in range(len(window)):
+            dense_s.append(dense[j])
+            lexical_s.append(
+                _token_weights_to_dict(sparse_w[j], ids[j].tolist(), unused)
+            )
+            tokens_num = int(mask[j].sum())
+            colbert_s.append(
+                colbert[j][: tokens_num - 1]
+            )  # drop padding (cls already gone)
+        i += bs
+
+    # Restore original input order (results were built in length-sorted order).
+    inv = np.argsort(order)
+    return {
+        "dense_vecs": [dense_s[k] for k in inv],
+        "lexical_weights": [lexical_s[k] for k in inv],
+        "colbert_vecs": [colbert_s[k] for k in inv],
+    }
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", type=int, default=8000)
@@ -131,26 +305,81 @@ class ModelManager:
         self._last_used = time.monotonic()
         return result
 
-    def encode(self, texts: List[str]) -> dict:
-        def work(model: BGEM3FlagModel) -> dict:
-            res = model.encode(
-                texts,
-                batch_size=self._batch,
-                max_length=self._maxlen,
-                return_dense=True,
-                return_sparse=True,
-                return_colbert_vecs=True,
-            )
-            return {
-                "dense_vecs": [v.tolist() for v in res["dense_vecs"]],
-                "sparse_vecs": [
-                    {k: float(v) for k, v in d.items()} for d in res["lexical_weights"]
-                ],
-                "colbert_vecs": [v.tolist() for v in res["colbert_vecs"]],
-            }
+    def encode(self, texts: List[str]) -> bytes:
+        def work(model: BGEM3FlagModel) -> bytes:
+            # encode_direct calls the GPU head forward ONCE (no FlagEmbedding probe
+            # double-forward); pack to bytes here on the worker thread — a handful of
+            # numpy memcpys, not millions of Python-float allocations.
+            res = encode_direct(model, texts, self._batch, self._maxlen)
+            return pack_encode(res)
 
         return self._run(work)
 
+
+# ─── Throughput stats (hardware-agnostic) ────────────────────────────────────
+# Logical counters for the perf harness: no GPU/VRAM probing, just request shape.
+# Forward-pass batch sizes are derived from len(texts) and --batch, which is exactly
+# how FlagEmbedding sub-batches a single encode() internally — so it shows whether
+# each /encode call actually fills the configured batch (the GPU-feed signal) without
+# hooking the model. Updated from both the worker thread (encode) and the event-loop
+# thread (inflight/429), so guarded by a plain lock.
+
+
+class Stats:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._forward_passes = 0
+            self._seqs_total = 0  # Σ texts encoded == Σ forward-pass sizes.
+            self._forward_batch_max = 0
+            self._encode_calls = 0
+            self._encode_seconds_total = 0.0
+            self._chunks_encoded_total = 0
+            self._requests_429 = 0
+            self._queue_depth_highwater = 0
+
+    def record_encode(self, n_texts: int, batch: int, seconds: float) -> None:
+        with self._lock:
+            self._encode_calls += 1
+            self._encode_seconds_total += seconds
+            self._chunks_encoded_total += n_texts
+            if n_texts > 0:
+                passes = (n_texts + batch - 1) // batch  # ceil(n / batch)
+                self._forward_passes += passes
+                self._seqs_total += n_texts
+                self._forward_batch_max = max(
+                    self._forward_batch_max, min(batch, n_texts)
+                )
+
+    def record_429(self) -> None:
+        with self._lock:
+            self._requests_429 += 1
+
+    def observe_inflight(self, inflight: int) -> None:
+        with self._lock:
+            self._queue_depth_highwater = max(self._queue_depth_highwater, inflight)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            mean = (
+                self._seqs_total / self._forward_passes if self._forward_passes else 0.0
+            )
+            return {
+                "forward_passes": self._forward_passes,
+                "forward_batch_mean": round(mean, 2),
+                "forward_batch_max": self._forward_batch_max,
+                "encode_calls": self._encode_calls,
+                "encode_seconds_total": round(self._encode_seconds_total, 3),
+                "chunks_encoded_total": self._chunks_encoded_total,
+                "requests_429": self._requests_429,
+                "queue_depth_highwater": self._queue_depth_highwater,
+            }
+
+
+STATS = Stats()
 
 MANAGER = ModelManager(MODEL_NAME, args.device, args.batch, args.maxlen)
 
@@ -168,11 +397,13 @@ def capacity_slot() -> Iterator[None]:
     whole request so the count reflects queued + processing work."""
     global _inflight
     if _inflight >= args.max_inflight:
+        STATS.record_429()
         raise HTTPException(
             status_code=429,
             detail=f"Resource busy: {args.max_inflight} requests already in flight.",
         )
     _inflight += 1
+    STATS.observe_inflight(_inflight)
     try:
         yield
     finally:
@@ -242,11 +473,38 @@ async def health() -> dict:
     }
 
 
-@app.post("/encode", response_class=ORJSONResponse)
-async def encode(req: EmbedRequest) -> dict:
+@app.get("/stats", response_class=ORJSONResponse)
+async def stats() -> dict:
+    """Throughput counters for the perf harness. ``config`` echoes the launch flags
+    (so a benchmark row records the embedder config without the operator retyping
+    it); ``runtime`` is the rolling tally since the last ``POST /stats/reset``."""
+    return {
+        "config": {
+            "batch": args.batch,
+            "max_inflight": args.max_inflight,
+            "maxlen": args.maxlen,
+        },
+        "runtime": STATS.snapshot(),
+        "inflight": _inflight,
+    }
+
+
+@app.post("/stats/reset")
+async def stats_reset() -> dict:
+    """Zero the rolling runtime counters (config echo is unaffected). The harness
+    calls this before each measured run so every result is clean."""
+    STATS.reset()
+    return {"status": "ok"}
+
+
+@app.post("/encode")
+async def encode(req: EmbedRequest) -> Response:
     with capacity_slot():
         try:
-            return await on_gpu(MANAGER.encode, req.texts)
+            t0 = time.monotonic()
+            blob = await on_gpu(MANAGER.encode, req.texts)
+            STATS.record_encode(len(req.texts), args.batch, time.monotonic() - t0)
+            return Response(content=blob, media_type="application/octet-stream")
         except HTTPException:
             raise
         except Exception as e:

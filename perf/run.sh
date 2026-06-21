@@ -113,6 +113,22 @@ corpus_name=$(jq -r '.name' "$manifest")
     exit 1
 }
 
+# Preflight: this script drives load against ALREADY-RUNNING services and starts
+# nothing. A down mindex/embedder would otherwise surface only as cryptic k6
+# failures, so probe reachability now and fail with the launch command.
+curl -sk --max-time 5 "$mindex_url/health" >/dev/null 2>&1 || {
+    echo "mindex unreachable at $mindex_url — start it (or pass --mindex-url)." >&2
+    exit 1
+}
+if [ -n "$embedder_url" ]; then
+    curl -s --max-time 5 "$embedder_url/health" >/dev/null 2>&1 || {
+        echo "embedder unreachable at $embedder_url — start it, e.g.:" >&2
+        echo "    cd embedder && uv run python -m bge_m3_api --port 11211 --batch 512" >&2
+        echo "or pass --embedder-url \"\" to skip embedder /stats capture." >&2
+        exit 1
+    }
+fi
+
 # fdiv NUM DEN [DECIMALS] — safe float divide (0 when DEN<=0).
 fdiv() {
     awk -v n="$1" -v d="$2" -v p="${3:-2}" \
@@ -151,8 +167,11 @@ if [ -z "$out" ]; then
     n_eb="$(jget "$mindex_url/config" '.embed_batch' NA)"
     n_pool="$(jget "$mindex_url/config" '.db_pool_size' NA)"
     n_xb=NA
+    # Guard the pipeline: under `set -euo pipefail` an unreachable embedder makes
+    # curl|jq exit non-zero and kills the whole script before the first echo — a
+    # silent exit. `|| echo NA` keeps auto-naming working when the embedder is down.
     [ -n "$embedder_url" ] &&
-        n_xb="$(curl -sk --max-time 10 "$embedder_url/stats" 2>/dev/null | jq -r '.config.batch // "NA"')"
+        n_xb="$(curl -sk --max-time 10 "$embedder_url/stats" 2>/dev/null | jq -r '.config.batch // "NA"' 2>/dev/null || echo NA)"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     fn="${stamp}_eb${n_eb}_pool${n_pool}_xb${n_xb}"
     # filename-safe label fragment

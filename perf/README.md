@@ -9,14 +9,53 @@ are endpoint URLs and parameters.
 
 ## Why this exists
 
-Indexing was leaving the GPU underused (~15 GB of 32 GB). The likely cause is in the
-code: mindex sends `--embed-batch` (default 256) chunks per `/encode`, but the
-embedder **re-splits** that into `--batch`-sized GPU forward passes — and the
-embedder's `--batch` defaults to **16**. The embedder also serializes on one GPU
-worker thread, so concurrent requests *queue* rather than enlarging the forward
-pass. So the dominant lever is the embedder `--batch` (paired with mindex
-`--embed-batch`); concurrency and `--db-pool-size` are secondary. This harness lets
-you confirm that and find the peak.
+Indexing was leaving the GPU badly underused. This harness was built to find out why,
+and it turned up **four** distinct bottlenecks — none of which was "the GPU is slow."
+They are documented in full below; the short version is that the embedder's *response
+handling* and *forward orchestration* dominated, not the matmuls.
+
+## What the benchmarks found
+
+The investigation peeled off four layers, in order. Numbers are from one machine and
+are **illustrative of the shape**, not a spec — re-measure on yours.
+
+1. **JSON response serialization (≈10× tax).** The embedder returned all three heads
+   as JSON. ColBERT is a *multivector* — one 1024-d vector **per token** — so a single
+   `/encode` reply ran to hundreds of MB, and `.tolist()` + `orjson.dumps` of it ate
+   ~70% of each request, all on the GPU worker thread (so the GPU sat idle during
+   serialization). The "GPU encode share" looked high only because that CPU time was
+   being timed as encode. **Fix:** a compact length-prefixed **binary `/encode` wire
+   format** (see `embedder/README.md` and `src/models/bge_m3.rs`). This alone took the
+   single-stream rate from ~24-25 to the point where the GPU was the next limit.
+
+2. **The GPU forward batch is capped by SHARD SIZE, not by `--batch`.** Each `/index`
+   request embeds in one shot, so the forward-pass batch equals *chunks-per-request*.
+   With the default `corpus/fetch.sh --shard-files 8` that's only ~38 chunks
+   (`fwd_batch_mean≈38`), no matter how large `--embed-batch` or the embedder `--batch`
+   is. **Fix:** fatten shards (`--shard-files 64`) → `fwd_batch_mean≈252` and a real
+   batched forward. Note the bare backbone **saturates around batch ~64-128**, so going
+   far past that buys little — pick a shard size that fills the GPU, not the maximum.
+
+3. **FlagEmbedding forwards every batch twice (≈2×).** `BGEM3FlagModel.encode` runs a
+   full model forward on the first batch *purely to probe for OOM*, discards it, then
+   forwards the same data again in the real loop. Since mindex sends one batch per
+   `/encode`, everything was embedded twice. **Fix:** the embedder calls the GPU head
+   forward (`EncoderOnlyEmbedderM3ModelForInference.forward`) **directly, once**, and
+   reuses FlagEmbedding's exact dense/sparse/colbert post-processing (verified
+   byte-identical). Encode rate jumped ~87 → ~133 chunks/s at the same `fwd_batch`.
+
+4. **At low concurrency the pipeline is serial, so a faster GPU just idles more.** Once
+   encode is fast, it's only ~35% of wall time at c=1 — the rest is mindex slicing +
+   Qdrant upsert + transport. **Concurrency** overlaps those with the GPU (the embedder
+   serializes encode on one worker thread, but the *non*-GPU work parallelizes). End to
+   end this reached ~117 chunks/s at c=4 on the same box.
+
+**Takeaway / lever order:** the binary protocol and single-forward fixes are baked into
+the code. What's left for *you* to tune per machine: **(a)** shard size until the GPU
+fills (`fwd_batch_mean`), **(b)** request concurrency until throughput plateaus or the
+latency knee / `err_*` appear. `--embed-batch` and the embedder `--batch` only need to
+be ≥ chunks-per-request so they don't *re-split* a shard; past that they're not the
+lever. This harness lets you find both knees on your hardware.
 
 ## Pieces
 
@@ -104,17 +143,26 @@ these files. Change them on the embedder's launch command and restart it by hand
 
 ## Tuning method
 
-1. **Baseline** at current defaults. Note `fwd_batch_mean` (expect ≈16) and
-   `chunks_per_s`.
-2. **Sweep the embedder `--batch`** upward (16 → 32 → 64 → 128 → …), restarting the
-   embedder and rerunning each time. Watch VRAM with *your own* tool (e.g.
-   `rocm-smi`/`nvidia-smi`) out of band. Stop when `chunks_per_s` plateaus or you
-   near the VRAM ceiling.
-3. **Pair** mindex `--embed-batch` ≥ embedder `--batch` so each `/encode` actually
-   fills a forward pass (otherwise `fwd_batch_mean` stays below `--batch`).
-4. **Then push concurrency + `--db-pool-size`** until `err_500` (pool exhaustion) or
-   `err_429`/`embedder_429` (backpressure) appear — that's the concurrency ceiling.
-5. Pick the config at the **latency knee** with an acceptable error rate.
+The two code-level taxes (JSON serialization, double forward) are already fixed, so
+tuning is about **feeding** the GPU and then **keeping it fed**:
+
+1. **Baseline** at current defaults (`perf/env/baseline.env`). Note `fwd_batch_mean`,
+   `chunks_per_s`, and the `embedder_encode_s / wall_clock_s` ratio.
+2. **Grow shard size** to enlarge the GPU forward batch — this is the primary lever.
+   Rebuild the corpus with bigger shards and rerun:
+   `corpus/fetch.sh --name shard64 --shard-files 64` then `run.sh --corpus
+   corpus/data/shard64 …`. Watch `fwd_batch_mean` climb and `chunks_per_s` with it.
+   The bare backbone **saturates around batch ~64-128**, so stop once `fwd_batch_mean`
+   is in that range — bigger shards past that add latency, not throughput.
+3. **Keep `--embed-batch` and the embedder `--batch` ≥ chunks-per-request** so a shard
+   isn't re-split into several smaller forwards. They are guardrails, not the lever.
+4. **Push concurrency + `--db-pool-size`** (`perf/env/high-concurrency.env`) to overlap
+   slicing / Qdrant upsert with GPU encode. Raise until `chunks_per_s` plateaus, the
+   latency knee appears, or `err_500` (pool exhaustion: concurrency > `--db-pool-size`)
+   / `err_429`/`embedder_429` (backpressure) show up.
+5. Watch VRAM with *your own* tool (`rocm-smi`/`nvidia-smi`) out of band. Pick the
+   config at the **latency knee** with an acceptable error rate — the optimum is
+   machine-specific.
 
 ## Reading the results (`perf/results/*.csv`)
 
@@ -122,7 +170,8 @@ One file per run, one row per concurrency level. Headline columns:
 
 - `chunks_per_s` — primary throughput metric.
 - `fwd_batch_mean` / `fwd_batch_max` — sequences per GPU forward pass. If this stays
-  near 16 while you raise batches, the GPU is starved — the core symptom.
+  small while you raise `--embed-batch`/`--batch`, the cap is **shard size**, not the
+  batch flags — fatten shards (`--shard-files`). Aim to fill the GPU (~64-128), no more.
 - `embedder_encode_s` vs `wall_clock_s` — how much of the wall time is actual GPU
   encoding vs overhead (slicing / Qdrant upsert / transport). `encode_s ≈ wall_s` ⇒
   GPU-bound; much lower ⇒ the GPU is idle waiting on the rest of the pipeline.
@@ -155,5 +204,5 @@ auto-generated takeaways. Deps: `pandas`, `matplotlib` (+ a Jupyter kernel).
 - Keep the corpus large enough to keep the GPU busy for the whole run (tens of
   thousands of chunks); a too-small corpus finishes before steady state.
 - The embedder `/stats` numbers are **logical** (derived from request shape and
-  `--batch`, matching how FlagEmbedding sub-batches) — not GPU telemetry. Correlate
+  `--batch`, matching how the embedder sub-batches a call) — not GPU telemetry. Correlate
   them with your own VRAM/utilization tool for the hardware view.

@@ -87,7 +87,25 @@ after N idle seconds).
 
 ## Contract (frozen)
 
-`POST /encode` `{ "texts": [...] }` → `{ "dense_vecs", "sparse_vecs", "colbert_vecs" }`,
-positionally aligned with the input. `GET /health` reports liveness without loading
-the model. mindex depends on these exact shapes — don't change them without changing
-mindex in the same commit.
+`POST /encode` `{ "texts": [...] }` (JSON request) → a **little-endian binary body**
+(`application/octet-stream`) carrying dense / sparse / ColBERT for each input,
+positionally aligned. The response is binary, not JSON: ColBERT is a multivector
+(one 1024-d vector per token), so a JSON body ran to hundreds of MB per call and
+`.tolist()` + `orjson.dumps` of it dominated request time (~70%, all on the GPU
+worker thread). The length-prefixed layout is documented on `pack_encode` in
+`src/bge_m3_api/__main__.py`; the consumer (`src/models/bge_m3.rs::parse_encode_response`)
+and the test mock (`tests/mock_embedder/main.py`) mirror it **byte-for-byte** — change
+one and you change all three in the same commit. `GET /health` reports liveness
+without loading the model.
+
+## Stats (perf harness only, not part of the frozen contract)
+
+`GET /stats` → `{ "config": { batch, max_inflight, maxlen }, "runtime": { … },
+"inflight": N }`. `config` echoes the launch flags; `runtime` is a rolling tally
+since the last reset: `forward_passes`, `forward_batch_mean`/`forward_batch_max`
+(sequences per GPU forward pass — derived from `len(texts)` and `--batch`, exactly
+how FlagEmbedding sub-batches one `encode()`, so it shows whether each call fills the
+batch — the GPU-feed signal), `encode_calls`, `encode_seconds_total`,
+`chunks_encoded_total`, `requests_429`, `queue_depth_highwater`. `POST /stats/reset`
+zeroes the runtime tally (config untouched). Purely logical counters — no GPU/VRAM
+probing. Consumed by `perf/run.sh`; mindex itself never calls these.

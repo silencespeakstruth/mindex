@@ -24,6 +24,8 @@ pub enum EmbedUpsertError {
     Cancelled,
     /// The model server request failed.
     Embed(reqwest::Error),
+    /// The embedder's binary response couldn't be decoded (wire-format skew).
+    Decode(String),
     /// A vector-store upsert failed.
     Store(VectorStoreError),
 }
@@ -55,6 +57,7 @@ pub async fn embed_and_upsert(
             Ok(val) => val,
             Err(EncodeError::Cancelled) => return Err(EmbedUpsertError::Cancelled),
             Err(EncodeError::Request(e)) => return Err(EmbedUpsertError::Embed(e)),
+            Err(EncodeError::Decode(e)) => return Err(EmbedUpsertError::Decode(e)),
         };
 
         let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
