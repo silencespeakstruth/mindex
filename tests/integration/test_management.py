@@ -2,14 +2,19 @@
 Integration tests for the management endpoints:
 
   GET    /projects/{guid}          — stats (files by status, chunks by language)
+  GET    /projects/{guid}/files    — per-file listing (status/lang/hash/chunks/retries)
+  POST   /projects/{guid}/retry    — requeue failed files (reset retry_count)
   DELETE /projects/{guid}          — hard delete (rows + Qdrant collection), idempotent
   DELETE /projects/{guid}/files    — soft delete by include/exclude selector
   POST   /gc                       — forced, blocking garbage collection
+  GET    /status                   — live runtime/concurrency state
+  GET    /config                   — static capabilities + tuning knobs
 
 Deletions are soft (mark + GC), so every deletion test calls POST /gc explicitly
 and asserts the data is then physically gone (stats / search).
 """
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -68,6 +73,34 @@ def delete_files(
 
 def search(client: httpx.Client, project: str, query: str) -> httpx.Response:
     return client.post(f"{MINDEX_URL}/v0/{project}/search", json={"query": query})
+
+
+def list_files(
+    client: httpx.Client,
+    project: str,
+    status: str | None = None,
+    language: str | None = None,
+) -> httpx.Response:
+    params = {}
+    if status is not None:
+        params["status"] = status
+    if language is not None:
+        params["language"] = language
+    return client.get(f"{MINDEX_URL}/projects/{project}/files", params=params)
+
+
+def retry_files(
+    client: httpx.Client,
+    project: str,
+    include: dict | None = None,
+    exclude: dict | None = None,
+) -> httpx.Response:
+    body: dict = {}
+    if include is not None:
+        body["include"] = include
+    if exclude is not None:
+        body["exclude"] = exclude
+    return client.post(f"{MINDEX_URL}/projects/{project}/retry", json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -272,3 +305,102 @@ def test_health_checks_all_dependencies(client: httpx.Client) -> None:
     assert body["status"] == "ok", body
     assert body["checks"] == {"sqlite": "ok", "qdrant": "ok", "embedder": "ok"}, body
     assert isinstance(body["indexing_files"], int)
+
+
+# ---------------------------------------------------------------------------
+# GET /projects/{guid}/files
+# ---------------------------------------------------------------------------
+
+
+def test_files_lists_metadata_and_filters(client: httpx.Client, project: str) -> None:
+    index_files(
+        client, project, {"rust": {"a.rs": RUST_V1}, "python": {"b.py": PYTHON_SRC}}
+    )
+
+    resp = list_files(client, project)
+    assert resp.status_code == 200
+    files = {f["path"]: f for f in resp.json()["files"]}
+    assert set(files) == {"a.rs", "b.py"}, files
+    a = files["a.rs"]
+    assert a["status"] == "indexed"
+    assert a["programming_language"] == "rust"
+    assert a["chunk_count"] >= 1
+    assert a["retry_count"] == 0
+    assert len(a["sha256"]) == 64
+    assert isinstance(a["status_updated_at"], int)
+
+    # Filters: by status and by language.
+    indexed = list_files(client, project, status="indexed").json()["files"]
+    assert {f["path"] for f in indexed} == {"a.rs", "b.py"}
+    assert list_files(client, project, status="failed").json()["files"] == []
+    rust_only = list_files(client, project, language="rust").json()["files"]
+    assert {f["path"] for f in rust_only} == {"a.rs"}
+
+
+def test_files_404_for_unknown_project(client: httpx.Client, project: str) -> None:
+    assert list_files(client, project).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /projects/{guid}/retry
+# ---------------------------------------------------------------------------
+
+
+def test_retry_requeues_failed_file(
+    client: httpx.Client, project: str, embed_fail: Callable[[int], None]
+) -> None:
+    # Drive a file to 'failed' by failing its embed; the /index call then returns 503.
+    embed_fail(1)
+    assert index_files(client, project, {"rust": {"a.rs": RUST_V1}}).status_code == 503
+
+    failed = list_files(client, project, status="failed").json()["files"]
+    assert len(failed) == 1, failed
+    assert failed[0]["retry_count"] >= 1
+
+    # Requeue (empty selector = all failed): retry_count is reset to 0. status stays
+    # 'failed' until the retry worker (next sweep) re-embeds it.
+    resp = retry_files(client, project)
+    assert resp.status_code == 200
+    assert resp.json()["requeued_files"] == 1
+
+    after = list_files(client, project, status="failed").json()["files"]
+    assert len(after) == 1, after
+    assert after[0]["retry_count"] == 0
+
+
+def test_retry_no_failed_files_is_204(client: httpx.Client, project: str) -> None:
+    index_files(client, project, {"rust": {"a.rs": RUST_V1}})
+    assert retry_files(client, project).status_code == 204
+
+
+# ---------------------------------------------------------------------------
+# GET /status and GET /config
+# ---------------------------------------------------------------------------
+
+
+def test_status_reports_runtime_state(client: httpx.Client, project: str) -> None:
+    index_files(client, project, {"rust": {"a.rs": RUST_V1}})
+    body = client.get(f"{MINDEX_URL}/status").json()
+    assert set(body) == {
+        "indexing_claims",
+        "gc_running",
+        "pool_available",
+        "pool_size",
+        "indexing_files",
+        "files_by_status",
+    }
+    assert body["pool_size"] >= 1
+    assert 0 <= body["pool_available"] <= body["pool_size"]
+    assert isinstance(body["gc_running"], bool)
+    assert body["files_by_status"]["indexed"] >= 1
+
+
+def test_config_lists_languages_and_knobs(client: httpx.Client) -> None:
+    body = client.get(f"{MINDEX_URL}/config").json()
+    assert "rust" in body["languages"]
+    assert "python" in body["languages"]
+    assert isinstance(body["model_id"], str) and body["model_id"]
+    assert body["max_retries"] >= 1
+    assert body["db_pool_size"] >= 1
+    assert isinstance(body["embed_batch"], int)
+    assert isinstance(body["stuck_grace_mins"], int)

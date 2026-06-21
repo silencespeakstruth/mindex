@@ -55,6 +55,10 @@ EXC_PATHS=()
 [[ -n "${MINDEX_EXCLUDE_LANG:-}" ]] && read -ra EXC_LANGS <<<"$MINDEX_EXCLUDE_LANG"
 [[ -n "${MINDEX_EXCLUDE_PATH:-}" ]] && read -ra EXC_PATHS <<<"$MINDEX_EXCLUDE_PATH"
 
+# Offline fallback list of valid languages. The canonical source is the server's
+# GET /config (`.languages`); refresh_valid_langs replaces this on demand when the
+# server is reachable, so a flag is validated against the live set. This baked-in
+# copy is only used when /config cannot be fetched (server down, no curl/jq).
 VALID_LANGS=(rust python javascript typescript tsx go c cpp java csharp ruby php bash html css json scala haskell ocaml zig sql)
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -118,6 +122,21 @@ is_valid_lang() {
         [[ "$l" == "$needle" ]] && return 0
     done
     return 1
+}
+
+# Best-effort refresh of VALID_LANGS from the server's GET /config (the canonical
+# language list). On any failure — server unreachable, curl/jq missing, malformed
+# JSON — the baked-in fallback above is kept, so offline validation still works.
+refresh_valid_langs() {
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local cfg_opts=(-sS -X GET "${SERVER%/}/config")
+    [[ "$NO_VERIFY" -eq 1 ]] && cfg_opts+=(-k)
+    local body langs
+    body=$(curl "${cfg_opts[@]}" 2>/dev/null) || return 0
+    mapfile -t langs < <(printf '%s' "$body" | jq -r '.languages[]?' 2>/dev/null) || return 0
+    [[ ${#langs[@]} -gt 0 ]] && VALID_LANGS=("${langs[@]}")
+    return 0
 }
 
 # ─── Arg parsing ────────────────────────────────────────────────────────────
@@ -195,6 +214,11 @@ if [[ -n "$TOP_K" ]]; then
     [[ "$TOP_K" =~ ^[0-9]+$ ]] || die "--top-k must be a non-negative integer, got: $TOP_K"
 fi
 
+# Only the language flags need validation, so only fetch the canonical list when
+# they are present — a plain search never hard-depends on /config being reachable.
+if [[ ${#INC_LANGS[@]} -gt 0 || ${#EXC_LANGS[@]} -gt 0 ]]; then
+    refresh_valid_langs
+fi
 for l in "${INC_LANGS[@]}" "${EXC_LANGS[@]}"; do
     [[ -z "$l" ]] && continue
     is_valid_lang "$l" || die "unknown language '$l' (valid: ${VALID_LANGS[*]})"

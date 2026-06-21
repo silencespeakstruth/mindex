@@ -211,6 +211,8 @@ async fn main() -> Result<(), BoxError> {
                 embed_batch: args.embed_batch,
                 indexing_locks: indexing_locks.clone(),
                 gc_flag: gc_flag.clone(),
+                stuck_grace_mins: args.stuck_grace_mins,
+                db_pool_size: args.db_pool_size,
             },
             args.max_body_mb * 1024 * 1024,
             sigterm_token.child_token()) => {

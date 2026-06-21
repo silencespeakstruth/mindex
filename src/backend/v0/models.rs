@@ -39,7 +39,41 @@ pub enum ProgrammingLanguage {
 
 impl ToSql for ProgrammingLanguage {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        let val = match self {
+        Ok(ToSqlOutput::from(self.name()))
+    }
+}
+
+impl ProgrammingLanguage {
+    /// Every variant, in declaration order. The single source of truth for the
+    /// supported-language set exposed by `GET /config` (so clients — e.g. the search
+    /// frontend — read the live list instead of hardcoding their own copy).
+    pub const ALL: &'static [ProgrammingLanguage] = &[
+        ProgrammingLanguage::Rust,
+        ProgrammingLanguage::Python,
+        ProgrammingLanguage::JavaScript,
+        ProgrammingLanguage::TypeScript,
+        ProgrammingLanguage::Tsx,
+        ProgrammingLanguage::Go,
+        ProgrammingLanguage::C,
+        ProgrammingLanguage::Cpp,
+        ProgrammingLanguage::Java,
+        ProgrammingLanguage::CSharp,
+        ProgrammingLanguage::Ruby,
+        ProgrammingLanguage::Php,
+        ProgrammingLanguage::Bash,
+        ProgrammingLanguage::Html,
+        ProgrammingLanguage::Css,
+        ProgrammingLanguage::Json,
+        ProgrammingLanguage::Scala,
+        ProgrammingLanguage::Haskell,
+        ProgrammingLanguage::Ocaml,
+        ProgrammingLanguage::Zig,
+        ProgrammingLanguage::Sql,
+    ];
+
+    /// The lowercase wire name (matches the serde rename and the SQLite `ToSql`).
+    pub fn name(self) -> &'static str {
+        match self {
             ProgrammingLanguage::Rust       => "rust",
             ProgrammingLanguage::Python     => "python",
             ProgrammingLanguage::JavaScript => "javascript",
@@ -61,8 +95,7 @@ impl ToSql for ProgrammingLanguage {
             ProgrammingLanguage::Ocaml      => "ocaml",
             ProgrammingLanguage::Zig        => "zig",
             ProgrammingLanguage::Sql        => "sql",
-        };
-        Ok(ToSqlOutput::from(val))
+        }
     }
 }
 
@@ -316,4 +349,79 @@ pub struct HealthResponse {
     /// Files in `status='indexing'` across *all* projects right now.
     pub indexing_files: i64,
     pub checks: HealthChecks,
+}
+
+/// `GET /projects/{guid}/files` query string — optional filters. `language`
+/// deserializes from its lowercase wire name (e.g. `?language=rust`).
+#[derive(Deserialize, Debug, Default)]
+pub struct FileListQuery {
+    pub status: Option<String>,
+    pub language: Option<ProgrammingLanguage>,
+}
+
+/// One file in `GET /projects/{guid}/files`. `chunk_count` counts only `active`
+/// chunks (soft-deleted ones awaiting GC are excluded).
+#[derive(Serialize, Debug)]
+pub struct FileInfo {
+    pub path: UnixPath,
+    pub programming_language: ProgrammingLanguage,
+    pub status: String,
+    pub sha256: String,
+    pub chunk_count: u64,
+    pub retry_count: i64,
+    pub status_updated_at: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct FileListResponse {
+    pub files: Vec<FileInfo>,
+}
+
+/// `POST /projects/{guid}/retry` body — same selector shape as the cancel/delete
+/// endpoints, but **both fields optional**: an empty body means "every `failed`
+/// file". Retry is non-destructive (it only resets the retry counter so the worker
+/// re-attempts the file), so a blanket requeue is the useful dead-letter-recovery
+/// default rather than a footgun to guard against.
+#[derive(Deserialize, Serialize, Debug, Default)]
+pub struct RetryRequest {
+    pub include: Option<SearchFilter>,
+    pub exclude: Option<SearchFilter>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct RetryResponse {
+    pub requeued_files: u64,
+}
+
+/// `GET /status` — live runtime/concurrency state (cheap to compute; for diagnosing
+/// 429/409/503 and stuck work). Distinct from `GET /config` (static knobs) and
+/// `GET /health` (dependency liveness).
+#[derive(Serialize, Debug)]
+pub struct StatusResponse {
+    /// Per-file `(project, model, path)` indexing claims held right now — the size of
+    /// the in-process mutual-exclusion table (contention here is what returns 429).
+    pub indexing_claims: usize,
+    /// Whether a garbage-collection pass is running (a `POST /gc` now returns 409).
+    pub gc_running: bool,
+    /// SQLite connections currently free in the pool (0 ⇒ the next `transaction`
+    /// fails fast with `PoolEmpty` → 500).
+    pub pool_available: usize,
+    pub pool_size: usize,
+    /// Files in `status='indexing'` across all projects.
+    pub indexing_files: i64,
+    /// Global `project_files` counts by status.
+    pub files_by_status: FileStatusCounts,
+}
+
+/// `GET /config` — static server capabilities and tuning knobs. `languages` is the
+/// canonical supported-language list (derived from the `ProgrammingLanguage` enum).
+#[derive(Serialize, Debug)]
+pub struct ConfigResponse {
+    pub version: &'static str,
+    pub model_id: String,
+    pub languages: Vec<&'static str>,
+    pub embed_batch: usize,
+    pub db_pool_size: usize,
+    pub stuck_grace_mins: i64,
+    pub max_retries: i64,
 }

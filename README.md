@@ -181,10 +181,14 @@ All endpoints are HTTPS. TLS is the only transport security — there is **no AP
 | `POST /v0/{project}/search` | Hybrid search; returns top-k chunks with scores. |
 | `GET /projects` | List all projects with summary counts. |
 | `GET /projects/{project}` | Stats: files by status, chunks per language. |
+| `GET /projects/{project}/files` | Per-file listing (status, language, hash, active-chunk count, retry count); optional `?status=` / `?language=` filters. `?status=failed` is the dead-letter view. |
 | `DELETE /projects/{project}` | Hard-delete a project (rows + Qdrant collection). |
 | `DELETE /projects/{project}/files` | Soft-delete files by an include/exclude selector (body). |
 | `POST /projects/{project}/cancel` | Best-effort cancel of in-flight indexing for files matching an include/exclude selector (body); only `indexing` files are affected. |
+| `POST /projects/{project}/retry` | Requeue `failed` files for the retry worker (resets `retry_count`); optional include/exclude selector (body) — empty body = all failed files. |
 | `POST /gc` | Run garbage collection synchronously. |
+| `GET /status` | Live runtime state: held indexing claims, GC running flag, SQLite pool headroom, file counts by status. |
+| `GET /config` | Static capabilities and tuning knobs: version, model, supported languages, batch/pool/retry settings. |
 | `GET /health` | Readiness: pings SQLite + Qdrant + the embedder, reports files currently indexing. |
 | `GET /version` | Running mindex version. |
 

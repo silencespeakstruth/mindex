@@ -10,11 +10,13 @@ is *not done* or *deliberately constrained*.
   lists every candidate GUID per query). Fine for moderate projects; very large
   collections may want a stored Qdrant payload field (`project_guid`) + a `match`
   filter instead.
-- **After `MAX_RETRIES` (3) failures a file stays `status='failed'`** and needs
-  manual re-indexing (re-push). Surfaced via a WARN at startup and hourly
-  (`worker::retry::warn_permanently_failed`) and now via `GET /projects/{guid}`
-  (per-project `failed` count); a real dead-letter view / metric / alert is still
-  future work.
+- **After `MAX_RETRIES` (3) failures a file stays `status='failed'`** and is no
+  longer retried automatically. Surfaced via a WARN at startup and hourly
+  (`worker::retry::warn_permanently_failed`), via `GET /projects/{guid}` (per-project
+  `failed` count), and now as a proper dead-letter view: `GET
+  /projects/{guid}/files?status=failed` lists the stuck files, and `POST
+  /projects/{guid}/retry` requeues them (resets `retry_count`) without re-pushing
+  content. A standing metric / alert is still future work.
 - **Deleting all of a project's files leaves the project row + an empty Qdrant
   collection.** `DELETE /files` is scoped to files (the project persists so it can
   be re-indexed), so matching everything still leaves an empty collection behind.

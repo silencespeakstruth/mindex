@@ -147,9 +147,20 @@ before the embed — this also closes the prepare race where cancel lands before
 chunks exist), and the **retry worker re-checks status after acquiring the claim**
 (else `cancelled → indexing`, a legal move, would resurrect it). A cancel that lands
 mid-embed lets that pass finish; `mark_indexed`'s `cancelled → indexed` is then
-trigger-rejected and GC reclaims the orphaned vectors. `GET /projects` (list
-all, summary counts), `GET /projects/{guid}` (per-language stats), `POST /gc` (one
-synchronous GC pass), `GET /health` (pings SQLite + Qdrant + embedder, reports files
+trigger-rejected and GC reclaims the orphaned vectors. `POST /projects/{guid}/retry`
+**requeues `failed` files** (same body selector, but **empty body = all failed**,
+since retry is non-destructive): it is a **metadata-only** write — `retry_count = 0`,
+status stays `failed`, so it skips the state-machine triggers and takes no
+`IndexClaim` — and it deliberately leaves `status_updated_at` untouched so the retry
+worker (whose `failed` branch needs `status_updated_at < now-60`) re-embeds on the
+next sweep rather than after another grace window. `GET /projects` (list all, summary
+counts), `GET /projects/{guid}` (per-language stats), `GET /projects/{guid}/files`
+(per-file listing — status / language / hash / active-chunk count / `retry_count`,
+with optional `?status=`/`?language=` filters; `?status=failed` is the dead-letter
+view), `POST /gc` (one synchronous GC pass), `GET /status` (live runtime/concurrency
+state — held indexing claims, GC flag, SQLite pool headroom, global status counts),
+`GET /config` (static knobs + the canonical supported-language list, read by the
+search frontend), `GET /health` (pings SQLite + Qdrant + embedder, reports files
 indexing) and `GET /version` round it out.
 
 **FK is RESTRICT.** `project_file_chunks → project_files` is `ON DELETE RESTRICT`.
@@ -292,12 +303,17 @@ in `TODO.md`.)
 
 **Adding a language touches all of these** — each omission fails differently (422 →
 SQLite CHECK 500 → silently skipped file), so do the whole list:
-1. `ProgrammingLanguage` enum + `ToSql`/`FromSql` (`models.rs`), lowercase serde name.
+1. `ProgrammingLanguage` enum + `ToSql`/`FromSql` + `ALL`/`name()` (`models.rs`),
+   lowercase serde name. `ALL`/`name()` is the single source `GET /config` exposes,
+   so a new variant must be added to `ALL` (else it's absent from the served list).
 2. `CHECK` constraint in `v0.1.0_schema.sql`.
 3. `tree-sitter-<lang>` in `Cargo.toml` (verify ≥ 0.23).
 4. Arm in `tree_sitter_language(pl)` (`handlers.rs`) — total match, missing arm = compile error.
 5. `detect_language` + `Language::name()` in `scanner.rs` (else the indexer silently skips the file).
-6. `VALID_LANGS` + `ext_to_lexer()` in `tools/search/mindex-search.sh`.
+6. `ext_to_lexer()` in `tools/search/mindex-search.sh` (the pygments lexer map). Its
+   `VALID_LANGS` array is now only an **offline fallback** — the canonical validation
+   list comes from `GET /config` at runtime — so it need not be hand-synced (though
+   keeping it current keeps the offline path accurate).
 7. Rebuild the image (`docker compose build mindex`) and, since the `CHECK` changed,
    drop the DB volume (`docker compose down && docker volume rm mindex_mindex_db && up -d`)
    — `CREATE TABLE IF NOT EXISTS` won't alter an existing table.
@@ -320,6 +336,10 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   `$EDITOR` (`--edit`), then stdin. Every option has a `MINDEX_*` env-var fallback
   (so it can run fully env-driven, e.g. an alias or CI job); an explicit flag wins
   over its variable. (The old `mindex-search-edit` POSIX-sh wrapper was folded in.)
+  Language-flag validation pulls the valid set from the server's `GET /config`
+  (`refresh_valid_langs`, fetched only when a `--include/--exclude-lang` is given),
+  falling back to the baked-in `VALID_LANGS` array when `/config` is unreachable —
+  so the language list is no longer hand-synced with the server.
 - **`tools/mcp/mindex/` (`mindex`, Python/Poetry)** — MCP stdio server (sibling of the
   CLIs; hits the same HTTP API). The **intended primary way an agent drives mindex**:
   `search` for precise code to read or edit (top-5 cap fixed in the adapter — the

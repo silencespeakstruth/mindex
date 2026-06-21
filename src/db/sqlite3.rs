@@ -31,6 +31,9 @@ impl From<StatusCode> for SQLite3PoolError {
 
 pub struct SQLite3Pool {
     conns: Arc<Mutex<Vec<Connection>>>,
+    /// Total connections the pool was created with (the high-water mark). Stored so
+    /// `GET /status` can report saturation as `available()` / `size`.
+    size: usize,
 }
 
 impl SQLite3Pool {
@@ -67,7 +70,19 @@ impl SQLite3Pool {
 
         Self {
             conns: Arc::new(Mutex::new(conns)),
+            size: len,
         }
+    }
+
+    /// Total connections the pool holds when fully idle.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Connections currently free (not checked out). A momentary snapshot — useful
+    /// for the `GET /status` saturation report, not for control flow.
+    pub async fn available(&self) -> usize {
+        self.conns.lock().await.len()
     }
 
     async fn acquire(&self) -> Option<Connection> {

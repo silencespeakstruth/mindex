@@ -12,12 +12,19 @@ use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChunkCounts;
 use crate::backend::v0::models::Code;
+use crate::backend::v0::models::ConfigResponse;
 use crate::backend::v0::models::DeleteFilesRequest;
 use crate::backend::v0::models::DeleteFilesResponse;
 use crate::backend::v0::models::DriftRequest;
 use crate::backend::v0::models::DriftResponse;
+use crate::backend::v0::models::FileInfo;
+use crate::backend::v0::models::FileListQuery;
+use crate::backend::v0::models::FileListResponse;
 use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
+use crate::backend::v0::models::RetryRequest;
+use crate::backend::v0::models::RetryResponse;
+use crate::backend::v0::models::StatusResponse;
 use crate::backend::v0::models::HealthChecks;
 use crate::backend::v0::models::HealthResponse;
 use crate::backend::v0::models::ProjectListResponse;
@@ -49,6 +56,7 @@ use crate::slicing::traits::SlicerError;
 use axum::Json;
 use axum::debug_handler;
 use axum::extract::Path;
+use axum::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::ErrorResponse;
@@ -1606,6 +1614,208 @@ pub async fn post_cancel(
     }
 }
 
+/// `GET /projects/{guid}/files` — lists the project's files with per-file status,
+/// language, content hash, active-chunk count, retry count, and last status change.
+/// Optional `?status=` and `?language=` query filters narrow the set (e.g.
+/// `?status=failed` is the dead-letter view). 404 if the project has never been seen
+/// (mirrors `get_project_stats`); an empty file set on a known project is `200` with
+/// `files: []`. Pure read — cancellation-safe, takes no locks.
+#[debug_handler]
+pub async fn get_files(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+    Query(q): Query<FileListQuery>,
+) -> Result<Json<FileListResponse>, ErrorResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+
+    let result = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let exists = tx
+                .query_row("SELECT 1 FROM projects WHERE guid = ?1", params![pg], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok(None);
+            }
+
+            // Optional status/language filters, numbered after the pinned project guid.
+            let mut where_parts = vec!["f.project_guid = ?1".to_string()];
+            let mut binds: Vec<Bind> = vec![Bind::Guid(pg)];
+            let mut n = 2usize;
+            if let Some(status) = q.status.as_ref() {
+                where_parts.push(format!("f.status = ?{n}"));
+                binds.push(Bind::Path(status.clone()));
+                n += 1;
+            }
+            if let Some(lang) = q.language {
+                where_parts.push(format!("f.programming_language = ?{n}"));
+                binds.push(Bind::Lang(lang));
+            }
+
+            let sql = format!(
+                "SELECT f.path, f.programming_language, f.status, f.sha256,
+                        f.retry_count, f.status_updated_at,
+                        (SELECT COUNT(*) FROM project_file_chunks c
+                          WHERE c.project_guid = f.project_guid
+                            AND c.model_id = f.model_id
+                            AND c.file_path = f.path
+                            AND c.status = 'active') AS chunk_count
+                 FROM project_files f
+                 WHERE {}
+                 ORDER BY f.path",
+                where_parts.join(" AND ")
+            );
+            let files = tx
+                .prepare(&sql)?
+                .query_map(params_from_iter(binds.iter()), |r| {
+                    Ok(FileInfo {
+                        path: r.get::<_, String>(0)?,
+                        programming_language: r.get::<_, ProgrammingLanguage>(1)?,
+                        status: r.get::<_, String>(2)?,
+                        sha256: r.get::<_, String>(3)?,
+                        retry_count: r.get::<_, i64>(4)?,
+                        status_updated_at: r.get::<_, i64>(5)?,
+                        chunk_count: r.get::<_, i64>(6)? as u64,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)?;
+            Ok(Some(files))
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = ?e, project_guid = %pg.0, "Failed to list project files from SQLite.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    match result {
+        Some(files) => Ok(Json(FileListResponse { files })),
+        None => Err(StatusCode::NOT_FOUND.into()),
+    }
+}
+
+/// `POST /projects/{guid}/retry` — requeues `failed` files for the retry worker by
+/// resetting their retry counter. The `include`/`exclude` selector (same shape as
+/// cancel/delete) is **optional**: an empty body requeues *every* `failed` file —
+/// retry is non-destructive, so a blanket dead-letter recovery is the useful default.
+///
+/// This is a **metadata-only** write: `status` stays `failed`, so it never passes
+/// through the state-machine triggers (no transition to reject) and never takes the
+/// per-file `IndexClaim`. It deliberately leaves `status_updated_at` untouched — the
+/// retry worker only picks a `failed` file whose `status_updated_at` is older than
+/// 60s, so keeping the old timestamp lets the next sweep (≤60s) re-embed it at once;
+/// bumping it would add a needless 60s delay. It races benignly with that worker,
+/// which re-checks status under its own claim. Returns 204 when nothing matched, else
+/// 200 with the count of files requeued.
+#[debug_handler]
+pub async fn post_retry(
+    Path(project_guid): Path<UUIDv4>,
+    State(s): State<RouterState>,
+    Json(req): Json<RetryRequest>,
+) -> Result<Response, ErrorResponse> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+    let (where_sql, binds) = build_file_filter(pg, &req.include, &req.exclude);
+
+    // `build_file_filter` already pins the project (and excludes 'deleted'); appending
+    // a constant `status = 'failed'` keeps the existing bind numbering intact.
+    let update_sql =
+        format!("UPDATE project_files SET retry_count = 0 WHERE {where_sql} AND status = 'failed'");
+    let requeued_files: u64 = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let n = tx.execute(&update_sql, params_from_iter(binds.iter()))?;
+            Ok(n as u64)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = ?e, project_guid = %pg.0, "Failed to requeue failed files.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(project_guid = %pg.0, requeued_files, "Requeued failed files for the retry worker.");
+
+    if requeued_files == 0 {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok((StatusCode::OK, Json(RetryResponse { requeued_files })).into_response())
+    }
+}
+
+/// `GET /status` — a live runtime/concurrency snapshot for diagnostics: how many
+/// per-file indexing claims are held right now, whether a GC pass is running, SQLite
+/// pool headroom, and global `project_files` counts by status. Cheap — one grouped
+/// SQLite read plus two in-memory reads. Distinct from `GET /health` (dependency
+/// liveness) and `GET /config` (static knobs).
+#[debug_handler]
+pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusResponse>, StatusCode> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+
+    let counts: Vec<(String, i64)> = s
+        .db_pool
+        .transaction(guard.0.child_token(), |tx| {
+            tx.prepare("SELECT status, COUNT(*) FROM project_files GROUP BY status")?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|e| {
+            error!(error = %e, "Failed to read global file-status counts from SQLite.");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut files_by_status = FileStatusCounts::default();
+    for (status, n) in &counts {
+        files_by_status.set(status, *n as u64);
+    }
+    let indexing_files = files_by_status.indexing as i64;
+
+    // In-memory state: the per-file claim table and the GC flag. Recover from a
+    // poisoned lock rather than panic (it is a plain membership set — see `IndexClaim`).
+    let indexing_claims = s
+        .indexing_locks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let gc_running = s.gc_flag.load(std::sync::atomic::Ordering::Acquire);
+
+    Ok(Json(StatusResponse {
+        indexing_claims,
+        gc_running,
+        pool_available: s.db_pool.available().await,
+        pool_size: s.db_pool.size(),
+        indexing_files,
+        files_by_status,
+    }))
+}
+
+/// `GET /config` — static server capabilities and tuning knobs (the running version,
+/// the embedding model, the canonical supported-language list, and the CLI-set
+/// concurrency knobs). The `languages` array is the single source of truth clients
+/// (e.g. the search frontend) read instead of hardcoding their own copy.
+#[debug_handler]
+pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    Json(ConfigResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        model_id: model_id.clone(),
+        languages: ProgrammingLanguage::ALL.iter().map(|l| l.name()).collect(),
+        embed_batch: s.embed_batch,
+        db_pool_size: s.db_pool_size,
+        stuck_grace_mins: s.stuck_grace_mins,
+        max_retries: crate::worker::retry::MAX_RETRIES,
+    })
+}
+
 /// `POST /gc` — runs a full GC pass synchronously and returns what it removed:
 /// hard-deletes soft-deleted chunks (whose vectors are confirmed gone from Qdrant),
 /// then the now-empty `deleted` file rows, then prunes the old status log. Blocking
@@ -2053,5 +2263,80 @@ mod tests {
             IndexClaim::try_acquire(&locks, key).is_some(),
             "slot must free up once the holding Prepared drops at end of post_index"
         );
+    }
+
+    // ── retry requeue ────────────────────────────────────────────────────────
+
+    /// `post_retry`'s UPDATE resets `retry_count` on a `failed` file and — critically
+    /// — leaves `status_updated_at` untouched. The retry worker only picks a `failed`
+    /// file whose timestamp is older than 60s, so preserving the old stamp lets the
+    /// next sweep re-embed it immediately instead of after another grace window.
+    #[tokio::test]
+    async fn retry_resets_count_and_preserves_timestamp() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1);
+        pool.transaction(CancellationToken::new(), |tx| {
+            for m in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                params![guid(), "BAAI/bge-m3"],
+            )?;
+            tx.execute(
+                "INSERT INTO project_files
+                     (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, 'a.rs', ?3, 'rust', 'indexing')",
+                params![guid(), "BAAI/bge-m3", "0".repeat(64)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Reach `failed` legally (indexing → failed), then pin a maxed retry_count and
+        // an old status_updated_at directly — both are plain column writes, not status
+        // transitions, so no trigger fires.
+        let pg = guid().0.as_simple().to_string();
+        set_file_status(&pool, &pg, "a.rs", "BAAI/bge-m3", "failed", true, CancellationToken::new()).await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "UPDATE project_files SET retry_count = 9, status_updated_at = 1000
+                 WHERE project_guid = ?1 AND path = 'a.rs'",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Run exactly what `post_retry` runs: an empty selector (requeue all) plus the
+        // constant `status = 'failed'`.
+        let (where_sql, binds) = build_file_filter(guid(), &None, &None);
+        let update_sql =
+            format!("UPDATE project_files SET retry_count = 0 WHERE {where_sql} AND status = 'failed'");
+        let n = pool
+            .transaction(CancellationToken::new(), move |tx| {
+                Ok(tx.execute(&update_sql, params_from_iter(binds.iter()))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "the failed file should be requeued");
+
+        let (status, retry_count, updated): (String, i64, i64) = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.query_row(
+                    "SELECT status, retry_count, status_updated_at FROM project_files
+                     WHERE project_guid = ?1 AND path = 'a.rs'",
+                    params![guid()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(status, "failed", "metadata-only write: status must stay 'failed'");
+        assert_eq!(retry_count, 0, "retry_count must be reset so the worker re-picks it");
+        assert_eq!(updated, 1000, "status_updated_at must NOT be bumped (else a +60s delay)");
     }
 }

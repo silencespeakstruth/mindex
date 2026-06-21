@@ -1,7 +1,7 @@
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::backend::v0::handlers::{
-    delete_files, delete_project, get_health, get_project_stats, get_projects, get_version,
-    post_cancel, post_drift, post_gc, post_index, post_search,
+    delete_files, delete_project, get_config, get_files, get_health, get_project_stats,
+    get_projects, get_status, get_version, post_cancel, post_drift, post_gc, post_index,
+    post_retry, post_search,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -45,6 +46,12 @@ pub struct RouterState {
     /// a single bool serializes `POST /gc` against itself and the hourly worker
     /// (see `GcGuard` in `worker::gc`). A concurrent `POST /gc` gets 409.
     pub gc_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Minutes a file may sit in `indexing` before the retry worker treats it as
+    /// crash-orphaned (the `--stuck-grace-mins` CLI flag). Reported by `GET /config`.
+    pub stuck_grace_mins: i64,
+    /// Connection-pool size (the `--db-pool-size` CLI flag). Reported by `GET /config`
+    /// (and paired with the live `available()` count in `GET /status`).
+    pub db_pool_size: usize,
 }
 
 pub struct CancellationGuard(pub CancellationToken);
@@ -76,10 +83,16 @@ pub async fn run(
             "/projects/{project_guid}",
             get(get_project_stats).delete(delete_project),
         )
-        .route("/projects/{project_guid}/files", delete(delete_files))
+        .route(
+            "/projects/{project_guid}/files",
+            get(get_files).delete(delete_files),
+        )
         .route("/projects/{project_guid}/cancel", post(post_cancel))
+        .route("/projects/{project_guid}/retry", post(post_retry))
         .route("/projects/{project_guid}/drift", post(post_drift))
         .route("/gc", post(post_gc))
+        .route("/status", get(get_status))
+        .route("/config", get(get_config))
         .route("/health", get(get_health))
         .route("/version", get(get_version))
         .layer(DefaultBodyLimit::max(body_limit_bytes))
