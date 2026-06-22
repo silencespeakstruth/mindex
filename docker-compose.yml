@@ -1,3 +1,11 @@
+# Turnkey stack: Qdrant + the mindex server (the embedder runs on the HOST — see
+# README "Running"). This is the canonical reference for the server's flags and also
+# the perf-benchmark harness: the command flags read from the environment, so a profile
+# swaps in with `docker compose --env-file perf/env/<f>.env up -d` (see .env.example).
+#
+# Integration tests use docker-compose.test.yml instead (not this file). A maintainer
+# running Qdrant on the host can drop the bundled qdrant via the untracked, auto-merged
+# docker-compose.override.yml (`docker compose up -d --no-deps mindex`).
 services:
 
   qdrant:

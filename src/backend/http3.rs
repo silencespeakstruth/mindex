@@ -1,6 +1,5 @@
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use std::collections::HashSet;
@@ -46,6 +45,18 @@ pub struct RouterState {
     pub max_chunk_tokens: usize,
     /// `top_k` used when a `/search` request omits it (`[search]` config).
     pub default_top_k: u64,
+    /// Upper bound a `/search` request may set for `top_k` (`[search]` config).
+    pub max_top_k: u64,
+    /// Maximum search-query length in bytes (`[search]` config).
+    pub max_query_bytes: usize,
+    /// Per-file source size cap for `/index` (`[limits]` config).
+    pub max_code_bytes: usize,
+    /// File-count cap for one `/index` request (`[limits]` config).
+    pub max_files_per_request: usize,
+    /// Entry cap for one `/drift` `path → sha256` map (`[limits]` config).
+    pub max_drift_files: usize,
+    /// Globs + languages cap for one selector (`[limits]` config).
+    pub max_selector_patterns: usize,
     /// Paths per batch on soft-delete / cancel (`[indexing]` config).
     pub path_batch_size: usize,
     /// Status-log retention for the synchronous `POST /gc` pass (`[workers]` config).
@@ -74,10 +85,6 @@ impl Drop for CancellationGuard {
     fn drop(&mut self) {
         self.0.cancel();
     }
-}
-
-pub fn cancelled_499() -> StatusCode {
-    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
 }
 
 pub async fn run(

@@ -60,6 +60,13 @@ const DEFAULT_MAX_CHUNK_TOKENS: usize = 512;
 const MODEL_MAX_TOKENS: usize = 512;
 
 const DEFAULT_TOP_K: u64 = 5;
+const DEFAULT_MAX_TOP_K: u64 = 100;
+const DEFAULT_MAX_QUERY_BYTES: usize = 32768;
+
+const DEFAULT_MAX_CODE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_FILES_PER_REQUEST: usize = 10_000;
+const DEFAULT_MAX_DRIFT_FILES: usize = 200_000;
+const DEFAULT_MAX_SELECTOR_PATTERNS: usize = 256;
 
 const DEFAULT_GC_INTERVAL_SECONDS: u64 = 3600;
 const DEFAULT_STATUS_LOG_RETENTION_DAYS: u64 = 30;
@@ -143,6 +150,25 @@ pub struct SlicerConfig {
 pub struct SearchConfig {
     /// `top_k` used when a `/search` request omits it.
     pub default_top_k: u64,
+    /// Upper bound a request may set for `top_k` (rejected with 400 above this).
+    pub max_top_k: u64,
+    /// Maximum search-query length in bytes (rejected with 400 above this).
+    pub max_query_bytes: usize,
+}
+
+/// Request-shape limits enforced at the API edge (each violation → 400 with a stable
+/// error code). They bound resource use; raise them if a legitimate workload needs more.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsConfig {
+    /// Maximum size of a single file's source `code` in an `/index` request.
+    pub max_code_bytes: usize,
+    /// Maximum number of files in one `/index` request.
+    pub max_files_per_request: usize,
+    /// Maximum number of entries in one `/drift` `path → sha256` map.
+    pub max_drift_files: usize,
+    /// Maximum globs + languages combined in one `include`/`exclude` selector.
+    pub max_selector_patterns: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +191,7 @@ pub struct Config {
     pub indexing: IndexingConfig,
     pub slicer: SlicerConfig,
     pub search: SearchConfig,
+    pub limits: LimitsConfig,
     pub workers: WorkerConfig,
 }
 
@@ -236,7 +263,22 @@ impl Default for SlicerConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { default_top_k: DEFAULT_TOP_K }
+        Self {
+            default_top_k: DEFAULT_TOP_K,
+            max_top_k: DEFAULT_MAX_TOP_K,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+        }
+    }
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_code_bytes: DEFAULT_MAX_CODE_BYTES,
+            max_files_per_request: DEFAULT_MAX_FILES_PER_REQUEST,
+            max_drift_files: DEFAULT_MAX_DRIFT_FILES,
+            max_selector_patterns: DEFAULT_MAX_SELECTOR_PATTERNS,
+        }
     }
 }
 
@@ -604,6 +646,29 @@ impl Config {
 
         if self.search.default_top_k < 1 {
             e.push("[search].default_top_k = 0 returns nothing. Fix: use at least 1 (default 5).".to_string());
+        }
+        if self.search.max_top_k < self.search.default_top_k {
+            e.push(format!(
+                "[search].max_top_k = {} is below default_top_k = {}; the default would be rejected. \
+                 Fix: set max_top_k >= default_top_k.",
+                self.search.max_top_k, self.search.default_top_k
+            ));
+        }
+        if self.search.max_query_bytes < 1 {
+            e.push("[search].max_query_bytes = 0 rejects every query. Fix: use at least 1 (default 32768).".to_string());
+        }
+
+        if self.limits.max_code_bytes < 1 {
+            e.push("[limits].max_code_bytes = 0 rejects every file. Fix: use at least 1 (default 16 MiB).".to_string());
+        }
+        if self.limits.max_files_per_request < 1 {
+            e.push("[limits].max_files_per_request = 0 rejects every index request. Fix: use at least 1 (default 10000).".to_string());
+        }
+        if self.limits.max_drift_files < 1 {
+            e.push("[limits].max_drift_files = 0 rejects every drift request. Fix: use at least 1 (default 200000).".to_string());
+        }
+        if self.limits.max_selector_patterns < 1 {
+            e.push("[limits].max_selector_patterns = 0 rejects every selector. Fix: use at least 1 (default 256).".to_string());
         }
 
         if self.workers.gc_interval_seconds < 1 {

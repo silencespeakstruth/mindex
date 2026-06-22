@@ -1,3 +1,12 @@
+# Integration-test stack (does NOT extend docker-compose.yml): Qdrant + a deterministic
+# mock embedder (no GPU) + mindex + a pytest runner that drives the HTTPS API. This is
+# mindex's primary containerized use. Run:
+#
+#   docker compose -f docker-compose.test.yml up --build \
+#       --exit-code-from test-runner --abort-on-container-exit
+#
+# Migrations are additive (CREATE ... IF NOT EXISTS), so a re-run against the persisted
+# test_mindex_db volume needs no reset. Each test uses a fresh project GUID.
 services:
 
   qdrant:

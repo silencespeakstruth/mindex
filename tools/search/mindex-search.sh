@@ -326,6 +326,14 @@ fi
 
 # ─── Handle non-200 status codes ────────────────────────────────────────────
 
+# Errors are RFC 7807 application/problem+json: pull out "[code] detail" for a tidy
+# message, falling back to the raw body for a non-JSON error (or empty if no body).
+err_msg() {
+    [[ -s "$resp_file" ]] || return 0
+    jq -er 'if .code then "[\(.code)] \(.detail // .title // "")" else empty end' \
+        "$resp_file" 2>/dev/null || body_text
+}
+
 body_text() {
     [[ -s "$resp_file" ]] && cat "$resp_file"
 }
@@ -333,29 +341,30 @@ body_text() {
 case "$http_code" in
     200) ;;
     400)
-        msg=$(body_text)
-        die "400 Bad Request — malformed search request.${msg:+ Server said: $msg}"
+        msg=$(err_msg)
+        die "400 Bad Request — invalid search request.${msg:+ Server said: $msg}"
         ;;
     404)
         printf 'No results: the project has no indexed (active) chunks matching your filters.\n' >&2
         exit 1
         ;;
     422)
-        msg=$(body_text)
+        msg=$(err_msg)
         die "422 Unprocessable Entity — request did not match the API schema.${msg:+ Server said: $msg}"
         ;;
     499)
         die "499 — the server cancelled the request (treated it as a client disconnect)."
         ;;
     503)
-        die "503 Service Unavailable — the embedding model server or Qdrant is down. Try again shortly."
+        msg=$(err_msg)
+        die "503 Service Unavailable — the embedding model server or Qdrant is down. Try again shortly.${msg:+ Server said: $msg}"
         ;;
     500)
-        msg=$(body_text)
+        msg=$(err_msg)
         die "500 Internal Server Error.${msg:+ Server said: $msg}"
         ;;
     *)
-        msg=$(body_text)
+        msg=$(err_msg)
         die "unexpected HTTP $http_code.${msg:+ Server said: $msg}"
         ;;
 esac

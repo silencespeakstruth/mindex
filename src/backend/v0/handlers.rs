@@ -4,10 +4,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use super::models::IndexRequest;
+use crate::backend::error::ApiError;
+use crate::backend::error::ProblemDetails;
+use crate::backend::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::backend::http3;
 use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
-use crate::backend::http3::cancelled_499;
+use crate::backend::v0::validate;
 use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChunkCounts;
@@ -55,11 +58,8 @@ use crate::slicing::traits::Slicer;
 use crate::slicing::traits::SlicerError;
 use axum::Json;
 use axum::debug_handler;
-use axum::extract::Path;
-use axum::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::ErrorResponse;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use qdrant_client::qdrant::point_id::PointIdOptions;
@@ -379,7 +379,7 @@ impl FileIndexer<'_> {
         path: &str,
         code: &str,
         hasher: &mut Sha256,
-    ) -> Result<Option<Prepared>, ErrorResponse> {
+    ) -> Result<Option<Prepared>, ApiError> {
         let span = info_span!("indexing_file", ?pl, path);
         async move {
             let project_guid = self.project_guid;
@@ -400,7 +400,7 @@ impl FileIndexer<'_> {
                             "The file is already being indexed by another in-flight \
                              request; returning 429 so the caller retries."
                         );
-                        return Err(StatusCode::TOO_MANY_REQUESTS.into());
+                        return Err(ApiError::FileInFlight);
                     }
                 }
             };
@@ -422,7 +422,7 @@ impl FileIndexer<'_> {
                     .from_cancelled()
                     .map_err(|err| {
                         error!(error = ?err, "Failed to read the stored file hash from SQLite.");
-                        StatusCode::INTERNAL_SERVER_ERROR
+                        ApiError::from(err)
                     })?;
 
                 if unchanged {
@@ -455,7 +455,7 @@ impl FileIndexer<'_> {
                     .from_cancelled()
                     .map_err(|err| {
                         error!(error = ?err, "Failed to mark the file 'indexing' in SQLite.");
-                        StatusCode::INTERNAL_SERVER_ERROR
+                        ApiError::from(err)
                     })?;
             }
 
@@ -533,16 +533,17 @@ impl FileIndexer<'_> {
                 Ok(v) => v,
                 Err(SQLite3PoolError::Cancelled) => {
                     self.recover(path, "cancelled", false).await;
-                    return Err(cancelled_499().into());
+                    return Err(ApiError::Cancelled);
                 }
-                Err(SQLite3PoolError::HTTPStatusCode(sc)) => {
+                Err(SQLite3PoolError::HTTPStatusCode(_)) => {
+                    // Set only by `slicer_err_to_pool_err` (always 500): a slicer failure.
                     self.recover(path, "failed", true).await;
-                    return Err(sc.into());
+                    return Err(ApiError::Internal);
                 }
                 Err(err) => {
                     error!(error = ?err, "Slicing / chunk insertion failed; marking file 'failed'.");
                     self.recover(path, "failed", true).await;
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+                    return Err(ApiError::Internal);
                 }
             };
 
@@ -572,7 +573,7 @@ impl FileIndexer<'_> {
     /// since it was prepared — without it the raw `cancelled → indexed` UPDATE would
     /// trip the state-machine trigger and error the whole batch, leaving sibling
     /// files stuck in `indexing`.
-    async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<(), ErrorResponse> {
+    async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<(), ApiError> {
         let project_guid = self.project_guid;
         let (sha256_f, path_f, model_id_f) = (
             sha256.to_string(),
@@ -596,7 +597,7 @@ impl FileIndexer<'_> {
             .from_cancelled()
             .map_err(|err| {
                 error!(error = ?err, "Failed to mark the file 'indexed' in SQLite.");
-                StatusCode::INTERNAL_SERVER_ERROR
+                ApiError::from(err)
             })?;
         Ok(())
     }
@@ -728,21 +729,24 @@ impl FileIndexer<'_> {
     request_body = IndexRequest,
     responses(
         (status = 200, description = "Per-file chunk counts for the files actually (re)indexed.", body = IndexResponse),
-        (status = 429, description = "The same file is already being indexed by another in-flight request — retry."),
-        (status = 499, description = "Client closed the connection; indexing was cancelled (nginx convention)."),
-        (status = 500, description = "SQLite, slicer, or Qdrant upsert failure; the batch was marked `failed` for the retry worker."),
-        (status = 503, description = "The embedder is unreachable or returned persistent backpressure; the batch was marked `failed`."),
+        (status = 400, description = "Validation failed (bad path, oversized file, too many files).", body = ProblemDetails),
+        (status = 429, description = "The same file is already being indexed by another in-flight request — retry.", body = ProblemDetails),
+        (status = 499, description = "Client closed the connection; indexing was cancelled (nginx convention).", body = ProblemDetails),
+        (status = 500, description = "SQLite, slicer, or Qdrant upsert failure; the batch was marked `failed` for the retry worker.", body = ProblemDetails),
+        (status = 503, description = "The embedder is unreachable or returned persistent backpressure; the batch was marked `failed`.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_index(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-    Json(payload): Json<IndexRequest>,
-) -> Result<Json<IndexResponse>, ErrorResponse> {
+    ApiJson(payload): ApiJson<IndexRequest>,
+) -> Result<Json<IndexResponse>, ApiError> {
     let span = info_span!("indexing", project_guid = %project_guid.0);
 
     async move {
+        validate::validate_index_request(&payload, s.max_files_per_request, s.max_code_bytes)?;
+
         let guard = http3::CancellationGuard(CancellationToken::new());
 
         let db_pool = s.db_pool;
@@ -781,7 +785,7 @@ pub async fn post_index(
                 .from_cancelled()
                 .map_err(|err| {
                     error!(error = ?err, "Failed to ensure the project row in SQLite.");
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    ApiError::from(err)
                 })?;
         }
 
@@ -792,7 +796,7 @@ pub async fn post_index(
                 "Failed to ensure the Qdrant collection. \
                  Check Qdrant is reachable at --qdrant-server and accepting connections."
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::Internal
         })?;
 
         let mut res = IndexResponse {
@@ -856,7 +860,7 @@ pub async fn post_index(
             Ok(()) => {}
             Err(EmbedUpsertError::Cancelled) => {
                 indexer.recover_all(&prepared, "cancelled", false).await;
-                return Err(cancelled_499().into());
+                return Err(ApiError::Cancelled);
             }
             Err(EmbedUpsertError::Embed(request_err)) => {
                 error!(
@@ -866,7 +870,7 @@ pub async fn post_index(
                      (from inside the container it must bind 0.0.0.0, not 127.0.0.1)."
                 );
                 indexer.recover_all(&prepared, "failed", true).await;
-                return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+                return Err(ApiError::EmbedderUnavailable);
             }
             Err(EmbedUpsertError::Decode(decode_err)) => {
                 error!(
@@ -876,7 +880,7 @@ pub async fn post_index(
                      redeploy them from the same revision."
                 );
                 indexer.recover_all(&prepared, "failed", true).await;
-                return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+                return Err(ApiError::EmbedderUnavailable);
             }
             Err(EmbedUpsertError::Store(qdrant_err)) => {
                 error!(
@@ -885,7 +889,7 @@ pub async fn post_index(
                      Check Qdrant is reachable at --qdrant-server."
                 );
                 indexer.recover_all(&prepared, "failed", true).await;
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+                return Err(ApiError::Internal);
             }
         }
 
@@ -954,7 +958,7 @@ async fn read_drift_baseline(
     s: &RouterState,
     token: &CancellationToken,
     project_guid: UUIDv4,
-) -> Result<(HashMap<String, String>, HashSet<String>), ErrorResponse> {
+) -> Result<(HashMap<String, String>, HashSet<String>), ApiError> {
     let rows: Vec<(String, String, String)> = s
         .db_pool
         .transaction(token.child_token(), move |tx| {
@@ -979,7 +983,7 @@ async fn read_drift_baseline(
                 project_guid = %project_guid.0,
                 "Failed to read the project manifest for drift. Check the DB is writable."
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(err)
         })?;
 
     let mut indexed: HashMap<String, String> = HashMap::new();
@@ -1009,16 +1013,18 @@ async fn read_drift_baseline(
     request_body = DriftRequest,
     responses(
         (status = 200, description = "Working-tree divergence in four buckets (stale/missing/orphaned/indexing).", body = DriftResponse),
-        (status = 499, description = "Client closed the connection."),
-        (status = 500, description = "SQLite read failure."),
+        (status = 400, description = "Validation failed (bad path, bad sha256, too many files).", body = ProblemDetails),
+        (status = 499, description = "Client closed the connection.", body = ProblemDetails),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_drift(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-    Json(payload): Json<DriftRequest>,
-) -> Result<Json<DriftResponse>, ErrorResponse> {
+    ApiJson(payload): ApiJson<DriftRequest>,
+) -> Result<Json<DriftResponse>, ApiError> {
+    validate::validate_drift_request(&payload, s.max_drift_files)?;
     let guard = http3::CancellationGuard(CancellationToken::new());
     let (indexed, in_flight) = read_drift_baseline(&s, &guard.0, project_guid).await?;
     Ok(Json(compute_drift(&indexed, &in_flight, &payload.files)))
@@ -1045,21 +1051,27 @@ pub async fn post_drift(
     request_body = SearchRequest,
     responses(
         (status = 200, description = "Ranked matches, sorted by score descending.", body = SearchResponse),
-        (status = 404, description = "No active chunks match (empty project or over-narrow filter)."),
-        (status = 499, description = "Client closed the connection."),
-        (status = 500, description = "SQLite failure while building the candidate set or fetching display rows."),
-        (status = 503, description = "The embedder or Qdrant is unreachable."),
+        (status = 400, description = "Validation failed (empty/oversized query, top_k out of range, oversized selector).", body = ProblemDetails),
+        (status = 404, description = "No active chunks match (empty project or over-narrow filter).", body = ProblemDetails),
+        (status = 499, description = "Client closed the connection.", body = ProblemDetails),
+        (status = 500, description = "SQLite failure while building the candidate set or fetching display rows.", body = ProblemDetails),
+        (status = 503, description = "The embedder or Qdrant is unreachable.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_search(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(state): State<RouterState>,
-    Json(payload): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>, StatusCode> {
+    ApiJson(payload): ApiJson<SearchRequest>,
+) -> Result<Json<SearchResponse>, ApiError> {
     let span = info_span!("searching", project_guid = %project_guid.0);
 
     async move {
+    validate::validate_query(&payload.query, state.max_query_bytes)?;
+    validate::validate_top_k(payload.top_k, state.max_top_k)?;
+    validate::validate_selector(&payload.include, state.max_selector_patterns)?;
+    validate::validate_selector(&payload.exclude, state.max_selector_patterns)?;
+
     let guard = http3::CancellationGuard(CancellationToken::new());
 
     let EmbeddingModel::BGEm3 { client, .. } = state.model;
@@ -1077,14 +1089,14 @@ pub async fn post_search(
         .await
     {
         Ok(val) => Ok(val),
-        Err(EncodeError::Cancelled) => Err(cancelled_499()),
+        Err(EncodeError::Cancelled) => Err(ApiError::Cancelled),
         Err(EncodeError::Request(request_err)) => {
             error!(
                 error = ?request_err,
                 "Failed to embed the search query. \
                  Check the model server at --model-server is up and reachable."
             );
-            Err(StatusCode::SERVICE_UNAVAILABLE)
+            Err(ApiError::EmbedderUnavailable)
         }
         Err(EncodeError::Decode(decode_err)) => {
             error!(
@@ -1093,7 +1105,7 @@ pub async fn post_search(
                  The embedder and mindex binary wire formats disagree — \
                  redeploy them from the same revision."
             );
-            Err(StatusCode::SERVICE_UNAVAILABLE)
+            Err(ApiError::EmbedderUnavailable)
         }
     }?;
 
@@ -1112,31 +1124,31 @@ pub async fn post_search(
         .with_cancellation_token(&guard.0)
         .await
         .from_cancelled()
-        .map_err(|err| match err {
-            SQLite3PoolError::Cancelled => cancelled_499(),
-            SQLite3PoolError::HTTPStatusCode(status_code) => status_code,
-            err => {
+        .map_err(|err| {
+            if !matches!(err, SQLite3PoolError::Cancelled) {
                 error!(error = %err, "Failed to query candidate chunks from SQLite.");
-                StatusCode::INTERNAL_SERVER_ERROR
             }
+            ApiError::from(err)
         })?;
 
     if candidate_ids.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::NoMatch);
     }
 
+    // The embedder must return exactly one vector per head for the single query; an
+    // empty list is an embedder contract violation, not a client error.
     let dense = dense_vecs
         .into_iter()
         .next()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(ApiError::EmbedderUnavailable)?;
     let sparse = sparse_vecs
         .into_iter()
         .next()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(ApiError::EmbedderUnavailable)?;
     let colbert = colbert_vecs
         .into_iter()
         .next()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(ApiError::EmbedderUnavailable)?;
 
     let search_hits = state
         .qdrant
@@ -1156,7 +1168,7 @@ pub async fn post_search(
             "Qdrant query failed. Check Qdrant is reachable at --qdrant-server \
              and the project's collection exists."
         );
-        StatusCode::SERVICE_UNAVAILABLE
+        ApiError::QdrantUnavailable
     })?;
 
     // Winners as (id, score), keeping Qdrant's order (we re-sort after the fetch).
@@ -1175,7 +1187,7 @@ pub async fn post_search(
         .collect();
 
     if scored.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::NoMatch);
     }
 
     // Query 2 (display): fetch `code`/metadata for *only* the top-k winners.
@@ -1212,12 +1224,11 @@ pub async fn post_search(
         .with_cancellation_token(&guard.0)
         .await
         .from_cancelled()
-        .map_err(|err| match err {
-            SQLite3PoolError::Cancelled => cancelled_499(),
-            err => {
+        .map_err(|err| {
+            if !matches!(err, SQLite3PoolError::Cancelled) {
                 error!(error = %err, "Failed to fetch result rows from SQLite.");
-                StatusCode::INTERNAL_SERVER_ERROR
             }
+            ApiError::from(err)
         })?;
 
     let mut results: Vec<SearchResult> = scored
@@ -1261,13 +1272,13 @@ pub async fn post_search(
     tag = "Projects",
     responses(
         (status = 200, description = "All projects with summary counts.", body = ProjectListResponse),
-        (status = 500, description = "SQLite read failure."),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn get_projects(
     State(s): State<RouterState>,
-) -> Result<Json<ProjectListResponse>, ErrorResponse> {
+) -> Result<Json<ProjectListResponse>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
 
     let projects = s
@@ -1301,7 +1312,7 @@ pub async fn get_projects(
         .from_cancelled()
         .map_err(|e| {
             error!(error = %e, "Failed to list projects from SQLite.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     Ok(Json(ProjectListResponse { projects }))
@@ -1320,15 +1331,15 @@ pub async fn get_projects(
     params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
     responses(
         (status = 200, description = "Per-status file counts and per-language chunk counts.", body = ProjectStats),
-        (status = 404, description = "The project has never been seen."),
-        (status = 500, description = "SQLite read failure."),
+        (status = 404, description = "The project has never been seen.", body = ProblemDetails),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn get_project_stats(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-) -> Result<Json<ProjectStats>, ErrorResponse> {
+) -> Result<Json<ProjectStats>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
     let pg = project_guid;
 
@@ -1399,7 +1410,7 @@ pub async fn get_project_stats(
         .from_cancelled()
         .map_err(|e| {
             error!(error = ?e, project_guid = %pg.0, "Failed to query project stats from SQLite.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     match result {
@@ -1408,7 +1419,7 @@ pub async fn get_project_stats(
             files,
             chunks,
         })),
-        None => Err(StatusCode::NOT_FOUND.into()),
+        None => Err(ApiError::ProjectNotFound),
     }
 }
 
@@ -1428,14 +1439,14 @@ pub async fn get_project_stats(
     params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
     responses(
         (status = 204, description = "Project deleted (or did not exist) — idempotent."),
-        (status = 500, description = "SQLite delete or Qdrant collection-drop failure."),
+        (status = 500, description = "SQLite delete or Qdrant collection-drop failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn delete_project(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-) -> Result<StatusCode, ErrorResponse> {
+) -> Result<StatusCode, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
     let collection = collection_for(project_guid);
     let pg = project_guid;
@@ -1453,7 +1464,7 @@ pub async fn delete_project(
         .from_cancelled()
         .map_err(|e| {
             error!(error = ?e, project_guid = %pg.0, "Failed to hard-delete project rows from SQLite.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     s.qdrant.delete_collection(&collection).await.map_err(|e| {
@@ -1462,7 +1473,7 @@ pub async fn delete_project(
             collection = %collection,
             "Failed to delete the Qdrant collection. Check Qdrant is reachable at --qdrant-server."
         );
-        StatusCode::INTERNAL_SERVER_ERROR
+        ApiError::Internal
     })?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1561,31 +1572,19 @@ fn build_file_filter(
     responses(
         (status = 200, description = "Files matched and soft-deleted.", body = DeleteFilesResponse),
         (status = 204, description = "The selector matched no files — nothing changed."),
-        (status = 400, description = "Empty selector: at least one non-empty `include`/`exclude` is required."),
-        (status = 500, description = "SQLite failure."),
+        (status = 400, description = "Empty or oversized selector.", body = ProblemDetails),
+        (status = 500, description = "SQLite failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn delete_files(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-    Json(req): Json<DeleteFilesRequest>,
-) -> Result<Response, ErrorResponse> {
-    let nonempty = |f: &Option<SearchFilter>| {
-        f.as_ref().is_some_and(|x| {
-            x.paths.as_ref().is_some_and(|p| !p.is_empty())
-                || x.programming_languages
-                    .as_ref()
-                    .is_some_and(|l| !l.is_empty())
-        })
-    };
-    if !nonempty(&req.include) && !nonempty(&req.exclude) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "DELETE /files requires a non-empty include or exclude selector",
-        )
-            .into());
-    }
+    ApiJson(req): ApiJson<DeleteFilesRequest>,
+) -> Result<Response, ApiError> {
+    validate::require_nonempty_selector(&req.include, &req.exclude)?;
+    validate::validate_selector(&req.include, s.max_selector_patterns)?;
+    validate::validate_selector(&req.exclude, s.max_selector_patterns)?;
 
     let guard = http3::CancellationGuard(CancellationToken::new());
     let pg = project_guid;
@@ -1606,7 +1605,7 @@ pub async fn delete_files(
         .from_cancelled()
         .map_err(|e| {
             error!(error = ?e, project_guid = %pg.0, "Failed to select files for deletion.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     if paths.is_empty() {
@@ -1649,7 +1648,7 @@ pub async fn delete_files(
             .from_cancelled()
             .map_err(|e| {
                 error!(error = ?e, project_guid = %pg.0, "Failed to soft-delete files.");
-                StatusCode::INTERNAL_SERVER_ERROR
+                ApiError::from(e)
             })?;
         deleted_files += n;
     }
@@ -1686,31 +1685,19 @@ pub async fn delete_files(
     responses(
         (status = 200, description = "In-flight indexing cancelled for the matched files.", body = CancelResponse),
         (status = 204, description = "No `indexing` files matched (e.g. already finished) — nothing changed."),
-        (status = 400, description = "Empty selector: at least one non-empty `include`/`exclude` is required."),
-        (status = 500, description = "SQLite failure."),
+        (status = 400, description = "Empty or oversized selector.", body = ProblemDetails),
+        (status = 500, description = "SQLite failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_cancel(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-    Json(req): Json<CancelRequest>,
-) -> Result<Response, ErrorResponse> {
-    let nonempty = |f: &Option<SearchFilter>| {
-        f.as_ref().is_some_and(|x| {
-            x.paths.as_ref().is_some_and(|p| !p.is_empty())
-                || x.programming_languages
-                    .as_ref()
-                    .is_some_and(|l| !l.is_empty())
-        })
-    };
-    if !nonempty(&req.include) && !nonempty(&req.exclude) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "POST /cancel requires a non-empty include or exclude selector",
-        )
-            .into());
-    }
+    ApiJson(req): ApiJson<CancelRequest>,
+) -> Result<Response, ApiError> {
+    validate::require_nonempty_selector(&req.include, &req.exclude)?;
+    validate::validate_selector(&req.include, s.max_selector_patterns)?;
+    validate::validate_selector(&req.exclude, s.max_selector_patterns)?;
 
     let guard = http3::CancellationGuard(CancellationToken::new());
     let pg = project_guid;
@@ -1734,7 +1721,7 @@ pub async fn post_cancel(
         .from_cancelled()
         .map_err(|e| {
             error!(error = ?e, project_guid = %pg.0, "Failed to select files to cancel.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     if paths.is_empty() {
@@ -1780,7 +1767,7 @@ pub async fn post_cancel(
             .from_cancelled()
             .map_err(|e| {
                 error!(error = ?e, project_guid = %pg.0, "Failed to cancel indexing files.");
-                StatusCode::INTERNAL_SERVER_ERROR
+                ApiError::from(e)
             })?;
         cancelled_files += n;
     }
@@ -1812,16 +1799,17 @@ pub async fn post_cancel(
     ),
     responses(
         (status = 200, description = "Per-file listing (status / language / hash / chunk & retry counts).", body = FileListResponse),
-        (status = 404, description = "The project has never been seen."),
-        (status = 500, description = "SQLite read failure."),
+        (status = 400, description = "Malformed query parameter (e.g. unknown language).", body = ProblemDetails),
+        (status = 404, description = "The project has never been seen.", body = ProblemDetails),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn get_files(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-    Query(q): Query<FileListQuery>,
-) -> Result<Json<FileListResponse>, ErrorResponse> {
+    ApiQuery(q): ApiQuery<FileListQuery>,
+) -> Result<Json<FileListResponse>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
     let pg = project_guid;
 
@@ -1885,12 +1873,12 @@ pub async fn get_files(
         .from_cancelled()
         .map_err(|e| {
             error!(error = ?e, project_guid = %pg.0, "Failed to list project files from SQLite.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     match result {
         Some(files) => Ok(Json(FileListResponse { files })),
-        None => Err(StatusCode::NOT_FOUND.into()),
+        None => Err(ApiError::ProjectNotFound),
     }
 }
 
@@ -1920,15 +1908,21 @@ pub async fn get_files(
     responses(
         (status = 200, description = "Matched `failed` files requeued for the retry worker.", body = RetryResponse),
         (status = 204, description = "No `failed` files matched — nothing changed."),
-        (status = 500, description = "SQLite failure."),
+        (status = 400, description = "Oversized selector.", body = ProblemDetails),
+        (status = 500, description = "SQLite failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_retry(
-    Path(project_guid): Path<UUIDv4>,
+    ApiPath(project_guid): ApiPath<UUIDv4>,
     State(s): State<RouterState>,
-    Json(req): Json<RetryRequest>,
-) -> Result<Response, ErrorResponse> {
+    ApiJson(req): ApiJson<RetryRequest>,
+) -> Result<Response, ApiError> {
+    // Retry deliberately allows an empty body (= every `failed` file), so no
+    // non-empty-selector requirement — only the pattern-count cap applies.
+    validate::validate_selector(&req.include, s.max_selector_patterns)?;
+    validate::validate_selector(&req.exclude, s.max_selector_patterns)?;
+
     let guard = http3::CancellationGuard(CancellationToken::new());
     let pg = project_guid;
     let (where_sql, binds) = build_file_filter(pg, &req.include, &req.exclude);
@@ -1948,7 +1942,7 @@ pub async fn post_retry(
         .from_cancelled()
         .map_err(|e| {
             error!(error = ?e, project_guid = %pg.0, "Failed to requeue failed files.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     info!(project_guid = %pg.0, requeued_files, "Requeued failed files for the retry worker.");
@@ -1974,11 +1968,11 @@ pub async fn post_retry(
     tag = "Observability",
     responses(
         (status = 200, description = "Live runtime/concurrency snapshot.", body = StatusResponse),
-        (status = 500, description = "SQLite read failure."),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
-pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusResponse>, StatusCode> {
+pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusResponse>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
 
     let counts: Vec<(String, i64)> = s
@@ -1994,7 +1988,7 @@ pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusRespo
         .from_cancelled()
         .map_err(|e| {
             error!(error = %e, "Failed to read global file-status counts from SQLite.");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::from(e)
         })?;
 
     let mut files_by_status = FileStatusCounts::default();
@@ -2067,14 +2061,14 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
     tag = "Garbage Collection",
     responses(
         (status = 200, description = "GC pass completed; counts of what was physically removed.", body = GcResponse),
-        (status = 409, description = "A GC pass is already running (manual or the hourly worker) — retry later."),
+        (status = 409, description = "A GC pass is already running (manual or the hourly worker) — retry later.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
-pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, StatusCode> {
+pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, ApiError> {
     let Some(_guard) = crate::worker::gc::GcGuard::try_acquire(&s.gc_flag) else {
         info!("POST /gc rejected: a garbage-collection pass is already running.");
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::GcRunning);
     };
     let cg = http3::CancellationGuard(CancellationToken::new());
     let (chunks_removed, files_removed, status_log_pruned) =

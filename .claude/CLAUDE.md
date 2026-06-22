@@ -38,7 +38,12 @@ params, never globals — `EmbedTuning` (embed.rs), `BGEm3Tuning` (bge_m3.rs),
 `RetryTuning` (retry.rs), `QdrantStore`'s prefetch fields, `Slicer::new` token window,
 `SQLite3Pool::new` page/synchronous, and the rest via `RouterState` fields. A new knob =
 add the key to the right `config.rs` section + its `Default` + a validation rule, then
-thread it to the consumer (don't reintroduce a `const`).
+thread it to the consumer (don't reintroduce a `const`). **Request-shape limits are
+knobs too:** the `[limits]` section (`max_code_bytes`, `max_files_per_request`,
+`max_drift_files`, `max_selector_patterns`) and `[search].max_top_k`/`max_query_bytes`
+bound a request at the API edge — they reach the handlers via `RouterState` and feed the
+validation layer (see Error handling & validation). They are TOML-only (no CLI flag), so
+tuning them in a container means mounting a `config.toml`, not adding a `--flag`.
 
 ## Repository layout
 
@@ -48,13 +53,17 @@ src/
   config.rs             Cli (flags), Config (TOML sections), resolve() — XDG load + override + validate
   backend/
     http3.rs            RouterState, EmbeddingModel, CancellationGuard, run() (HTTP/1.1+2 today)
-    v0/{handlers,models}.rs   post_index/post_search; request/response types, ProgrammingLanguage, UUIDv4, GlobPattern
+    error.rs            ApiError (the client-error catalogue) + ProblemDetails (RFC 7807 body)
+    extract.rs          ApiJson/ApiPath/ApiQuery — extractors that render rejections as ApiError
+    openapi.rs          assembled OpenAPI doc (paths + schemas, incl. ProblemDetails)
+    v0/{handlers,models,validate}.rs   post_index/post_search; request/response types, ProgrammingLanguage, UUIDv4, GlobPattern; request-edge validation
   db/
     sqlite3.rs          SQLite3Pool, SQLite3PoolError
     qdrant.rs           VectorStore trait (+ QdrantStore impl), VectorStoreError, ChunkAsVector, collection_name/collection_for
     files.rs            set_file_status — shared project_files.status transition
     migrations/   v0.1.0_schema.sql (projects, project_files, project_file_chunks);
-                  v0.2.0_status_machine.sql (status-transition triggers + project_file_status_log)
+                  v0.2.0_status_machine.sql (status-transition triggers + project_file_status_log);
+                  v0.3.0_validation_checks.sql (defense-in-depth shape triggers: sha256-hex, line/column span, non-empty code, retry_count >= 0)
   models/bge_m3.rs      BGEm3HttpClient, BGEm3Model trait, EncodeError
   embed.rs              embed_and_upsert — shared embed→upsert pipeline, EmbedUpsertError
   slicing/traits.rs     Slicer, SlicedChunk, SlicerError, Tokenizing trait
@@ -68,6 +77,9 @@ tools/mcp/scout/        scout (Python/Poetry) — MCP stdio server; token-saving
 embedder/               vendored BGE-M3 server (3 heads); host-run + GPU, NOT in the image — see embedder/README.md
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
+
+(`docker-compose.override.yml` is a local-only, untracked file some maintainers use to
+point the mindex container at host-run Qdrant — see Docker & CI.)
 
 ## Core invariants (violating these causes bugs)
 
@@ -295,12 +307,41 @@ one isn't test-constructible. `SQLite3Pool` is intentionally **not** a trait (it
 generic-closure `transaction` isn't object-safe) — test DB code against a real
 `:memory:` pool.
 
-## Error handling & logging
+## Error handling, validation & logging
+
+**The client error contract is `ApiError` → RFC 7807 (`backend/error.rs`).** Every
+non-2xx response is an `application/problem+json` body (`ProblemDetails`) carrying a
+**stable, namespaced machine `code`** (`validation.top_k_out_of_range`, `selector.empty`,
+`project.not_found`, `embedder.unavailable`, …) plus English `title`/`detail` and an
+optional `field`/`meta`. The `code` is the **localization key** — the server stays
+English; a client maps `code` → its own catalogue and interpolates `meta`. `ApiError` is
+the *single* enum (one variant per kind); its `code()`/`status()`/`title()`/`detail()`/
+`meta()` and the lone `IntoResponse` impl are the only place a response shape is built.
+**Codes are an API contract:** the `codes_are_stable` snapshot test fails on any
+rename/add/remove, so changing one is deliberate (also update the OpenAPI catalogue in
+`openapi.rs`'s `info.description` and any client). Handlers return `Result<_, ApiError>`;
+domain errors reach it via `From`/explicit constructors at the call site (which keep the
+contextual log + sysadmin hint — `From` itself is a pure mapping and never logs).
 
 - Domain errors (`SQLite3PoolError`, `SlicerError`, `EncodeError`, `VectorStoreError`,
-  `EmbedUpsertError`) are convertible to HTTP statuses. No external error crates;
-  follow `slicer_err_to_pool_err` / `from_cancelled`. `from_cancelled` maps the
-  `None` from `with_cancellation_token` (timeout/cancel) to `Cancelled`.
+  `EmbedUpsertError`) convert into `ApiError` (`SQLite3PoolError::Cancelled` → `Cancelled`
+  = 499, else `Internal`; embed/encode request/decode → `EmbedderUnavailable` = 503; Qdrant
+  search → `QdrantUnavailable`, upsert/drop → `Internal`). No external error crates;
+  `from_cancelled` still maps the `None` from `with_cancellation_token` (timeout/cancel) to
+  `SQLite3PoolError::Cancelled` first.
+
+**Validation happens at the edge (`backend/v0/validate.rs`), before any work**, so bad
+input is a 400 with a precise `code` — never an opaque 500 from a SQLite `CHECK`. It
+**mirrors the schema constraints** (`validate_path` = the `project_files.path` CHECK plus
+a `..`-traversal guard; `validate_sha256_hex` = 64 hex chars) and enforces the `[limits]`/
+`search.max_*` caps (`top_k`, query length, per-file code size, file/drift counts,
+selector size). `require_nonempty_selector` is the shared empty-selector guard for the
+destructive management endpoints. The schema `CHECK`s/`v0.3.0` triggers remain as
+**defense-in-depth** behind this (a bug that bypasses the edge still can't write bad
+rows). **Uniform rejections:** handlers take `ApiJson`/`ApiPath`/`ApiQuery` (`extract.rs`)
+instead of the bare axum extractors, so a malformed body, a non-UUID path, or a bad query
+string is the same problem+json envelope (`request.malformed_body`/`malformed_path`) — not
+axum's default plain-text 400.
 - No `unwrap`/`expect` in production paths (workers use `unwrap_or_default` for
   best-effort queries). Startup-only panics (`SQLite3Pool::new`) use
   `unwrap_or_else(|e| panic!(...))` naming the file and what to check.
@@ -411,31 +452,46 @@ they take the GUID + filters as call args).
   BuildKit) supported; no `--mount=type=cache`.
 - `entrypoint.sh` generates a self-signed RSA-4096 cert into the `mindex_certs`
   volume on first start.
-- **Prod compose** (`docker-compose.yml`): `qdrant` + `mindex`;
-  `extra_hosts: host.docker.internal:host-gateway` lets the container reach a
-  host-run embedder. The embedder source is vendored in `embedder/` but is
-  deliberately *not* built or composed here — its heavy GPU deps (~8 GB torch) keep
-  it on the host; it's a temporary wrapper until an off-the-shelf server emits all
-  three BGE-M3 heads.
+Three compose files, three roles (all build the **same** `Dockerfile`):
+- **Prod compose** (`docker-compose.yml`): the turnkey/reference stack — `qdrant` +
+  `mindex` — *and* the perf-benchmark harness (the `command:` flags read from the
+  environment; swap a profile with `docker compose --env-file perf/env/<f>.env up -d`,
+  see `.env.example`). `extra_hosts: host.docker.internal:host-gateway` lets the
+  container reach a **host-run embedder** (deliberately not composed — its ~8 GB torch
+  deps keep it on the host; a temporary wrapper until an off-the-shelf server emits all
+  three BGE-M3 heads). It is the canonical reference for the server's flags. Because the
+  `[limits]`/`search.max_*` knobs are TOML-only, tuning them in the container means
+  mounting a `config.toml` (the flags here don't cover them; defaults are sensible).
+- **Local override** (`docker-compose.override.yml`, **untracked**, auto-merged): some
+  maintainers run Qdrant as a host service instead of the bundled container; this
+  overrides `mindex.command`'s `--qdrant-server` to `host.docker.internal:6334`. Start
+  with `docker compose up -d --no-deps mindex`. Optional and personal — not committed.
 - **Test compose** (`docker-compose.test.yml`, doesn't extend base): qdrant +
-  mock-embedder + mindex + test-runner. Run:
+  mock-embedder + mindex + test-runner — the integration-test stack (mindex's *primary*
+  containerized use). Run:
   `docker compose -f docker-compose.test.yml up --build --exit-code-from test-runner --abort-on-container-exit`.
   Healthchecks use `/dev/tcp` (qdrant) and `urllib` (embedder) because neither image
   has curl. `mindex` has no host port; test-runner reaches it on the internal net.
+  Migrations are additive (incl. `v0.3.0`'s `IF NOT EXISTS` triggers), so a re-run
+  against the persisted `test_mindex_db` volume does **not** need a volume drop.
 
 ## Tests
 
 - **Unit** (`cargo test --bin mindex`): slicer (incl. a fake-`Tokenizing` test, no
   HF download), `build_search_query` SQL/param numbering, `embed_and_upsert` via fake
   `BGEm3Model` + fake `VectorStore`, SQLite pool (incl. the connection-leak
-  regression), GC sweep (incl. the orphan-prevention regression via a `FakeStore`).
+  regression), GC sweep (incl. the orphan-prevention regression via a `FakeStore`),
+  the `ApiError` → `ProblemDetails` envelope + the `codes_are_stable` contract snapshot
+  (`backend/error.rs`), and the per-rule validation tests (`backend/v0/validate.rs`).
   No server/Docker; some slicer tests need the BGE-M3 tokenizer from the HF cache.
 - **Integration** (`tests/integration/`, pytest in Docker): mock embedder returns
   deterministic vectors seeded by text hash (stable ranking assertions). `test_e2e.py`
   is the rust happy path; `test_filters_and_languages.py` covers non-rust languages
   and include/exclude (language + path-GLOB) filters; `test_management.py` covers the
   stats / delete-project / delete-files / GC endpoints (each deletion test calls
-  `POST /gc` to confirm physical removal). Fresh project GUID per test.
+  `POST /gc` to confirm physical removal); `test_validation.py` asserts the
+  problem+json envelope + expected `code` for bad path / over-cap top_k / empty query /
+  empty selector / bad sha256 / malformed body / non-UUID path. Fresh project GUID per test.
 
 ## Linting (zero warnings everywhere — non-default flags matter)
 
@@ -456,9 +512,13 @@ they take the GUID + filters as call args).
 1. New loops touching Qdrant/SQLite/model-server must respect the `CancellationToken`.
 2. Multi-row DB writes go inside a `transaction`.
 3. New endpoints register in `backend::http3::run`, use `RouterState`, `{param}` route
-   syntax, `#[debug_handler]`. They also need a `#[utoipa::path(...)]` annotation (tag =
-   one of the existing groups, documented responses, a `**Concurrency:**` note) **and**
-   an entry in `backend::openapi.rs`'s `paths(...)` (+ any new body/response type in
+   syntax, `#[debug_handler]`, and the `ApiJson`/`ApiPath`/`ApiQuery` extractors (not the
+   bare axum ones) so rejections stay problem+json. Return `Result<_, ApiError>` and
+   validate inputs at the top via `backend::v0::validate` (a new check = a new `ApiError`
+   variant + its `code`/`status`/`detail` arms + the `codes_are_stable` snapshot + a unit
+   test). They also need a `#[utoipa::path(...)]` annotation (tag = one of the existing
+   groups, every error response citing `body = ProblemDetails`, a `**Concurrency:**` note)
+   **and** an entry in `backend::openapi.rs`'s `paths(...)` (+ any new body/response type in
    `schemas(...)`) — a handler missing there is silently absent from Swagger, not a
    compile error; the `openapi_spec_is_complete_and_versioned` test guards the path count.
    Swagger UI is served at `/swagger-ui`, the raw spec at `/api-docs/openapi.json`; the
@@ -471,4 +531,7 @@ they take the GUID + filters as call args).
    status-changing paths need a transition test.
 7. Adding a language → the full checklist under **Languages**.
 8. Schema change → new migration file in the `MIGRATIONS` slice; the DB is
-   droppable (no upgrade path).
+   droppable (no upgrade path). SQLite can't `ALTER` a `CHECK` onto an existing table, so
+   add new constraints as `BEFORE INSERT/UPDATE` triggers (the `v0.2.0` status machine /
+   `v0.3.0` validation checks pattern) — additive, so they apply to a persisted DB without
+   a volume drop. A *column* change (vs. a constraint) still needs a fresh DB.

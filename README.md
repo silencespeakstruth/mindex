@@ -162,7 +162,13 @@ docker compose up -d --build
 ```
 
 mindex listens on `https://localhost:11111` (a self-signed cert is generated on first
-start; mount real certs at `/certs` to override).
+start; mount real certs at `/certs` to override). This compose file is the **turnkey
+stack** and the canonical reference for the server's flags; it doubles as the
+perf-benchmark harness (swap a profile with `docker compose --env-file perf/env/<f>.env
+up -d`). A separate `docker-compose.test.yml` (Qdrant + a mock embedder + mindex +
+pytest runner) is used only for the integration suite — see **Testing** below — and the
+untracked `docker-compose.override.yml` is an optional local tweak to point mindex at a
+host-run Qdrant.
 
 **3 — Build the host tools** (once). The indexer is a small Rust crate; the search tool
 is a shell script needing `curl` + `jq` (plus `pygmentize` for color):
@@ -222,6 +228,16 @@ Garbage Collection / Observability / Config) are served as **Swagger UI at
 | `GET /health` | Readiness: pings SQLite + Qdrant + the embedder, reports files currently indexing. |
 | `GET /version` | Running mindex version. |
 
+**Errors.** Every non-2xx response is an [RFC 7807](https://datatracker.ietf.org/doc/html/rfc7807)
+`application/problem+json` body with a **stable, namespaced machine `code`** — e.g.
+`validation.top_k_out_of_range`, `selector.empty`, `project.not_found`,
+`embedder.unavailable` — plus an English `title`/`detail` and, for field errors, a `field`
+and a structured `meta` (`{min, max, got, …}`). The `code` is the contract a client keys
+on (and the key it localizes against — the prose is English and informational). Bad input
+is rejected at the edge as a `400` with a precise code (an invalid path, an oversized
+query, `top_k` over the cap, a malformed body) rather than surfacing as an opaque `500`.
+The full code catalogue is in the Swagger description.
+
 ## Key configuration
 
 mindex is configured in two layers: a **TOML config file** (base values) plus **CLI
@@ -244,6 +260,12 @@ context):
 - `--db-path` — SQLite metadata file.
 - `--embed-batch` — chunks per `/encode` call (GPU-load lever; match the embedder's `--batch`).
 
+**Request limits** are tunable too — the `[limits]` section (`max_code_bytes`,
+`max_files_per_request`, `max_drift_files`, `max_selector_patterns`) and
+`[search].max_top_k` / `max_query_bytes` bound a request at the API edge (each violation
+is a `400` with a stable code). They live in the TOML file only (no CLI flag), so a
+containerized server tunes them by mounting a `config.toml`; the defaults are generous.
+
 The `mindex-index` CLI follows the same scheme (`~/.config/mindex/indexer.toml`; see
 [`tools/indexer/indexer.example.toml`](tools/indexer/indexer.example.toml)).
 
@@ -261,6 +283,21 @@ BGE-M3's three-head GPU forward **directly, once per batch**, bypassing FlagEmbe
 discard-and-retry double forward. Together these multiplied indexing throughput several
 times over; see [`embedder/README.md`](embedder/README.md) and
 [`perf/README.md`](perf/README.md) for the full investigation.
+
+## Testing
+
+- **Unit tests** run natively, no services: `cargo test --bin mindex` (some slicer tests
+  need the BGE-M3 tokenizer in the local Hugging Face cache).
+- **Integration tests** run the whole stack in Docker against a deterministic mock
+  embedder (no GPU), via a dedicated compose file:
+
+  ```sh
+  docker compose -f docker-compose.test.yml up --build \
+      --exit-code-from test-runner --abort-on-container-exit
+  ```
+
+  This is mindex's primary containerized use. Each test uses a fresh project GUID;
+  migrations are additive, so re-runs against the persisted volume need no reset.
 
 ## Status & roadmap
 

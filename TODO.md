@@ -41,6 +41,12 @@ is *not done* or *deliberately constrained*.
 
 ## Future work
 
+- **Server-side error-message localization.** The error contract is in place — every
+  failure is RFC 7807 `application/problem+json` with a stable, namespaced `code`
+  (`backend/error.rs`) plus structured `meta` for interpolation — but the server only
+  emits English `title`/`detail`. A client localizes by keying on `code`. If
+  server-driven translation is ever wanted, add a `code` → localized-template table
+  (selected by `Accept-Language`); no code outside `ApiError::detail`/`title` changes.
 - **Performance benchmarks for large-codebase indexing.** The "fast indexing"
   claim is so far unmeasured — no reproducible benchmark suite exists. Needed
   before quoting any numbers.
@@ -68,12 +74,13 @@ is *not done* or *deliberately constrained*.
 - **A claim collision penalizes innocent files in the same batch.** When a multi-file
   `/index` batch hits 429 on *one* contended file, `post_index` recovers every
   already-prepared file in that batch to `failed` with `retry_count += 1` (it can't
-  tell a contention 429 from a genuine prepare error — `prepare` returns an opaque
-  `ErrorResponse`). No corruption (the retry worker re-indexes them), but repeated
-  collisions on the same co-batched file could burn its 3 retries and strand it in
-  `failed`. Fix: have `prepare` signal contention distinctly (e.g. a `Contended`
-  variant) so the batch recovers those files **without** incrementing retry, or simply
-  leaves them `indexing` for the worker.
+  tell a contention 429 from a genuine prepare error — `prepare` returns an `ApiError`
+  and `post_index` recovers on *any* `Err`). No corruption (the retry worker re-indexes
+  them), but repeated collisions on the same co-batched file could burn its 3 retries
+  and strand it in `failed`. Fix: have `prepare` signal contention distinctly (it
+  already returns `ApiError::FileInFlight`, so `post_index` could branch on it) so the
+  batch recovers those files **without** incrementing retry, or simply leaves them
+  `indexing` for the worker.
 
 ## Assumptions
 

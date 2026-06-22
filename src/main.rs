@@ -30,6 +30,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("db/migrations/v0.1.0_schema.sql"),
     include_str!("db/migrations/v0.2.0_status_machine.sql"),
+    include_str!("db/migrations/v0.3.0_validation_checks.sql"),
 ];
 
 #[tokio::main]
@@ -199,6 +200,12 @@ async fn main() -> Result<(), BoxError> {
                 min_chunk_tokens: cfg.slicer.min_chunk_tokens,
                 max_chunk_tokens: cfg.slicer.max_chunk_tokens,
                 default_top_k: cfg.search.default_top_k,
+                max_top_k: cfg.search.max_top_k,
+                max_query_bytes: cfg.search.max_query_bytes,
+                max_code_bytes: cfg.limits.max_code_bytes,
+                max_files_per_request: cfg.limits.max_files_per_request,
+                max_drift_files: cfg.limits.max_drift_files,
+                max_selector_patterns: cfg.limits.max_selector_patterns,
                 path_batch_size: cfg.indexing.path_batch_size,
                 status_log_retention_days: cfg.workers.status_log_retention_days,
                 max_retries: cfg.workers.max_retries,
