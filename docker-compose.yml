@@ -3,27 +3,22 @@
 # the perf-benchmark harness: the command flags read from the environment, so a profile
 # swaps in with `docker compose --env-file perf/env/<f>.env up -d` (see .env.example).
 #
-# Integration tests use docker-compose.test.yml instead (not this file). A maintainer
-# running Qdrant on the host can drop the bundled qdrant via the untracked, auto-merged
-# docker-compose.override.yml (`docker compose up -d --no-deps mindex`).
+# No host ports are published: the whole stack lives on the internal compose network and
+# talks to itself there. The only host boundary it crosses is OUTBOUND — reaching the
+# embedder on the host (host.docker.internal:11211, via extra_hosts below). Integration
+# tests use docker-compose.test.yml instead (not this file).
 services:
 
   qdrant:
     image: qdrant/qdrant:v1.14.1
     volumes:
       - qdrant_data:/qdrant/storage
-    # Dashboard/REST (6333) + gRPC (6334) published to loopback only — the service
-    # has no auth, so it must not be exposed on all interfaces. mindex itself
-    # reaches Qdrant over the internal compose network, not these host ports.
-    ports:
-      - "127.0.0.1:6333:6333"
-      - "127.0.0.1:6334:6334"
+    # No ports published — Qdrant has no auth and must not be exposed on the host.
+    # mindex reaches it over the internal compose network (http://qdrant:6334).
     restart: unless-stopped
 
   mindex:
     build: .
-    ports:
-      - "11111:11111"
     volumes:
       - mindex_db:/data
       - hf_cache:/root/.cache/huggingface

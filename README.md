@@ -161,14 +161,18 @@ uv run python -m bge_m3_api --port 11211          # binds 0.0.0.0; ~4–6 GB VRA
 docker compose up -d --build
 ```
 
-mindex listens on `https://localhost:11111` (a self-signed cert is generated on first
-start; mount real certs at `/certs` to override). This compose file is the **turnkey
-stack** and the canonical reference for the server's flags; it doubles as the
-perf-benchmark harness (swap a profile with `docker compose --env-file perf/env/<f>.env
-up -d`). A separate `docker-compose.test.yml` (Qdrant + a mock embedder + mindex +
-pytest runner) is used only for the integration suite — see **Testing** below — and the
-untracked `docker-compose.override.yml` is an optional local tweak to point mindex at a
-host-run Qdrant.
+mindex listens on `:11111` **inside the compose network only** — this stack publishes
+**no host ports** (Qdrant has no auth and mustn't be exposed; the API stays off the host
+by default). A self-signed cert is generated on first start (mount real certs at `/certs`
+to override). The container still reaches the host embedder *outbound* via
+`host.docker.internal:11211`. To drive the API from the host (the indexer / search /
+MCP tools below all target `https://localhost:11111`), publish the port yourself — add a
+`ports: ["127.0.0.1:11111:11111"]` to the `mindex` service in a personal compose file, or
+run the host tools from inside the network. This compose file is the **turnkey stack** and
+the canonical reference for the server's flags; it doubles as the perf-benchmark harness
+(swap a profile with `docker compose --env-file perf/env/<f>.env up -d`). A separate
+`docker-compose.test.yml` (Qdrant + a mock embedder + mindex + pytest runner) is used only
+for the integration suite — see **Testing** below.
 
 **3 — Build the host tools** (once). The indexer is a small Rust crate; the search tool
 is a shell script needing `curl` + `jq` (plus `pygmentize` for color):

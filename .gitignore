@@ -15,7 +15,5 @@ certs/
 
 .claude/settings.local.json
 
-docker-compose.override.yml
-
 .mypy_cache
 .ruff_cache

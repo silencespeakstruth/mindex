@@ -78,9 +78,6 @@ embedder/               vendored BGE-M3 server (3 heads); host-run + GPU, NOT in
 Dockerfile, docker-compose{,.test}.yml, rust-toolchain.toml (pins 1.95)
 ```
 
-(`docker-compose.override.yml` is a local-only, untracked file some maintainers use to
-point the mindex container at host-run Qdrant — see Docker & CI.)
-
 ## Core invariants (violating these causes bugs)
 
 **Project isolation = collection + has_id filter.** Qdrant uses one collection per
@@ -452,20 +449,19 @@ they take the GUID + filters as call args).
   BuildKit) supported; no `--mount=type=cache`.
 - `entrypoint.sh` generates a self-signed RSA-4096 cert into the `mindex_certs`
   volume on first start.
-Three compose files, three roles (all build the **same** `Dockerfile`):
+Two compose files, two roles (both build the **same** `Dockerfile`):
 - **Prod compose** (`docker-compose.yml`): the turnkey/reference stack — `qdrant` +
   `mindex` — *and* the perf-benchmark harness (the `command:` flags read from the
   environment; swap a profile with `docker compose --env-file perf/env/<f>.env up -d`,
-  see `.env.example`). `extra_hosts: host.docker.internal:host-gateway` lets the
-  container reach a **host-run embedder** (deliberately not composed — its ~8 GB torch
-  deps keep it on the host; a temporary wrapper until an off-the-shelf server emits all
-  three BGE-M3 heads). It is the canonical reference for the server's flags. Because the
-  `[limits]`/`search.max_*` knobs are TOML-only, tuning them in the container means
-  mounting a `config.toml` (the flags here don't cover them; defaults are sensible).
-- **Local override** (`docker-compose.override.yml`, **untracked**, auto-merged): some
-  maintainers run Qdrant as a host service instead of the bundled container; this
-  overrides `mindex.command`'s `--qdrant-server` to `host.docker.internal:6334`. Start
-  with `docker compose up -d --no-deps mindex`. Optional and personal — not committed.
+  see `.env.example`). **Publishes no host ports** — the whole stack lives on the
+  internal compose network (mindex → Qdrant at `http://qdrant:6334`); the only host
+  boundary it crosses is *outbound*, via `extra_hosts: host.docker.internal:host-gateway`,
+  which lets the container reach a **host-run embedder** (`:11211`, deliberately not
+  composed — its ~8 GB torch deps keep it on the host; a temporary wrapper until an
+  off-the-shelf server emits all three BGE-M3 heads). It is the canonical reference for
+  the server's flags. Because the `[limits]`/`search.max_*` knobs are TOML-only, tuning
+  them in the container means mounting a `config.toml` (the flags here don't cover them;
+  defaults are sensible).
 - **Test compose** (`docker-compose.test.yml`, doesn't extend base): qdrant +
   mock-embedder + mindex + test-runner — the integration-test stack (mindex's *primary*
   containerized use). Run:
