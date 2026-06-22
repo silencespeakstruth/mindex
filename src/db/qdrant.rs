@@ -29,6 +29,33 @@ use crate::backend::v0::models::UUIDv4;
 
 const COLLECTION_SCHEMA_VERSION: &str = "v0";
 
+/// Dense / ColBERT vector width. **Structural, not configurable**: it is dictated by
+/// the BGE-M3 model and baked into every collection's schema — changing it without a
+/// matching model + collection rebuild silently breaks search.
+const VECTOR_DIM: u64 = 1024;
+
+/// Production [`VectorStore`] backed by a Qdrant client plus the retrieval prefetch
+/// limits from `[qdrant]` config. Wrapping the external `Qdrant` (rather than impl'ing
+/// the trait on it directly) is what lets the tuning travel with the store without
+/// widening the trait's `search` signature for every test fake.
+pub struct QdrantStore {
+    client: Qdrant,
+    dense_prefetch_limit: u32,
+    sparse_prefetch_limit: u32,
+    fusion_limit: u32,
+}
+
+impl QdrantStore {
+    pub fn new(
+        client: Qdrant,
+        dense_prefetch_limit: u32,
+        sparse_prefetch_limit: u32,
+        fusion_limit: u32,
+    ) -> Self {
+        Self { client, dense_prefetch_limit, sparse_prefetch_limit, fusion_limit }
+    }
+}
+
 pub fn collection_name(project_guid_simple: &str) -> String {
     format!("{}_{}", project_guid_simple, COLLECTION_SCHEMA_VERSION)
 }
@@ -129,20 +156,22 @@ pub trait VectorStore: Send + Sync {
 }
 
 #[async_trait]
-impl VectorStore for Qdrant {
+impl VectorStore for QdrantStore {
     async fn ensure_project(&self, collection: &str) -> Result<(), VectorStoreError> {
-        if self.collection_exists(collection).await? {
+        if self.client.collection_exists(collection).await? {
             return Ok(());
         }
 
         let mut vectors_config = VectorsConfigBuilder::default();
 
-        vectors_config
-            .add_named_vector_params("dense", VectorParamsBuilder::new(1024, Distance::Cosine));
+        vectors_config.add_named_vector_params(
+            "dense",
+            VectorParamsBuilder::new(VECTOR_DIM, Distance::Cosine),
+        );
 
         vectors_config.add_named_vector_params(
             "colbert",
-            VectorParamsBuilder::new(1024, Distance::Cosine)
+            VectorParamsBuilder::new(VECTOR_DIM, Distance::Cosine)
                 .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim)),
         );
 
@@ -157,6 +186,7 @@ impl VectorStore for Qdrant {
         // so the claim can't serialize it.) Matched on the rendered message because the
         // client surfaces no typed "already exists" variant.
         if let Err(e) = self
+            .client
             .create_collection(
                 CreateCollectionBuilder::new(collection)
                     .vectors_config(vectors_config)
@@ -180,7 +210,8 @@ impl VectorStore for Qdrant {
     ) -> Result<(), VectorStoreError> {
         let points: Vec<PointStruct> = chunks.into_iter().map(|c| c.into()).collect();
 
-        self.upsert_points(UpsertPointsBuilder::new(collection, points))
+        self.client
+            .upsert_points(UpsertPointsBuilder::new(collection, points))
             .await?;
 
         Ok(())
@@ -191,7 +222,8 @@ impl VectorStore for Qdrant {
         collection: &str,
         qdrant_guids: Vec<String>,
     ) -> Result<(), VectorStoreError> {
-        self.delete_points(DeletePointsBuilder::new(collection).points(qdrant_guids))
+        self.client
+            .delete_points(DeletePointsBuilder::new(collection).points(qdrant_guids))
             .await?;
 
         Ok(())
@@ -201,15 +233,15 @@ impl VectorStore for Qdrant {
         // Idempotent: skip if it never existed (e.g. a project deleted before any
         // file was indexed, or a repeated DELETE). Qualified call avoids resolving
         // back into this trait method.
-        if !self.collection_exists(collection).await? {
+        if !self.client.collection_exists(collection).await? {
             return Ok(());
         }
-        Qdrant::delete_collection(self, collection).await?;
+        self.client.delete_collection(collection).await?;
         Ok(())
     }
 
     async fn health(&self) -> Result<(), VectorStoreError> {
-        self.health_check().await?;
+        self.client.health_check().await?;
         Ok(())
     }
 
@@ -243,28 +275,30 @@ impl VectorStore for Qdrant {
         // load-bearing. `QueryPointsBuilder` has a single `query` field, so two flat
         // `.query()` calls would make the second silently overwrite the first; the
         // RRF fusion would vanish and only the ColBERT rerank would run. Instead the
-        // inner prefetch fuses dense+sparse (RRF) into a 200-candidate pool, and the
-        // outer query reranks that pool with ColBERT MaxSim.
+        // inner prefetch fuses dense+sparse (RRF) into a `fusion_limit`-candidate pool,
+        // and the outer query reranks that pool with ColBERT MaxSim. The prefetch /
+        // fusion limits come from `[qdrant]` config.
         let fusion_prefetch = PrefetchQueryBuilder::default()
             .prefetch(vec![
                 PrefetchQueryBuilder::default()
                     .query(dense)
                     .using("dense")
-                    .limit(200u32)
+                    .limit(self.dense_prefetch_limit)
                     .filter(filter.clone())
                     .build(),
                 PrefetchQueryBuilder::default()
                     .query(Query::from(sparse_query))
                     .using("sparse")
-                    .limit(200u32)
+                    .limit(self.sparse_prefetch_limit)
                     .filter(filter.clone())
                     .build(),
             ])
             .query(Query::new_fusion(Fusion::Rrf))
-            .limit(200u32)
+            .limit(self.fusion_limit)
             .build();
 
         let response = self
+            .client
             .query(
                 QueryPointsBuilder::new(collection)
                     .prefetch(vec![fusion_prefetch])

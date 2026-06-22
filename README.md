@@ -106,6 +106,30 @@ resurrects it).
 | **mindex** (`tools/mcp/mindex/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md). |
 | **scout** (`tools/mcp/scout/`) | Second MCP server: a **token-saving** layer over the same search API. The agent sends a few decomposed sub-queries, a local LLM reads the chunks and returns only a compact summary + `file:line` pointers, so raw code never enters the agent's context — roughly an order-of-magnitude less context than raw search on a survey. Orient with its `digest` tool, then follow its pointers with raw `search` for exact code. See [`tools/mcp/scout/README.md`](tools/mcp/scout/README.md). |
 
+## Install (native CLI)
+
+To get the host commands on your `PATH` instead of running them from the build tree,
+install them with `cargo install` (the idiomatic Rust route — no sudo). They land in
+`~/.cargo/bin`, so make sure that's on your `PATH` (`export PATH="$HOME/.cargo/bin:$PATH"`
+in your shell rc — on a default rustup setup it often isn't):
+
+```sh
+cargo install --locked --path .             # mindex (server)
+cargo install --locked --path tools/indexer # mindex-index (separate crate)
+ln -sf "$PWD/tools/search/mindex-search.sh" ~/.cargo/bin/mindex-search
+```
+
+Re-run the `cargo install` lines (add `--force`) after pulling changes to rebuild in
+place. **Prereqs:** rustup (the pinned 1.95 toolchain auto-installs from
+`rust-toolchain.toml`) plus the usual native build deps (`cc`/`clang`, `cmake`,
+`protoc`, `pkg-config`); `mindex-search` needs `jq`, and `pygmentize`
+(`python-pygments`) is optional for syntax-highlighted output.
+
+> The native **`mindex` server** binary still needs its runtime to actually *run* — TLS
+> cert/key paths, the XDG `mindex/config.toml`, and a reachable Qdrant + embedder. The
+> canonical deployment stays docker-compose (below); the native binary is handy for
+> `mindex --help`, `--version`, and ad-hoc runs.
+
 ## Running
 
 **The shape of it.** Three services and two host-side CLI tools. The dependency order
@@ -200,14 +224,28 @@ Garbage Collection / Observability / Config) are served as **Swagger UI at
 
 ## Key configuration
 
-Server flags (see `mindex --help` for the full set; `docker-compose.yml` for defaults in
+mindex is configured in two layers: a **TOML config file** (base values) plus **CLI
+flags** that override it. Precedence is `flag > file > built-in default`. The file is
+found by XDG convention — `--config <path>` / `$MINDEX_CONFIG`, then
+`$XDG_CONFIG_HOME/mindex/config.toml` (i.e. `~/.config/mindex/config.toml`), then
+`$XDG_CONFIG_DIRS/*/mindex/config.toml`. A missing file is fine (defaults are used). At
+startup mindex logs which paths it checked, the file it loaded, and every value a flag
+overrode; an invalid config aborts startup with an explanation. See
+[`config.example.toml`](config.example.toml) for every key (each carries its unit, e.g.
+`embed_batch_chunks`, `gc_interval_seconds`, `health_timeout_ms`) and its default.
+
+Common flags (see `mindex --help` for the full set; `docker-compose.yml` for defaults in
 context):
 
+- `--config` — path to a TOML config file (overrides XDG discovery).
 - `--bind` — listen address (default `127.0.0.1:11111`).
 - `--model-server` — embedder URL (default `http://localhost:11211`).
 - `--qdrant-server` — Qdrant gRPC URL (default `http://localhost:6334`).
 - `--db-path` — SQLite metadata file.
 - `--embed-batch` — chunks per `/encode` call (GPU-load lever; match the embedder's `--batch`).
+
+The `mindex-index` CLI follows the same scheme (`~/.config/mindex/indexer.toml`; see
+[`tools/indexer/indexer.example.toml`](tools/indexer/indexer.example.toml)).
 
 ## Why a custom embedder?
 

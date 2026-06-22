@@ -13,17 +13,45 @@ AST chunking → `BGE-M3` multi-vector embeddings (dense/sparse/ColBERT) → `Qd
 vectors + `SQLite3` metadata. Internal service: TLS is the only transport security,
 no API auth.
 
+## Configuration (two-level: TOML file + CLI flags)
+
+`config.rs` owns it. Precedence is **CLI flag > TOML file > compiled default**, and
+the *only* place defaults live is the `Default` impls in `config.rs` — clap holds no
+`default_value` (every flag is `Option<T>`, so "passed" is distinguishable from
+"absent"; that's what makes the override layering work). `resolve()` finds the file by
+XDG canon (`--config`/`$MINDEX_CONFIG` → `$XDG_CONFIG_HOME/mindex/config.toml` →
+`$XDG_CONFIG_DIRS/*/mindex/config.toml`; a missing file is fine → defaults), logs
+every path it checked, the source it loaded, and **every flag override**, then
+validates. Validation collects *all* problems (not fail-fast) with what/why/how-to-fix
+messages; any error aborts startup (`deny_unknown_fields` makes a mis-typed key a parse
+error). Keys carry their unit (`*_ms/_seconds/_minutes/_days/_chunks/_tokens/_bytes/
+_points/_mib`). The indexer CLI has the same scheme in `tools/indexer/src/config.rs`
+(`mindex/indexer.toml`). Documented examples: `config.example.toml`,
+`tools/indexer/indexer.example.toml`.
+
+**Only genuine tuning knobs are configurable.** Structural invariants stay as `const`
+next to their code with a "why not configurable" comment — they would break the system
+if changed alone: the BGE-M3 vector width `1024` (`qdrant.rs::VECTOR_DIM`),
+`ENCODE_MAGIC`, `COLLECTION_SCHEMA_VERSION`, HTTP `499`, and `PRAGMA foreign_keys=ON`
+/ `journal_mode=WAL`. **Threading:** config values reach code through constructors/
+params, never globals — `EmbedTuning` (embed.rs), `BGEm3Tuning` (bge_m3.rs),
+`RetryTuning` (retry.rs), `QdrantStore`'s prefetch fields, `Slicer::new` token window,
+`SQLite3Pool::new` page/synchronous, and the rest via `RouterState` fields. A new knob =
+add the key to the right `config.rs` section + its `Default` + a validation rule, then
+thread it to the consumer (don't reintroduce a `const`).
+
 ## Repository layout
 
 ```
 src/
   main.rs               CLI (clap), startup, migrations, worker spawn, signal handling
+  config.rs             Cli (flags), Config (TOML sections), resolve() — XDG load + override + validate
   backend/
     http3.rs            RouterState, EmbeddingModel, CancellationGuard, run() (HTTP/1.1+2 today)
     v0/{handlers,models}.rs   post_index/post_search; request/response types, ProgrammingLanguage, UUIDv4, GlobPattern
   db/
     sqlite3.rs          SQLite3Pool, SQLite3PoolError
-    qdrant.rs           VectorStore trait (+impl for Qdrant), VectorStoreError, ChunkAsVector, collection_name/collection_for
+    qdrant.rs           VectorStore trait (+ QdrantStore impl), VectorStoreError, ChunkAsVector, collection_name/collection_for
     files.rs            set_file_status — shared project_files.status transition
     migrations/   v0.1.0_schema.sql (projects, project_files, project_file_chunks);
                   v0.2.0_status_machine.sql (status-transition triggers + project_file_status_log)
@@ -247,7 +275,7 @@ Recovery is per-batch: if any `prepare` or the shared embed fails, every
 already-prepared file (still `indexing`, chunks inserted) is recovered to
 `failed`/`cancelled` via `recover_all` and the retry worker re-embeds them later.
 `tree_sitter::Parser` is `Send`, so the slicer is built inside the `spawn_blocking`
-closure. The `/index` request body limit is `--max-body-mb` (default 256 MiB) via
+closure. The `/index` request body limit is `[server].max_body_mib` / `--max-body-mib` (default 256 MiB) via
 `DefaultBodyLimit` — axum's 2 MB default is far too small for multi-file posts.
 
 ## Mockable interfaces

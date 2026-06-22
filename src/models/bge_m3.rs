@@ -6,12 +6,18 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-/// On HTTP 429 (the embedder's "resource busy" backpressure) `encode` retries this
-/// many times with exponential backoff before giving up — at which point the file
-/// is marked failed and the retry worker re-attempts it later.
-const MAX_429_RETRIES: u32 = 3;
-/// First backoff; doubles each retry (200ms → 400ms → 800ms).
-const BACKOFF_BASE: Duration = Duration::from_millis(200);
+/// Operational tuning for the embedder HTTP client (all from `[model]` config).
+#[derive(Debug, Clone, Copy)]
+pub struct BGEm3Tuning {
+    /// On HTTP 429 (the embedder's "resource busy" backpressure) `encode` retries
+    /// this many times with exponential backoff before giving up — at which point
+    /// the file is marked failed and the retry worker re-attempts it later.
+    pub max_429_retries: u32,
+    /// First 429 backoff; doubles each retry (e.g. 200ms → 400ms → 800ms).
+    pub backoff_base_ms: u64,
+    /// Liveness-ping timeout for the embedder's `/health`.
+    pub health_timeout_ms: u64,
+}
 
 #[derive(Serialize)]
 pub struct BGEm3EmbedRequest {
@@ -178,16 +184,22 @@ pub trait BGEm3Model: Send + Sync {
 pub struct BGEm3HttpClient {
     client: reqwest::Client,
     base_url: Url,
+    /// 429-retry budget (from config).
+    max_429_retries: u32,
     /// First 429 backoff (doubles each retry). A field so tests can shrink it.
     backoff_base: Duration,
+    /// `/health` ping timeout (from config).
+    health_timeout: Duration,
 }
 
 impl BGEm3HttpClient {
-    pub fn new(base_url: Url) -> Self {
+    pub fn new(base_url: Url, tuning: BGEm3Tuning) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url,
-            backoff_base: BACKOFF_BASE,
+            max_429_retries: tuning.max_429_retries,
+            backoff_base: Duration::from_millis(tuning.backoff_base_ms),
+            health_timeout: Duration::from_millis(tuning.health_timeout_ms),
         }
     }
 }
@@ -213,12 +225,12 @@ impl BGEm3Model for BGEm3HttpClient {
             // 429 = the embedder is at capacity. Back off and retry a few times
             // before surfacing the error.
             if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                && attempt < MAX_429_RETRIES
+                && attempt < self.max_429_retries
             {
                 let delay = self.backoff_base * 2u32.pow(attempt);
                 warn!(
                     attempt = attempt + 1,
-                    max_attempts = MAX_429_RETRIES,
+                    max_attempts = self.max_429_retries,
                     ?delay,
                     "Embedder returned 429 (busy); backing off and retrying."
                 );
@@ -245,7 +257,7 @@ impl BGEm3Model for BGEm3HttpClient {
         let url = self.base_url.join("health").unwrap(); // join of a literal cannot fail
         self.client
             .get(url)
-            .timeout(Duration::from_secs(2))
+            .timeout(self.health_timeout)
             .send()
             .await?
             .error_for_status()?;
@@ -262,6 +274,10 @@ mod tests {
     use axum::routing::post;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The 429-retry budget the test client is built with (was the `MAX_429_RETRIES`
+    /// const before it moved to config).
+    const TEST_MAX_429_RETRIES: u32 = 3;
 
     /// Stub embedder that replies 429 for the first `fail_first` requests, then 200
     /// with an (empty but valid) `BGEm3EmbedResponse`. Returns a client pointed at it
@@ -297,7 +313,9 @@ mod tests {
         let client = BGEm3HttpClient {
             client: reqwest::Client::new(),
             base_url: Url::parse(&format!("http://{addr}/")).unwrap(),
+            max_429_retries: TEST_MAX_429_RETRIES,
             backoff_base: Duration::from_millis(1), // keep the test fast
+            health_timeout: Duration::from_secs(2),
         };
         (client, hits)
     }
@@ -321,7 +339,7 @@ mod tests {
         let (client, hits) = stub_embedder(usize::MAX).await;
         let res = client.encode(req(), CancellationToken::new()).await;
         assert!(matches!(res, Err(EncodeError::Request(_))), "expected give-up, got {res:?}");
-        assert_eq!(hits.load(Ordering::SeqCst), 1 + MAX_429_RETRIES as usize);
+        assert_eq!(hits.load(Ordering::SeqCst), 1 + TEST_MAX_429_RETRIES as usize);
     }
 
     #[tokio::test]

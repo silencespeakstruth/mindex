@@ -1,4 +1,5 @@
 mod client;
+mod config;
 mod scanner;
 
 use anyhow::{Context, Result};
@@ -39,9 +40,14 @@ Cancellation: press Ctrl+C at any time. In-flight batch requests are dropped\n\
 immediately; the server cancels the corresponding work and returns HTTP 499."
 )]
 struct Cli {
-    /// mindex server URL
-    #[arg(long, default_value = "https://127.0.0.1:11111")]
-    server: String,
+    /// Path to a TOML config file. Overrides XDG discovery
+    /// ($XDG_CONFIG_HOME/mindex/indexer.toml then $XDG_CONFIG_DIRS).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// mindex server URL (default: https://127.0.0.1:11111; or config server_url)
+    #[arg(long)]
+    server: Option<String>,
 
     /// Project GUID — 32-char hex without dashes (e.g. the output of: uuidgen | tr -d -)
     #[arg(long)]
@@ -66,13 +72,13 @@ struct Cli {
     #[arg(long)]
     no_verify: bool,
 
-    /// API protocol version embedded in the URL path
-    #[arg(long, default_value = "v0")]
-    protocol: String,
+    /// API protocol version embedded in the URL path (default: v0; or config protocol)
+    #[arg(long)]
+    protocol: Option<String>,
 
-    /// Maximum number of files per upload batch (one HTTP request per batch)
-    #[arg(long, default_value_t = 100)]
-    batch_size: usize,
+    /// Maximum number of files per upload batch (default: 100; or config batch_size_files)
+    #[arg(long)]
+    batch_size: Option<usize>,
 
     /// Number of parallel upload streams. Files are split evenly across this
     /// many workers, each uploading one batch at a time and drawn as its own
@@ -136,7 +142,17 @@ struct WorkerStats {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let concurrency = cli.concurrency.unwrap_or_else(default_concurrency).max(1);
+
+    // Two-level config: TOML file (XDG: mindex/indexer.toml) → CLI overrides → defaults.
+    let cfg = config::resolve(config::Overrides {
+        config: cli.config.clone(),
+        server: cli.server.clone(),
+        protocol: cli.protocol.clone(),
+        batch_size: cli.batch_size,
+        concurrency: cli.concurrency,
+        no_verify: cli.no_verify,
+    })?;
+    let concurrency = cfg.concurrency.unwrap_or_else(default_concurrency).max(1);
 
     // Wire Ctrl+C to a CancellationToken so in-flight requests are dropped cleanly.
     let cancel = CancellationToken::new();
@@ -159,7 +175,7 @@ async fn main() -> Result<()> {
     let row = |label: &str, value: String| {
         eprintln!("  {}  {}", style(format!("{label:<7}")).dim(), style(value).cyan());
     };
-    row("server", cli.server.clone());
+    row("server", cfg.server_url.clone());
     row("project", cli.project.clone());
     row("root", root.display().to_string());
     row("threads", concurrency.to_string());
@@ -191,7 +207,7 @@ async fn main() -> Result<()> {
     // ── HTTP client (shared by every worker) ──────────────────────────────────
     let http = Arc::new(
         reqwest::ClientBuilder::new()
-            .danger_accept_invalid_certs(cli.no_verify)
+            .danger_accept_invalid_certs(cfg.no_verify)
             .build()
             .context("failed to build HTTP client")?,
     );
@@ -202,7 +218,7 @@ async fn main() -> Result<()> {
     // No uploads, no warm-up (read-only against an existing project).
     if cli.check {
         let actionable =
-            run_check(&http, &cli.server, &cli.project, scan.files, &cancel, cli.json).await?;
+            run_check(&http, &cfg.server_url, &cli.project, scan.files, &cancel, cli.json).await?;
         if cancel.is_cancelled() || actionable {
             std::process::exit(1);
         }
@@ -216,8 +232,8 @@ async fn main() -> Result<()> {
     if !cancel.is_cancelled() {
         upload_batch(
             &http,
-            &cli.server,
-            &cli.protocol,
+            &cfg.server_url,
+            &cfg.protocol,
             &cli.project,
             IndexRequest { files: HashMap::new() },
             &cancel,
@@ -248,10 +264,10 @@ async fn main() -> Result<()> {
         let http = http.clone();
         let shared = shared.clone();
         let cancel = cancel.clone();
-        let server = cli.server.clone();
-        let protocol = cli.protocol.clone();
+        let server = cfg.server_url.clone();
+        let protocol = cfg.protocol.clone();
         let project = cli.project.clone();
-        let batch_size = cli.batch_size;
+        let batch_size = cfg.batch_size_files;
         let verbose = cli.verbose;
         handles.push(tokio::spawn(async move {
             run_worker(

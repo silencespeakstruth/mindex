@@ -330,8 +330,11 @@ struct FileIndexer<'a> {
     model_id: &'a str,
     project_guid: UUIDv4,
     collection: &'a str,
-    /// Chunks per `/encode` call (GPU batch lever).
-    embed_batch: usize,
+    /// Embed/upsert batch sizing + sparse threshold (from config).
+    embed_tuning: crate::embed::EmbedTuning,
+    /// Slicer token window (from config).
+    min_chunk_tokens: usize,
+    max_chunk_tokens: usize,
     /// Request-scoped cancellation token (the handler's `CancellationGuard`).
     token: &'a CancellationToken,
     /// Shared set of `(project, model, path)` keys currently being indexed — the
@@ -460,6 +463,8 @@ impl FileIndexer<'_> {
             let tokenizer = self.tokenizer.clone();
             let (path_m, model_id_m, code_m) =
                 (path.to_string(), self.model_id.to_string(), code.to_string());
+            let (min_chunk_tokens, max_chunk_tokens) =
+                (self.min_chunk_tokens, self.max_chunk_tokens);
             let slicer_token = self.token.clone();
 
             let result = self
@@ -473,8 +478,13 @@ impl FileIndexer<'_> {
                         params![project_guid, path_m, model_id_m],
                     )?;
 
-                    let mut slicer = Slicer::new(tree_sitter_language(pl), &*tokenizer)
-                        .map_err(slicer_err_to_pool_err)?;
+                    let mut slicer = Slicer::new(
+                        tree_sitter_language(pl),
+                        &*tokenizer,
+                        min_chunk_tokens,
+                        max_chunk_tokens,
+                    )
+                    .map_err(slicer_err_to_pool_err)?;
 
                     let chunks = slicer
                         .parse(&code_m, slicer_token)
@@ -551,7 +561,7 @@ impl FileIndexer<'_> {
             self.collection,
             chunks,
             self.token,
-            self.embed_batch,
+            self.embed_tuning,
         )
         .await
     }
@@ -798,7 +808,9 @@ pub async fn post_index(
             model_id: &model_id,
             project_guid,
             collection: &collection,
-            embed_batch: s.embed_batch,
+            embed_tuning: s.embed_tuning,
+            min_chunk_tokens: s.min_chunk_tokens,
+            max_chunk_tokens: s.max_chunk_tokens,
             token: &guard.0,
             indexing_locks: &indexing_locks,
         };
@@ -1135,7 +1147,7 @@ pub async fn post_search(
             sparse.keys().copied().collect(),
             sparse.values().copied().collect(),
             colbert,
-            payload.top_k.unwrap_or(5) as u64,
+            payload.top_k.map(|k| k as u64).unwrap_or(state.default_top_k),
         )
         .await
     .map_err(|err| {
@@ -1603,7 +1615,7 @@ pub async fn delete_files(
 
     // 2) Soft-delete chunks + files, batched to stay under SQLite's bind-variable limit.
     let mut deleted_files: u64 = 0;
-    for batch in paths.chunks(500) {
+    for batch in paths.chunks(s.path_batch_size) {
         let batch: Vec<String> = batch.to_vec();
         let n = s
             .db_pool
@@ -1734,7 +1746,7 @@ pub async fn post_cancel(
     //    the file UPDATE makes it a no-op for any row that raced to 'indexed' between
     //    the SELECT and here (the trigger would reject cancelled→… otherwise).
     let mut cancelled_files: u64 = 0;
-    for batch in paths.chunks(500) {
+    for batch in paths.chunks(s.path_batch_size) {
         let batch: Vec<String> = batch.to_vec();
         let n = s
             .db_pool
@@ -2031,10 +2043,10 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
         version: env!("CARGO_PKG_VERSION"),
         model_id: model_id.clone(),
         languages: ProgrammingLanguage::ALL.iter().map(|l| l.name()).collect(),
-        embed_batch: s.embed_batch,
+        embed_batch: s.embed_tuning.embed_batch,
         db_pool_size: s.db_pool_size,
         stuck_grace_mins: s.stuck_grace_mins,
-        max_retries: crate::worker::retry::MAX_RETRIES,
+        max_retries: s.max_retries,
     })
 }
 
@@ -2066,7 +2078,7 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, S
     };
     let cg = http3::CancellationGuard(CancellationToken::new());
     let (chunks_removed, files_removed, status_log_pruned) =
-        crate::worker::gc::collect(&s.db_pool, &*s.qdrant, &cg.0).await;
+        crate::worker::gc::collect(&s.db_pool, &*s.qdrant, s.status_log_retention_days, &cg.0).await;
     Ok(Json(GcResponse {
         chunks_removed,
         files_removed,
@@ -2201,7 +2213,7 @@ mod tests {
     async fn pool_with_file(status: &'static str, sha: &'static str) -> SQLite3Pool {
         // Pool size 1: the single ":memory:" connection is reused, so the row
         // inserted below is visible to the later hash-check transaction.
-        let p = SQLite3Pool::new(FsPath::new(":memory:"), 1);
+        let p = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
         p.transaction(CancellationToken::new(), move |tx| {
             tx.execute_batch(
                 "CREATE TABLE project_files (
@@ -2526,7 +2538,7 @@ mod tests {
     /// next sweep re-embed it immediately instead of after another grace window.
     #[tokio::test]
     async fn retry_resets_count_and_preserves_timestamp() {
-        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1);
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), |tx| {
             for m in crate::MIGRATIONS {
                 tx.execute_batch(m)?;

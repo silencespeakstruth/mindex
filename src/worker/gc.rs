@@ -9,9 +9,9 @@ use tracing::{error, info};
 use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 
-/// How long transition rows are kept in `project_file_status_log`. The log grows
-/// one row per status change, so it is pruned alongside the chunk sweep.
-const STATUS_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600); // 30 days
+/// Seconds in a day — used to turn the configured retention (in days) into the
+/// `unixepoch()` arithmetic the status-log prune does.
+pub(crate) const SECONDS_PER_DAY: i64 = 24 * 3600;
 
 /// Process-wide GC mutual exclusion. GC is global (not per-project), so a single
 /// flag serializes the whole pass. Mirrors `IndexClaim` but with one slot, so a
@@ -44,11 +44,12 @@ impl Drop for GcGuard {
 pub(crate) async fn collect(
     db_pool: &SQLite3Pool,
     store: &dyn VectorStore,
+    status_log_retention_days: u64,
     token: &CancellationToken,
 ) -> (usize, usize, usize) {
     let chunks = sweep(db_pool, store, token).await;
     let files = prune_deleted_files(db_pool, token).await;
-    let log = prune_status_log(db_pool, token).await;
+    let log = prune_status_log(db_pool, status_log_retention_days, token).await;
     (chunks, files, log)
 }
 
@@ -56,9 +57,11 @@ pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     store: Arc<dyn VectorStore>,
     gc_flag: Arc<AtomicBool>,
+    gc_interval_seconds: u64,
+    status_log_retention_days: u64,
     token: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    let mut interval = tokio::time::interval(Duration::from_secs(gc_interval_seconds.max(1)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -79,7 +82,8 @@ pub async fn run(
         };
 
         info!("GC worker: starting sweep.");
-        let (chunks, files, _log) = collect(&db_pool, &*store, &token).await;
+        let (chunks, files, _log) =
+            collect(&db_pool, &*store, status_log_retention_days, &token).await;
         info!(chunks_removed = chunks, files_removed = files, "GC worker: sweep complete.");
     }
 }
@@ -117,11 +121,16 @@ pub(crate) async fn prune_deleted_files(db_pool: &SQLite3Pool, token: &Cancellat
     }
 }
 
-/// Deletes `project_file_status_log` rows older than [`STATUS_LOG_RETENTION`].
-/// A single `DELETE` (SQLite has no `DELETE ... LIMIT` in the bundled build); the
-/// audit log is small relative to the chunk tables, so one statement is fine.
-pub(crate) async fn prune_status_log(db_pool: &SQLite3Pool, token: &CancellationToken) -> usize {
-    let max_age_secs = STATUS_LOG_RETENTION.as_secs() as i64;
+/// Deletes `project_file_status_log` rows older than `retention_days` (from
+/// `[workers].status_log_retention_days`). A single `DELETE` (SQLite has no
+/// `DELETE ... LIMIT` in the bundled build); the audit log is small relative to the
+/// chunk tables, so one statement is fine.
+pub(crate) async fn prune_status_log(
+    db_pool: &SQLite3Pool,
+    retention_days: u64,
+    token: &CancellationToken,
+) -> usize {
+    let max_age_secs = retention_days as i64 * SECONDS_PER_DAY;
 
     let pruned = db_pool
         .transaction(token.clone(), move |tx| {
@@ -138,7 +147,7 @@ pub(crate) async fn prune_status_log(db_pool: &SQLite3Pool, token: &Cancellation
         Ok(rows) => {
             info!(
                 rows,
-                retention_days = STATUS_LOG_RETENTION.as_secs() / 86_400,
+                retention_days,
                 "GC worker: pruned old status-log rows."
             );
             rows
@@ -322,7 +331,7 @@ mod tests {
     }
 
     async fn migrated_pool() -> SQLite3Pool {
-        let pool = SQLite3Pool::new(Path::new(":memory:"), 1);
+        let pool = SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), |tx| {
             for migration in crate::MIGRATIONS {
                 tx.execute_batch(migration)?;
@@ -466,7 +475,7 @@ mod tests {
         .unwrap();
         assert_eq!(status_log_count(&pool).await, 3);
 
-        prune_status_log(&pool, &CancellationToken::new()).await;
+        prune_status_log(&pool, 30, &CancellationToken::new()).await;
 
         // The 40- and 31-day rows are gone; the 1-day row remains.
         assert_eq!(status_log_count(&pool).await, 1);

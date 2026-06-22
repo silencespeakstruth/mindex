@@ -12,26 +12,24 @@ use crate::backend::v0::models::UUIDv4;
 use crate::db::files::set_file_status;
 use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
-use crate::embed::{EmbedUpsertError, embed_and_upsert};
+use crate::embed::{EmbedTuning, EmbedUpsertError, embed_and_upsert};
 use crate::models::bge_m3::BGEm3Model;
 
-pub(crate) const MAX_RETRIES: i64 = 3;
-
-/// How often the worker re-warns about permanently-failed files (in addition to
-/// the one-shot warning at startup).
-const FAILED_WARN_INTERVAL: Duration = Duration::from_secs(3600);
-
 /// Logs a WARN if any files have exhausted their retries (`status='failed'` with
-/// `retry_count >= MAX_RETRIES`). The retry worker stops touching such files, so
+/// `retry_count >= max_retries`). The retry worker stops touching such files, so
 /// they are otherwise invisible. Called once at startup and periodically by the
-/// worker.
-pub(crate) async fn warn_permanently_failed(db_pool: &SQLite3Pool, token: CancellationToken) {
+/// worker. `max_retries` comes from `[workers].max_retries`.
+pub(crate) async fn warn_permanently_failed(
+    db_pool: &SQLite3Pool,
+    max_retries: i64,
+    token: CancellationToken,
+) {
     let count: i64 = db_pool
-        .transaction(token, |tx| {
+        .transaction(token, move |tx| {
             tx.query_row(
                 "SELECT COUNT(*) FROM project_files
                  WHERE status = 'failed' AND retry_count >= ?1",
-                rusqlite::params![MAX_RETRIES],
+                rusqlite::params![max_retries],
                 |r| r.get(0),
             )
             .map_err(SQLite3PoolError::from)
@@ -42,7 +40,7 @@ pub(crate) async fn warn_permanently_failed(db_pool: &SQLite3Pool, token: Cancel
     if count > 0 {
         warn!(
             count,
-            max_retries = MAX_RETRIES,
+            max_retries,
             "Files have exhausted their retries and are stuck in 'failed'; they will not be \
              retried automatically. Re-push them to reindex, and check the model server \
              (--model-server) and Qdrant (--qdrant-server) reachability."
@@ -84,23 +82,38 @@ pub(crate) async fn warn_orphaned_indexing(db_pool: &SQLite3Pool, token: Cancell
     }
 }
 
-#[allow(clippy::too_many_arguments)] // irreducible worker deps (db, store, embedder, model_id, batch, grace, locks, token)
+/// Tuning for the retry worker (from `[workers]`/`[indexing]` config), bundled so
+/// the long worker arg list stays readable.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryTuning {
+    pub embed: EmbedTuning,
+    /// Seconds between sweeps; also the post-failure grace before a `failed` file is
+    /// retried (a `failed` row must be at least this old).
+    pub retry_interval_seconds: u64,
+    /// How often the periodic permanently-failed warning re-fires.
+    pub failed_warn_interval_seconds: u64,
+    /// `failed` retry budget (`retry_count < max_retries`).
+    pub max_retries: i64,
+    /// Minutes-as-seconds a mid-flight row may age before it looks crash-orphaned.
+    pub stuck_grace_secs: i64,
+}
+
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     store: Arc<dyn VectorStore>,
     model_client: Arc<dyn BGEm3Model>,
     model_id: String,
-    embed_batch: usize,
-    stuck_grace_secs: i64,
+    tuning: RetryTuning,
     indexing_locks: Arc<Mutex<HashSet<String>>>,
     token: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let failed_warn_interval = Duration::from_secs(tuning.failed_warn_interval_seconds.max(1));
+    let mut interval = tokio::time::interval(Duration::from_secs(tuning.retry_interval_seconds.max(1)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Throttle the periodic permanently-failed warning. Start in the past so the
     // first sweep with such files warns immediately.
-    let mut last_failed_warn = Instant::now() - FAILED_WARN_INTERVAL;
+    let mut last_failed_warn = Instant::now() - failed_warn_interval;
 
     loop {
         tokio::select! {
@@ -111,8 +124,8 @@ pub async fn run(
             }
         }
 
-        if last_failed_warn.elapsed() >= FAILED_WARN_INTERVAL {
-            warn_permanently_failed(&db_pool, token.clone()).await;
+        if last_failed_warn.elapsed() >= failed_warn_interval {
+            warn_permanently_failed(&db_pool, tuning.max_retries, token.clone()).await;
             last_failed_warn = Instant::now();
         }
 
@@ -134,9 +147,16 @@ pub async fn run(
                              AND status_updated_at < unixepoch() - ?3)
                          OR (status = 'failed'
                              AND retry_count < ?1
-                             AND status_updated_at < unixepoch() - 60))",
+                             AND status_updated_at < unixepoch() - ?4))",
                 )?
-                .query_map(rusqlite::params![MAX_RETRIES, model_id, stuck_grace_secs], |row| {
+                .query_map(
+                    rusqlite::params![
+                        tuning.max_retries,
+                        model_id,
+                        tuning.stuck_grace_secs,
+                        tuning.retry_interval_seconds as i64
+                    ],
+                    |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -156,7 +176,7 @@ pub async fn run(
 
             retry_file(
                 &db_pool, &*store, &*model_client, &project_guid, &path, &file_model_id,
-                embed_batch, &indexing_locks, &token,
+                tuning.embed, &indexing_locks, &token,
             )
             .await;
         }
@@ -174,7 +194,7 @@ async fn retry_file(
     project_guid: &str,
     path: &str,
     model_id: &str,
-    embed_batch: usize,
+    embed: EmbedTuning,
     indexing_locks: &Arc<Mutex<HashSet<String>>>,
     token: &CancellationToken,
 ) {
@@ -263,7 +283,7 @@ async fn retry_file(
         .map(|(g, code)| (UUIDv4(Uuid::parse_str(&g).unwrap_or_default()), code))
         .collect();
 
-    let success = match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed_batch)
+    let success = match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed)
         .await
     {
         Ok(()) => true,
@@ -326,6 +346,9 @@ mod tests {
     const PG: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const MODEL: &str = "BAAI/bge-m3";
     const PATH: &str = "a.rs";
+    /// Embed tuning used by the retry-worker tests (small embed batch).
+    const TEST_EMBED: EmbedTuning =
+        EmbedTuning { embed_batch: 64, upsert_batch: 256, sparse_min_weight: 1e-5 };
 
     struct OkEmbedder;
     #[async_trait]
@@ -393,7 +416,7 @@ mod tests {
     /// Migrated pool with a project + a file currently in `'failed'` (retry_count=1)
     /// and `n_chunks` active chunks — i.e. a file the retry worker would pick up.
     async fn pool_with_failed_file(n_chunks: usize) -> SQLite3Pool {
-        let pool = SQLite3Pool::new(Path::new(":memory:"), 1);
+        let pool = SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), move |tx| {
             for m in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
@@ -459,7 +482,7 @@ mod tests {
         let store = Store { fail_upsert: false };
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
 
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
         // The transition log proves the path went through 'indexing', never failed→indexed.
@@ -474,7 +497,7 @@ mod tests {
         let store = Store { fail_upsert: true };
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
 
         // Was failed(1) → indexing → failed(2).
         assert_eq!(current(&pool).await, ("failed".to_string(), 2));
@@ -489,7 +512,7 @@ mod tests {
         let store = Store { fail_upsert: false };
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
 
         // No chunks (too short) → indexing → indexed, retry_count reset. Must NOT be
         // 'failed' (that would trap it: failed→indexed is an illegal transition).
@@ -510,7 +533,7 @@ mod tests {
         let _held = IndexClaim::try_acquire(&locks, key).expect("slot starts free");
 
         let log_before = log_pairs(&pool).await.len();
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
 
         // Untouched: still failed(1), and not a single new transition was logged.
         assert_eq!(current(&pool).await, ("failed".to_string(), 1));
@@ -532,7 +555,7 @@ mod tests {
 
         let store = Store { fail_upsert: true }; // would fail loudly if it ran
         let locks = Arc::new(Mutex::new(HashSet::new()));
-        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, 64, &locks, &CancellationToken::new()).await;
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
 
         // Untouched: still 'cancelled', no new transition logged (not re-driven).
         assert_eq!(current(&pool).await.0, "cancelled");

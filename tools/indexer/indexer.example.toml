@@ -1,0 +1,19 @@
+# mindex-index (indexer CLI) configuration (example).
+#
+# Copy to $XDG_CONFIG_HOME/mindex/indexer.toml (defaults to
+# ~/.config/mindex/indexer.toml), or point at it with `--config <path>` /
+# $MINDEX_INDEXER_CONFIG. Every key is OPTIONAL: omitted keys use the built-in
+# default. CLI flags override the file; the file overrides the defaults. The
+# indexer reports (on stderr) which file it used and every value a flag overrode.
+#
+# Only the operational knobs live here. Per-invocation arguments (--project,
+# --root, --include/--exclude, --check, --json, --verbose) are flags only.
+
+server_url = "https://127.0.0.1:11111" # mindex server
+protocol = "v0"                        # API version embedded in the URL path
+batch_size_files = 100                 # files per upload batch (one HTTP request each)
+# concurrency = 4                      # parallel upload streams; omit to default to
+                                       # min(logical CPUs, 4). Keep <= the server's
+                                       # [database].pool_size or batches hit PoolEmpty.
+no_verify = false                      # skip TLS verification (needed for the default
+                                       # self-signed cert). --no-verify can only turn this on.

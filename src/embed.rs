@@ -1,7 +1,9 @@
 //! Shared embedding + Qdrant upsert pipeline used by both the indexing handler
 //! (`post_index`) and the retry worker. Both need the identical "encode in
-//! batches of `embed_batch`, split sparse weights, upsert in batches of 256" loop;
-//! keeping it here means one code path and one place to change vector assembly.
+//! batches of `embed_batch`, split sparse weights, upsert in batches of
+//! `upsert_batch`" loop; keeping it here means one code path and one place to
+//! change vector assembly. Batch sizes + the sparse threshold come from config
+//! via [`EmbedTuning`].
 
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -10,10 +12,17 @@ use crate::backend::v0::models::UUIDv4;
 use crate::db::qdrant::{ChunkAsVector, VectorStore, VectorStoreError};
 use crate::models::bge_m3::{BGEm3EmbedRequest, BGEm3EmbedResponse, BGEm3Model, EncodeError};
 
-/// Number of points sent to Qdrant per upsert.
-const UPSERT_BATCH: usize = 256;
-/// Sparse weights at or below this magnitude are dropped before upsert.
-const SPARSE_MIN_WEIGHT: f32 = 1e-5;
+/// Tuning for the embed→upsert pipeline (from `[indexing]`/`[qdrant]` config),
+/// passed as one value so the two callers (handler + retry worker) stay in sync.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedTuning {
+    /// Chunks sent to the model server per `/encode` call (GPU batch lever).
+    pub embed_batch: usize,
+    /// Points sent to Qdrant per upsert.
+    pub upsert_batch: usize,
+    /// Sparse weights at or below this magnitude are dropped before upsert.
+    pub sparse_min_weight: f32,
+}
 
 /// Failure modes of [`embed_and_upsert`], kept distinct so callers can map each
 /// to their own control flow (HTTP status + file-status recovery in the handler;
@@ -31,19 +40,21 @@ pub enum EmbedUpsertError {
 }
 
 /// Embeds `chunks` (each `(qdrant_guid, code)`) and upserts the resulting
-/// multi-vectors into `collection`. `embed_batch` is the number of chunks sent per
-/// `/encode` call — the lever for GPU batch size (the model server further
-/// sub-batches by its own `--batch`). Side-effect-free apart from the embed/upsert
-/// I/O, so behaviour is identical for every caller.
+/// multi-vectors into `collection`. `tuning.embed_batch` is the number of chunks
+/// sent per `/encode` call — the lever for GPU batch size (the model server further
+/// sub-batches by its own `--batch`); `tuning.upsert_batch` and
+/// `tuning.sparse_min_weight` govern Qdrant upsert sizing and sparse pruning.
+/// Side-effect-free apart from the embed/upsert I/O, so behaviour is identical for
+/// every caller.
 pub async fn embed_and_upsert(
     embedder: &dyn BGEm3Model,
     store: &dyn VectorStore,
     collection: &str,
     chunks: &[(UUIDv4, String)],
     token: &CancellationToken,
-    embed_batch: usize,
+    tuning: EmbedTuning,
 ) -> Result<(), EmbedUpsertError> {
-    for batch in chunks.chunks(embed_batch.max(1)) {
+    for batch in chunks.chunks(tuning.embed_batch.max(1)) {
         let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
         let guids: Vec<UUIDv4> = batch.iter().map(|(g, _)| *g).collect();
 
@@ -72,7 +83,7 @@ pub async fn embed_and_upsert(
             let mut sparse_indices: Vec<u32> = Vec::with_capacity(sparse.len());
             let mut sparse_values: Vec<f32> = Vec::with_capacity(sparse.len());
             for (k, w) in sparse.iter() {
-                if *w > SPARSE_MIN_WEIGHT {
+                if *w > tuning.sparse_min_weight {
                     sparse_indices.push(*k);
                     sparse_values.push(*w);
                 }
@@ -87,7 +98,7 @@ pub async fn embed_and_upsert(
             });
         }
 
-        for points_batch in vector_batch.chunks(UPSERT_BATCH) {
+        for points_batch in vector_batch.chunks(tuning.upsert_batch.max(1)) {
             store
                 .insert_batch(collection, points_batch.to_vec())
                 .await
@@ -107,6 +118,10 @@ mod tests {
     use uuid::Uuid;
 
     use crate::db::qdrant::SearchHit;
+
+    /// Tuning used by the embed tests (small embed batch to exercise batching).
+    const TEST_TUNING: EmbedTuning =
+        EmbedTuning { embed_batch: 64, upsert_batch: 256, sparse_min_weight: 1e-5 };
 
     /// Embedder fake: returns deterministic vectors aligned to the input count, or
     /// `Cancelled` when configured to.
@@ -201,7 +216,7 @@ mod tests {
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
         let input = chunks(3);
 
-        embed_and_upsert(&embedder, &store, "c", &input, &CancellationToken::new(), 64)
+        embed_and_upsert(&embedder, &store, "c", &input, &CancellationToken::new(), TEST_TUNING)
             .await
             .expect("should succeed");
 
@@ -215,7 +230,7 @@ mod tests {
         let embedder = StubEmbedder { cancel: false };
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
 
-        embed_and_upsert(&embedder, &store, "c", &[], &CancellationToken::new(), 64)
+        embed_and_upsert(&embedder, &store, "c", &[], &CancellationToken::new(), TEST_TUNING)
             .await
             .expect("empty is a no-op success");
 
@@ -227,7 +242,7 @@ mod tests {
         let embedder = StubEmbedder { cancel: false };
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: true };
 
-        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), 64).await;
+        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), TEST_TUNING).await;
         assert!(matches!(res, Err(EmbedUpsertError::Store(_))));
     }
 
@@ -236,7 +251,7 @@ mod tests {
         let embedder = StubEmbedder { cancel: true };
         let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
 
-        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), 64).await;
+        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), TEST_TUNING).await;
         assert!(matches!(res, Err(EmbedUpsertError::Cancelled)));
         // Nothing should have been upserted on the cancel path.
         assert!(store.upserted.lock().unwrap().is_empty());

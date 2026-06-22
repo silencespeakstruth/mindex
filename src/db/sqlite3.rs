@@ -37,8 +37,21 @@ pub struct SQLite3Pool {
 }
 
 impl SQLite3Pool {
-    pub fn new(db_path: &Path, len: usize) -> Self {
+    /// `page_size_bytes` and `synchronous` come from `[database]` config.
+    /// `journal_mode = WAL` and `foreign_keys = ON` are **not** configurable: WAL is
+    /// required by the concurrency model (readers during writes) and foreign keys are
+    /// a correctness invariant (the chunk→file RESTRICT FK).
+    pub fn new(db_path: &Path, len: usize, page_size_bytes: u32, synchronous: &str) -> Self {
         let mut conns = Vec::with_capacity(len);
+
+        // `page_size` only takes effect before the DB is first written, so it must be
+        // set before any other statement; the rest follow. WAL + foreign_keys are fixed.
+        let pragmas = format!(
+            "PRAGMA page_size = {page_size_bytes};\n\
+             PRAGMA journal_mode = WAL;\n\
+             PRAGMA foreign_keys = ON;\n\
+             PRAGMA synchronous = {synchronous};\n"
+        );
 
         for _ in 0..len {
             let conn = Connection::open(db_path).unwrap_or_else(|err| {
@@ -48,14 +61,7 @@ impl SQLite3Pool {
                 )
             });
 
-            conn.execute_batch(
-                r#"
-                PRAGMA journal_mode = WAL;
-                PRAGMA foreign_keys = ON;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA page_size = 16384;
-                "#,
-            )
+            conn.execute_batch(&pragmas)
             .unwrap_or_else(|err| {
                 panic!(
                     "Failed to apply startup PRAGMAs on {db_path:?}: {err}. \
@@ -154,7 +160,7 @@ mod tests {
     // Each connection to ":memory:" is an independent database, so the pool is
     // sized to 1 wherever shared state across transactions matters.
     fn pool(size: usize) -> SQLite3Pool {
-        SQLite3Pool::new(Path::new(":memory:"), size)
+        SQLite3Pool::new(Path::new(":memory:"), size, 16384, "NORMAL")
     }
 
     #[tokio::test]

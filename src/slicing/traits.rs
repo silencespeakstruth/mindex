@@ -20,6 +20,11 @@ impl Tokenizing for Tokenizer {
 pub struct Slicer<'a> {
     pub tokenizer: &'a dyn Tokenizing,
     pub parser: Parser,
+    /// Inclusive token window a node must fall in to be selected (from `[slicer]`
+    /// config). BGE-M3 performs best in this range; the window is measured, not
+    /// computed, because tokenization is context-dependent.
+    min_tokens: usize,
+    max_tokens: usize,
 }
 
 #[derive(Error, Debug)]
@@ -55,12 +60,17 @@ pub struct SlicedChunk {
 }
 
 impl<'a> Slicer<'a> {
-    pub fn new(language: Language, tokenizer: &'a dyn Tokenizing) -> Result<Self, SlicerError> {
+    pub fn new(
+        language: Language,
+        tokenizer: &'a dyn Tokenizing,
+        min_tokens: usize,
+        max_tokens: usize,
+    ) -> Result<Self, SlicerError> {
         let mut parser = Parser::new();
 
         parser.set_language(&language)?;
 
-        Ok(Self { parser, tokenizer })
+        Ok(Self { parser, tokenizer, min_tokens, max_tokens })
     }
 
     pub fn parse(
@@ -102,7 +112,7 @@ impl<'a> Slicer<'a> {
                     /* In practice, BGE-M3 models perform best with input sequences
                      * within this length range to balance context and semantic density.
                      */
-                    if (128..=512).contains(&len) {
+                    if (self.min_tokens..=self.max_tokens).contains(&len) {
                         let line_start = code[..node.start_byte()]
                             .rfind('\n')
                             .map_or(0, |i| i + 1);
@@ -127,11 +137,11 @@ impl<'a> Slicer<'a> {
                         });
                         // Do not descend: children would produce overlapping chunks.
                         descend = false;
-                    } else if len < 128 {
+                    } else if len < self.min_tokens {
                         // Children are strictly smaller; no qualifying node below.
                         descend = false;
                     }
-                    // len > 512: keep descending to find qualifying sub-nodes.
+                    // len > max_tokens: keep descending to find qualifying sub-nodes.
                 } else {
                     descend = false;
                 }
@@ -166,7 +176,7 @@ mod tests {
     }
 
     fn slicer() -> Slicer<'static> {
-        Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), tokenizer()).unwrap()
+        Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), tokenizer(), 128, 512).unwrap()
     }
 
     fn all_source_files() -> Vec<(String, String)> {
@@ -211,7 +221,7 @@ mod tests {
             + &"    let _ = compute_something_meaningful(1, 2, 3);\n".repeat(5)
             + "}\n";
         let mut slicer =
-            Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), &OnePerByte).unwrap();
+            Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), &OnePerByte, 128, 512).unwrap();
         let chunks = slicer.parse(&src, CancellationToken::new()).unwrap();
         assert!(!chunks.is_empty(), "the fn node should have been selected");
     }

@@ -1,0 +1,63 @@
+# mindex server configuration (example).
+#
+# Copy to $XDG_CONFIG_HOME/mindex/config.toml (defaults to
+# ~/.config/mindex/config.toml), or point at it with `--config <path>` /
+# $MINDEX_CONFIG. Every key is OPTIONAL: anything omitted falls back to the
+# built-in default shown below. CLI flags override the file; the file overrides
+# the defaults. At startup mindex logs which file it loaded and every value a flag
+# overrode.
+#
+# Keys carry their unit in the name (_ms, _seconds, _minutes, _days, _chunks,
+# _tokens, _bytes, _points, _mib) so there is never a question of what a number
+# means. Invalid values abort startup with an explanation.
+
+[server]
+bind = "127.0.0.1:11111"   # interface:port to listen on
+cert_path = "cert.pem"     # TLS certificate (PEM)
+key_path = "key.pem"       # TLS private key (PEM)
+max_body_mib = 256         # max /index request body (MiB); posts carry many files
+
+[model]
+name = "BAAI/bge-m3"                 # embedding model id (one model supported today)
+server_url = "http://localhost:11211" # the BGE-M3 embedder
+health_timeout_ms = 2000             # /health ping timeout
+max_429_retries = 3                  # retries when the embedder returns 429 (busy)
+backoff_base_ms = 200                # first 429 backoff; doubles each retry
+
+[qdrant]
+server_url = "http://localhost:6334" # Qdrant gRPC endpoint
+upsert_batch_points = 256            # points per Qdrant upsert
+dense_prefetch_limit = 200           # dense candidates before RRF fusion
+sparse_prefetch_limit = 200          # sparse candidates before RRF fusion
+fusion_limit = 200                   # candidates after fusion, before ColBERT rerank
+# Invariant: dense/sparse_prefetch_limit >= fusion_limit >= search.default_top_k.
+
+[database]
+path = "mindex.db"      # SQLite file (use ":memory:" for ephemeral)
+pool_size = 4           # connection pool size; the indexer's --concurrency must be <= this
+page_size_bytes = 16384 # SQLite page size; power of two in 512..=65536
+synchronous = "normal"  # SQLite synchronous mode: off / normal / full / extra
+# Note: journal_mode=WAL and foreign_keys=ON are fixed (correctness invariants).
+
+[indexing]
+embed_batch_chunks = 256   # chunks per /encode call — the GPU batch lever
+stuck_grace_minutes = 30   # how long a file may sit in 'indexing' before the retry
+                           # worker treats it as crash-orphaned; MUST exceed the
+                           # longest legitimate in-flight indexing request
+path_batch_size = 500      # paths per batch on soft-delete/cancel (SQLite bind limit; 1..=999)
+sparse_min_weight = 0.00001 # sparse weights at or below this are dropped before upsert
+
+[slicer]
+min_chunk_tokens = 128  # smallest node token-span that becomes a chunk
+max_chunk_tokens = 512  # largest; must be <= 512 (the BGE-M3 input limit)
+
+[search]
+default_top_k = 5  # results returned when a /search request omits top_k
+
+[workers]
+gc_interval_seconds = 3600          # how often the GC sweep runs
+status_log_retention_days = 30      # how long status-transition log rows are kept
+retry_interval_seconds = 60         # how often the retry worker sweeps (also the
+                                    # post-failure grace before a 'failed' file is retried)
+failed_warn_interval_seconds = 3600 # how often the permanently-failed warning re-fires
+max_retries = 3                     # retry budget before a file stays 'failed' for good

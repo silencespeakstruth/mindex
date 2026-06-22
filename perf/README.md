@@ -129,7 +129,7 @@ docker compose --env-file perf/env/big-batch.env up -d --force-recreate mindex
 
 Ready profiles in `perf/env/`: `baseline.env`, `big-batch.env`,
 `high-concurrency.env`. Variables: `MINDEX_EMBED_BATCH`, `MINDEX_DB_POOL_SIZE`,
-`MINDEX_MAX_BODY_MB`, `MINDEX_STUCK_GRACE_MINS`, `MINDEX_MODEL_SERVER`,
+`MINDEX_MAX_BODY_MIB`, `MINDEX_STUCK_GRACE_MINS`, `MINDEX_MODEL_SERVER`,
 `MINDEX_RUST_LOG`. Verify what a profile resolves to before starting:
 
 ```bash

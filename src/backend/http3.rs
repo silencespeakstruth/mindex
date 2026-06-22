@@ -22,6 +22,7 @@ use crate::backend::v0::handlers::{
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
+use crate::embed::EmbedTuning;
 use crate::models::bge_m3::BGEm3Model;
 
 #[derive(Clone)]
@@ -38,8 +39,19 @@ pub struct RouterState {
     pub db_pool: Arc<SQLite3Pool>,
     pub qdrant: Arc<dyn VectorStore>,
     pub model: EmbeddingModel,
-    /// Chunks per `/encode` call during indexing (GPU batch lever).
-    pub embed_batch: usize,
+    /// Embed/upsert batch sizing + sparse threshold (`[indexing]`/`[qdrant]` config).
+    pub embed_tuning: EmbedTuning,
+    /// Slicer token window (`[slicer]` config).
+    pub min_chunk_tokens: usize,
+    pub max_chunk_tokens: usize,
+    /// `top_k` used when a `/search` request omits it (`[search]` config).
+    pub default_top_k: u64,
+    /// Paths per batch on soft-delete / cancel (`[indexing]` config).
+    pub path_batch_size: usize,
+    /// Status-log retention for the synchronous `POST /gc` pass (`[workers]` config).
+    pub status_log_retention_days: u64,
+    /// `failed` retry budget, reported by `GET /config` (`[workers]` config).
+    pub max_retries: i64,
     /// Per-file indexing mutual-exclusion table: the set of
     /// `(project, model, path)` keys currently being indexed. Serializes
     /// concurrent same-file `/index` requests (see `IndexClaim` in handlers).
@@ -76,7 +88,7 @@ pub async fn run(
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Indexing posts many files at once, so the body easily exceeds axum's 2 MB
-    // default; lift the limit (configurable via --max-body-mb).
+    // default; lift the limit (configurable via --max-body-mib / [server].max_body_mib).
     let router = Router::new()
         .route("/v0/{project_guid}/index", post(post_index))
         .route("/v0/{project_guid}/search", post(post_search))
