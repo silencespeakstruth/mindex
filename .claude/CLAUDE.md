@@ -449,7 +449,7 @@ they take the GUID + filters as call args).
   BuildKit) supported; no `--mount=type=cache`.
 - `entrypoint.sh` generates a self-signed RSA-4096 cert into the `mindex_certs`
   volume on first start.
-Two compose files, two roles (both build the **same** `Dockerfile`):
+Three compose files (all build the **same** `Dockerfile`):
 - **Prod compose** (`docker-compose.yml`): the turnkey/reference stack — `qdrant` +
   `mindex` — *and* the perf-benchmark harness (the `command:` flags read from the
   environment; swap a profile with `docker compose --env-file perf/env/<f>.env up -d`,
@@ -462,6 +462,12 @@ Two compose files, two roles (both build the **same** `Dockerfile`):
   the server's flags. Because the `[limits]`/`search.max_*` knobs are TOML-only, tuning
   them in the container means mounting a `config.toml` (the flags here don't cover them;
   defaults are sensible).
+- **Exposed overlay** (`docker-compose.exposed.yml`): opt-in, **not** auto-merged —
+  pass it explicitly (`docker compose -f docker-compose.yml -f docker-compose.exposed.yml
+  up -d`). Publishes the mindex API (`11111`) and the Qdrant dashboard (`6333`) on
+  `127.0.0.1` only (neither has auth), so host tools can reach the API. Base stack stays
+  port-less; this is the sanctioned way to open it, replacing the old untracked
+  `docker-compose.override.yml`.
 - **Test compose** (`docker-compose.test.yml`, doesn't extend base): qdrant +
   mock-embedder + mindex + test-runner — the integration-test stack (mindex's *primary*
   containerized use). Run:

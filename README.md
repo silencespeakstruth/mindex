@@ -166,9 +166,13 @@ mindex listens on `:11111` **inside the compose network only** — this stack pu
 by default). A self-signed cert is generated on first start (mount real certs at `/certs`
 to override). The container still reaches the host embedder *outbound* via
 `host.docker.internal:11211`. To drive the API from the host (the indexer / search /
-MCP tools below all target `https://localhost:11111`), publish the port yourself — add a
-`ports: ["127.0.0.1:11111:11111"]` to the `mindex` service in a personal compose file, or
-run the host tools from inside the network. This compose file is the **turnkey stack** and
+MCP tools below all target `https://localhost:11111`), merge the opt-in
+`docker-compose.exposed.yml` overlay, which publishes the mindex API and the Qdrant
+dashboard on loopback:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.exposed.yml up -d
+``` This compose file is the **turnkey stack** and
 the canonical reference for the server's flags; it doubles as the perf-benchmark harness
 (swap a profile with `docker compose --env-file perf/env/<f>.env up -d`). A separate
 `docker-compose.test.yml` (Qdrant + a mock embedder + mindex + pytest runner) is used only
