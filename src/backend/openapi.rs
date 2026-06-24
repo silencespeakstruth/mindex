@@ -43,8 +43,9 @@ contracts are stable within `v0`. The management/observability endpoints \
 
 **Concurrency.** Every operation's description states whether it is concurrency-safe \
 and how it interacts with in-flight indexing, GC, and the SQLite pool. Watch for \
-**429** (same-file index already in flight), **409** (a GC pass is already running), \
-and **499** (client closed the connection — nginx convention).
+**409** (a GC pass is already running) and **499** (client closed the connection — \
+nginx convention). A same-file index collision skips the contended file silently \
+(absent from the response, like an unchanged file) rather than returning 429.
 
 **Errors.** Every non-2xx response is an RFC 7807 `application/problem+json` body \
 (schema `ProblemDetails`) carrying a stable, namespaced machine `code` — the key a \
@@ -52,7 +53,7 @@ client localizes against (the `detail`/`title` prose is English and informationa
 Field-specific errors add `field` and a structured `meta` for interpolation. The code \
 catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_path`, \
 `internal.error`, `embedder.unavailable`, `qdrant.unavailable`, `gc.already_running`, \
-`index.file_in_flight`, `project.not_found`, `search.no_match`, `selector.empty`, \
+`project.not_found`, `search.no_match`, `selector.empty`, \
 `validation.path_invalid`, `validation.sha256_invalid`, `validation.top_k_out_of_range`, \
 `validation.query_empty`, `validation.query_too_long`, `validation.code_too_large`, \
 `validation.too_many_files`, `validation.selector_too_large`.",

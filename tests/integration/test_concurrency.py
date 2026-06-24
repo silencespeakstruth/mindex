@@ -7,8 +7,9 @@ is to pin the invariants that make the various "stale write clobbers a later ind
 interleavings impossible:
 
   * the per-file claim is held for the *whole* pipeline (prepare → embed →
-    mark_indexed/recover), so a second same-file request gets 429 and never runs
-    concurrently — it can only re-run after the first fully terminates;
+    mark_indexed/recover), so a second same-file request is skipped (absent from the
+    response, like an unchanged file) and never runs concurrently — the contended file
+    can only be (re)indexed after the first request fully terminates;
   * regardless of how requests interleave, a file settles to exactly one terminal
     state with exactly one set of `active` chunks (no double-insert, no orphan);
   * an embed failure marks the file `failed` (chunks inserted, no vectors) and is
@@ -116,12 +117,9 @@ def test_concurrent_same_file_one_winner_consistent(
     statuses = _concurrent(6, lambda _i: _index_same(project, RUST_V1))
     embed_delay(0.0)
 
-    # Every response is a clean 200 or 429 — never a 5xx from a concurrent clash.
-    assert all(s in (200, 429) for s in statuses), statuses
-    assert 200 in statuses, statuses
-    # The claim is held across the whole pipeline, so the simultaneous siblings are
-    # refused rather than running in parallel.
-    assert 429 in statuses, statuses
+    # Every response is a clean 200 — contested files are silently skipped (absent from
+    # the response body), never a 5xx from a concurrent clash.
+    assert all(s == 200 for s in statuses), statuses
 
     # Exactly one file, indexed, no failed/cancelled — a single consistent outcome.
     f = _files(client, project)
@@ -141,7 +139,7 @@ def test_concurrent_same_file_no_chunk_leak(
     embed_delay(0.8)
     statuses = _concurrent(6, lambda _i: _index_same(project, RUST_V1))
     embed_delay(0.0)
-    assert all(s in (200, 429) for s in statuses), statuses
+    assert all(s == 200 for s in statuses), statuses
 
     run_gc(client)
     chunks = _rust_chunks(client, project)
@@ -167,7 +165,7 @@ def test_concurrent_reindex_changing_content_settles(
         6, lambda i: _index_same(project, RUST_V1 if i % 2 else RUST_V2)
     )
     embed_delay(0.0)
-    assert all(s in (200, 429) for s in statuses), statuses
+    assert all(s == 200 for s in statuses), statuses
 
     run_gc(client)
     f = _files(client, project)
@@ -290,9 +288,10 @@ def test_failed_index_does_not_clobber_a_later_index(
 ) -> None:
     # The exact "concurrent stale write" interleaving, made concrete:
     #   Request 1 goes in-flight then fails its embed (ends 'failed').
-    #   Request 2 fires for the same file *while Request 1 holds the claim* — it is
-    #   refused (429), so it can never run concurrently and there is no window for
-    #   Request 1's later 'failed' write to race a Request 2 success.
+    #   Request 2 fires for the same file *while Request 1 holds the claim* — the
+    #   contested file is skipped (absent from the 200 response), so it can never run
+    #   concurrently and there is no window for Request 1's later 'failed' write to
+    #   race a Request 2 success.
     # After Request 1 finishes, a fresh reindex cleanly wins; the earlier 'failed'
     # state is gone and the file ends 'indexed' with one consistent chunk set.
     embed_delay(1.5)
@@ -310,10 +309,12 @@ def test_failed_index_does_not_clobber_a_later_index(
     worker.start()
     try:
         _wait_for_indexing(client, project)
-        # Request 2 collides with the held claim while Request 1 is still embedding.
+        # Request 2 collides with the held claim while Request 1 is still embedding —
+        # the contested file is skipped and absent from the response body.
         with httpx.Client(verify=False, timeout=30.0) as c2:
             r2 = index_files(c2, project, {"rust": {"src/a.rs": RUST_V2}})
-        assert r2.status_code == 429, r2.text
+        assert r2.status_code == 200, r2.text
+        assert "src/a.rs" not in r2.json()["files"].get("rust", {}), r2.text
     finally:
         worker.join(timeout=30)
     assert not worker.is_alive(), "Request 1 did not finish"

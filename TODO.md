@@ -47,9 +47,6 @@ is *not done* or *deliberately constrained*.
   emits English `title`/`detail`. A client localizes by keying on `code`. If
   server-driven translation is ever wanted, add a `code` → localized-template table
   (selected by `Accept-Language`); no code outside `ApiError::detail`/`title` changes.
-- **Performance benchmarks for large-codebase indexing.** The "fast indexing"
-  claim is so far unmeasured — no reproducible benchmark suite exists. Needed
-  before quoting any numbers.
 - **Cloud-GPU deployment template for the embedder.** Running `embedder/` on a
   remote GPU (and pointing mindex at it via `--model-server`) is a supported use
   case for machines without a local GPU, but there is no ready-made template
@@ -71,16 +68,6 @@ is *not done* or *deliberately constrained*.
   one DB, replace the in-process set with a DB-level compare-and-swap claim — e.g. a
   conditional `… → indexing` update plus an epoch column checked at `mark_indexed`, so
   a superseded writer abandons rather than clobbering. Requires a schema migration.
-- **A claim collision penalizes innocent files in the same batch.** When a multi-file
-  `/index` batch hits 429 on *one* contended file, `post_index` recovers every
-  already-prepared file in that batch to `failed` with `retry_count += 1` (it can't
-  tell a contention 429 from a genuine prepare error — `prepare` returns an `ApiError`
-  and `post_index` recovers on *any* `Err`). No corruption (the retry worker re-indexes
-  them), but repeated collisions on the same co-batched file could burn its 3 retries
-  and strand it in `failed`. Fix: have `prepare` signal contention distinctly (it
-  already returns `ApiError::FileInFlight`, so `post_index` could branch on it) so the
-  batch recovers those files **without** incrementing retry, or simply leaves them
-  `indexing` for the worker.
 
 ## Assumptions
 

@@ -398,7 +398,7 @@ impl FileIndexer<'_> {
                     None => {
                         info!(
                             "The file is already being indexed by another in-flight \
-                             request; returning 429 so the caller retries."
+                             request; skipping it so the rest of the batch can proceed."
                         );
                         return Err(ApiError::FileInFlight);
                     }
@@ -717,10 +717,10 @@ impl FileIndexer<'_> {
 /// deleted inline, so indexing latency is decoupled from Qdrant delete latency.
 ///
 /// **Concurrency:** safe. Each `(project, model, path)` is serialized by an in-process
-/// claim — a second in-flight request for the *same* file gets **429** (retry later);
-/// different files proceed in parallel. A concurrent `POST /cancel` is reconciled
-/// before the embed pass. On any failure the whole batch is recovered to
-/// `failed`/`cancelled` and the retry worker re-attempts it.
+/// claim — a second in-flight request for the *same* file is **skipped** (it is absent
+/// from the response, like an unchanged file); different files proceed in parallel.
+/// A concurrent `POST /cancel` is reconciled before the embed pass. On any failure
+/// the whole batch is recovered to `failed`/`cancelled` and the retry worker re-attempts it.
 #[utoipa::path(
     post,
     path = "/v0/{project_guid}/index",
@@ -730,7 +730,6 @@ impl FileIndexer<'_> {
     responses(
         (status = 200, description = "Per-file chunk counts for the files actually (re)indexed.", body = IndexResponse),
         (status = 400, description = "Validation failed (bad path, oversized file, too many files).", body = ProblemDetails),
-        (status = 429, description = "The same file is already being indexed by another in-flight request — retry.", body = ProblemDetails),
         (status = 499, description = "Client closed the connection; indexing was cancelled (nginx convention).", body = ProblemDetails),
         (status = 500, description = "SQLite, slicer, or Qdrant upsert failure; the batch was marked `failed` for the retry worker.", body = ProblemDetails),
         (status = 503, description = "The embedder is unreachable or returned persistent backpressure; the batch was marked `failed`.", body = ProblemDetails),
@@ -829,8 +828,12 @@ pub async fn post_index(
                 match indexer.prepare(pl, path, code, &mut sha256_hasher).await {
                     Ok(Some(p)) => prepared.push(p),
                     Ok(None) => {} // unchanged — skipped
+                    // Another in-flight request holds the claim for this file; skip it
+                    // so the rest of the batch proceeds. Innocent co-batched files must
+                    // not pay a retry_count penalty for an unrelated file's contention.
+                    Err(ApiError::FileInFlight) => {}
                     Err(e) => {
-                        // A later file failed to prepare; recover the ones already prepared
+                        // A real prepare failure; recover the ones already prepared
                         // (they're 'indexing' with chunks inserted) before bailing.
                         indexer.recover_all(&prepared, "failed", true).await;
                         return Err(e);
@@ -1961,7 +1964,8 @@ pub async fn post_retry(
 /// liveness) and `GET /config` (static knobs).
 ///
 /// **Concurrency:** safe — read-only. This is the endpoint to inspect *why* you saw a
-/// 429 (held indexing claims), a 409 (`gc_running`), or a 500 (`pool_available` at 0).
+/// 409 (`gc_running`) or a 500 (`pool_available` at 0); `indexing_claims` shows how
+/// many files are mid-pipeline (same-file collisions are now skipped, not 429).
 #[utoipa::path(
     get,
     path = "/status",
@@ -2492,8 +2496,8 @@ mod tests {
         // the per-file claim is owned by `Prepared._claim`, and `post_index` keeps
         // the `Vec<Prepared>` in scope through embed_all AND mark_indexed/recover_all.
         // So a request that goes on to *fail* still holds the lock while it recovers
-        // to `failed`; no second request for the same file can start (it gets 429)
-        // until the first fully terminates. This is what makes the interleaving
+        // to `failed`; no second request for the same file can start (the contended
+        // file is skipped) until the first fully terminates. This is what makes the interleaving
         // "req1 releases → req3 reindexes → req1's late `failed` lands" impossible:
         // req1 never releases mid-pipeline.
         let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));

@@ -45,7 +45,9 @@ pub enum ApiError {
     QdrantUnavailable,
     /// A GC pass is already running (manual or the hourly worker). 409.
     GcRunning,
-    /// The same file is already being indexed by another in-flight request. 429.
+    /// The same file is already being indexed by another in-flight request.
+    /// Internal sentinel only — `post_index` catches this and skips the file (200);
+    /// it is never returned to the client.
     FileInFlight,
     /// The project has never been seen. 404.
     ProjectNotFound,
