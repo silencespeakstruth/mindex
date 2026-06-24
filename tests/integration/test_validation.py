@@ -100,3 +100,90 @@ def test_bad_uuid_path(client: httpx.Client) -> None:
         json={"query": "x"},
     )
     assert_problem(resp, 400, "request.malformed_path")
+
+
+def test_bad_uuid_path_on_management_endpoint(client: httpx.Client) -> None:
+    # The ApiPath extractor wraps every route: management endpoints must also return
+    # request.malformed_path, not a plain-text 400.
+    resp = client.get(f"{MINDEX_URL}/projects/not-a-uuid")
+    assert_problem(resp, 400, "request.malformed_path")
+
+    resp2 = client.request(
+        "DELETE",
+        f"{MINDEX_URL}/projects/not-a-uuid/files",
+        json={"include": {"paths": ["**"]}},
+    )
+    assert_problem(resp2, 400, "request.malformed_path")
+
+
+# ── query length cap ───────────────────────────────────────────────────────────
+
+
+def test_query_too_long_rejected(client: httpx.Client, project: str) -> None:
+    # Default max_query_bytes = 32768; send one byte over the cap.
+    resp = search(client, project, {"query": "a" * 32769})
+    assert_problem(resp, 400, "validation.query_too_long")
+    meta = resp.json()["meta"]
+    assert meta["max"] == 32768
+
+
+# ── selector size cap ──────────────────────────────────────────────────────────
+
+
+def test_selector_too_large_on_delete_files(client: httpx.Client, project: str) -> None:
+    # Default max_selector_patterns = 256; send 257 path globs to cross the cap.
+    too_many = [f"src/f{i}/**" for i in range(257)]
+    resp = client.request(
+        "DELETE",
+        f"{MINDEX_URL}/projects/{project}/files",
+        json={"include": {"paths": too_many}},
+    )
+    assert_problem(resp, 400, "validation.selector_too_large")
+    meta = resp.json()["meta"]
+    assert meta["max"] == 256
+
+
+def test_selector_too_large_on_cancel(client: httpx.Client, project: str) -> None:
+    too_many = [f"src/f{i}/**" for i in range(257)]
+    resp = client.post(
+        f"{MINDEX_URL}/projects/{project}/cancel",
+        json={"include": {"paths": too_many}},
+    )
+    assert_problem(resp, 400, "validation.selector_too_large")
+
+
+# ── selector emptiness on /cancel ─────────────────────────────────────────────
+
+
+def test_cancel_empty_selector_problem_json(client: httpx.Client, project: str) -> None:
+    # Empty body (no include/exclude) on POST /cancel returns selector.empty, matching
+    # the same rule enforced on DELETE /files and POST /cancel.
+    resp = client.post(f"{MINDEX_URL}/projects/{project}/cancel", json={})
+    assert_problem(resp, 400, "selector.empty")
+
+
+# ── malformed body on /index ──────────────────────────────────────────────────
+
+
+def test_malformed_json_body_on_index(client: httpx.Client, project: str) -> None:
+    # ApiJson rejects invalid JSON on every endpoint — not just /search.
+    resp = client.post(
+        f"{MINDEX_URL}/v0/{project}/index",
+        content=b"{bad",
+        headers={"content-type": "application/json"},
+    )
+    assert_problem(resp, 400, "request.malformed_body")
+
+
+# ── drift path validation ──────────────────────────────────────────────────────
+
+
+def test_drift_path_invalid_rejected(client: httpx.Client, project: str) -> None:
+    # The drift validator runs validate_path before validate_sha256_hex.
+    # A traversal path must return path_invalid, not sha256_invalid.
+    good_sha = "a" * 64
+    resp = client.post(
+        f"{MINDEX_URL}/projects/{project}/drift",
+        json={"files": {"../escape.rs": good_sha}},
+    )
+    assert_problem(resp, 400, "validation.path_invalid")

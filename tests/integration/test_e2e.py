@@ -198,6 +198,28 @@ def test_search_empty_project_returns_404(client: httpx.Client, project: str) ->
     assert resp.status_code == 404
 
 
+def test_tiny_file_produces_zero_chunks_but_is_indexed(
+    client: httpx.Client, project: str
+) -> None:
+    # A file too short to reach the 128-token slicer minimum produces zero chunks.
+    # The handler counts chunks from Prepared.chunks (which is empty), so the
+    # response carries chunk_count == 0. The file must still reach status='indexed'
+    # (not 'failed') — a zero-chunk file is a valid indexed file, not an error.
+    tiny = "fn add(a: i32, b: i32) -> i32 { a + b }"
+    resp = index(client, project, tiny, path="src/tiny.rs")
+    assert resp.status_code == 200
+    files = resp.json()["files"]["rust"]
+    assert files.get("src/tiny.rs", -1) == 0, files
+
+    # The file is 'indexed' in the project stats (not failed, not missing).
+    s = client.get(f"{MINDEX_URL}/projects/{project}").json()
+    assert s["files"]["indexed"] == 1, s
+    assert s["files"].get("failed", 0) == 0, s
+
+    # No active chunks → search returns 404, not a server error.
+    assert search(client, project, "add two numbers").status_code == 404
+
+
 def test_multiple_files_indexed_independently(
     client: httpx.Client, project: str
 ) -> None:

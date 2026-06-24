@@ -14,6 +14,7 @@ Deletions are soft (mark + GC), so every deletion test calls POST /gc explicitly
 and asserts the data is then physically gone (stats / search).
 """
 
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -404,3 +405,133 @@ def test_config_lists_languages_and_knobs(client: httpx.Client) -> None:
     assert body["db_pool_size"] >= 1
     assert isinstance(body["embed_batch"], int)
     assert isinstance(body["stuck_grace_mins"], int)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /projects/{guid}/files — exclude-only selector
+# ---------------------------------------------------------------------------
+
+
+def test_delete_files_exclude_only_selector(client: httpx.Client, project: str) -> None:
+    # An exclude-only body (no include) is a valid non-empty selector: it deletes
+    # every file that does NOT match the exclusion.
+    index_files(
+        client,
+        project,
+        {"rust": {"src/keep.rs": RUST_V1, "tests/drop.rs": RUST_V2}},
+    )
+
+    # Exclude src/**: only tests/drop.rs survives the filter, so it gets deleted.
+    resp = delete_files(client, project, exclude={"paths": ["src/**"]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted_files"] == 1
+
+    assert run_gc(client).status_code == 200
+
+    after = stats(client, project).json()
+    assert after["files"]["indexed"] == 1, after
+    assert after["files"].get("deleted", 0) == 0, after
+
+    # The surviving file is src/keep.rs; tests/drop.rs is gone.
+    files = {f["path"]: f for f in list_files(client, project).json()["files"]}
+    assert set(files) == {"src/keep.rs"}, files
+
+
+# ---------------------------------------------------------------------------
+# POST /projects/{guid}/retry — scoped selector
+# ---------------------------------------------------------------------------
+
+
+def test_retry_with_path_selector_requeues_only_matching_files(
+    client: httpx.Client, project: str, embed_fail: Callable[[int], None]
+) -> None:
+    # Fail 2 files in one batch, then retry only one of them by path selector.
+    embed_fail(2)
+    assert (
+        index_files(
+            client,
+            project,
+            {"rust": {"src/a.rs": RUST_V1, "src/b.rs": RUST_V2}},
+        ).status_code
+        == 503
+    )
+
+    failed = list_files(client, project, status="failed").json()["files"]
+    assert len(failed) == 2, failed
+    assert all(f["retry_count"] >= 1 for f in failed), failed
+
+    # Requeue only src/a.rs; src/b.rs must keep its elevated retry_count.
+    resp = retry_files(client, project, include={"paths": ["src/a.rs"]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["requeued_files"] == 1
+
+    files_after = {
+        f["path"]: f
+        for f in list_files(client, project, status="failed").json()["files"]
+    }
+    assert files_after["src/a.rs"]["retry_count"] == 0, files_after
+    assert files_after["src/b.rs"]["retry_count"] >= 1, files_after
+
+
+# ---------------------------------------------------------------------------
+# GET /projects/{guid}/files — combined status + language filter
+# ---------------------------------------------------------------------------
+
+
+def test_list_files_combined_status_and_language_filter(
+    client: httpx.Client, project: str
+) -> None:
+    index_files(
+        client,
+        project,
+        {"rust": {"a.rs": RUST_V1}, "python": {"b.py": PYTHON_SRC}},
+    )
+    # ?status=indexed&language=rust must return only a.rs, not b.py.
+    resp = list_files(client, project, status="indexed", language="rust")
+    assert resp.status_code == 200
+    paths = {f["path"] for f in resp.json()["files"]}
+    assert paths == {"a.rs"}, paths
+
+    # ?status=failed&language=rust — nothing matches.
+    empty = list_files(client, project, status="failed", language="rust").json()[
+        "files"
+    ]
+    assert empty == [], empty
+
+
+# ---------------------------------------------------------------------------
+# GET /status — indexing_claims counter during live indexing
+# ---------------------------------------------------------------------------
+
+
+def test_status_shows_indexing_claims_during_live_embed(
+    client: httpx.Client, project: str, embed_delay: Callable[[float], None]
+) -> None:
+    # Hold the embed long enough to read /status mid-flight and observe a claim.
+    embed_delay(3.0)
+
+    def do_index() -> None:
+        with httpx.Client(verify=False, timeout=30.0) as c:
+            index_files(c, project, {"rust": {"src/a.rs": RUST_V1}})
+
+    worker = threading.Thread(target=do_index)
+    worker.start()
+    try:
+        # Poll until the file enters 'indexing', then check /status.
+        import time
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            s = stats(client, project)
+            if s.status_code == 200 and s.json()["files"]["indexing"] >= 1:
+                break
+            time.sleep(0.05)
+
+        body = client.get(f"{MINDEX_URL}/status").json()
+        assert body["indexing_claims"] >= 1, body
+        assert body["indexing_files"] >= 1, body
+        assert body["files_by_status"]["indexing"] >= 1, body
+    finally:
+        worker.join(timeout=30)
+    assert not worker.is_alive()
+    embed_delay(0.0)
