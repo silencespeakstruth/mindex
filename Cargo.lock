@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "mindex"
-version = "0.2.0-beta"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
