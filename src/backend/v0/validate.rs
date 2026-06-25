@@ -19,7 +19,9 @@ pub fn validate_path(path: &str) -> Result<(), ApiError> {
         || path.contains('\\')
         || path.split('/').any(|seg| seg == "..");
     if invalid {
-        Err(ApiError::PathInvalid { path: path.to_string() })
+        Err(ApiError::PathInvalid {
+            path: path.to_string(),
+        })
     } else {
         Ok(())
     }
@@ -30,7 +32,9 @@ pub fn validate_sha256_hex(path: &str, sha: &str) -> Result<(), ApiError> {
     if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(ApiError::Sha256Invalid { path: path.to_string() })
+        Err(ApiError::Sha256Invalid {
+            path: path.to_string(),
+        })
     }
 }
 
@@ -51,19 +55,28 @@ pub fn validate_query(query: &str, max_bytes: usize) -> Result<(), ApiError> {
         return Err(ApiError::QueryEmpty);
     }
     if query.len() > max_bytes {
-        return Err(ApiError::QueryTooLong { got: query.len(), max: max_bytes });
+        return Err(ApiError::QueryTooLong {
+            got: query.len(),
+            max: max_bytes,
+        });
     }
     Ok(())
 }
 
 /// One `include`/`exclude` selector: its globs + languages combined must stay within
 /// the pattern cap. (Glob *syntax* is already validated when `GlobPattern` deserializes.)
-pub fn validate_selector(filter: &Option<SearchFilter>, max_patterns: usize) -> Result<(), ApiError> {
+pub fn validate_selector(
+    filter: &Option<SearchFilter>,
+    max_patterns: usize,
+) -> Result<(), ApiError> {
     if let Some(f) = filter {
         let n = f.paths.as_ref().map_or(0, Vec::len)
             + f.programming_languages.as_ref().map_or(0, Vec::len);
         if n > max_patterns {
-            return Err(ApiError::SelectorTooLarge { got: n, max: max_patterns });
+            return Err(ApiError::SelectorTooLarge {
+                got: n,
+                max: max_patterns,
+            });
         }
     }
     Ok(())
@@ -79,7 +92,9 @@ pub fn require_nonempty_selector(
     let nonempty = |f: &Option<SearchFilter>| {
         f.as_ref().is_some_and(|x| {
             x.paths.as_ref().is_some_and(|p| !p.is_empty())
-                || x.programming_languages.as_ref().is_some_and(|l| !l.is_empty())
+                || x.programming_languages
+                    .as_ref()
+                    .is_some_and(|l| !l.is_empty())
         })
     };
     if nonempty(include) || nonempty(exclude) {
@@ -98,7 +113,10 @@ pub fn validate_index_request(
 ) -> Result<(), ApiError> {
     let total: usize = req.files.values().map(HashMap::len).sum();
     if total > max_files {
-        return Err(ApiError::TooManyFiles { got: total, max: max_files });
+        return Err(ApiError::TooManyFiles {
+            got: total,
+            max: max_files,
+        });
     }
     for files in req.files.values() {
         for (path, Code { code }) in files {
@@ -118,7 +136,10 @@ pub fn validate_index_request(
 /// Validate a `/drift` body: entry-count cap, each path's format, each sha256's format.
 pub fn validate_drift_request(req: &DriftRequest, max_files: usize) -> Result<(), ApiError> {
     if req.files.len() > max_files {
-        return Err(ApiError::TooManyFiles { got: req.files.len(), max: max_files });
+        return Err(ApiError::TooManyFiles {
+            got: req.files.len(),
+            max: max_files,
+        });
     }
     for (path, sha) in &req.files {
         validate_path(path)?;
@@ -168,15 +189,27 @@ mod tests {
         assert!(validate_top_k(None, 100).is_ok());
         assert!(validate_top_k(Some(1), 100).is_ok());
         assert!(validate_top_k(Some(100), 100).is_ok());
-        assert_eq!(err_code(validate_top_k(Some(0), 100).unwrap_err()), "validation.top_k_out_of_range");
-        assert_eq!(err_code(validate_top_k(Some(101), 100).unwrap_err()), "validation.top_k_out_of_range");
+        assert_eq!(
+            err_code(validate_top_k(Some(0), 100).unwrap_err()),
+            "validation.top_k_out_of_range"
+        );
+        assert_eq!(
+            err_code(validate_top_k(Some(101), 100).unwrap_err()),
+            "validation.top_k_out_of_range"
+        );
     }
 
     #[test]
     fn query_non_empty_and_bounded() {
         assert!(validate_query("hello", 1024).is_ok());
-        assert_eq!(err_code(validate_query("", 1024).unwrap_err()), "validation.query_empty");
-        assert_eq!(err_code(validate_query("abcd", 3).unwrap_err()), "validation.query_too_long");
+        assert_eq!(
+            err_code(validate_query("", 1024).unwrap_err()),
+            "validation.query_empty"
+        );
+        assert_eq!(
+            err_code(validate_query("abcd", 3).unwrap_err()),
+            "validation.query_too_long"
+        );
     }
 
     #[test]
@@ -209,7 +242,12 @@ mod tests {
     fn index_request_caps() {
         let mut files = HashMap::new();
         let mut inner = HashMap::new();
-        inner.insert("src/a.rs".to_string(), Code { code: "x".repeat(10) });
+        inner.insert(
+            "src/a.rs".to_string(),
+            Code {
+                code: "x".repeat(10),
+            },
+        );
         files.insert(ProgrammingLanguage::Rust, inner);
         let req = IndexRequest { files };
 
