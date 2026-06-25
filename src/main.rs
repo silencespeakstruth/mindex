@@ -215,6 +215,7 @@ async fn main() -> Result<(), BoxError> {
                 db_pool_size: cfg.database.pool_size,
             },
             cfg.server.max_body_mib * 1024 * 1024,
+            cfg.server.http3,
             sigterm_token.child_token()) => {
             if let Err(err) = res {
                 error!(

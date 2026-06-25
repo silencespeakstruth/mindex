@@ -89,6 +89,10 @@ pub struct ServerConfig {
     pub key_path: PathBuf,
     /// Max `/index` request body in MiB (indexing posts many files at once).
     pub max_body_mib: usize,
+    /// Enable HTTP/3 over QUIC on the same port (UDP). When set, `--cert-path`
+    /// and `--key-path` must also be explicitly provided as CLI flags.
+    #[serde(default)]
+    pub http3: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,6 +206,7 @@ impl Default for ServerConfig {
             cert_path: PathBuf::from(DEFAULT_CERT_PATH),
             key_path: PathBuf::from(DEFAULT_KEY_PATH),
             max_body_mib: DEFAULT_MAX_BODY_MIB,
+            http3: false,
         }
     }
 }
@@ -363,6 +368,11 @@ pub struct Cli {
     /// crash-orphaned (default: 30). Must exceed the longest legitimate in-flight request.
     #[arg(long)]
     pub stuck_grace_mins: Option<i64>,
+
+    /// Enable HTTP/3 over QUIC (UDP) on the same port as the TLS server.
+    /// Requires --cert-path and --key-path to be explicitly provided.
+    #[arg(long, default_value = "false")]
+    pub http3: bool,
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -485,6 +495,26 @@ pub fn resolve(cli: &Cli) -> Result<(Config, ConfigSource), ConfigError> {
 
     apply_cli_overrides(&mut config, cli);
 
+    // --http3 requires explicit cert/key CLI flags because the QUIC endpoint reads
+    // the certificate independently of axum-server.  Relying on path defaults risks
+    // a silent misconfiguration, so we enforce clarity here.
+    if cli.http3 && (cli.cert_path.is_none() || cli.key_path.is_none()) {
+        let mut missing = Vec::new();
+        if cli.cert_path.is_none() {
+            missing.push("--cert-path");
+        }
+        if cli.key_path.is_none() {
+            missing.push("--key-path");
+        }
+        return Err(ConfigError(format!(
+            "--http3 requires {} to be explicitly provided as a CLI flag{}. \
+             Fix: pass {} when enabling HTTP/3.",
+            missing.join(" and "),
+            if missing.len() == 1 { "" } else { "s" },
+            missing.join(" and "),
+        )));
+    }
+
     if let Err(errors) = config.validate() {
         let body = errors
             .iter()
@@ -523,6 +553,10 @@ fn apply_cli_overrides(cfg: &mut Config, cli: &Cli) {
     over!(cli.db_pool_size, cfg.database.pool_size, "database.pool_size");
     over!(cli.embed_batch, cfg.indexing.embed_batch_chunks, "indexing.embed_batch_chunks");
     over!(cli.stuck_grace_mins, cfg.indexing.stuck_grace_minutes, "indexing.stuck_grace_minutes");
+    if cli.http3 {
+        info!(key = "server.http3", old = false, new = true, "Config value overridden by CLI flag.");
+        cfg.server.http3 = true;
+    }
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -751,6 +785,7 @@ mod tests {
             embed_batch: Some(512),
             max_body_mib: None,
             stuck_grace_mins: None,
+            http3: false,
         };
         apply_cli_overrides(&mut cfg, &cli);
         assert_eq!(cfg.indexing.embed_batch_chunks, 512); // flag beats file

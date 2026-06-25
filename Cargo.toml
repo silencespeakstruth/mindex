@@ -7,7 +7,13 @@ license = "Unlicense"
 [dependencies]
 axum = { version = "0.8.9", features = ["json", "macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+bytes = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+rustls-pemfile = "2"
 tokio = { version = "1.52.3", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tree-sitter            = "0.26.9"
@@ -56,4 +62,3 @@ utoipa = { version = "5.5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0", default-features = false, features = ["axum", "vendored"] }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
