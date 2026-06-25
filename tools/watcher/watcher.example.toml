@@ -1,0 +1,16 @@
+# mindex-watch configuration example.
+# Place at $XDG_CONFIG_HOME/mindex/watcher.toml (usually ~/.config/mindex/watcher.toml).
+
+server_url = "https://127.0.0.1:11111"
+protocol   = "v0"
+
+# Skip TLS certificate verification — required for the default self-signed cert.
+no_verify = false
+
+# Milliseconds to accumulate filesystem events before flushing a batch.
+# Increase if your editor writes many files quickly (save-all, format-on-save).
+debounce_ms = 1000
+
+# Seconds between full drift checks (walk + hash + compare to index).
+# The drift check catches changes that happened while the watcher was offline.
+drift_interval_secs = 300
