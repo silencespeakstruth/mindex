@@ -333,7 +333,7 @@ mod tests {
     async fn migrated_pool() -> SQLite3Pool {
         let pool = SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), |tx| {
-            for migration in crate::MIGRATIONS {
+            for (_, migration) in crate::MIGRATIONS {
                 tx.execute_batch(migration)?;
             }
             Ok(())

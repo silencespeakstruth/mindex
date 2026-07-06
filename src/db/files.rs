@@ -75,7 +75,7 @@ mod tests {
     async fn migrated_pool() -> SQLite3Pool {
         let pool = SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), |tx| {
-            for m in crate::MIGRATIONS {
+            for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
             tx.execute(

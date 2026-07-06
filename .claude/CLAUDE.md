@@ -532,7 +532,11 @@ Three compose files (all build the **same** `Dockerfile`):
    legal transition (triggers enforce it — see the state machine). New
    status-changing paths need a transition test.
 7. Adding a language → the full checklist under **Languages**.
-8. Schema change → new migration file in the `MIGRATIONS` slice; the DB is
+8. Schema change → new migration file in the `MIGRATIONS` slice **with the next sequential
+   integer version** (e.g. `(4, include_str!("db/migrations/v0.4.0_foo.sql"))`). Startup
+   reads `PRAGMA user_version` and applies only migrations whose version exceeds it, then
+   sets `user_version` to the highest applied version. All SQL must use `IF NOT EXISTS` so
+   a cold re-run on a DB that was already at that version is a no-op; the DB is otherwise
    droppable (no upgrade path). SQLite can't `ALTER` a `CHECK` onto an existing table, so
    add new constraints as `BEFORE INSERT/UPDATE` triggers (the `v0.2.0` status machine /
    `v0.3.0` validation checks pattern) — additive, so they apply to a persisted DB without

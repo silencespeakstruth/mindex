@@ -380,6 +380,8 @@ pub struct GcResponse {
 #[derive(Serialize, Debug, ToSchema)]
 pub struct VersionResponse {
     pub version: &'static str,
+    /// Applied `PRAGMA user_version` — the highest migration version in the running binary.
+    pub db_schema_version: i32,
 }
 
 /// One dependency's liveness: `"ok"` or `"error: <reason>"`.

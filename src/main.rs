@@ -25,12 +25,13 @@ mod worker;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-// Applied in order on startup, inside one transaction. `pub(crate)` so test
-// modules build a schema-identical `:memory:` pool from the same source.
-pub(crate) const MIGRATIONS: &[&str] = &[
-    include_str!("db/migrations/v0.1.0_schema.sql"),
-    include_str!("db/migrations/v0.2.0_status_machine.sql"),
-    include_str!("db/migrations/v0.3.0_validation_checks.sql"),
+// Applied in order on startup: only migrations whose version exceeds the
+// current `PRAGMA user_version` are run, inside one transaction. `pub(crate)`
+// so test modules build a schema-identical `:memory:` pool from the same source.
+pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("db/migrations/v0.1.0_schema.sql")),
+    (2, include_str!("db/migrations/v0.2.0_status_machine.sql")),
+    (3, include_str!("db/migrations/v0.3.0_validation_checks.sql")),
 ];
 
 #[tokio::main]
@@ -83,17 +84,30 @@ async fn main() -> Result<(), BoxError> {
         &cfg.sqlite_synchronous(),
     ));
 
-    match db_pool
+    let db_schema_version = match db_pool
         .transaction(token, |tx| {
-            for migration in MIGRATIONS {
-                tx.execute_batch(migration)?;
+            let current: i32 =
+                tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            let pending: Vec<_> = MIGRATIONS.iter().filter(|(v, _)| *v > current).collect();
+            for (_, sql) in &pending {
+                tx.execute_batch(sql)?;
             }
-
-            Ok(())
+            if let Some((max_v, _)) = pending.last() {
+                tx.pragma_update(None, "user_version", max_v)?;
+            }
+            let applied = !pending.is_empty();
+            Ok((pending.last().map_or(current, |(v, _)| *v), applied))
         })
         .await
     {
-        Ok(_) => info!(db_path = ?cfg.database.path, "Schema migration completed."),
+        Ok((v, true)) => {
+            info!(db_path = ?cfg.database.path, schema_version = v, "Schema migration completed.");
+            v
+        }
+        Ok((v, false)) => {
+            info!(db_path = ?cfg.database.path, schema_version = v, "Schema already up to date; no migrations run.");
+            v
+        }
         Err(err) => {
             error!(
                 error = ?err,
@@ -104,7 +118,7 @@ async fn main() -> Result<(), BoxError> {
             );
             return Err(err.into());
         }
-    }
+    };
 
     let model_id = cfg.model.name.as_str(); // For now, only one model is supported.
 
@@ -213,6 +227,7 @@ async fn main() -> Result<(), BoxError> {
                 gc_flag: gc_flag.clone(),
                 stuck_grace_mins: cfg.indexing.stuck_grace_minutes,
                 db_pool_size: cfg.database.pool_size,
+                db_schema_version,
             },
             cfg.server.max_body_mib * 1024 * 1024,
             cfg.server.http3,

@@ -81,6 +81,8 @@ pub struct RouterState {
     pub stuck_grace_mins: i64,
     /// Connection-pool size. Reported by `GET /config`.
     pub db_pool_size: usize,
+    /// Applied `PRAGMA user_version` after startup migrations. Reported by `GET /version`.
+    pub db_schema_version: i32,
 }
 
 pub struct CancellationGuard(pub CancellationToken);

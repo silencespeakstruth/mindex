@@ -2094,8 +2094,8 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, A
     responses((status = 200, description = "The running mindex version.", body = VersionResponse)),
 )]
 #[debug_handler]
-pub async fn get_version() -> Json<VersionResponse> {
-    Json(VersionResponse { version: env!("CARGO_PKG_VERSION") })
+pub async fn get_version(State(s): State<RouterState>) -> Json<VersionResponse> {
+    Json(VersionResponse { version: env!("CARGO_PKG_VERSION"), db_schema_version: s.db_schema_version })
 }
 
 /// `GET /health` — a *smart* readiness check: confirms both stores (SQLite +
@@ -2538,7 +2538,7 @@ mod tests {
     async fn retry_resets_count_and_preserves_timestamp() {
         let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), |tx| {
-            for m in crate::MIGRATIONS {
+            for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
             tx.execute(
