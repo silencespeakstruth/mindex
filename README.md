@@ -101,7 +101,8 @@ resurrects it).
 |-------|-----------|
 | **mindex** (`src/`) | The Rust async HTTPS server — the API below. |
 | **embedder** (`embedder/`) | The BGE-M3 model server exposing all three heads over `/encode` + `/health`. Runs on the host (GPU) or in the cloud — see below. |
-| **mindex-index** (`tools/indexer/`) | CLI that walks a directory tree and uploads files for indexing (`--concurrency`, glob include/exclude, live progress). |
+| **mindex-index** (`tools/indexer/`) | CLI that walks a directory tree and uploads files for indexing (`--concurrency`, glob include/exclude, live progress). `--check` reports working-tree drift (stale/missing/orphaned) instead of uploading. |
+| **mindex-watch** (`tools/watcher/`) | inotify daemon that keeps the index live automatically: watches the project root, debounces edits, reindexes changed files and removes deleted ones, plus a periodic drift sweep to catch offline changes. Reads the repo-root `.mindex` for GUID + scope. |
 | **mindex-search.sh** (`tools/search/`) | Terminal search frontend: a query in, syntax-highlighted matches out. Configurable by flags or `MINDEX_*` env vars. |
 | **mindex** (`tools/mcp/mindex/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md). |
 | **scout** (`tools/mcp/scout/`) | Second MCP server: a **token-saving** layer over the same search API. The agent sends a few decomposed sub-queries, a local LLM reads the chunks and returns only a compact summary + `file:line` pointers, so raw code never enters the agent's context — roughly an order-of-magnitude less context than raw search on a survey. Orient with its `digest` tool, then follow its pointers with raw `search` for exact code. See [`tools/mcp/scout/README.md`](tools/mcp/scout/README.md). |
@@ -116,6 +117,7 @@ in your shell rc — on a default rustup setup it often isn't):
 ```sh
 cargo install --locked --path .             # mindex (server)
 cargo install --locked --path tools/indexer # mindex-index (separate crate)
+cargo install --locked --path tools/watcher # mindex-watch (separate crate)
 ln -sf "$PWD/tools/search/mindex-search.sh" ~/.cargo/bin/mindex-search
 ```
 
@@ -132,10 +134,11 @@ place. **Prereqs:** rustup (the pinned 1.95 toolchain auto-installs from
 
 ## Running
 
-**The shape of it.** Three services and two host-side CLI tools. The dependency order
-is bottom-up: **Qdrant** (vectors) and the **embedder** (BGE-M3) come up first; the
+**The shape of it.** Three services and a handful of host-side CLI tools. The dependency
+order is bottom-up: **Qdrant** (vectors) and the **embedder** (BGE-M3) come up first; the
 **mindex server** connects to both and serves the HTTPS API; then the **`mindex-index`**
-and **`mindex-search.sh`** tools — which run on your machine — drive that API over HTTPS.
+and **`mindex-search.sh`** tools — which run on your machine — drive that API over HTTPS
+(with **`mindex-watch`** as an optional daemon that keeps the index live automatically).
 So you start the two backends, start mindex pointed at them, then build the tools once and
 use them. `docker-compose.yml` wires Qdrant + mindex together and is the **canonical
 reference for the server's flags** — read it for the exact values; treat it as an
@@ -230,6 +233,7 @@ Garbage Collection / Observability / Config) are served as **Swagger UI at
 | `DELETE /projects/{project}/files` | Soft-delete files by an include/exclude selector (body). |
 | `POST /projects/{project}/cancel` | Best-effort cancel of in-flight indexing for files matching an include/exclude selector (body); only `indexing` files are affected. |
 | `POST /projects/{project}/retry` | Requeue `failed` files for the retry worker (resets `retry_count`); optional include/exclude selector (body) — empty body = all failed files. |
+| `POST /projects/{project}/drift` | Read-only: compare a posted `path → sha256` manifest (body) against the index; returns four buckets — `stale` / `missing` / `orphaned` / `indexing`. Powers `mindex-index --check`, `mindex-watch`, and the `drift` MCP tool. |
 | `POST /gc` | Run garbage collection synchronously. |
 | `GET /status` | Live runtime state: held indexing claims, GC running flag, SQLite pool headroom, file counts by status. |
 | `GET /config` | Static capabilities and tuning knobs: version, model, supported languages, batch/pool/retry settings. |
@@ -243,8 +247,9 @@ Garbage Collection / Observability / Config) are served as **Swagger UI at
 and a structured `meta` (`{min, max, got, …}`). The `code` is the contract a client keys
 on (and the key it localizes against — the prose is English and informational). Bad input
 is rejected at the edge as a `400` with a precise code (an invalid path, an oversized
-query, `top_k` over the cap, a malformed body) rather than surfacing as an opaque `500`.
-The full code catalogue is in the Swagger description.
+query, `top_k` over the cap, a malformed body) rather than surfacing as an opaque `500`;
+a body over `[server].max_body_mib` is a `413` (`request.body_too_large`). The full code
+catalogue is in the Swagger description.
 
 ## Key configuration
 

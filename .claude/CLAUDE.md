@@ -71,6 +71,7 @@ src/
 scripts/entrypoint.sh   Docker entrypoint: self-signed cert on first start
 tests/                  mock_embedder/ (FastAPI), integration/ (pytest), see Tests
 tools/indexer/          mindex-index CLI (own Cargo.toml/lock, not in workspace)
+tools/watcher/          mindex-watch CLI (own Cargo.toml/lock) — inotify daemon that live-syncs the index
 tools/search/           mindex-search.sh (bash) — search frontend (flags + MINDEX_* env)
 tools/mcp/mindex/       mindex (Python/Poetry) — MCP stdio server; search + live-index for a coding agent
 tools/mcp/scout/        scout (Python/Poetry) — MCP stdio server; token-saving digest (decomposed queries → local-LLM summary)
@@ -192,7 +193,17 @@ since retry is non-destructive): it is a **metadata-only** write — `retry_coun
 status stays `failed`, so it skips the state-machine triggers and takes no
 `IndexClaim` — and it deliberately leaves `status_updated_at` untouched so the retry
 worker (whose `failed` branch needs `status_updated_at < now-60`) re-embeds on the
-next sweep rather than after another grace window. `GET /projects` (list all, summary
+next sweep rather than after another grace window. `POST /projects/{guid}/drift` is a
+**read-only** working-tree comparison — it takes a posted `path → sha256` manifest
+(entry count capped by `[limits].max_drift_files`) and, without touching any state,
+classifies each path against the SQLite baseline into four buckets: `stale` (indexed
+but hash differs → needs reindex), `missing` (present in the manifest but not indexed —
+`failed`/never-indexed rows count as missing), `orphaned` (indexed but absent from the
+manifest → should be deleted), and `indexing` (in-flight, deliberately excluded from
+`stale`/`missing` since its stored hash is the *incoming* value not yet embedded). An
+unknown project isn't a 404 — every posted file is simply `missing`. It's the query
+behind `mindex-index --check`, the `drift` MCP tool, and the watcher's periodic sweep.
+`GET /projects` (list all, summary
 counts), `GET /projects/{guid}` (per-language stats), `GET /projects/{guid}/files`
 (per-file listing — status / language / hash / active-chunk count / `retry_count`,
 with optional `?status=`/`?language=` filters; `?status=failed` is the dead-letter
@@ -224,7 +235,10 @@ positionally aligned with the chunk list.
 The embedder client (`bge_m3.rs::BGEm3HttpClient`) retries HTTP **429** (embedder
 busy/backpressure) up to 3× with exponential backoff (200/400/800ms), respecting
 the cancellation token during sleeps; if it's still 429, it gives up — the file is
-marked `failed` and the retry worker re-attempts later (layered backoff).
+marked `failed` and the retry worker re-attempts later (layered backoff). Each
+`/encode` attempt also carries a whole-request timeout (`[model].encode_timeout_ms`,
+default 10 min) so a wedged embedder can't hang the retry worker indefinitely — the
+attempt fails and re-enters the same `failed` → retry path.
 
 ## Slicer
 
@@ -287,7 +301,9 @@ already-prepared file (still `indexing`, chunks inserted) is recovered to
 `failed`/`cancelled` via `recover_all` and the retry worker re-embeds them later.
 `tree_sitter::Parser` is `Send`, so the slicer is built inside the `spawn_blocking`
 closure. The `/index` request body limit is `[server].max_body_mib` / `--max-body-mib` (default 256 MiB) via
-`DefaultBodyLimit` — axum's 2 MB default is far too small for multi-file posts.
+`DefaultBodyLimit` — axum's 2 MB default is far too small for multi-file posts. A body
+over that cap is rendered as problem+json (`ApiError::BodyTooLarge` → **413**
+`request.body_too_large`), not axum's default plain-text 413.
 
 ## Mockable interfaces
 
@@ -396,6 +412,20 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   indexing mindex itself** (the CLIs' `long_about` text pollutes results).
   `chunk_count == 0` in the response means "sliced to no chunks" (below 128 tokens),
   *not* unchanged — hash-unchanged files are skipped server-side and absent entirely.
+  `--check` runs a `POST /drift` instead of uploading: it walks + hashes the tree,
+  reports stale/missing/orphaned, and exits non-zero on any actionable drift
+  (`--json` prints the raw drift body for scripts).
+- **`tools/watcher/` (`mindex-watch`)** — own crate (own `Cargo.toml/lock`, not in the
+  workspace, same two-level XDG config scheme as the indexer via `mindex/watcher.toml`
+  + `watcher.example.toml`). An **inotify daemon** that keeps the index live: it watches
+  the project root, debounces filesystem events (`--debounce-ms`, default 1000), and
+  reindexes changed files / `delete_files` removed ones — the same live-sync an agent
+  does by hand through the MCP server, but automatic. It reads the same repo-root
+  `.mindex` (GUID + optional `include_paths`/`exclude_paths`/`languages` scope) and
+  every `--drift-interval` seconds (default 300) runs a full `POST /drift` sweep to catch
+  changes made while it was offline. `--dry-run` logs every planned action but makes no
+  mutating call (the read-only drift check still runs). It is the daemon counterpart to
+  the agent-driven MCP maintenance and the manual `mindex-index --check`.
 - **`tools/search/mindex-search.sh` (bash)** — the single search frontend. POSTs search,
   renders with `pygmentize` if present (else plain). Results print **ascending by
   score** so the best match is last, right above the prompt. Every API status is
@@ -412,7 +442,10 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   CLIs; hits the same HTTP API). The **intended primary way an agent drives mindex**:
   `search` for precise code to read or edit (top-5 cap fixed in the adapter — the
   model can't raise it), `index_files`/`delete_files` to keep the index live as it
-  edits.
+  edits. `drift` (wraps `POST /drift`) lets the agent verify the index against the
+  working tree before trusting search, and `cancel_indexing` (wraps `POST /cancel`)
+  aborts in-flight work for a selector; `health`/`list_projects`/`project_stats` round
+  out the read-only introspection tools.
   Live reindex is meant to be called freely — unchanged files are hash-skipped
   server-side — but `index_files` carries full bodies, so it is **only** for the few
   files just touched, passed **verbatim**; a *bulk* (re)index or path-exclude job goes
@@ -476,7 +509,10 @@ Three compose files (all build the **same** `Dockerfile`):
   `docker compose -f docker-compose.test.yml up --build --exit-code-from test-runner --abort-on-container-exit`.
   Healthchecks use `/dev/tcp` (qdrant) and `urllib` (embedder) because neither image
   has curl. `mindex` has no host port; test-runner reaches it on the internal net.
-  Migrations are additive (incl. `v0.3.0`'s `IF NOT EXISTS` triggers), so a re-run
+  `mindex` mounts `tests/integration/mindex-test-config.toml` (small `[limits]`/
+  `[search].max_*` caps) so the request-shape limit tests can exercise the edge
+  rejections — those knobs are TOML-only, so they can't be set by a compose `command:`
+  flag. Migrations are additive (incl. `v0.3.0`'s `IF NOT EXISTS` triggers), so a re-run
   against the persisted `test_mindex_db` volume does **not** need a volume drop.
 
 ## Tests
@@ -486,8 +522,15 @@ Three compose files (all build the **same** `Dockerfile`):
   `BGEm3Model` + fake `VectorStore`, SQLite pool (incl. the connection-leak
   regression), GC sweep (incl. the orphan-prevention regression via a `FakeStore`),
   the `ApiError` → `ProblemDetails` envelope + the `codes_are_stable` contract snapshot
-  (`backend/error.rs`), and the per-rule validation tests (`backend/v0/validate.rs`).
-  No server/Docker; some slicer tests need the BGE-M3 tokenizer from the HF cache.
+  (`backend/error.rs`), the per-rule validation tests (`backend/v0/validate.rs`), the
+  migration runner (`apply_pending_migrations` — fresh/partial/up-to-date DBs +
+  `user_version` stamping), the `v0.2.0`/`v0.3.0` triggers (illegal transitions +
+  defense-in-depth shape checks rejected at the SQLite layer), and the retry worker's
+  `sweep_candidates` selection rules (stuck grace / failed cooldown / retry budget).
+  The `tools/` crates carry their own unit tests too (`mindex-watch`'s
+  `convert_event`/`classify` + `.mindex` parsing; the indexer's `scan()` language
+  detection + globs). No server/Docker; some slicer tests need the BGE-M3 tokenizer from
+  the HF cache.
 - **Integration** (`tests/integration/`, pytest in Docker): mock embedder returns
   deterministic vectors seeded by text hash (stable ranking assertions). `test_e2e.py`
   is the rust happy path; `test_filters_and_languages.py` covers non-rust languages
@@ -495,11 +538,16 @@ Three compose files (all build the **same** `Dockerfile`):
   stats / delete-project / delete-files / GC endpoints (each deletion test calls
   `POST /gc` to confirm physical removal); `test_validation.py` asserts the
   problem+json envelope + expected `code` for bad path / over-cap top_k / empty query /
-  empty selector / bad sha256 / malformed body / non-UUID path. Fresh project GUID per test.
+  empty selector / bad sha256 / malformed body / non-UUID path (and the request-shape
+  limit caps — code size / file counts / drift manifest / 413 body cap — via the mounted
+  `mindex-test-config.toml`); `test_concurrency.py` covers a `DELETE /projects` racing a
+  live index, search with the embedder down (503 `embedder.unavailable`), and pool
+  saturation. Fresh project GUID per test.
 
 ## Linting (zero warnings everywhere — non-default flags matter)
 
-- Rust: `cargo clippy --bin mindex` and `cd tools/indexer && cargo clippy`.
+- Rust: `cargo clippy --bin mindex`, `cd tools/indexer && cargo clippy`, and
+  `cd tools/watcher && cargo clippy` (each `tools/` crate is its own workspace).
 - Shell: `shellcheck scripts/entrypoint.sh`, `shellcheck --shell=bash tools/search/mindex-search.sh`;
   format with `shfmt -i 4 -ci` (4-space + indented case — bare `shfmt` defaults to tabs).
 - Python (`tests/`): `ruff check`, `ruff format --check` **and** `black --check`
