@@ -31,7 +31,7 @@ uv run python -m bge_m3_api --port 11211
 
 ### GPU / torch build (supply torch out-of-band)
 
-`pyproject.toml` does **not** let uv manage torch at all: a never-true override
+`pyproject.toml` does **not** let `uv` manage torch at all: a never-true override
 marker (`[tool.uv] override-dependencies`) drops it from the resolution, so `uv
 sync` installs everything **except** torch (and never pulls the default CUDA wheel
 with its multi-GB `nvidia-*` libs). The right accelerator build is per-machine (AMD
