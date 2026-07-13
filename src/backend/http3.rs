@@ -215,7 +215,7 @@ pub async fn run(
     );
 
     // HTTP/1.1+2 over TLS+TCP — runs until the cancellation token fires.
-    axum_server::bind_rustls(
+    let serve_result = axum_server::bind_rustls(
         addr,
         RustlsConfig::from_pem_file(pem_files.0, pem_files.1).await?,
     )
@@ -227,6 +227,13 @@ pub async fn run(
         h3_cancel.cancel();
         quic.close(0u32.into(), b"server shutdown");
         let _ = h3_handle.await;
+    }
+
+    // `None` = cancelled by the shutdown token (clean exit); `Some(Err)` = the TCP
+    // server died on its own (bind conflict, TLS handshake config, ...) and must
+    // surface — otherwise the process exits 0 having never served.
+    if let Some(res) = serve_result {
+        res?;
     }
 
     Ok(())
@@ -275,6 +282,13 @@ async fn serve_h3_connection(
         .build::<_, Bytes>(h3_quinn::Connection::new(conn))
         .await?;
 
+    // Per-connection token: cancelled when this function returns (client closed the
+    // connection, connection error, or server shutdown), so in-flight request tasks
+    // drop their handler futures — firing each handler's `CancellationGuard` exactly
+    // like axum does on the TCP path when the client disconnects.
+    let conn_cancel = cancel.child_token();
+    let _conn_guard = conn_cancel.clone().drop_guard();
+
     loop {
         tokio::select! {
             biased;
@@ -285,7 +299,7 @@ async fn serve_h3_connection(
                     Err(e) => { warn!(error = %e, "HTTP/3 connection accept error"); break; }
                     Ok(Some(resolver)) => {
                         let router = router.clone();
-                        let cancel = cancel.clone();
+                        let cancel = conn_cancel.clone();
                         tokio::spawn(async move {
                             match resolver.resolve_request().await {
                                 Ok((req, stream)) => {
@@ -335,11 +349,12 @@ async fn serve_h3_request(
                             data.advance(n);
                         }
                         if body.len() > body_limit_bytes {
-                            let _ = stream
-                                .send_response(Response::builder().status(413).body(()).unwrap())
-                                .await;
-                            let _ = stream.finish().await;
-                            return Ok(());
+                            use axum::response::IntoResponse;
+                            return send_axum_response(
+                                crate::backend::error::ApiError::BodyTooLarge.into_response(),
+                                &mut stream,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -347,22 +362,30 @@ async fn serve_h3_request(
         }
     }
 
-    // Forward to the axum router — identical logic to the TCP path.
+    // Forward to the axum router — identical logic to the TCP path. Dropping the
+    // future on connection close is what fires the handler's `CancellationGuard`.
     let (parts, _) = req.into_parts();
-    let resp = router
-        .oneshot(Request::from_parts(parts, Body::from(body)))
-        .await?;
+    let resp = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(()),
+        resp = router.oneshot(Request::from_parts(parts, Body::from(body))) => resp?,
+    };
 
+    send_axum_response(resp, &mut stream).await
+}
+
+/// Send an axum `Response` back over an HTTP/3 bidi stream. Shared by the normal
+/// routing path and the over-limit 413 so both emit the same problem+json envelope.
+async fn send_axum_response(
+    resp: Response<Body>,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (resp_parts, resp_body) = resp.into_parts();
-    stream
-        .send_response(Response::from_parts(resp_parts, ()))
-        .await?;
-
+    stream.send_response(Response::from_parts(resp_parts, ())).await?;
     let data = axum::body::to_bytes(resp_body, usize::MAX).await?;
     if !data.is_empty() {
         stream.send_data(data).await?;
     }
     stream.finish().await?;
-
     Ok(())
 }

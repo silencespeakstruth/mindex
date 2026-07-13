@@ -72,6 +72,11 @@ where
 }
 
 fn malformed_body(rej: JsonRejection) -> ApiError {
+    // axum's DefaultBodyLimit surfaces as a 413 JsonRejection; keep the status
+    // and the stable code instead of flattening it into a 400 malformed_body.
+    if rej.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::BodyTooLarge;
+    }
     ApiError::MalformedBody(rej.body_text())
 }
 
@@ -81,4 +86,46 @@ fn malformed_query(rej: QueryRejection) -> ApiError {
 
 fn malformed_path(rej: PathRejection) -> ApiError {
     ApiError::MalformedPath(rej.body_text())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::extract::DefaultBodyLimit;
+    use axum::routing::post;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn oversized_body_is_413_problem_json_not_400() {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[allow(dead_code)]
+            x: String,
+        }
+        async fn h(ApiJson(_): ApiJson<Body>) -> &'static str {
+            "ok"
+        }
+
+        let app = Router::new()
+            .route("/", post(h))
+            .layer(DefaultBodyLimit::max(8));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"x":"far-longer-than-eight-bytes"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "request.body_too_large");
+    }
 }

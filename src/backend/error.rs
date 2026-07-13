@@ -58,6 +58,8 @@ pub enum ApiError {
     MalformedBody(String),
     /// A path parameter could not be parsed (e.g. a non-UUID project guid). 400.
     MalformedPath(String),
+    /// The request body exceeded the configured size limit. 413.
+    BodyTooLarge,
 
     // ── Selector ──────────────────────────────────────────────────────────────
     /// A management selector (`include`/`exclude`) was empty where non-empty is required. 400.
@@ -97,6 +99,7 @@ impl ApiError {
             ApiError::NoMatch => "search.no_match",
             ApiError::MalformedBody(_) => "request.malformed_body",
             ApiError::MalformedPath(_) => "request.malformed_path",
+            ApiError::BodyTooLarge => "request.body_too_large",
             ApiError::SelectorEmpty => "selector.empty",
             ApiError::PathInvalid { .. } => "validation.path_invalid",
             ApiError::Sha256Invalid { .. } => "validation.sha256_invalid",
@@ -120,6 +123,7 @@ impl ApiError {
             ApiError::GcRunning => StatusCode::CONFLICT,
             ApiError::FileInFlight => StatusCode::TOO_MANY_REQUESTS,
             ApiError::ProjectNotFound | ApiError::NoMatch => StatusCode::NOT_FOUND,
+            ApiError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             // Everything else is a client input error.
             _ => StatusCode::BAD_REQUEST,
         }
@@ -138,6 +142,7 @@ impl ApiError {
             ApiError::NoMatch => "No matching results",
             ApiError::MalformedBody(_) => "Malformed request body",
             ApiError::MalformedPath(_) => "Malformed path parameter",
+            ApiError::BodyTooLarge => "Request body too large",
             ApiError::SelectorEmpty => "Empty selector",
             ApiError::PathInvalid { .. } => "Invalid file path",
             ApiError::Sha256Invalid { .. } => "Invalid sha256",
@@ -177,6 +182,7 @@ impl ApiError {
             ApiError::NoMatch => "No active chunks match (empty project or over-narrow filter).".into(),
             ApiError::MalformedBody(msg) => format!("The request body could not be parsed: {msg}"),
             ApiError::MalformedPath(msg) => format!("A path parameter could not be parsed: {msg}"),
+            ApiError::BodyTooLarge => "The request body exceeds the configured size limit ([server].max_body_mib).".into(),
             ApiError::SelectorEmpty => "At least one non-empty `include` or `exclude` selector is required.".into(),
             ApiError::PathInvalid { path } => format!(
                 "Path {path:?} is invalid: paths must be non-empty, repo-relative (no leading '/'), \
@@ -312,6 +318,7 @@ mod tests {
             ApiError::NoMatch,
             ApiError::MalformedBody(String::new()),
             ApiError::MalformedPath(String::new()),
+            ApiError::BodyTooLarge,
             ApiError::SelectorEmpty,
             ApiError::PathInvalid { path: String::new() },
             ApiError::Sha256Invalid { path: String::new() },
@@ -332,6 +339,7 @@ mod tests {
             "internal.error",
             "project.not_found",
             "qdrant.unavailable",
+            "request.body_too_large",
             "request.cancelled",
             "request.malformed_body",
             "request.malformed_path",

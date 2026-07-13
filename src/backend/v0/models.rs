@@ -459,7 +459,9 @@ pub struct RetryResponse {
 #[derive(Serialize, Debug, ToSchema)]
 pub struct StatusResponse {
     /// Per-file `(project, model, path)` indexing claims held right now — the size of
-    /// the in-process mutual-exclusion table (contention here is what returns 429).
+    /// the in-process mutual-exclusion table. A same-file collision is skipped
+    /// server-side (the file is simply absent from that `/index` response), never
+    /// surfaced as an error.
     pub indexing_claims: usize,
     /// Whether a garbage-collection pass is running (a `POST /gc` now returns 409).
     pub gc_running: bool,

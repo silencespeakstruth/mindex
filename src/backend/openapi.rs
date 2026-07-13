@@ -52,6 +52,7 @@ nginx convention). A same-file index collision skips the contended file silently
 client localizes against (the `detail`/`title` prose is English and informational). \
 Field-specific errors add `field` and a structured `meta` for interpolation. The code \
 catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_path`, \
+`request.body_too_large`, \
 `internal.error`, `embedder.unavailable`, `qdrant.unavailable`, `gc.already_running`, \
 `project.not_found`, `search.no_match`, `selector.empty`, \
 `validation.path_invalid`, `validation.sha256_invalid`, `validation.top_k_out_of_range`, \

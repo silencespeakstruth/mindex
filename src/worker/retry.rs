@@ -24,7 +24,7 @@ pub(crate) async fn warn_permanently_failed(
     max_retries: i64,
     token: CancellationToken,
 ) {
-    let count: i64 = db_pool
+    let count: i64 = match db_pool
         .transaction(token, move |tx| {
             tx.query_row(
                 "SELECT COUNT(*) FROM project_files
@@ -35,7 +35,18 @@ pub(crate) async fn warn_permanently_failed(
             .map_err(SQLite3PoolError::from)
         })
         .await
-        .unwrap_or(0);
+    {
+        Ok(c) => c,
+        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(e) => {
+            error!(
+                error = ?e,
+                "Retry worker: failed to count permanently-failed files. \
+                 Check the DB file is readable and not locked by another process."
+            );
+            0
+        }
+    };
 
     if count > 0 {
         warn!(
@@ -58,7 +69,7 @@ pub(crate) async fn warn_permanently_failed(
 /// the operator knows recovery is pending — it happens within one `stuck_grace_mins`
 /// window plus a sweep.
 pub(crate) async fn warn_orphaned_indexing(db_pool: &SQLite3Pool, token: CancellationToken) {
-    let count: i64 = db_pool
+    let count: i64 = match db_pool
         .transaction(token, |tx| {
             tx.query_row(
                 "SELECT COUNT(*) FROM project_files
@@ -69,7 +80,18 @@ pub(crate) async fn warn_orphaned_indexing(db_pool: &SQLite3Pool, token: Cancell
             .map_err(SQLite3PoolError::from)
         })
         .await
-        .unwrap_or(0);
+    {
+        Ok(c) => c,
+        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(e) => {
+            error!(
+                error = ?e,
+                "Retry worker: failed to count orphaned mid-flight files. \
+                 Check the DB file is readable and not locked by another process."
+            );
+            0
+        }
+    };
 
     if count > 0 {
         warn!(
@@ -129,7 +151,7 @@ pub async fn run(
             last_failed_warn = Instant::now();
         }
 
-        let stuck_files: Vec<(String, String, String)> = db_pool
+        let stuck_files: Vec<(String, String, String)> = match db_pool
             .transaction(token.clone(), {
                 let model_id = model_id.clone();
                 move |tx| {
@@ -167,7 +189,18 @@ pub async fn run(
                 .map_err(SQLite3PoolError::from)
             }})
             .await
-            .unwrap_or_default();
+        {
+            Ok(v) => v,
+            Err(SQLite3PoolError::Cancelled) => continue,
+            Err(e) => {
+                error!(
+                    error = ?e,
+                    "Retry worker: failed to query stuck/failed files; skipping this sweep. \
+                     Check the DB file is readable and not locked by another process."
+                );
+                continue;
+            }
+        };
 
         for (project_guid, path, file_model_id) in stuck_files {
             if token.is_cancelled() {
@@ -214,7 +247,7 @@ async fn retry_file(
     // `cancelled → indexing` is a legal transition, so without this guard the worker
     // would resurrect a just-cancelled file. Only proceed if it's still in a retryable
     // state ('indexing' stuck, 'just_uploaded', or 'failed'); otherwise leave it be.
-    let current_status: Option<String> = db_pool
+    let current_status: Option<String> = match db_pool
         .transaction(token.clone(), {
             let (pg, p, m) = (project_guid.to_string(), path.to_string(), model_id.to_string());
             move |tx| {
@@ -229,7 +262,20 @@ async fn retry_file(
             }
         })
         .await
-        .unwrap_or_default();
+    {
+        Ok(v) => v,
+        Err(SQLite3PoolError::Cancelled) => return,
+        Err(e) => {
+            error!(
+                error = ?e,
+                %project_guid,
+                %path,
+                "Retry worker: failed to re-read the file status under the claim; skipping. \
+                 Check the DB file is readable and not locked by another process."
+            );
+            return;
+        }
+    };
     if !matches!(
         current_status.as_deref(),
         Some("indexing" | "just_uploaded" | "failed")
@@ -278,10 +324,37 @@ async fn retry_file(
     let collection = collection_name(project_guid);
 
     // The chunk rows store qdrant_guid as text; parse back to UUIDv4 for upsert.
+    // A stored guid that fails to parse (the schema CHECK only enforces length 32,
+    // not hex) must be skipped, never coerced to the nil UUID — several corrupt rows
+    // would collide onto one point and search could never find them.
     let to_embed: Vec<(UUIDv4, String)> = chunks
         .into_iter()
-        .map(|(g, code)| (UUIDv4(Uuid::parse_str(&g).unwrap_or_default()), code))
+        .filter_map(|(g, code)| match Uuid::parse_str(&g) {
+            Ok(u) => Some((UUIDv4(u), code)),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    %project_guid,
+                    %path,
+                    qdrant_guid = %g,
+                    "Retry worker: stored qdrant_guid is not a valid UUID; skipping this chunk."
+                );
+                None
+            }
+        })
         .collect();
+
+    // All chunks were corrupt: embedding nothing and calling it 'indexed' would hide
+    // the corruption — leave the file 'failed' for the operator to re-push.
+    if to_embed.is_empty() {
+        error!(
+            %project_guid, %path,
+            "Retry worker: every stored chunk has a corrupt qdrant_guid; leaving the file 'failed'. \
+             Re-push the file to reindex it from source."
+        );
+        set_file_status(db_pool, project_guid, path, model_id, "failed", true, token.clone()).await;
+        return;
+    }
 
     let success = match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed)
         .await
@@ -370,20 +443,23 @@ mod tests {
         }
     }
 
-    /// `VectorStore` fake whose `insert_batch` succeeds or fails on demand.
+    /// `VectorStore` fake whose `insert_batch` succeeds or fails on demand and records
+    /// the guids it was asked to upsert (so tests can assert corrupt ones are skipped).
     struct Store {
         fail_upsert: bool,
+        upserted: std::sync::Mutex<Vec<UUIDv4>>,
     }
     #[async_trait]
     impl VectorStore for Store {
         async fn insert_batch(
             &self,
             _collection: &str,
-            _chunks: Vec<ChunkAsVector>,
+            chunks: Vec<ChunkAsVector>,
         ) -> Result<(), VectorStoreError> {
             if self.fail_upsert {
                 Err(VectorStoreError("forced upsert failure".to_string()))
             } else {
+                self.upserted.lock().unwrap().extend(chunks.iter().map(|c| c.guid));
                 Ok(())
             }
         }
@@ -479,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn retry_success_goes_failed_indexing_indexed_and_resets_count() {
         let pool = pool_with_failed_file(2).await;
-        let store = Store { fail_upsert: false };
+        let store = Store { fail_upsert: false, upserted: std::sync::Mutex::new(vec![]) };
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
         retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
@@ -494,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn retry_store_failure_goes_failed_indexing_failed_and_bumps_count() {
         let pool = pool_with_failed_file(2).await;
-        let store = Store { fail_upsert: true };
+        let store = Store { fail_upsert: true, upserted: std::sync::Mutex::new(vec![]) };
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
         retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
@@ -509,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn retry_with_no_active_chunks_marks_indexed() {
         let pool = pool_with_failed_file(0).await;
-        let store = Store { fail_upsert: false };
+        let store = Store { fail_upsert: false, upserted: std::sync::Mutex::new(vec![]) };
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
         retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
@@ -519,13 +595,42 @@ mod tests {
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
     }
 
+    #[tokio::test]
+    async fn retry_skips_chunks_with_corrupt_qdrant_guid() {
+        // One valid chunk + one whose qdrant_guid is 32 chars but not a UUID.
+        let pool = pool_with_failed_file(1).await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid,
+                      start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, ?2, ?3, 'code', ?4, 1, 2, 0, 1, 'active')",
+                params![PG, PATH, MODEL, "z".repeat(32)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let store = Store { fail_upsert: false, upserted: std::sync::Mutex::new(vec![]) };
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
+
+        // The file still completes (the valid chunk was embedded), and exactly one
+        // point was upserted — the corrupt one was skipped, not upserted as nil.
+        assert_eq!(current(&pool).await.0, "indexed");
+        let upserted = store.upserted.lock().unwrap().clone();
+        assert_eq!(upserted.len(), 1, "corrupt-guid chunk must be skipped, got {upserted:?}");
+        assert!(upserted.iter().all(|u| !u.0.is_nil()), "nil UUID must never be upserted");
+    }
+
     /// If a live `/index` request already holds the file's claim, the worker must NOT
     /// touch it — no status change, no transition logged. This is the worker↔handler
     /// race guard (the key here is built exactly as the handler builds it).
     #[tokio::test]
     async fn retry_skips_when_file_claim_is_held() {
         let pool = pool_with_failed_file(2).await;
-        let store = Store { fail_upsert: true }; // would fail loudly if it ran
+        let store = Store { fail_upsert: true, upserted: std::sync::Mutex::new(vec![]) }; // would fail loudly if it ran
 
         let locks = Arc::new(Mutex::new(HashSet::new()));
         // Simulate a live `/index` holding the slot.
@@ -553,7 +658,7 @@ mod tests {
         set_file_status(&pool, PG, PATH, MODEL, "cancelled", false, CancellationToken::new()).await;
         let log_before = log_pairs(&pool).await.len();
 
-        let store = Store { fail_upsert: true }; // would fail loudly if it ran
+        let store = Store { fail_upsert: true, upserted: std::sync::Mutex::new(vec![]) }; // would fail loudly if it ran
         let locks = Arc::new(Mutex::new(HashSet::new()));
         retry_file(&pool, &store, &OkEmbedder, PG, PATH, MODEL, TEST_EMBED, &locks, &CancellationToken::new()).await;
 

@@ -123,8 +123,10 @@ legitimate in-flight request**: cross-file batching holds a whole batch in `inde
 through the embed pass, so a too-short grace lets the worker race a live batch
 (re-embedding its files and tripping illegal transitions). A stuck file with **no
 active chunks** (too short → 0 chunks) is marked `indexed`, not `failed` (a wrong
-`failed` would trap it, since `failed→indexed` is illegal). `sha256` and the
-`retry_count` reset land only on `indexed`. Status writes go through
+`failed` would trap it, since `failed→indexed` is illegal). `sha256` is (re)written
+when the file enters `indexing` (the prepare upsert) and confirmed again at
+`indexed`, so the stored hash always matches the chunks in the table; the
+`retry_count` reset still lands only on `indexed`. Status writes go through
 `db::files::set_file_status` (stamps `status_updated_at`, WARNs on a rejected
 transition); every transition is logged to `project_file_status_log` by AFTER-triggers.
 A file that exhausts `MAX_RETRIES` (3) stays `failed` and is never retried again

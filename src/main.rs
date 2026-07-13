@@ -165,6 +165,7 @@ async fn main() -> Result<(), BoxError> {
             max_429_retries: cfg.model.max_429_retries,
             backoff_base_ms: cfg.model.backoff_base_ms,
             health_timeout_ms: cfg.model.health_timeout_ms,
+            encode_timeout_ms: cfg.model.encode_timeout_ms,
         },
     ));
 

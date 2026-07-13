@@ -177,7 +177,7 @@ fn build_search_query(project_guid: UUIDv4, req: &SearchRequest) -> (String, Vec
                     c
                 })
                 .collect();
-            meta_where.push(clauses.join(" OR "));
+            meta_where.push(format!("({})", clauses.join(" OR ")));
             binds.extend(paths.iter().map(|p| Bind::Path(p.0.as_str().to_string())));
         }
     }
@@ -343,12 +343,14 @@ struct FileIndexer<'a> {
 }
 
 /// True iff this file is already **successfully indexed** with this exact content:
-/// a row exists with `status = 'indexed'` and a matching `sha256`. Only an
-/// `indexed` row counts — the `sha256` is written at `indexing` time (the column
-/// is `NOT NULL`), so a file that was sliced but never embedded (e.g. the embedder
-/// was down, leaving it `failed`/`indexing`) carries the right hash without having
-/// any vectors. Gating the skip on `status = 'indexed'` is what lets a later
-/// re-index pick such a file back up instead of treating it as unchanged forever.
+/// a row exists with `status = 'indexed'` and a matching `sha256`. The stored
+/// `sha256` always reflects the content whose chunks are currently in the table —
+/// it is (re)written when the file enters `indexing` (the prepare upsert) and
+/// confirmed at `indexed`. Only an `indexed` row counts for the skip, because a
+/// non-`indexed` row has no (complete) vectors: a file sliced but never embedded
+/// (e.g. the embedder was down, leaving it `failed`/`indexing`) carries the right
+/// hash without any vectors. Gating the skip on `status = 'indexed'` is what lets a
+/// later re-index pick such a file back up instead of treating it as unchanged forever.
 fn file_already_indexed(
     tx: &rusqlite::Transaction,
     project_guid: UUIDv4,
@@ -367,6 +369,17 @@ fn file_already_indexed(
         .optional()?;
     Ok(existing.as_deref() == Some(sha256))
 }
+
+/// The prepare-phase upsert that moves a file into `indexing`. Extracted as a const
+/// so the sha256-refresh regression test executes the exact production statement
+/// (binds: ?1 project_guid, ?2 path, ?3 sha256, ?4 programming_language, ?5 model_id).
+const MARK_INDEXING_UPSERT_SQL: &str = "INSERT INTO project_files
+         (project_guid, path, sha256, programming_language, model_id,
+          status, status_updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, 'indexing', unixepoch())
+     ON CONFLICT (project_guid, model_id, path)
+     DO UPDATE SET status = 'indexing', sha256 = excluded.sha256,
+                   status_updated_at = unixepoch()";
 
 impl FileIndexer<'_> {
     /// Phase 1 for one file: hash-check → mark `indexing` → mark old chunks deleted,
@@ -440,12 +453,7 @@ impl FileIndexer<'_> {
                 self.db_pool
                     .transaction(self.token.child_token(), move |tx| {
                         tx.execute(
-                            "INSERT INTO project_files
-                                 (project_guid, path, sha256, programming_language, model_id,
-                                  status, status_updated_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, 'indexing', unixepoch())
-                             ON CONFLICT (project_guid, model_id, path)
-                             DO UPDATE SET status = 'indexing', status_updated_at = unixepoch()",
+                            MARK_INDEXING_UPSERT_SQL,
                             params![project_guid, path_u, sha256_u, pl, model_id_u],
                         )?;
                         Ok(())
@@ -730,6 +738,7 @@ impl FileIndexer<'_> {
     responses(
         (status = 200, description = "Per-file chunk counts for the files actually (re)indexed.", body = IndexResponse),
         (status = 400, description = "Validation failed (bad path, oversized file, too many files).", body = ProblemDetails),
+        (status = 413, description = "The request body exceeded [server].max_body_mib.", body = ProblemDetails),
         (status = 499, description = "Client closed the connection; indexing was cancelled (nginx convention).", body = ProblemDetails),
         (status = 500, description = "SQLite, slicer, or Qdrant upsert failure; the batch was marked `failed` for the retry worker.", body = ProblemDetails),
         (status = 503, description = "The embedder is unreachable or returned persistent backpressure; the batch was marked `failed`.", body = ProblemDetails),
@@ -917,9 +926,10 @@ pub async fn post_index(
 /// view. Kept separate from the handler so it is unit-testable without a DB.
 ///
 /// `in_flight` is checked **first**: a file currently being indexed is reported
-/// `indexing` and never `stale`/`missing`, because its stored `sha256` is the
-/// *previous* value (updated only at `mark_indexed`), so a hash comparison would be
-/// meaningless and re-triggering it would race the live batch.
+/// `indexing` and never `stale`/`missing`. Its stored `sha256` is the *incoming*
+/// content's hash (written when the file enters `indexing`), but its vectors are
+/// not ready yet, so it must be excluded from drift regardless — re-triggering it
+/// would race the live batch.
 fn compute_drift(
     indexed: &HashMap<String, String>,
     in_flight: &HashSet<String>,
@@ -2384,6 +2394,152 @@ mod tests {
         assert_eq!(
             binds,
             vec![Bind::Guid(guid()), Bind::Path("vendor/**".into())]
+        );
+    }
+
+    // ── include-glob OR precedence (regression, red until fixed) ────────────
+    // Multiple include globs are ORed; without parentheses the OR leaks past the
+    // AND-joined project/status pins: `pin AND pin AND g1 OR g2` parses as
+    // `(pin AND pin AND g1) OR g2`, so the second glob matches soft-deleted
+    // chunks and other projects' chunks.
+
+    #[test]
+    fn include_path_glob_group_is_parenthesized() {
+        let (sql, _) =
+            build_search_query(guid(), &req(Some(paths(&["src/**", "tests/**"])), None));
+        assert!(
+            sql.contains("(c.file_path GLOB ?2 OR c.file_path GLOB ?3)"),
+            "include glob group must be parenthesized so OR cannot leak past AND: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn include_paths_do_not_leak_foreign_or_deleted_chunks() {
+        let p1 = UUIDv4(Uuid::from_u128(1));
+        let p2 = UUIDv4(Uuid::from_u128(2));
+        let ga = UUIDv4(Uuid::from_u128(0xA)); // P1, active, src/a.rs → expected
+        let gt = UUIDv4(Uuid::from_u128(0xB)); // P1, deleted, tests/t.rs → excluded
+        let gx = UUIDv4(Uuid::from_u128(0xC)); // P2, active, tests/x.rs → excluded
+
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            for (pg, path, chunk_guid, chunk_status) in [
+                (p1, "src/a.rs", ga, "active"),
+                (p1, "tests/t.rs", gt, "deleted"),
+                (p2, "tests/x.rs", gx, "active"),
+            ] {
+                tx.execute(
+                    "INSERT OR IGNORE INTO projects (guid, model_id)
+                     VALUES (?1, 'BAAI/bge-m3')",
+                    params![pg],
+                )?;
+                tx.execute(
+                    "INSERT INTO project_files
+                         (project_guid, model_id, path, sha256, programming_language, status)
+                     VALUES (?1, 'BAAI/bge-m3', ?2, ?3, 'rust', 'indexing')",
+                    params![pg, path, "0".repeat(64)],
+                )?;
+                tx.execute(
+                    "INSERT INTO project_file_chunks
+                         (project_guid, file_path, model_id, code, qdrant_guid,
+                          start_line, end_line, start_column, end_column, status)
+                     VALUES (?1, ?2, 'BAAI/bge-m3', 'code', ?3, 1, 2, 0, 1, ?4)",
+                    params![pg, path, chunk_guid, chunk_status],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (sql, binds) =
+            build_search_query(p1, &req(Some(paths(&["src/**", "tests/**"])), None));
+        let got: Vec<UUIDv4> = pool
+            .transaction(CancellationToken::new(), move |tx| {
+                tx.prepare(&sql)?
+                    .query_map(params_from_iter(binds), |r| r.get::<_, UUIDv4>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got,
+            vec![ga],
+            "candidate set must contain only the project's own active chunks \
+             matching the include globs — no soft-deleted or foreign-project chunks"
+        );
+    }
+
+    // ── sha256 refresh at indexing start (regression, red until fixed) ──────
+    // The prepare upsert must refresh sha256 on reindex of an existing row.
+    // Otherwise a crash/embed-failure recovered by the retry worker (which marks
+    // 'indexed' via set_file_status, never touching sha256) leaves the row with
+    // the OLD content hash next to the NEW content's chunks — and a later revert
+    // of the file to the old content is hash-skipped forever, serving stale chunks.
+    #[tokio::test]
+    async fn reindex_upsert_refreshes_sha256_at_indexing_start() {
+        const SHA_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const SHA_NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
+                params![guid()],
+            )?;
+            tx.execute(
+                "INSERT INTO project_files
+                     (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, 'BAAI/bge-m3', 'src/a.py', ?2, 'python', 'indexing')",
+                params![guid(), SHA_OLD],
+            )?;
+            // indexing → indexed: the state a previously indexed file sits in.
+            tx.execute(
+                "UPDATE project_files SET status = 'indexed' WHERE project_guid = ?1",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Reindex with changed content: the exact production prepare upsert.
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                MARK_INDEXING_UPSERT_SQL,
+                params![guid(), "src/a.py", SHA_NEW, ProgrammingLanguage::Python, "BAAI/bge-m3"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (status, sha): (String, String) = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.query_row(
+                    "SELECT status, sha256 FROM project_files WHERE project_guid = ?1",
+                    params![guid()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(status, "indexing");
+        assert_eq!(
+            sha, SHA_NEW,
+            "the prepare upsert must refresh sha256 on conflict — a retry-worker \
+             recovery marks 'indexed' without writing sha256, so a stale stored hash \
+             would desync from the freshly inserted chunks"
         );
     }
 

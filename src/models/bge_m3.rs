@@ -17,6 +17,9 @@ pub struct BGEm3Tuning {
     pub backoff_base_ms: u64,
     /// Liveness-ping timeout for the embedder's `/health`.
     pub health_timeout_ms: u64,
+    /// Whole-request timeout for one `/encode` call (connect + response body);
+    /// applied per attempt, so each 429 retry gets a fresh budget.
+    pub encode_timeout_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -190,6 +193,8 @@ pub struct BGEm3HttpClient {
     backoff_base: Duration,
     /// `/health` ping timeout (from config).
     health_timeout: Duration,
+    /// Per-attempt `/encode` request timeout (from config).
+    encode_timeout: Duration,
 }
 
 impl BGEm3HttpClient {
@@ -200,6 +205,7 @@ impl BGEm3HttpClient {
             max_429_retries: tuning.max_429_retries,
             backoff_base: Duration::from_millis(tuning.backoff_base_ms),
             health_timeout: Duration::from_millis(tuning.health_timeout_ms),
+            encode_timeout: Duration::from_millis(tuning.encode_timeout_ms),
         }
     }
 }
@@ -215,7 +221,12 @@ impl BGEm3Model for BGEm3HttpClient {
 
         let mut attempt: u32 = 0;
         loop {
-            let send = self.client.post(url.clone()).json(&req).send();
+            let send = self
+                .client
+                .post(url.clone())
+                .timeout(self.encode_timeout)
+                .json(&req)
+                .send();
 
             let response = tokio::select! {
                 _ = token.cancelled() => return Err(EncodeError::Cancelled),
@@ -316,6 +327,7 @@ mod tests {
             max_429_retries: TEST_MAX_429_RETRIES,
             backoff_base: Duration::from_millis(1), // keep the test fast
             health_timeout: Duration::from_secs(2),
+            encode_timeout: Duration::from_secs(5),
         };
         (client, hits)
     }
@@ -350,6 +362,38 @@ mod tests {
         token.cancel();
         let res = client.encode(req(), token).await;
         assert!(matches!(res, Err(EncodeError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn encode_times_out_on_a_wedged_embedder() {
+        // A stub that accepts the request and then never responds.
+        let app = Router::new().route(
+            "/encode",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                "never reached"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = BGEm3HttpClient {
+            client: reqwest::Client::new(),
+            base_url: Url::parse(&format!("http://{addr}/")).unwrap(),
+            max_429_retries: TEST_MAX_429_RETRIES,
+            backoff_base: Duration::from_millis(1),
+            health_timeout: Duration::from_secs(2),
+            encode_timeout: Duration::from_millis(100),
+        };
+
+        let started = std::time::Instant::now();
+        let res = client.encode(req(), CancellationToken::new()).await;
+        match res {
+            Err(EncodeError::Request(e)) => assert!(e.is_timeout(), "expected a timeout, got {e:?}"),
+            other => panic!("expected Err(Request(timeout)), got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "must fail fast, not hang");
     }
 
     /// Build a wire-format body by hand (the encoding side `pack_encode` lives in

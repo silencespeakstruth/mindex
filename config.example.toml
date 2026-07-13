@@ -23,6 +23,7 @@ server_url = "http://localhost:11211" # the BGE-M3 embedder
 health_timeout_ms = 2000             # /health ping timeout
 max_429_retries = 3                  # retries when the embedder returns 429 (busy)
 backoff_base_ms = 200                # first 429 backoff; doubles each retry
+encode_timeout_ms = 600000           # per-attempt /encode request timeout (ms); 10 min
 
 [qdrant]
 server_url = "http://localhost:6334" # Qdrant gRPC endpoint

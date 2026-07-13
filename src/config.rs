@@ -36,6 +36,7 @@ const DEFAULT_MODEL_SERVER: &str = "http://localhost:11211";
 const DEFAULT_HEALTH_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_MAX_429_RETRIES: u32 = 3;
 const DEFAULT_BACKOFF_BASE_MS: u64 = 200;
+const DEFAULT_ENCODE_TIMEOUT_MS: u64 = 600_000;
 
 const DEFAULT_QDRANT_SERVER: &str = "http://localhost:6334";
 const DEFAULT_UPSERT_BATCH_POINTS: usize = 256;
@@ -106,6 +107,8 @@ pub struct ModelConfig {
     pub max_429_retries: u32,
     /// First 429 backoff; doubles each retry.
     pub backoff_base_ms: u64,
+    /// Whole-request timeout for one `/encode` call, applied per attempt.
+    pub encode_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,6 +222,7 @@ impl Default for ModelConfig {
             health_timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
             max_429_retries: DEFAULT_MAX_429_RETRIES,
             backoff_base_ms: DEFAULT_BACKOFF_BASE_MS,
+            encode_timeout_ms: DEFAULT_ENCODE_TIMEOUT_MS,
         }
     }
 }
@@ -587,6 +591,9 @@ impl Config {
         if self.model.health_timeout_ms < 1 {
             e.push("[model].health_timeout_ms = 0 would time out instantly. Fix: use at least 1 (ms), e.g. 2000.".to_string());
         }
+        if self.model.encode_timeout_ms < 1 {
+            e.push("[model].encode_timeout_ms = 0 would time out instantly. Fix: use at least 1 (ms), e.g. 600000.".to_string());
+        }
 
         if self.qdrant.upsert_batch_points < 1 {
             e.push("[qdrant].upsert_batch_points = 0 would never upsert. Fix: use at least 1 (e.g. 256).".to_string());
@@ -804,6 +811,14 @@ mod tests {
         assert!(errs.iter().any(|m| m.contains("max_chunk_tokens")));
         assert!(errs.iter().any(|m| m.contains("synchronous")));
         assert!(errs.iter().any(|m| m.contains("fusion_limit")));
+    }
+
+    #[test]
+    fn zero_encode_timeout_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.model.encode_timeout_ms = 0;
+        let errs = cfg.validate().expect_err("should be invalid");
+        assert!(errs.iter().any(|m| m.contains("encode_timeout_ms")));
     }
 
     #[test]
