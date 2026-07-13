@@ -33,9 +33,13 @@ services:
       - test_mindex_db:/data
       - test_mindex_certs:/certs
       - hf_cache:/root/.cache/huggingface
+      # Request-shape limits are TOML-only (no CLI flag); the limit tests in
+      # test_validation.py rely on the shrunken values in this file.
+      - ./tests/integration/mindex-test-config.toml:/config/mindex-test-config.toml:ro
     environment:
       RUST_LOG: info
     command:
+      - --config=/config/mindex-test-config.toml
       - --bind=0.0.0.0:11111
       - --db-path=/data/mindex.db
       - --cert-path=/certs/cert.pem

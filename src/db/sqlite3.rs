@@ -227,4 +227,65 @@ mod tests {
             "connection leaked on drop — pool exhausted: {res:?}"
         );
     }
+
+    // The pool fast-fails rather than queueing: with every connection checked out, an
+    // extra transaction gets PoolEmpty immediately (the API contract behind the 500),
+    // and once a holder finishes, the pool serves again.
+    #[tokio::test]
+    async fn saturated_pool_fast_fails_then_recovers() {
+        let p = Arc::new(SQLite3Pool::new(Path::new(":memory:"), 2, 16384, "NORMAL"));
+
+        // Check out both connections and hold them for 300ms.
+        let mut holders = Vec::new();
+        for _ in 0..2 {
+            let p = Arc::clone(&p);
+            holders.push(tokio::spawn(async move {
+                p.transaction(CancellationToken::new(), |_tx| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        // Let both blocking tasks actually acquire their connections.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(p.available().await, 0, "both connections should be checked out");
+
+        // The N+1-th caller is rejected immediately, not queued.
+        let res = p.transaction(CancellationToken::new(), |_tx| Ok(())).await;
+        assert!(
+            matches!(res, Err(SQLite3PoolError::PoolEmpty)),
+            "a saturated pool must fast-fail with PoolEmpty, got {res:?}"
+        );
+
+        // Once the holders return their connections, service resumes.
+        for h in holders {
+            h.await.unwrap().unwrap();
+        }
+        let res = p.transaction(CancellationToken::new(), |_tx| Ok(1)).await;
+        assert!(matches!(res, Ok(1)), "pool must recover after connections return: {res:?}");
+        assert_eq!(p.available().await, 2);
+    }
+
+    // A panicking closure is a programmer error: its connection is deliberately
+    // dropped (not returned), the caller gets an error instead of a propagated panic,
+    // and the pool keeps serving on the remaining connections.
+    #[tokio::test]
+    async fn closure_panic_costs_one_connection_but_pool_keeps_serving() {
+        let p = pool(2);
+
+        let res = p
+            .transaction(CancellationToken::new(), |_tx| -> Result<(), SQLite3PoolError> {
+                panic!("bug in the closure")
+            })
+            .await;
+        assert!(res.is_err(), "a panicked transaction must surface as an error");
+
+        // One connection was sacrificed with the panicked task...
+        assert_eq!(p.available().await, 1, "the panicked task's connection is dropped");
+
+        // ...but the pool still serves with the other one.
+        let res = p.transaction(CancellationToken::new(), |_tx| Ok(5)).await;
+        assert!(matches!(res, Ok(5)), "pool must keep serving after a closure panic: {res:?}");
+    }
 }

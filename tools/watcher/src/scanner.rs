@@ -65,3 +65,35 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         _                                             => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn representative_extensions_map_to_their_language() {
+        let cases = [
+            ("a.rs", Language::Rust),
+            ("a.pyw", Language::Python),
+            ("a.mjs", Language::JavaScript),
+            ("a.tsx", Language::Tsx),
+            ("a.hh", Language::Cpp),
+            ("a.phtml", Language::Php),
+            ("a.lhs", Language::Haskell),
+            ("a.mli", Language::Ocaml),
+            ("a.sql", Language::Sql),
+        ];
+        for (path, want) in cases {
+            assert_eq!(detect_language(Path::new(path)), Some(want), "{path}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_missing_extension_detects_nothing() {
+        // A silently-skipped file is the failure mode the language checklist warns
+        // about — `None` here is what makes the caller count it, not index it.
+        for path in ["README.md", "Makefile", "a.rs.bak", ".gitignore"] {
+            assert_eq!(detect_language(Path::new(path)), None, "{path}");
+        }
+    }
+}

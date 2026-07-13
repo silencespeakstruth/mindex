@@ -1,0 +1,16 @@
+# Test-stack config for the mindex container (docker-compose.test.yml mounts it and
+# passes --config). It shrinks the request-shape limits — which are TOML-only, no CLI
+# flag — to sizes the limit tests in test_validation.py can trip cheaply. The values
+# must stay far above what any *other* test posts (a few files of a few KiB each).
+# Everything not set here keeps its compiled default.
+
+[server]
+# 2 MiB body cap: lets the 413 test post ~3 MiB instead of the 256 MiB default.
+max_body_mib = 2
+
+[limits]
+# 64 KiB per file: the oversized-code test posts ~70 KiB.
+max_code_bytes = 65536
+# 50 files per /index request / 50 entries per /drift manifest.
+max_files_per_request = 50
+max_drift_files = 50

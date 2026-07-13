@@ -134,9 +134,13 @@ def test_search_finds_python_content(client: httpx.Client, project: str) -> None
     assert any("process_records" in r["code"] for r in results)
 
 
-def test_search_results_sorted_by_score_desc(client: httpx.Client, project: str) -> None:
+def test_search_results_sorted_by_score_desc(
+    client: httpx.Client, project: str
+) -> None:
     index_files(
-        client, project, {"rust": {"a.rs": RUST_V1, "b.rs": RUST_V2}, "python": {"c.py": PYTHON_SRC}}
+        client,
+        project,
+        {"rust": {"a.rs": RUST_V1, "b.rs": RUST_V2}, "python": {"c.py": PYTHON_SRC}},
     )
     resp = search(client, project, "process records batch", top_k=10)
     assert resp.status_code == 200
@@ -237,11 +241,13 @@ def test_search_exclude_path_glob_omits_matches(
 def test_search_invalid_language_in_filter_is_rejected(
     client: httpx.Client, project: str
 ) -> None:
-    # An unknown language enum value must be refused by the JSON schema (422),
-    # not silently ignored.
+    # An unknown language enum value must be refused, not silently ignored. The
+    # ApiJson extractor renders any body-deserialization failure as the uniform
+    # problem+json envelope: 400 request.malformed_body (not axum's default 422).
     index_files(client, project, {"rust": {"a.rs": RUST_V1}})
     resp = client.post(
         f"{MINDEX_URL}/v0/{project}/search",
         json={"query": "x", "include": {"programming_languages": ["cobol"]}},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "request.malformed_body", resp.text

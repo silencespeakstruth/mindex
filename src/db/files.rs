@@ -274,6 +274,141 @@ mod tests {
         );
     }
 
+    // ── v0.3.0 defense-in-depth shape triggers ──────────────────────────────
+    // The API edge (backend::v0::validate) is the primary guard; these prove the
+    // last-line triggers actually fire on a direct write that bypasses it.
+
+    fn is_shape_rejection(res: &Result<(), SQLite3PoolError>, needle: &str) -> bool {
+        matches!(res, Err(SQLite3PoolError::Sql(e)) if e.to_string().contains(needle))
+    }
+
+    async fn insert_file_with_sha(
+        pool: &SQLite3Pool,
+        sha256: String,
+    ) -> Result<(), SQLite3PoolError> {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO project_files
+                     (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing')",
+                params![PG, MODEL, PATH, sha256],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Inserts a chunk row with the given shape (code, lines, columns) for the
+    /// already-present PATH file. Used to probe the chunk-shape trigger directly.
+    async fn insert_chunk(
+        pool: &SQLite3Pool,
+        code: &'static str,
+        lines: (i64, i64),
+        cols: (i64, i64),
+    ) -> Result<(), SQLite3PoolError> {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid,
+                      start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
+                params![
+                    PG,
+                    PATH,
+                    MODEL,
+                    code,
+                    uuid::Uuid::new_v4().simple().to_string(),
+                    lines.0,
+                    lines.1,
+                    cols.0,
+                    cols.1
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn sha256_must_be_hex_on_insert_and_update() {
+        // 64 chars of 'z' passes the v0.1.0 length CHECK; only the trigger stops it.
+        let pool = migrated_pool().await;
+        let res = insert_file_with_sha(&pool, "z".repeat(64)).await;
+        assert!(is_shape_rejection(&res, "hexadecimal"), "non-hex sha256 insert must be rejected, got {res:?}");
+
+        let pool = pool_with_file("indexing").await;
+        let res = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.execute(
+                    "UPDATE project_files SET sha256 = ?1
+                     WHERE project_guid = ?2 AND model_id = ?3 AND path = ?4",
+                    params!["Z".repeat(64), PG, MODEL, PATH],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(is_shape_rejection(&res, "hexadecimal"), "non-hex sha256 update must be rejected, got {res:?}");
+
+        // Mixed-case hex is legal (the guard is hex-ness, not case).
+        let pool = migrated_pool().await;
+        assert!(insert_file_with_sha(&pool, "AbCdEf1234".repeat(6) + "abcd").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn retry_count_must_be_non_negative() {
+        let pool = migrated_pool().await;
+        let res = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.execute(
+                    "INSERT INTO project_files
+                         (project_guid, model_id, path, sha256, programming_language,
+                          status, retry_count)
+                     VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing', -1)",
+                    params![PG, MODEL, PATH, "0".repeat(64)],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(is_shape_rejection(&res, "non-negative"), "negative retry_count insert must be rejected, got {res:?}");
+
+        let pool = pool_with_file("indexing").await;
+        let res = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.execute(
+                    "UPDATE project_files SET retry_count = retry_count - 1
+                     WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
+                    params![PG, MODEL, PATH],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(is_shape_rejection(&res, "non-negative"), "negative retry_count update must be rejected, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn chunk_shape_trigger_rejects_bad_rows_and_allows_good_ones() {
+        let pool = pool_with_file("indexing").await;
+
+        // A well-formed chunk (the control: the trigger must not over-fire).
+        assert!(insert_chunk(&pool, "fn main() {}", (1, 2), (0, 1)).await.is_ok());
+
+        let bad_shapes: &[(&'static str, (i64, i64), (i64, i64), &str)] = &[
+            ("", (1, 2), (0, 1), "empty code"),
+            ("code", (-1, 2), (0, 1), "negative start_line"),
+            ("code", (1, -2), (0, 1), "negative end_line"),
+            ("code", (1, 2), (-1, 1), "negative start_column"),
+            ("code", (1, 2), (0, -1), "negative end_column"),
+            ("code", (5, 2), (0, 1), "inverted line span"),
+        ];
+        for (code, lines, cols, what) in bad_shapes {
+            let res = insert_chunk(&pool, code, *lines, *cols).await;
+            assert!(
+                is_shape_rejection(&res, "valid line/column span"),
+                "{what} must be rejected, got {res:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn set_file_status_increments_then_resets_retry_count() {
         let pool = pool_with_file("indexing").await;

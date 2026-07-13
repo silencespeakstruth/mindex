@@ -34,6 +34,25 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
     (3, include_str!("db/migrations/v0.3.0_validation_checks.sql")),
 ];
 
+/// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
+/// then stamps `user_version` to the highest applied version. Returns the resulting
+/// schema version and whether anything was applied. Extracted from the startup
+/// transaction so the versioning logic is unit-testable.
+pub(crate) fn apply_pending_migrations(
+    tx: &rusqlite::Transaction,
+) -> Result<(i32, bool), db::sqlite3::SQLite3PoolError> {
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let pending: Vec<_> = MIGRATIONS.iter().filter(|(v, _)| *v > current).collect();
+    for (_, sql) in &pending {
+        tx.execute_batch(sql)?;
+    }
+    if let Some((max_v, _)) = pending.last() {
+        tx.pragma_update(None, "user_version", max_v)?;
+    }
+    let applied = !pending.is_empty();
+    Ok((pending.last().map_or(current, |(v, _)| *v), applied))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     tracing_subscriber::registry()
@@ -85,19 +104,7 @@ async fn main() -> Result<(), BoxError> {
     ));
 
     let db_schema_version = match db_pool
-        .transaction(token, |tx| {
-            let current: i32 =
-                tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            let pending: Vec<_> = MIGRATIONS.iter().filter(|(v, _)| *v > current).collect();
-            for (_, sql) in &pending {
-                tx.execute_batch(sql)?;
-            }
-            if let Some((max_v, _)) = pending.last() {
-                tx.pragma_update(None, "user_version", max_v)?;
-            }
-            let applied = !pending.is_empty();
-            Ok((pending.last().map_or(current, |(v, _)| *v), applied))
-        })
+        .transaction(token, apply_pending_migrations)
         .await
     {
         Ok((v, true)) => {
@@ -255,4 +262,140 @@ async fn main() -> Result<(), BoxError> {
     info!("Shutdown complete.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::sqlite3::SQLite3PoolError;
+    use std::path::Path;
+
+    fn pool() -> SQLite3Pool {
+        SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL")
+    }
+
+    async fn user_version(pool: &SQLite3Pool) -> i32 {
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.pragma_query_value(None, "user_version", |r| r.get(0))
+                .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn object_exists(pool: &SQLite3Pool, kind: &'static str, name: &'static str) -> bool {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                rusqlite::params![kind, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .unwrap()
+            > 0
+    }
+
+    #[tokio::test]
+    async fn fresh_db_applies_all_migrations_and_stamps_user_version() {
+        let p = pool();
+        let (v, applied) = p
+            .transaction(CancellationToken::new(), apply_pending_migrations)
+            .await
+            .unwrap();
+
+        let (max_v, _) = MIGRATIONS.last().unwrap();
+        assert_eq!((v, applied), (*max_v, true));
+        assert_eq!(user_version(&p).await, *max_v);
+        // One representative object per migration proves each batch actually ran.
+        assert!(object_exists(&p, "table", "project_files").await, "v0.1.0 schema missing");
+        assert!(
+            object_exists(&p, "trigger", "project_files_status_update_guard").await,
+            "v0.2.0 status machine missing"
+        );
+        assert!(
+            object_exists(&p, "trigger", "project_files_sha256_insert_guard").await,
+            "v0.3.0 validation checks missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_run_is_a_noop() {
+        let p = pool();
+        p.transaction(CancellationToken::new(), apply_pending_migrations)
+            .await
+            .unwrap();
+        let (v, applied) = p
+            .transaction(CancellationToken::new(), apply_pending_migrations)
+            .await
+            .unwrap();
+
+        let (max_v, _) = MIGRATIONS.last().unwrap();
+        assert_eq!((v, applied), (*max_v, false), "an up-to-date DB must apply nothing");
+    }
+
+    #[tokio::test]
+    async fn partially_migrated_db_applies_only_newer_migrations() {
+        // Simulate a DB created before v0.2.0/v0.3.0 existed: schema only, version 1.
+        let p = pool();
+        p.transaction(CancellationToken::new(), |tx| {
+            tx.execute_batch(MIGRATIONS[0].1)?;
+            tx.pragma_update(None, "user_version", 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (v, applied) = p
+            .transaction(CancellationToken::new(), apply_pending_migrations)
+            .await
+            .unwrap();
+
+        let (max_v, _) = MIGRATIONS.last().unwrap();
+        assert_eq!((v, applied), (*max_v, true));
+        assert!(object_exists(&p, "trigger", "project_files_status_update_guard").await);
+        assert!(object_exists(&p, "trigger", "project_files_sha256_insert_guard").await);
+    }
+
+    #[tokio::test]
+    async fn db_already_at_max_version_is_trusted_and_untouched() {
+        // The filter trusts user_version: a DB stamped at the max version gets no
+        // migrations even if (hypothetically) its schema is empty.
+        let p = pool();
+        let (max_v, _) = *MIGRATIONS.last().unwrap();
+        p.transaction(CancellationToken::new(), move |tx| {
+            tx.pragma_update(None, "user_version", max_v)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (v, applied) = p
+            .transaction(CancellationToken::new(), apply_pending_migrations)
+            .await
+            .unwrap();
+        assert_eq!((v, applied), (max_v, false));
+        assert!(!object_exists(&p, "table", "project_files").await, "nothing must be applied");
+    }
+
+    #[tokio::test]
+    async fn every_migration_sql_is_idempotent() {
+        // The cold-start guarantee: re-running any batch on a DB that already has it
+        // must be a no-op (all SQL uses IF NOT EXISTS), never an error.
+        let p = pool();
+        p.transaction(CancellationToken::new(), |tx| {
+            for (_, sql) in MIGRATIONS {
+                tx.execute_batch(sql)?;
+            }
+            for (v, sql) in MIGRATIONS {
+                tx.execute_batch(sql).unwrap_or_else(|e| {
+                    panic!("migration {v} is not idempotent (re-run failed): {e}")
+                });
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 }

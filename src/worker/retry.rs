@@ -120,6 +120,53 @@ pub struct RetryTuning {
     pub stuck_grace_secs: i64,
 }
 
+/// The sweep's candidate query: which files this pass should try to re-index.
+/// Mid-flight rows (`just_uploaded`/`indexing`) qualify once older than
+/// `stuck_grace_secs`; `failed` rows qualify once older than the sweep interval
+/// *and* still inside their retry budget (`retry_count < max_retries`). Rows in any
+/// other status — or belonging to another model — are never selected. Extracted from
+/// the `run` loop so the selection rules are unit-testable.
+///
+/// `stuck_grace_secs` only decides *when* a mid-flight row looks abandoned; the
+/// actual guard against racing a still-live batch is the per-file claim taken in
+/// `retry_file` (a live `/index` holds it for the whole embed pass, so the worker
+/// skips). A too-short grace therefore no longer corrupts — it just makes the worker
+/// try (and harmlessly skip) sooner. The query still filters by grace to avoid
+/// churning fresh rows.
+fn sweep_candidates(
+    tx: &rusqlite::Transaction,
+    model_id: &str,
+    tuning: RetryTuning,
+) -> Result<Vec<(String, String, String)>, SQLite3PoolError> {
+    tx.prepare(
+        "SELECT project_guid, path, model_id
+         FROM project_files
+         WHERE model_id = ?2
+           AND ((status IN ('just_uploaded', 'indexing')
+                 AND status_updated_at < unixepoch() - ?3)
+             OR (status = 'failed'
+                 AND retry_count < ?1
+                 AND status_updated_at < unixepoch() - ?4))",
+    )?
+    .query_map(
+        rusqlite::params![
+            tuning.max_retries,
+            model_id,
+            tuning.stuck_grace_secs,
+            tuning.retry_interval_seconds as i64
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(SQLite3PoolError::from)
+}
+
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     store: Arc<dyn VectorStore>,
@@ -154,40 +201,8 @@ pub async fn run(
         let stuck_files: Vec<(String, String, String)> = match db_pool
             .transaction(token.clone(), {
                 let model_id = model_id.clone();
-                move |tx| {
-                // `stuck_grace_secs` only decides *when* a mid-flight row looks
-                // abandoned; the actual guard against racing a still-live batch is the
-                // per-file claim taken in `retry_file` (a live `/index` holds it for the
-                // whole embed pass, so the worker skips). A too-short grace therefore no
-                // longer corrupts — it just makes the worker try (and harmlessly skip)
-                // sooner. The query still filters by grace to avoid churning fresh rows.
-                tx.prepare(
-                    "SELECT project_guid, path, model_id
-                     FROM project_files
-                     WHERE model_id = ?2
-                       AND ((status IN ('just_uploaded', 'indexing')
-                             AND status_updated_at < unixepoch() - ?3)
-                         OR (status = 'failed'
-                             AND retry_count < ?1
-                             AND status_updated_at < unixepoch() - ?4))",
-                )?
-                .query_map(
-                    rusqlite::params![
-                        tuning.max_retries,
-                        model_id,
-                        tuning.stuck_grace_secs,
-                        tuning.retry_interval_seconds as i64
-                    ],
-                    |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(SQLite3PoolError::from)
-            }})
+                move |tx| sweep_candidates(tx, &model_id, tuning)
+            })
             .await
         {
             Ok(v) => v,
@@ -643,6 +658,128 @@ mod tests {
         // Untouched: still failed(1), and not a single new transition was logged.
         assert_eq!(current(&pool).await, ("failed".to_string(), 1));
         assert_eq!(log_pairs(&pool).await.len(), log_before, "retry must log nothing when the claim is held");
+    }
+
+    // ── sweep candidate selection ────────────────────────────────────────────
+
+    /// Tuning used by the sweep-selection tests: 30-min stuck grace, 60-s failed grace.
+    const TEST_TUNING: RetryTuning = RetryTuning {
+        embed: TEST_EMBED,
+        retry_interval_seconds: 60,
+        failed_warn_interval_seconds: 3600,
+        max_retries: 3,
+        stuck_grace_secs: 1800,
+    };
+
+    /// Migrated pool with just the project row (files seeded per test).
+    async fn migrated_pool() -> SQLite3Pool {
+        let pool = SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                params![PG, MODEL],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// Seeds one file at `status` (reached legally via 'indexing'), with the given
+    /// `retry_count`, and backdates `status_updated_at` by `age_secs`.
+    async fn seed_file(
+        pool: &SQLite3Pool,
+        path: &'static str,
+        status: &'static str,
+        age_secs: i64,
+        retry_count: i64,
+    ) {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO project_files
+                     (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, ?3, ?4, 'rust', ?5)",
+                params![
+                    PG,
+                    MODEL,
+                    path,
+                    "0".repeat(64),
+                    if status == "just_uploaded" { "just_uploaded" } else { "indexing" }
+                ],
+            )?;
+            if !matches!(status, "indexing" | "just_uploaded") {
+                tx.execute(
+                    "UPDATE project_files SET status = ?1
+                     WHERE project_guid = ?2 AND model_id = ?3 AND path = ?4",
+                    params![status, PG, MODEL, path],
+                )?;
+            }
+            // Backdating only touches non-status columns: no trigger fires.
+            tx.execute(
+                "UPDATE project_files
+                 SET status_updated_at = unixepoch() - ?1, retry_count = ?2
+                 WHERE project_guid = ?3 AND model_id = ?4 AND path = ?5",
+                params![age_secs, retry_count, PG, MODEL, path],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn sweep_paths(pool: &SQLite3Pool) -> Vec<String> {
+        let mut paths: Vec<String> = pool
+            .transaction(CancellationToken::new(), |tx| {
+                sweep_candidates(tx, MODEL, TEST_TUNING)
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, p, _)| p)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn sweep_selects_mid_flight_rows_only_past_the_stuck_grace() {
+        let pool = migrated_pool().await;
+        seed_file(&pool, "stuck_indexing.rs", "indexing", 1801, 0).await;
+        seed_file(&pool, "stuck_uploaded.rs", "just_uploaded", 1801, 0).await;
+        seed_file(&pool, "live_indexing.rs", "indexing", 10, 0).await;
+        seed_file(&pool, "live_uploaded.rs", "just_uploaded", 10, 0).await;
+
+        assert_eq!(sweep_paths(&pool).await, vec!["stuck_indexing.rs", "stuck_uploaded.rs"]);
+    }
+
+    #[tokio::test]
+    async fn sweep_selects_failed_rows_only_past_the_interval_and_under_budget() {
+        let pool = migrated_pool().await;
+        // Old enough + budget left → selected.
+        seed_file(&pool, "retryable.rs", "failed", 61, 2).await;
+        // Too fresh (failed less than one sweep interval ago) → skipped this pass.
+        seed_file(&pool, "fresh_failure.rs", "failed", 10, 0).await;
+        // Budget exhausted (retry_count == max_retries) → never selected again,
+        // no matter how old — this is the permanently-failed dead-letter state.
+        seed_file(&pool, "exhausted.rs", "failed", 100_000, 3).await;
+
+        assert_eq!(sweep_paths(&pool).await, vec!["retryable.rs"]);
+    }
+
+    #[tokio::test]
+    async fn sweep_never_selects_terminal_rows() {
+        // (A foreign-model row is unrepresentable: the schema CHECKs model_id to the
+        // single supported model, so only terminal statuses are probed here.)
+        let pool = migrated_pool().await;
+        seed_file(&pool, "done.rs", "indexed", 100_000, 0).await;
+        seed_file(&pool, "gone.rs", "deleted", 100_000, 0).await;
+        seed_file(&pool, "stopped.rs", "cancelled", 100_000, 0).await;
+
+        assert_eq!(sweep_paths(&pool).await, Vec::<String>::new());
     }
 
     /// If a `POST /cancel` flipped the file to `cancelled` in the window between the

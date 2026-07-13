@@ -187,3 +187,40 @@ def test_drift_path_invalid_rejected(client: httpx.Client, project: str) -> None
         json={"files": {"../escape.rs": good_sha}},
     )
     assert_problem(resp, 400, "validation.path_invalid")
+
+
+# ── request-shape limits ([limits] / [server], mindex-test-config.toml) ───────
+# The test stack mounts a config that shrinks the TOML-only limits so these caps
+# can be tripped cheaply: max_code_bytes = 64 KiB, max_files_per_request = 50,
+# max_drift_files = 50, max_body_mib = 2.
+
+
+def test_code_too_large_rejected(client: httpx.Client, project: str) -> None:
+    big = "// filler\n" * 7_000  # ~70 KiB, over the 64 KiB cap
+    resp = index_files(client, project, {"rust": {"src/big.rs": {"code": big}}})
+    assert_problem(resp, 400, "validation.code_too_large")
+    assert resp.json()["meta"]["max"] == 65536
+
+
+def test_too_many_files_rejected(client: httpx.Client, project: str) -> None:
+    files = {f"src/f{i}.rs": {"code": "fn x() {}"} for i in range(51)}
+    resp = index_files(client, project, {"rust": files})
+    assert_problem(resp, 400, "validation.too_many_files")
+
+
+def test_drift_too_many_files_rejected(client: httpx.Client, project: str) -> None:
+    manifest = {f"src/f{i}.rs": "a" * 64 for i in range(51)}
+    resp = client.post(
+        f"{MINDEX_URL}/projects/{project}/drift", json={"files": manifest}
+    )
+    assert_problem(resp, 400, "validation.too_many_files")
+
+
+def test_oversized_body_returns_413_problem_json(
+    client: httpx.Client, project: str
+) -> None:
+    # ~3 MiB body against the 2 MiB cap: DefaultBodyLimit rejects it before any
+    # handler runs, and the rejection must still be the problem+json envelope.
+    big = "x" * (3 * 1024 * 1024)
+    resp = index_files(client, project, {"rust": {"src/big.rs": {"code": big}}})
+    assert_problem(resp, 413, "request.body_too_large")

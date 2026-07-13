@@ -362,3 +362,97 @@ def test_failed_file_recovered_by_retry_worker(
         raise AssertionError(f"retry worker did not recover the failed file: {f}")
 
     assert search(client, project, "process records").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Hard delete racing a live index
+# ---------------------------------------------------------------------------
+
+
+def _assert_settled(client: httpx.Client, project: str) -> None:
+    """Global post-race invariant: nothing in flight, nothing left for GC.
+
+    After the racing requests have all returned and a GC pass ran, the runtime
+    must hold no indexing claims and the project no `indexing` files and no
+    lingering soft-deleted chunks — i.e. every interleaving settles, none wedges.
+    """
+    status = client.get(f"{MINDEX_URL}/status").json()
+    assert status["indexing_claims"] == 0, status
+    assert status["gc_running"] is False, status
+
+    resp = stats(client, project)
+    if resp.status_code == 404:  # the project itself was deleted — trivially settled
+        return
+    body = resp.json()
+    assert body["files"].get("indexing", 0) == 0, body
+    for lang_chunks in body["chunks"].values():
+        assert lang_chunks.get("deleted", 0) == 0, body
+
+
+def test_delete_project_during_live_indexing(
+    client: httpx.Client, project: str, embed_delay: Callable[[float], None]
+) -> None:
+    # DELETE /projects/{guid} (immediate hard delete) lands while a batch is
+    # mid-embed. The delete takes no claim, so it wins immediately; the live
+    # request's mark_indexed is a no-op (its row is gone) and its Qdrant upsert
+    # may hit a dropped collection — either way the request must terminate
+    # without resurrecting any state, and a repeated delete stays idempotent.
+    embed_delay(2.5)
+    outcome: dict = {}
+
+    def do_index() -> None:
+        with httpx.Client(verify=False, timeout=30.0) as c:
+            outcome["status"] = index_files(
+                c, project, {"rust": {"src/a.rs": RUST_V1}}
+            ).status_code
+
+    worker = threading.Thread(target=do_index)
+    worker.start()
+    try:
+        _wait_for_indexing(client, project)
+        resp = client.delete(f"{MINDEX_URL}/projects/{project}")
+        assert resp.status_code == 204, resp.text
+    finally:
+        worker.join(timeout=30)
+    assert not worker.is_alive(), "the /index request did not finish"
+    embed_delay(0.0)
+
+    # The live request terminated (success if its upsert beat the drop, a 5xx if
+    # it lost the collection underneath) — never hung, never a resurrected row.
+    assert outcome["status"] in (200, 500, 503), outcome
+
+    # The project is gone: stats 404, search 404, and the delete is idempotent.
+    assert stats(client, project).status_code == 404
+    assert search(client, project, "process records").status_code == 404
+    assert client.delete(f"{MINDEX_URL}/projects/{project}").status_code == 204
+
+    # A GC pass finds nothing to reclaim and nothing is left in flight.
+    assert run_gc(client).status_code == 200
+    _assert_settled(client, project)
+
+
+# ---------------------------------------------------------------------------
+# Embedder outage during search
+# ---------------------------------------------------------------------------
+
+
+def test_search_with_embedder_down_returns_503(
+    client: httpx.Client, project: str, embed_fail: Callable[[int], None]
+) -> None:
+    # /search embeds the query, so an embedder failure must surface as the
+    # documented 503 problem+json (embedder.unavailable) — not a 500 — and the
+    # index must be untouched: the same search succeeds once the embedder is back.
+    assert (
+        index_files(client, project, {"rust": {"src/a.rs": RUST_V1}}).status_code == 200
+    )
+
+    embed_fail(1)
+    resp = search(client, project, "process records")
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["code"] == "embedder.unavailable", body
+    assert resp.headers["content-type"].startswith("application/problem+json")
+
+    embed_fail(0)
+    assert search(client, project, "process records").status_code == 200
+    _assert_settled(client, project)

@@ -2758,4 +2758,248 @@ mod tests {
         assert_eq!(retry_count, 0, "retry_count must be reset so the worker re-picks it");
         assert_eq!(updated, 1000, "status_updated_at must NOT be bumped (else a +60s delay)");
     }
+
+    // ── phase-1 → phase-2 reconciliation (`drop_cancelled`) and batch recovery
+    //    (`recover_all`) ─────────────────────────────────────────────────────────
+    // These are the correctness core of a concurrent `POST /cancel` against a live
+    // `/index`: a file flipped out of `indexing` between prepare and embed must be
+    // dropped from the batch (its fresh chunks soft-deleted for GC), and an aborted
+    // batch must hand every prepared file to the retry worker — none may stay
+    // `indexing` with no one working on it.
+
+    use crate::db::files::set_file_status;
+    use crate::db::qdrant::{ChunkAsVector, SearchHit, VectorStoreError};
+    use crate::models::bge_m3::{BGEm3EmbedRequest, BGEm3EmbedResponse, EncodeError};
+    use async_trait::async_trait;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    const MODEL: &str = "BAAI/bge-m3";
+
+    /// Neither seam may be touched by `drop_cancelled`/`recover_all` — they are
+    /// SQLite-only paths. Any call is a test failure.
+    struct NoStore;
+    #[async_trait]
+    impl VectorStore for NoStore {
+        async fn insert_batch(&self, _c: &str, _v: Vec<ChunkAsVector>) -> Result<(), VectorStoreError> {
+            unreachable!("drop_cancelled/recover_all must not touch Qdrant")
+        }
+        async fn ensure_project(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_collection(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn health(&self) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_batch(&self, _c: &str, _g: Vec<String>) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn search(
+            &self,
+            _c: &str,
+            _i: Vec<UUIDv4>,
+            _d: Vec<f32>,
+            _si: Vec<u32>,
+            _sv: Vec<f32>,
+            _cb: Vec<Vec<f32>>,
+            _k: u64,
+        ) -> Result<Vec<SearchHit>, VectorStoreError> {
+            unreachable!()
+        }
+    }
+
+    struct NoEmbedder;
+    #[async_trait]
+    impl crate::models::bge_m3::BGEm3Model for NoEmbedder {
+        async fn encode(
+            &self,
+            _req: BGEm3EmbedRequest,
+            _token: CancellationToken,
+        ) -> Result<BGEm3EmbedResponse, EncodeError> {
+            unreachable!("drop_cancelled/recover_all must not call the embedder")
+        }
+        async fn health(&self) -> Result<(), EncodeError> {
+            unreachable!()
+        }
+    }
+
+    /// Migrated pool with the project and `paths` each inserted `indexing` with
+    /// `n_chunks` active chunks — the exact state `prepare` leaves behind.
+    async fn pool_with_prepared_files(paths: &'static [&'static str], n_chunks: usize) -> SQLite3Pool {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                params![guid(), MODEL],
+            )?;
+            for path in paths {
+                tx.execute(
+                    "INSERT INTO project_files
+                         (project_guid, model_id, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing')",
+                    params![guid(), MODEL, path, "0".repeat(64)],
+                )?;
+                for _ in 0..n_chunks {
+                    tx.execute(
+                        "INSERT INTO project_file_chunks
+                             (project_guid, file_path, model_id, code, qdrant_guid,
+                              start_line, end_line, start_column, end_column, status)
+                         VALUES (?1, ?2, ?3, 'code', ?4, 1, 2, 0, 1, 'active')",
+                        params![guid(), path, MODEL, Uuid::new_v4().simple().to_string()],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// Builds a `Prepared` for `path` the way `prepare` would: claim held, chunks
+    /// carried. The chunk list content is irrelevant to the paths under test.
+    fn prepared_for(locks: &Arc<Mutex<HashSet<String>>>, path: &str) -> Prepared {
+        let key = indexing_lock_key(&guid().0.as_simple().to_string(), MODEL, path);
+        Prepared {
+            pl: ProgrammingLanguage::Rust,
+            path: path.to_string(),
+            sha256: "0".repeat(64),
+            chunks: vec![(UUIDv4(Uuid::new_v4()), "code".to_string())],
+            _claim: IndexClaim::try_acquire(locks, key).expect("slot starts free"),
+        }
+    }
+
+    /// (status, active_chunks, deleted_chunks) for one path.
+    async fn file_state(pool: &SQLite3Pool, path: &'static str) -> (String, i64, i64) {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.query_row(
+                "SELECT f.status,
+                        (SELECT COUNT(*) FROM project_file_chunks c
+                         WHERE c.project_guid = f.project_guid AND c.file_path = f.path
+                           AND c.model_id = f.model_id AND c.status = 'active'),
+                        (SELECT COUNT(*) FROM project_file_chunks c
+                         WHERE c.project_guid = f.project_guid AND c.file_path = f.path
+                           AND c.model_id = f.model_id AND c.status = 'deleted')
+                 FROM project_files f
+                 WHERE f.project_guid = ?1 AND f.path = ?2 AND f.model_id = ?3",
+                params![guid(), path, MODEL],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The owned pieces a test-local `FileIndexer` borrows (kept alive by the caller).
+    struct IndexerFixture {
+        tokenizer: Arc<Tokenizer>,
+        token: CancellationToken,
+    }
+
+    fn fixture() -> IndexerFixture {
+        IndexerFixture {
+            tokenizer: Arc::new(Tokenizer::new(
+                tokenizers::models::wordlevel::WordLevel::default(),
+            )),
+            token: CancellationToken::new(),
+        }
+    }
+
+    /// A `FileIndexer` wired to fakes that reject any Qdrant/embedder call (the
+    /// paths under test are SQLite-only).
+    fn indexer<'a>(
+        pool: &'a SQLite3Pool,
+        locks: &'a Arc<Mutex<HashSet<String>>>,
+        fx: &'a IndexerFixture,
+    ) -> FileIndexer<'a> {
+        FileIndexer {
+            db_pool: pool,
+            store: &NoStore,
+            tokenizer: &fx.tokenizer,
+            embedder: &NoEmbedder,
+            model_id: MODEL,
+            project_guid: guid(),
+            collection: "unused",
+            embed_tuning: crate::embed::EmbedTuning {
+                embed_batch: 64,
+                upsert_batch: 256,
+                sparse_min_weight: 1e-5,
+            },
+            min_chunk_tokens: 128,
+            max_chunk_tokens: 512,
+            token: &fx.token,
+            indexing_locks: locks,
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_cancelled_keeps_files_still_indexing() {
+        let pool = pool_with_prepared_files(&["a.rs", "b.rs"], 2).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let prepared = vec![prepared_for(&locks, "a.rs"), prepared_for(&locks, "b.rs")];
+
+        let fx = fixture();
+        let kept = indexer(&pool, &locks, &fx).drop_cancelled(prepared).await;
+        let mut paths: Vec<_> = kept.iter().map(|p| p.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.rs", "b.rs"], "untouched files must all survive");
+        drop(kept); // release the claims before inspecting state
+
+        // No collateral damage: both files still 'indexing', chunks still active.
+        assert_eq!(file_state(&pool, "a.rs").await, ("indexing".to_string(), 2, 0));
+        assert_eq!(file_state(&pool, "b.rs").await, ("indexing".to_string(), 2, 0));
+    }
+
+    #[tokio::test]
+    async fn drop_cancelled_drops_flipped_files_and_soft_deletes_their_chunks() {
+        let pool = pool_with_prepared_files(&["a.rs", "b.rs"], 2).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let prepared = vec![prepared_for(&locks, "a.rs"), prepared_for(&locks, "b.rs")];
+
+        // A concurrent POST /cancel lands between prepare and embed: indexing → cancelled.
+        let pg = guid().0.as_simple().to_string();
+        set_file_status(&pool, &pg, "a.rs", MODEL, "cancelled", false, CancellationToken::new())
+            .await;
+
+        let fx = fixture();
+        let kept = indexer(&pool, &locks, &fx).drop_cancelled(prepared).await;
+        let paths: Vec<_> = kept.iter().map(|p| p.path.clone()).collect();
+        assert_eq!(paths, vec!["b.rs"], "the cancelled file must be dropped from the batch");
+
+        // The cancelled file's just-inserted chunks are handed to GC; the survivor
+        // is untouched.
+        assert_eq!(file_state(&pool, "a.rs").await, ("cancelled".to_string(), 0, 2));
+        assert_eq!(file_state(&pool, "b.rs").await, ("indexing".to_string(), 2, 0));
+    }
+
+    #[tokio::test]
+    async fn recover_all_hands_every_prepared_file_to_the_retry_worker() {
+        // The shared-embed-failure path: every prepared file goes indexing → failed
+        // with its retry budget burned by one.
+        let pool = pool_with_prepared_files(&["a.rs", "b.rs"], 1).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let prepared = vec![prepared_for(&locks, "a.rs"), prepared_for(&locks, "b.rs")];
+
+        let fx = fixture();
+        indexer(&pool, &locks, &fx).recover_all(&prepared, "failed", true).await;
+
+        for path in ["a.rs", "b.rs"] {
+            let (status, _, _) = file_state(&pool, path).await;
+            assert_eq!(status, "failed", "{path} must not be left 'indexing' after an aborted batch");
+        }
+
+        // The client-cancelled path: cancelled, without burning retry budget.
+        let pool = pool_with_prepared_files(&["c.rs"], 1).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let prepared = vec![prepared_for(&locks, "c.rs")];
+        let fx = fixture();
+        indexer(&pool, &locks, &fx).recover_all(&prepared, "cancelled", false).await;
+        assert_eq!(file_state(&pool, "c.rs").await.0, "cancelled");
+    }
 }
