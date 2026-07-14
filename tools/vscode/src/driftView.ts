@@ -5,10 +5,31 @@ import { DriftResponse } from "./api";
 export type Bucket = "stale" | "missing" | "orphaned" | "indexing";
 
 const BUCKETS: { id: Bucket; label: string; icon: string; tooltip: string }[] = [
-    { id: "stale", label: "Stale", icon: "diff-modified", tooltip: "Indexed, but the working-tree content differs — needs reindex" },
-    { id: "missing", label: "Missing", icon: "diff-added", tooltip: "Present locally but not indexed (never indexed or failed) — needs reindex" },
-    { id: "orphaned", label: "Orphaned", icon: "diff-removed", tooltip: "Indexed, but absent from the working tree — should be deleted from the index" },
-    { id: "indexing", label: "Indexing", icon: "sync", tooltip: "In flight on the server — no action needed" },
+    {
+        id: "stale",
+        label: "Stale",
+        icon: "diff-modified",
+        tooltip: "Indexed, but the working-tree content differs — needs reindex",
+    },
+    {
+        id: "missing",
+        label: "Missing",
+        icon: "diff-added",
+        tooltip: "Present locally but not indexed (never indexed or failed) — needs reindex",
+    },
+    {
+        id: "orphaned",
+        label: "Orphaned",
+        icon: "diff-removed",
+        tooltip:
+            "Indexed, but absent from the working tree — should be deleted from the index",
+    },
+    {
+        id: "indexing",
+        label: "Indexing",
+        icon: "sync",
+        tooltip: "In flight on the server — no action needed",
+    },
 ];
 
 /** A bucket whose files can be checkbox-selected (indexing is read-only). */
@@ -139,7 +160,9 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
             const checked =
                 node.kind === "file"
                     ? this.selected[node.bucket].has(node.relPath)
-                    : [...node.files()].every((f) => this.selected[node.bucket].has(f.relPath));
+                    : [...node.files()].every((f) =>
+                          this.selected[node.bucket].has(f.relPath)
+                      );
             item.checkboxState = checked
                 ? vscode.TreeItemCheckboxState.Checked
                 : vscode.TreeItemCheckboxState.Unchecked;

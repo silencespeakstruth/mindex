@@ -134,7 +134,9 @@ export function activate(context: vscode.ExtensionContext): void {
             const doc = vscode.window.activeTextEditor?.document;
             const proj = await loadProject();
             if (doc === undefined || !doc.uri.fsPath.startsWith(proj.root)) {
-                void vscode.window.showInformationMessage("mindex: no project file is active.");
+                void vscode.window.showInformationMessage(
+                    "mindex: no project file is active."
+                );
                 return;
             }
             const rel = path.relative(proj.root, doc.uri.fsPath).replaceAll("\\", "/");
@@ -160,7 +162,9 @@ export function activate(context: vscode.ExtensionContext): void {
             try {
                 const proj = await loadProject();
                 const n = await api.deleteFiles(proj.mindex.guid, { include: { paths } });
-                void vscode.window.showInformationMessage(`mindex: ${n} file(s) deleted from the index.`);
+                void vscode.window.showInformationMessage(
+                    `mindex: ${n} file(s) deleted from the index.`
+                );
                 await checkDrift();
             } catch (e) {
                 await reportError("Delete from index failed", e);
@@ -185,7 +189,9 @@ export function activate(context: vscode.ExtensionContext): void {
             }
         }),
 
-        vscode.commands.registerCommand("mindex.refreshStatus", () => statusProvider.refresh()),
+        vscode.commands.registerCommand("mindex.refreshStatus", () =>
+            statusProvider.refresh()
+        ),
 
         vscode.commands.registerCommand("mindex.retryAllFailed", async () => {
             try {
@@ -209,9 +215,13 @@ export function activate(context: vscode.ExtensionContext): void {
             }
             try {
                 const proj = await loadProject();
-                const n = await api.retry(proj.mindex.guid, { include: { paths: [filePath] } });
+                const n = await api.retry(proj.mindex.guid, {
+                    include: { paths: [filePath] },
+                });
                 void vscode.window.showInformationMessage(
-                    n > 0 ? `mindex: requeued ${filePath}.` : `mindex: ${filePath} is not failed anymore.`
+                    n > 0
+                        ? `mindex: requeued ${filePath}.`
+                        : `mindex: ${filePath} is not failed anymore.`
                 );
                 await statusProvider.refresh();
             } catch (e) {

@@ -46,7 +46,10 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusNode> {
                 {
                     label: "Server unreachable",
                     description: detail,
-                    icon: new vscode.ThemeIcon("error", new vscode.ThemeColor("errorForeground")),
+                    icon: new vscode.ThemeIcon(
+                        "error",
+                        new vscode.ThemeColor("errorForeground")
+                    ),
                     tooltip: `${detail}\nCheck mindex.serverUrl / mindex.noVerify and that the server is running.`,
                     children: [],
                 },

@@ -32,7 +32,8 @@ export async function reindexPaths(
                 title: "mindex: reindexing",
                 cancellable: true,
             },
-            (progress, token) => doReindex(api, guid, root, relPaths, batchSize, progress, token)
+            (progress, token) =>
+                doReindex(api, guid, root, relPaths, batchSize, progress, token)
         );
     try {
         return await run();

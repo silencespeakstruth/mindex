@@ -103,22 +103,45 @@ export class MindexApi {
     // ---- data plane ----
 
     index(guid: string, files: IndexFiles, signal?: AbortSignal): Promise<IndexResponse> {
-        return this.request("POST", `/${this.protocol}/${guid}/index`, { files }, signal) as Promise<IndexResponse>;
+        return this.request(
+            "POST",
+            `/${this.protocol}/${guid}/index`,
+            { files },
+            signal
+        ) as Promise<IndexResponse>;
     }
 
     search(guid: string, req: SearchRequest, signal?: AbortSignal): Promise<SearchResponse> {
-        return this.request("POST", `/${this.protocol}/${guid}/search`, req, signal) as Promise<SearchResponse>;
+        return this.request(
+            "POST",
+            `/${this.protocol}/${guid}/search`,
+            req,
+            signal
+        ) as Promise<SearchResponse>;
     }
 
     // ---- management ----
 
-    drift(guid: string, manifest: Record<string, string>, signal?: AbortSignal): Promise<DriftResponse> {
-        return this.request("POST", `/projects/${guid}/drift`, { files: manifest }, signal) as Promise<DriftResponse>;
+    drift(
+        guid: string,
+        manifest: Record<string, string>,
+        signal?: AbortSignal
+    ): Promise<DriftResponse> {
+        return this.request(
+            "POST",
+            `/projects/${guid}/drift`,
+            { files: manifest },
+            signal
+        ) as Promise<DriftResponse>;
     }
 
     /** Empty selector = requeue every failed file. Returns requeued count (204 → 0). */
     async retry(guid: string, selector?: Selector): Promise<number> {
-        const body = (await this.request("POST", `/projects/${guid}/retry`, selector ?? {})) as {
+        const body = (await this.request(
+            "POST",
+            `/projects/${guid}/retry`,
+            selector ?? {}
+        )) as {
             requeued_files: number;
         } | null;
         return body?.requeued_files ?? 0;
@@ -140,7 +163,10 @@ export class MindexApi {
         return body?.deleted_files ?? 0;
     }
 
-    listFiles(guid: string, filter?: { status?: string; language?: string }): Promise<{ files: FileEntry[] }> {
+    listFiles(
+        guid: string,
+        filter?: { status?: string; language?: string }
+    ): Promise<{ files: FileEntry[] }> {
         const params = new URLSearchParams();
         if (filter?.status) {
             params.set("status", filter.status);
@@ -148,8 +174,10 @@ export class MindexApi {
         if (filter?.language) {
             params.set("language", filter.language);
         }
-        const qs = params.size > 0 ? `?${params}` : "";
-        return this.request("GET", `/projects/${guid}/files${qs}`) as Promise<{ files: FileEntry[] }>;
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
+        return this.request("GET", `/projects/${guid}/files${qs}`) as Promise<{
+            files: FileEntry[];
+        }>;
     }
 
     // ---- observability ----
@@ -175,7 +203,8 @@ export class MindexApi {
         signal?: AbortSignal
     ): Promise<unknown> {
         const url = new URL(this.base + path);
-        const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
+        const payload =
+            body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
 
         return new Promise((resolve, reject) => {
             const headers: http.OutgoingHttpHeaders = { Accept: "application/json" };

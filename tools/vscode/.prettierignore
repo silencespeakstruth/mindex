@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.vsix
+package-lock.json
+
+# Prose is hand-formatted to match the rest of the repo's docs (which have no
+# prettier); leave it alone. Prettier owns code + config here, not markdown.
+*.md

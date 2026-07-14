@@ -209,15 +209,25 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run format:check && npm run lint && npm run compile",
     "package": "vsce package"
   },
   "dependencies": {
     "picomatch": "^4.0.2"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^20.11.0",
     "@types/picomatch": "^3.0.1",
     "@types/vscode": "^1.85.0",
-    "typescript": "^5.5.0"
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.5",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.64.0"
   }
 }

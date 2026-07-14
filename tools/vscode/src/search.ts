@@ -30,7 +30,11 @@ export async function runSearch(
     try {
         results = (
             await vscode.window.withProgress(
-                { location: vscode.ProgressLocation.Notification, title: "mindex: searching…", cancellable: true },
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: "mindex: searching…",
+                    cancellable: true,
+                },
                 (_p, token) => {
                     const abort = new AbortController();
                     token.onCancellationRequested(() => abort.abort());
@@ -55,15 +59,23 @@ export async function runSearch(
         return;
     }
 
-    await showResultsPicker(workspaceRoot, query, results);
+    showResultsPicker(workspaceRoot, query, results);
 }
 
 interface ResultItem extends vscode.QuickPickItem {
     result: SearchResult;
 }
 
-/** QuickPick over the results in server order (= rank order, score descending). */
-async function showResultsPicker(workspaceRoot: string, query: string, results: SearchResult[]): Promise<void> {
+/**
+ * QuickPick over the results in server order (= rank order, score descending).
+ * Returns as soon as the picker is shown — everything after that is driven by its
+ * events, so there is nothing for the caller to await.
+ */
+function showResultsPicker(
+    workspaceRoot: string,
+    query: string,
+    results: SearchResult[]
+): void {
     // Remember where the user was so Esc puts them back.
     const before = vscode.window.activeTextEditor;
     const beforeUri = before?.document.uri;
@@ -104,7 +116,9 @@ async function showResultsPicker(workspaceRoot: string, query: string, results: 
         picker.dispose();
         if (!accepted && beforeUri !== undefined) {
             try {
-                await vscode.window.showTextDocument(beforeUri, { selection: beforeSelection });
+                await vscode.window.showTextDocument(beforeUri, {
+                    selection: beforeSelection,
+                });
             } catch {
                 // The original document may be gone; nothing to restore.
             }
@@ -115,7 +129,11 @@ async function showResultsPicker(workspaceRoot: string, query: string, results: 
 
 /** First non-empty line of the chunk, trimmed and capped, as the item detail. */
 function snippet(code: string): string {
-    const line = code.split("\n").find((l) => l.trim() !== "")?.trim() ?? "";
+    const line =
+        code
+            .split("\n")
+            .find((l) => l.trim() !== "")
+            ?.trim() ?? "";
     return line.length > 100 ? `${line.slice(0, 100)}…` : line;
 }
 
