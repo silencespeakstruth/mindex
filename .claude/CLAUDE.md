@@ -450,7 +450,7 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   server-side — but `index_files` carries full bodies, so it is **only** for the few
   files just touched, passed **verbatim**; a *bulk* (re)index or path-exclude job goes
   through `mindex-index`, not a loop of `index_files`. Reads the project GUID from a
-  repo-root `.mindex` file (gitignored). No network at handshake (connects even with
+  repo-root `.mindex` file. No network at handshake (connects even with
   mindex down). `search` takes optional `include`/`exclude` filters
   (`{paths, programming_languages}`) passed straight through to `/search` — the only
   filtered MCP path (the tools otherwise expose just GUID+query); the backend already
@@ -469,7 +469,8 @@ Both CLIs document themselves via `--help`; only the non-obvious bits here.
   `search`), applied to every sub-query. mindex is untouched and the layer is fully
   removable. See `tools/mcp/scout/README.md`.
 
-The `.mindex` file (repo-root, gitignored) is **GUID on the first non-comment line**;
+The `.mindex` file (repo-root; committed in this repo, since the index scope is part
+of the project) is **GUID on the first non-comment line**;
 optional `exclude_paths:` / `include_paths:` / `languages:` lines below it carry
 project-standing search scope that the `digest` agent reads and passes as the
 `include`/`exclude` filters above (the MCP servers themselves don't parse `.mindex` —

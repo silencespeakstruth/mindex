@@ -1,0 +1,11 @@
+# mindex project marker. Read by the `digest` agent and the mindex
+# MCP/CLI tools. Format: the first non-comment, non-blank line is the project GUID;
+# optional scope lines below it are passed as search include/exclude filters.
+#   exclude_paths: <comma-separated globs>
+#   include_paths: <comma-separated globs>
+#   languages:     <comma-separated mindex language ids>
+c2d7e2c1-3165-42f5-9366-0ff1492b4bab
+# Excluded: tools/** (CLI long_about pollutes results), build artifacts (target),
+# the perf benchmark corpus/results (foreign source code — the main polluter),
+# python venvs, linter/python caches, git internals, agent settings, lockfiles, certs.
+exclude_paths: tools/**, target/**, **/target/**, perf/corpus/**, perf/results/**, **/.venv/**, **/__pycache__/**, .mypy_cache/**, .ruff_cache/**, .git/**, .claude/**, **/*.lock, **/*.pem

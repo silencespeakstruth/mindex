@@ -91,8 +91,9 @@ it with each query.
 - **First non-comment, non-blank line:** the project's GUID in the simple,
   un-hyphenated form the indexer stores (`uuidgen | tr -d '\n-'`). `#`-comment and
   blank lines are ignored.
-- **At the repo root**, and **gitignored** — it ties *this checkout* to *its mindex
-  project*, which is environment-specific, not shared.
+- **At the repo root**. It ties *this checkout* to *its mindex project* — gitignore
+  it when that binding is environment-specific; commit it when the whole team (or a
+  single-user setup, as in this repo) shares one index scope.
 - The GUID in `.mindex` **must equal** the one passed to `tools/indexer --project`.
   A mismatch points the tools at a different (likely empty) project and search
   silently returns nothing.
