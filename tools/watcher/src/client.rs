@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,7 +51,12 @@ pub async fn index_batch(
     files: HashMap<String, HashMap<String, Code>>,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let url = format!("{}/{}/{}/index", server.trim_end_matches('/'), protocol, guid);
+    let url = format!(
+        "{}/{}/{}/index",
+        server.trim_end_matches('/'),
+        protocol,
+        guid
+    );
 
     let resp = tokio::select! {
         biased;
@@ -87,7 +92,9 @@ pub async fn delete_files(
     }
 
     let url = format!("{}/projects/{}/files", server.trim_end_matches('/'), guid);
-    let body = DeleteFilesRequest { include: DeleteSelector { paths } };
+    let body = DeleteFilesRequest {
+        include: DeleteSelector { paths },
+    };
 
     let resp = tokio::select! {
         biased;

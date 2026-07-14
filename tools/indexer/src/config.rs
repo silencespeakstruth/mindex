@@ -93,8 +93,12 @@ pub fn resolve(ov: Overrides) -> Result<IndexerConfig> {
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("cannot read config file {}", path.display()))?;
-            toml::from_str(&text)
-                .with_context(|| format!("cannot parse {} as TOML (unknown keys are rejected)", path.display()))?
+            toml::from_str(&text).with_context(|| {
+                format!(
+                    "cannot parse {} as TOML (unknown keys are rejected)",
+                    path.display()
+                )
+            })?
         }
         None => {
             if is_explicit {
@@ -147,7 +151,10 @@ pub fn resolve(ov: Overrides) -> Result<IndexerConfig> {
         }
     }
     if !errs.is_empty() {
-        anyhow::bail!("invalid indexer configuration:\n  • {}", errs.join("\n  • "));
+        anyhow::bail!(
+            "invalid indexer configuration:\n  • {}",
+            errs.join("\n  • ")
+        );
     }
 
     Ok(cfg)

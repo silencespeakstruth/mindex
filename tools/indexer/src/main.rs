@@ -8,15 +8,15 @@ use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use sha2::{Digest, Sha256};
 
-use client::{Code, DriftRequest, IndexRequest, IndexResponse, check_drift, upload_batch};
-use scanner::{FileEntry, Language, ScanResult, scan};
+use client::{check_drift, upload_batch, Code, DriftRequest, IndexRequest, IndexResponse};
+use scanner::{scan, FileEntry, Language, ScanResult};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -173,7 +173,11 @@ async fn main() -> Result<()> {
     // ── Header (table-aligned: labels padded to a common width) ───────────────
     eprintln!();
     let row = |label: &str, value: String| {
-        eprintln!("  {}  {}", style(format!("{label:<7}")).dim(), style(value).cyan());
+        eprintln!(
+            "  {}  {}",
+            style(format!("{label:<7}")).dim(),
+            style(value).cyan()
+        );
     };
     row("server", cfg.server_url.clone());
     row("project", cli.project.clone());
@@ -193,7 +197,10 @@ async fn main() -> Result<()> {
             "  {} No source files found.{}",
             style("—").dim(),
             if scan.skipped_unknown > 0 {
-                format!("  ({} files with unrecognised extensions skipped)", scan.skipped_unknown)
+                format!(
+                    "  ({} files with unrecognised extensions skipped)",
+                    scan.skipped_unknown
+                )
             } else {
                 String::new()
             }
@@ -217,8 +224,15 @@ async fn main() -> Result<()> {
     // ── Drift check: hash the tree, ask the server what diverged, report, exit.
     // No uploads, no warm-up (read-only against an existing project).
     if cli.check {
-        let actionable =
-            run_check(&http, &cfg.server_url, &cli.project, scan.files, &cancel, cli.json).await?;
+        let actionable = run_check(
+            &http,
+            &cfg.server_url,
+            &cli.project,
+            scan.files,
+            &cancel,
+            cli.json,
+        )
+        .await?;
         if cancel.is_cancelled() || actionable {
             std::process::exit(1);
         }
@@ -235,7 +249,9 @@ async fn main() -> Result<()> {
             &cfg.server_url,
             &cfg.protocol,
             &cli.project,
-            IndexRequest { files: HashMap::new() },
+            IndexRequest {
+                files: HashMap::new(),
+            },
             &cancel,
         )
         .await
@@ -298,8 +314,16 @@ async fn main() -> Result<()> {
                 bar.set_position(done);
 
                 let elapsed = t0.elapsed().as_secs_f64();
-                let chunks_per_s = if elapsed > 0.0 { chunks as f64 / elapsed } else { 0.0 };
-                let files_per_s = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let chunks_per_s = if elapsed > 0.0 {
+                    chunks as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let files_per_s = if elapsed > 0.0 {
+                    done as f64 / elapsed
+                } else {
+                    0.0
+                };
                 let remaining = total_files.saturating_sub(done);
                 let eta = if files_per_s > 0.0 {
                     remaining as f64 / files_per_s
@@ -309,7 +333,11 @@ async fn main() -> Result<()> {
                 bar.set_message(format!(
                     "{chunks_per_s:.0} chunks/s · ETA {} · {chunks} chunks · {active} active{}",
                     fmt_eta(eta),
-                    if errs > 0 { format!(" · {errs} err") } else { String::new() },
+                    if errs > 0 {
+                        format!(" · {errs} err")
+                    } else {
+                        String::new()
+                    },
                 ));
 
                 tokio::select! {
@@ -486,17 +514,26 @@ async fn run_check(
     }
     spin.finish_and_clear();
 
-    let drift = check_drift(http, server, project, DriftRequest { files: manifest }, cancel)
-        .await
-        .context("drift check request failed (server unreachable, bad project GUID, or TLS?)")?;
+    let drift = check_drift(
+        http,
+        server,
+        project,
+        DriftRequest { files: manifest },
+        cancel,
+    )
+    .await
+    .context("drift check request failed (server unreachable, bad project GUID, or TLS?)")?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "stale": drift.stale,
-            "missing": drift.missing,
-            "orphaned": drift.orphaned,
-            "indexing": drift.indexing,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "stale": drift.stale,
+                "missing": drift.missing,
+                "orphaned": drift.orphaned,
+                "indexing": drift.indexing,
+            }))?
+        );
     } else {
         print_drift(&drift);
     }
@@ -511,7 +548,10 @@ fn print_drift(d: &client::DriftResponse) {
         if paths.is_empty() {
             return;
         }
-        eprintln!("  {}", style(format!("{label} ({})", paths.len())).fg(color).bold());
+        eprintln!(
+            "  {}",
+            style(format!("{label} ({})", paths.len())).fg(color).bold()
+        );
         for p in paths {
             eprintln!("    {}", style(p).fg(color).dim());
         }
@@ -528,7 +568,11 @@ fn print_drift(d: &client::DriftResponse) {
         } else {
             format!("  ({} file(s) currently indexing)", d.indexing.len())
         };
-        eprintln!("  {} index in sync{}", style("✓").green(), style(note).dim());
+        eprintln!(
+            "  {} index in sync{}",
+            style("✓").green(),
+            style(note).dim()
+        );
     } else {
         eprintln!();
         eprintln!(
@@ -632,7 +676,11 @@ fn print_verbose(pb: &ProgressBar, resp: &IndexResponse) {
                 "  {} {}  {}",
                 style("✓").green(),
                 path,
-                style(format!("{count} chunk{}", if count == 1 { "" } else { "s" })).green(),
+                style(format!(
+                    "{count} chunk{}",
+                    if count == 1 { "" } else { "s" }
+                ))
+                .green(),
             ));
         }
     }

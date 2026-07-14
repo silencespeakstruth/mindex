@@ -15,10 +15,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use watcher::{PendingEvent, classify, convert_event};
+use watcher::{classify, convert_event, PendingEvent};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -332,8 +332,10 @@ async fn flush(
 
     if cfg.dry_run {
         if n_upsert > 0 {
-            let paths: Vec<&str> =
-                upserts.values().flat_map(|m| m.keys().map(String::as_str)).collect();
+            let paths: Vec<&str> = upserts
+                .values()
+                .flat_map(|m| m.keys().map(String::as_str))
+                .collect();
             info!(files = n_upsert, ?paths, "[DRY-RUN] would index");
         }
         if !deletes.is_empty() {
@@ -412,8 +414,7 @@ async fn run_drift(cfg: &Cfg, http: &reqwest::Client, cancel: &CancellationToken
 
     if !drift.orphaned.is_empty() {
         let n = drift.orphaned.len();
-        match client::delete_files(http, &cfg.server_url, &cfg.guid, drift.orphaned, cancel).await
-        {
+        match client::delete_files(http, &cfg.server_url, &cfg.guid, drift.orphaned, cancel).await {
             Ok(confirmed) => info!(requested = n, confirmed, "drift: deleted orphaned files"),
             Err(e) => warn!(error = %e, "drift: delete orphaned files failed"),
         }
@@ -434,7 +435,9 @@ async fn build_manifest(cfg: &Cfg, cancel: &CancellationToken) -> HashMap<String
         }
 
         let abs = entry.into_path();
-        let Ok(rel_raw) = abs.strip_prefix(&cfg.root) else { continue };
+        let Ok(rel_raw) = abs.strip_prefix(&cfg.root) else {
+            continue;
+        };
         let rel = rel_raw.to_string_lossy().replace('\\', "/");
         let rel_path = Path::new(rel.as_str());
 
@@ -449,7 +452,9 @@ async fn build_manifest(cfg: &Cfg, cancel: &CancellationToken) -> HashMap<String
             }
         }
 
-        let Some(lang) = detect_language(&abs) else { continue };
+        let Some(lang) = detect_language(&abs) else {
+            continue;
+        };
         if !cfg.languages.is_empty() && !cfg.languages.iter().any(|l| l == lang.name()) {
             continue;
         }
@@ -477,7 +482,9 @@ async fn reindex_files(
             return;
         }
         let abs = cfg.root.join(rel);
-        let Some(lang) = detect_language(&abs) else { continue };
+        let Some(lang) = detect_language(&abs) else {
+            continue;
+        };
         if !cfg.languages.is_empty() && !cfg.languages.iter().any(|l| l == lang.name()) {
             continue;
         }
@@ -496,8 +503,15 @@ async fn reindex_files(
         return;
     }
     let n: usize = upserts.values().map(|m| m.len()).sum();
-    match client::index_batch(http, &cfg.server_url, &cfg.protocol, &cfg.guid, upserts, cancel)
-        .await
+    match client::index_batch(
+        http,
+        &cfg.server_url,
+        &cfg.protocol,
+        &cfg.guid,
+        upserts,
+        cancel,
+    )
+    .await
     {
         Ok(()) => info!(files = n, "drift: reindexed"),
         Err(e) => warn!(error = %e, "drift: reindex failed"),
@@ -506,7 +520,10 @@ async fn reindex_files(
 
 fn log_drift_summary(drift: &DriftResponse) {
     if !drift.indexing.is_empty() {
-        info!(files = drift.indexing.len(), "drift: files currently indexing (no action)");
+        info!(
+            files = drift.indexing.len(),
+            "drift: files currently indexing (no action)"
+        );
     }
     if drift.stale.is_empty() && drift.missing.is_empty() && drift.orphaned.is_empty() {
         info!("drift: index in sync");

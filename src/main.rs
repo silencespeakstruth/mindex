@@ -31,7 +31,10 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("db/migrations/v0.1.0_schema.sql")),
     (2, include_str!("db/migrations/v0.2.0_status_machine.sql")),
-    (3, include_str!("db/migrations/v0.3.0_validation_checks.sql")),
+    (
+        3,
+        include_str!("db/migrations/v0.3.0_validation_checks.sql"),
+    ),
 ];
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
@@ -103,10 +106,7 @@ async fn main() -> Result<(), BoxError> {
         &cfg.sqlite_synchronous(),
     ));
 
-    let db_schema_version = match db_pool
-        .transaction(token, apply_pending_migrations)
-        .await
-    {
+    let db_schema_version = match db_pool.transaction(token, apply_pending_migrations).await {
         Ok((v, true)) => {
             info!(db_path = ?cfg.database.path, schema_version = v, "Schema migration completed.");
             v
@@ -309,7 +309,10 @@ mod tests {
         assert_eq!((v, applied), (*max_v, true));
         assert_eq!(user_version(&p).await, *max_v);
         // One representative object per migration proves each batch actually ran.
-        assert!(object_exists(&p, "table", "project_files").await, "v0.1.0 schema missing");
+        assert!(
+            object_exists(&p, "table", "project_files").await,
+            "v0.1.0 schema missing"
+        );
         assert!(
             object_exists(&p, "trigger", "project_files_status_update_guard").await,
             "v0.2.0 status machine missing"
@@ -332,7 +335,11 @@ mod tests {
             .unwrap();
 
         let (max_v, _) = MIGRATIONS.last().unwrap();
-        assert_eq!((v, applied), (*max_v, false), "an up-to-date DB must apply nothing");
+        assert_eq!(
+            (v, applied),
+            (*max_v, false),
+            "an up-to-date DB must apply nothing"
+        );
     }
 
     #[tokio::test]
@@ -376,7 +383,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((v, applied), (max_v, false));
-        assert!(!object_exists(&p, "table", "project_files").await, "nothing must be applied");
+        assert!(
+            !object_exists(&p, "table", "project_files").await,
+            "nothing must be applied"
+        );
     }
 
     #[tokio::test]

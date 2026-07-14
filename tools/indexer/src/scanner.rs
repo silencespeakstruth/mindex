@@ -5,63 +5,81 @@ use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
-    Rust, Python, JavaScript, TypeScript, Tsx,
-    Go, C, Cpp, Java, CSharp, Ruby, Php,
-    Bash, Html, Css, Json, Scala, Haskell, Ocaml, Zig, Sql,
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Go,
+    C,
+    Cpp,
+    Java,
+    CSharp,
+    Ruby,
+    Php,
+    Bash,
+    Html,
+    Css,
+    Json,
+    Scala,
+    Haskell,
+    Ocaml,
+    Zig,
+    Sql,
 }
 
 impl Language {
     pub fn name(self) -> &'static str {
         match self {
-            Language::Rust       => "rust",
-            Language::Python     => "python",
+            Language::Rust => "rust",
+            Language::Python => "python",
             Language::JavaScript => "javascript",
             Language::TypeScript => "typescript",
-            Language::Tsx        => "tsx",
-            Language::Go         => "go",
-            Language::C          => "c",
-            Language::Cpp        => "cpp",
-            Language::Java       => "java",
-            Language::CSharp     => "csharp",
-            Language::Ruby       => "ruby",
-            Language::Php        => "php",
-            Language::Bash       => "bash",
-            Language::Html       => "html",
-            Language::Css        => "css",
-            Language::Json       => "json",
-            Language::Scala      => "scala",
-            Language::Haskell    => "haskell",
-            Language::Ocaml      => "ocaml",
-            Language::Zig        => "zig",
-            Language::Sql        => "sql",
+            Language::Tsx => "tsx",
+            Language::Go => "go",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Java => "java",
+            Language::CSharp => "csharp",
+            Language::Ruby => "ruby",
+            Language::Php => "php",
+            Language::Bash => "bash",
+            Language::Html => "html",
+            Language::Css => "css",
+            Language::Json => "json",
+            Language::Scala => "scala",
+            Language::Haskell => "haskell",
+            Language::Ocaml => "ocaml",
+            Language::Zig => "zig",
+            Language::Sql => "sql",
         }
     }
 }
 
 fn detect_language(path: &Path) -> Option<Language> {
     match path.extension()?.to_str()? {
-        "rs"                                          => Some(Language::Rust),
-        "py" | "pyw"                                  => Some(Language::Python),
-        "js" | "mjs" | "cjs" | "jsx"                 => Some(Language::JavaScript),
-        "ts" | "mts" | "cts"                          => Some(Language::TypeScript),
-        "tsx"                                         => Some(Language::Tsx),
-        "go"                                          => Some(Language::Go),
-        "c" | "h"                                     => Some(Language::C),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh"  => Some(Language::Cpp),
-        "java"                                        => Some(Language::Java),
-        "cs"                                          => Some(Language::CSharp),
-        "rb"                                          => Some(Language::Ruby),
-        "php" | "phtml"                               => Some(Language::Php),
-        "sh" | "bash"                                 => Some(Language::Bash),
-        "html" | "htm" | "xhtml"                      => Some(Language::Html),
-        "css"                                         => Some(Language::Css),
-        "json"                                        => Some(Language::Json),
-        "scala" | "sc"                                => Some(Language::Scala),
-        "hs" | "lhs"                                  => Some(Language::Haskell),
-        "ml" | "mli"                                  => Some(Language::Ocaml),
-        "zig"                                         => Some(Language::Zig),
-        "sql"                                         => Some(Language::Sql),
-        _                                             => None,
+        "rs" => Some(Language::Rust),
+        "py" | "pyw" => Some(Language::Python),
+        "js" | "mjs" | "cjs" | "jsx" => Some(Language::JavaScript),
+        "ts" | "mts" | "cts" => Some(Language::TypeScript),
+        "tsx" => Some(Language::Tsx),
+        "go" => Some(Language::Go),
+        "c" | "h" => Some(Language::C),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Language::Cpp),
+        "java" => Some(Language::Java),
+        "cs" => Some(Language::CSharp),
+        "rb" => Some(Language::Ruby),
+        "php" | "phtml" => Some(Language::Php),
+        "sh" | "bash" => Some(Language::Bash),
+        "html" | "htm" | "xhtml" => Some(Language::Html),
+        "css" => Some(Language::Css),
+        "json" => Some(Language::Json),
+        "scala" | "sc" => Some(Language::Scala),
+        "hs" | "lhs" => Some(Language::Haskell),
+        "ml" | "mli" => Some(Language::Ocaml),
+        "zig" => Some(Language::Zig),
+        "sql" => Some(Language::Sql),
+        _ => None,
     }
 }
 
@@ -133,7 +151,10 @@ pub fn scan(root: &Path, includes: &[String], excludes: &[String]) -> Result<Sca
         });
     }
 
-    Ok(ScanResult { files, skipped_unknown })
+    Ok(ScanResult {
+        files,
+        skipped_unknown,
+    })
 }
 
 #[cfg(test)]
@@ -167,9 +188,15 @@ mod tests {
         let result = scan(dir.path(), &[], &[]).unwrap();
 
         // Forward-slash root-relative paths, in walkdir's sorted order.
-        assert_eq!(rel_paths(&result), vec!["scripts/run.py", "src/main.rs", "tools/gen.rs"]);
+        assert_eq!(
+            rel_paths(&result),
+            vec!["scripts/run.py", "src/main.rs", "tools/gen.rs"]
+        );
         let langs: Vec<_> = result.files.iter().map(|f| f.language).collect();
-        assert_eq!(langs, vec![Language::Python, Language::Rust, Language::Rust]);
+        assert_eq!(
+            langs,
+            vec![Language::Python, Language::Rust, Language::Rust]
+        );
         // README.md has no detectable language: skipped and *counted* (the CLI
         // surfaces this so an unexpected extension isn't silently dropped).
         assert_eq!(result.skipped_unknown, 1);

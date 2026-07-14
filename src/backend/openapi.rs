@@ -172,7 +172,11 @@ mod tests {
         assert!(paths["/projects/{project_guid}"].get("get").is_some());
         assert!(paths["/projects/{project_guid}"].get("delete").is_some());
         assert!(paths["/projects/{project_guid}/files"].get("get").is_some());
-        assert!(paths["/projects/{project_guid}/files"].get("delete").is_some());
+        assert!(
+            paths["/projects/{project_guid}/files"]
+                .get("delete")
+                .is_some()
+        );
 
         // All six tag groups are declared.
         let tags = json["tags"].as_array().expect("tags array");
@@ -210,7 +214,11 @@ mod tests {
         );
 
         let index = get("/swagger-ui/").await.unwrap();
-        assert_eq!(index.status(), StatusCode::OK, "/swagger-ui/ must serve the UI");
+        assert_eq!(
+            index.status(),
+            StatusCode::OK,
+            "/swagger-ui/ must serve the UI"
+        );
 
         let css = get("/swagger-ui/swagger-ui.css").await.unwrap();
         assert_eq!(
@@ -218,10 +226,16 @@ mod tests {
             StatusCode::OK,
             "vendored Swagger UI assets must be embedded and served"
         );
-        let body = axum::body::to_bytes(css.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(css.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(!body.is_empty(), "the CSS asset must have content");
 
         let spec = get("/api-docs/openapi.json").await.unwrap();
-        assert_eq!(spec.status(), StatusCode::OK, "raw OpenAPI spec must be reachable");
+        assert_eq!(
+            spec.status(),
+            StatusCode::OK,
+            "raw OpenAPI spec must be reachable"
+        );
     }
 }

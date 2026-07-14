@@ -333,7 +333,9 @@ mod tests {
     }
 
     fn req() -> BGEm3EmbedRequest {
-        BGEm3EmbedRequest { texts: vec!["x".into()] }
+        BGEm3EmbedRequest {
+            texts: vec!["x".into()],
+        }
     }
 
     #[tokio::test]
@@ -350,8 +352,14 @@ mod tests {
         // Always 429 → 1 initial + 3 retries = 4 requests, then give up.
         let (client, hits) = stub_embedder(usize::MAX).await;
         let res = client.encode(req(), CancellationToken::new()).await;
-        assert!(matches!(res, Err(EncodeError::Request(_))), "expected give-up, got {res:?}");
-        assert_eq!(hits.load(Ordering::SeqCst), 1 + TEST_MAX_429_RETRIES as usize);
+        assert!(
+            matches!(res, Err(EncodeError::Request(_))),
+            "expected give-up, got {res:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1 + TEST_MAX_429_RETRIES as usize
+        );
     }
 
     #[tokio::test]
@@ -390,10 +398,15 @@ mod tests {
         let started = std::time::Instant::now();
         let res = client.encode(req(), CancellationToken::new()).await;
         match res {
-            Err(EncodeError::Request(e)) => assert!(e.is_timeout(), "expected a timeout, got {e:?}"),
+            Err(EncodeError::Request(e)) => {
+                assert!(e.is_timeout(), "expected a timeout, got {e:?}")
+            }
             other => panic!("expected Err(Request(timeout)), got {other:?}"),
         }
-        assert!(started.elapsed() < Duration::from_secs(5), "must fail fast, not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must fail fast, not hang"
+        );
     }
 
     /// Build a wire-format body by hand (the encoding side `pack_encode` lives in

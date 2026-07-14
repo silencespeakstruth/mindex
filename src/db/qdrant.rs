@@ -52,7 +52,12 @@ impl QdrantStore {
         sparse_prefetch_limit: u32,
         fusion_limit: u32,
     ) -> Self {
-        Self { client, dense_prefetch_limit, sparse_prefetch_limit, fusion_limit }
+        Self {
+            client,
+            dense_prefetch_limit,
+            sparse_prefetch_limit,
+            fusion_limit,
+        }
     }
 }
 
@@ -268,8 +273,7 @@ impl VectorStore for QdrantStore {
             ..Default::default()
         };
 
-        let sparse_query: Vec<(u32, f32)> =
-            sparse_indices.into_iter().zip(sparse_values).collect();
+        let sparse_query: Vec<(u32, f32)> = sparse_indices.into_iter().zip(sparse_values).collect();
 
         // Two-stage retrieval, expressed as a *nested* prefetch — this nesting is
         // load-bearing. `QueryPointsBuilder` has a single `query` field, so two flat

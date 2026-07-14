@@ -140,7 +140,10 @@ pub fn resolve(ov: Overrides) -> Result<WatcherConfig> {
         errs.push("drift_interval_secs must be >= 10 (default 300)".to_string());
     }
     if !errs.is_empty() {
-        anyhow::bail!("invalid watcher configuration:\n  • {}", errs.join("\n  • "));
+        anyhow::bail!(
+            "invalid watcher configuration:\n  • {}",
+            errs.join("\n  • ")
+        );
     }
 
     Ok(cfg)

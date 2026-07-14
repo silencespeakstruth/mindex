@@ -77,7 +77,11 @@ pub enum ApiError {
     /// The search query exceeded `max` bytes. 400.
     QueryTooLong { got: usize, max: usize },
     /// A single file's `code` exceeded `max` bytes. 400.
-    CodeTooLarge { path: String, got: usize, max: usize },
+    CodeTooLarge {
+        path: String,
+        got: usize,
+        max: usize,
+    },
     /// Too many files in one request (index or drift). 400.
     TooManyFiles { got: usize, max: usize },
     /// A selector carried too many globs+languages combined. 400.
@@ -172,18 +176,35 @@ impl ApiError {
     /// The default English `detail` (one human-readable sentence).
     fn detail(&self) -> String {
         match self {
-            ApiError::Cancelled => "The client closed the connection before the request completed.".into(),
+            ApiError::Cancelled => {
+                "The client closed the connection before the request completed.".into()
+            }
             ApiError::Internal => "An unexpected server error occurred.".into(),
-            ApiError::EmbedderUnavailable => "The embedding model server is unreachable or returned an undecodable response.".into(),
-            ApiError::QdrantUnavailable => "The vector store is unreachable or the query failed.".into(),
-            ApiError::GcRunning => "A garbage-collection pass is already running; retry later.".into(),
-            ApiError::FileInFlight => "The same file is already being indexed by another in-flight request; retry.".into(),
+            ApiError::EmbedderUnavailable => {
+                "The embedding model server is unreachable or returned an undecodable response."
+                    .into()
+            }
+            ApiError::QdrantUnavailable => {
+                "The vector store is unreachable or the query failed.".into()
+            }
+            ApiError::GcRunning => {
+                "A garbage-collection pass is already running; retry later.".into()
+            }
+            ApiError::FileInFlight => {
+                "The same file is already being indexed by another in-flight request; retry.".into()
+            }
             ApiError::ProjectNotFound => "The project has never been seen.".into(),
-            ApiError::NoMatch => "No active chunks match (empty project or over-narrow filter).".into(),
+            ApiError::NoMatch => {
+                "No active chunks match (empty project or over-narrow filter).".into()
+            }
             ApiError::MalformedBody(msg) => format!("The request body could not be parsed: {msg}"),
             ApiError::MalformedPath(msg) => format!("A path parameter could not be parsed: {msg}"),
-            ApiError::BodyTooLarge => "The request body exceeds the configured size limit ([server].max_body_mib).".into(),
-            ApiError::SelectorEmpty => "At least one non-empty `include` or `exclude` selector is required.".into(),
+            ApiError::BodyTooLarge => {
+                "The request body exceeds the configured size limit ([server].max_body_mib).".into()
+            }
+            ApiError::SelectorEmpty => {
+                "At least one non-empty `include` or `exclude` selector is required.".into()
+            }
             ApiError::PathInvalid { path } => format!(
                 "Path {path:?} is invalid: paths must be non-empty, repo-relative (no leading '/'), \
                  free of '..' traversal, and use '/' (no backslash)."
@@ -216,7 +237,9 @@ impl ApiError {
             ApiError::PathInvalid { path } | ApiError::Sha256Invalid { path } => {
                 Some(json!({ "path": path }))
             }
-            ApiError::TopKOutOfRange { got, max } => Some(json!({ "got": got, "min": 1, "max": max })),
+            ApiError::TopKOutOfRange { got, max } => {
+                Some(json!({ "got": got, "min": 1, "max": max }))
+            }
             ApiError::QueryTooLong { got, max } => Some(json!({ "got": got, "max": max })),
             ApiError::CodeTooLarge { path, got, max } => {
                 Some(json!({ "path": path, "got": got, "max": max }))
@@ -278,7 +301,9 @@ impl IntoResponse for ApiError {
         let mut resp = (status, Json(body)).into_response();
         resp.headers_mut().insert(
             CONTENT_TYPE,
-            "application/problem+json".parse().expect("static content-type is valid"),
+            "application/problem+json"
+                .parse()
+                .expect("static content-type is valid"),
         );
         resp
     }
@@ -320,12 +345,20 @@ mod tests {
             ApiError::MalformedPath(String::new()),
             ApiError::BodyTooLarge,
             ApiError::SelectorEmpty,
-            ApiError::PathInvalid { path: String::new() },
-            ApiError::Sha256Invalid { path: String::new() },
+            ApiError::PathInvalid {
+                path: String::new(),
+            },
+            ApiError::Sha256Invalid {
+                path: String::new(),
+            },
             ApiError::TopKOutOfRange { got: 0, max: 0 },
             ApiError::QueryEmpty,
             ApiError::QueryTooLong { got: 0, max: 0 },
-            ApiError::CodeTooLarge { path: String::new(), got: 0, max: 0 },
+            ApiError::CodeTooLarge {
+                path: String::new(),
+                got: 0,
+                max: 0,
+            },
             ApiError::TooManyFiles { got: 0, max: 0 },
             ApiError::SelectorTooLarge { got: 0, max: 0 },
         ];
@@ -354,7 +387,10 @@ mod tests {
             "validation.too_many_files",
             "validation.top_k_out_of_range",
         ];
-        assert_eq!(codes, expected, "error-code contract changed — update intentionally");
+        assert_eq!(
+            codes, expected,
+            "error-code contract changed — update intentionally"
+        );
     }
 
     #[tokio::test]
@@ -373,7 +409,10 @@ mod tests {
         assert_eq!(v["field"], "top_k");
         assert_eq!(v["meta"]["max"], 100);
         assert_eq!(v["meta"]["got"], 999);
-        assert_eq!(v["type"], "https://mindex/errors/validation.top_k_out_of_range");
+        assert_eq!(
+            v["type"],
+            "https://mindex/errors/validation.top_k_out_of_range"
+        );
     }
 
     #[test]

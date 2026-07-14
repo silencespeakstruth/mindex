@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -47,7 +47,11 @@ pub async fn check_drift(
     request: DriftRequest,
     cancel: &CancellationToken,
 ) -> Result<DriftResponse> {
-    let url = format!("{}/projects/{}/drift", server.trim_end_matches('/'), project);
+    let url = format!(
+        "{}/projects/{}/drift",
+        server.trim_end_matches('/'),
+        project
+    );
 
     let resp = tokio::select! {
         biased;

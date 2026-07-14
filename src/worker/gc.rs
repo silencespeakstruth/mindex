@@ -84,7 +84,11 @@ pub async fn run(
         info!("GC worker: starting sweep.");
         let (chunks, files, _log) =
             collect(&db_pool, &*store, status_log_retention_days, &token).await;
-        info!(chunks_removed = chunks, files_removed = files, "GC worker: sweep complete.");
+        info!(
+            chunks_removed = chunks,
+            files_removed = files,
+            "GC worker: sweep complete."
+        );
     }
 }
 
@@ -147,8 +151,7 @@ pub(crate) async fn prune_status_log(
         Ok(rows) => {
             info!(
                 rows,
-                retention_days,
-                "GC worker: pruned old status-log rows."
+                retention_days, "GC worker: pruned old status-log rows."
             );
             rows
         }
@@ -347,8 +350,9 @@ mod tests {
     /// the chunks are counted via `deleted_count`.
     async fn seed_deleted_chunks(pool: &SQLite3Pool, guid: &str, n: usize) {
         let g = guid.to_string();
-        let qdrant_guids: Vec<String> =
-            (0..n).map(|_| Uuid::new_v4().simple().to_string()).collect();
+        let qdrant_guids: Vec<String> = (0..n)
+            .map(|_| Uuid::new_v4().simple().to_string())
+            .collect();
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
@@ -398,10 +402,16 @@ mod tests {
         let guid = "a".repeat(32);
         seed_deleted_chunks(&pool, &guid, 3).await;
 
-        let store = FakeStore { fail: HashSet::new() };
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
         sweep(&pool, &store, &CancellationToken::new()).await;
 
-        assert_eq!(deleted_count(&pool, &guid).await, 0, "all confirmed rows should be gone");
+        assert_eq!(
+            deleted_count(&pool, &guid).await,
+            0,
+            "all confirmed rows should be gone"
+        );
     }
 
     #[tokio::test]
@@ -420,14 +430,24 @@ mod tests {
 
         // Confirmed-deleted project: rows gone. Failed project: rows kept for retry
         // (this is the orphan-prevention regression — old code deleted them anyway).
-        assert_eq!(deleted_count(&pool, &guid_ok).await, 0, "succeeded project should be swept");
-        assert_eq!(deleted_count(&pool, &guid_fail).await, 2, "failed project's rows must remain");
+        assert_eq!(
+            deleted_count(&pool, &guid_ok).await,
+            0,
+            "succeeded project should be swept"
+        );
+        assert_eq!(
+            deleted_count(&pool, &guid_fail).await,
+            2,
+            "failed project's rows must remain"
+        );
     }
 
     #[tokio::test]
     async fn sweep_on_empty_is_a_noop() {
         let pool = migrated_pool().await;
-        let store = FakeStore { fail: HashSet::new() };
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
         // No deleted chunks at all: must return promptly without error.
         sweep(&pool, &store, &CancellationToken::new()).await;
     }
@@ -438,17 +458,25 @@ mod tests {
 
         let guard = GcGuard::try_acquire(&flag).expect("free flag is acquirable");
         // A second acquire while the first is held must fail (serialization).
-        assert!(GcGuard::try_acquire(&flag).is_none(), "held flag rejects a second guard");
+        assert!(
+            GcGuard::try_acquire(&flag).is_none(),
+            "held flag rejects a second guard"
+        );
 
         drop(guard);
         // After the guard drops the flag is free again.
-        assert!(GcGuard::try_acquire(&flag).is_some(), "dropped guard frees the flag");
+        assert!(
+            GcGuard::try_acquire(&flag).is_some(),
+            "dropped guard frees the flag"
+        );
     }
 
     async fn status_log_count(pool: &SQLite3Pool) -> i64 {
         pool.transaction(CancellationToken::new(), |tx| {
-            tx.query_row("SELECT COUNT(*) FROM project_file_status_log", [], |r| r.get(0))
-                .map_err(SQLite3PoolError::from)
+            tx.query_row("SELECT COUNT(*) FROM project_file_status_log", [], |r| {
+                r.get(0)
+            })
+            .map_err(SQLite3PoolError::from)
         })
         .await
         .unwrap()

@@ -61,8 +61,7 @@ impl SQLite3Pool {
                 )
             });
 
-            conn.execute_batch(&pragmas)
-            .unwrap_or_else(|err| {
+            conn.execute_batch(&pragmas).unwrap_or_else(|err| {
                 panic!(
                     "Failed to apply startup PRAGMAs on {db_path:?}: {err}. \
                      The database file may be corrupt or locked by another process."
@@ -214,7 +213,10 @@ mod tests {
         // the "client went away mid-transaction" case. The spawn_blocking task keeps
         // running to completion regardless.
         let timed_out = tokio::time::timeout(Duration::from_millis(50), slow).await;
-        assert!(timed_out.is_err(), "the slow transaction future should have been dropped");
+        assert!(
+            timed_out.is_err(),
+            "the slow transaction future should have been dropped"
+        );
 
         // Give the orphaned blocking task time to finish and push the connection back.
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -249,7 +251,11 @@ mod tests {
         }
         // Let both blocking tasks actually acquire their connections.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(p.available().await, 0, "both connections should be checked out");
+        assert_eq!(
+            p.available().await,
+            0,
+            "both connections should be checked out"
+        );
 
         // The N+1-th caller is rejected immediately, not queued.
         let res = p.transaction(CancellationToken::new(), |_tx| Ok(())).await;
@@ -263,7 +269,10 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         let res = p.transaction(CancellationToken::new(), |_tx| Ok(1)).await;
-        assert!(matches!(res, Ok(1)), "pool must recover after connections return: {res:?}");
+        assert!(
+            matches!(res, Ok(1)),
+            "pool must recover after connections return: {res:?}"
+        );
         assert_eq!(p.available().await, 2);
     }
 
@@ -275,17 +284,28 @@ mod tests {
         let p = pool(2);
 
         let res = p
-            .transaction(CancellationToken::new(), |_tx| -> Result<(), SQLite3PoolError> {
-                panic!("bug in the closure")
-            })
+            .transaction(
+                CancellationToken::new(),
+                |_tx| -> Result<(), SQLite3PoolError> { panic!("bug in the closure") },
+            )
             .await;
-        assert!(res.is_err(), "a panicked transaction must surface as an error");
+        assert!(
+            res.is_err(),
+            "a panicked transaction must surface as an error"
+        );
 
         // One connection was sacrificed with the panicked task...
-        assert_eq!(p.available().await, 1, "the panicked task's connection is dropped");
+        assert_eq!(
+            p.available().await,
+            1,
+            "the panicked task's connection is dropped"
+        );
 
         // ...but the pool still serves with the other one.
         let res = p.transaction(CancellationToken::new(), |_tx| Ok(5)).await;
-        assert!(matches!(res, Ok(5)), "pool must keep serving after a closure panic: {res:?}");
+        assert!(
+            matches!(res, Ok(5)),
+            "pool must keep serving after a closure panic: {res:?}"
+        );
     }
 }

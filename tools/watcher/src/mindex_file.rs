@@ -44,11 +44,20 @@ pub fn parse(path: &Path) -> Result<MindexFile> {
         )
     })?;
 
-    Ok(MindexFile { guid, include_paths, exclude_paths, languages })
+    Ok(MindexFile {
+        guid,
+        include_paths,
+        exclude_paths,
+        languages,
+    })
 }
 
 fn comma_list(s: &str) -> Vec<String> {
-    s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn build_globsets(
@@ -118,7 +127,10 @@ mod tests {
     #[test]
     fn globsets_are_none_when_empty_and_match_when_built() {
         let (inc, exc) = build_globsets(&[], &[]).unwrap();
-        assert!(inc.is_none() && exc.is_none(), "empty patterns must mean 'no filter'");
+        assert!(
+            inc.is_none() && exc.is_none(),
+            "empty patterns must mean 'no filter'"
+        );
 
         let (inc, _) = build_globsets(&["src/**".to_string()], &[]).unwrap();
         let inc = inc.unwrap();

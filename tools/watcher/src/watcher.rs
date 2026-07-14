@@ -1,4 +1,4 @@
-use crate::scanner::{Language, detect_language};
+use crate::scanner::{detect_language, Language};
 use globset::GlobSet;
 use notify::event::{EventKind, ModifyKind, RenameMode};
 use std::path::{Path, PathBuf};
@@ -151,7 +151,10 @@ mod tests {
         ));
         assert_eq!(
             kinds(&out),
-            vec![(true, Path::new("/r/old.rs")), (false, Path::new("/r/new.rs"))],
+            vec![
+                (true, Path::new("/r/old.rs")),
+                (false, Path::new("/r/new.rs"))
+            ],
             "a rename must delete the OLD path and (re)index the NEW one"
         );
     }

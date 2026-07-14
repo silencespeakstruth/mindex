@@ -70,7 +70,12 @@ impl<'a> Slicer<'a> {
 
         parser.set_language(&language)?;
 
-        Ok(Self { parser, tokenizer, min_tokens, max_tokens })
+        Ok(Self {
+            parser,
+            tokenizer,
+            min_tokens,
+            max_tokens,
+        })
     }
 
     pub fn parse(
@@ -113,17 +118,18 @@ impl<'a> Slicer<'a> {
                      * within this length range to balance context and semantic density.
                      */
                     if (self.min_tokens..=self.max_tokens).contains(&len) {
-                        let line_start = code[..node.start_byte()]
-                            .rfind('\n')
-                            .map_or(0, |i| i + 1);
+                        let line_start = code[..node.start_byte()].rfind('\n').map_or(0, |i| i + 1);
                         // Only extend to line_start when the intervening bytes are pure
                         // whitespace (indentation).  Mid-line nodes (e.g. a block body
                         // that begins after `) -> T {`) must not pull in non-whitespace.
                         let is_pure_indent = code[line_start..node.start_byte()]
                             .bytes()
                             .all(|b| b == b' ' || b == b'\t');
-                        let code_start =
-                            if is_pure_indent { line_start } else { node.start_byte() };
+                        let code_start = if is_pure_indent {
+                            line_start
+                        } else {
+                            node.start_byte()
+                        };
                         res.push(SlicedChunk {
                             code: code[code_start..node.end_byte()].into(),
                             #[cfg(test)]
@@ -176,7 +182,13 @@ mod tests {
     }
 
     fn slicer() -> Slicer<'static> {
-        Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), tokenizer(), 128, 512).unwrap()
+        Slicer::new(
+            Language::new(tree_sitter_rust::LANGUAGE),
+            tokenizer(),
+            128,
+            512,
+        )
+        .unwrap()
     }
 
     fn all_source_files() -> Vec<(String, String)> {
@@ -187,11 +199,7 @@ mod tests {
         out
     }
 
-    fn collect_rs(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut Vec<(String, String)>,
-    ) {
+    fn collect_rs(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
@@ -220,8 +228,13 @@ mod tests {
         let src = "fn demo() {\n".to_string()
             + &"    let _ = compute_something_meaningful(1, 2, 3);\n".repeat(5)
             + "}\n";
-        let mut slicer =
-            Slicer::new(Language::new(tree_sitter_rust::LANGUAGE), &OnePerByte, 128, 512).unwrap();
+        let mut slicer = Slicer::new(
+            Language::new(tree_sitter_rust::LANGUAGE),
+            &OnePerByte,
+            128,
+            512,
+        )
+        .unwrap();
         let chunks = slicer.parse(&src, CancellationToken::new()).unwrap();
         assert!(!chunks.is_empty(), "the fn node should have been selected");
     }
@@ -246,14 +259,12 @@ mod tests {
     fn mindex_sources_produce_at_least_one_chunk() {
         let total: usize = all_source_files()
             .iter()
-            .map(|(_, src)| {
-                slicer()
-                    .parse(src, CancellationToken::new())
-                    .unwrap()
-                    .len()
-            })
+            .map(|(_, src)| slicer().parse(src, CancellationToken::new()).unwrap().len())
             .sum();
-        assert!(total > 0, "no chunks produced across all mindex source files");
+        assert!(
+            total > 0,
+            "no chunks produced across all mindex source files"
+        );
     }
 
     #[test]
@@ -309,33 +320,35 @@ mod tests {
         for (name, src) in all_source_files() {
             for chunk in slicer().parse(&src, CancellationToken::new()).unwrap() {
                 let before_start = &src[..chunk.start_byte];
-                let expected_start_line =
-                    before_start.bytes().filter(|&b| b == b'\n').count() + 1;
+                let expected_start_line = before_start.bytes().filter(|&b| b == b'\n').count() + 1;
                 let line_start = before_start.rfind('\n').map_or(0, |i| i + 1);
                 let expected_start_col = chunk.start_byte - line_start;
 
                 assert_eq!(
                     chunk.start_line, expected_start_line,
-                    "{name}: start_line mismatch at byte {}", chunk.start_byte
+                    "{name}: start_line mismatch at byte {}",
+                    chunk.start_byte
                 );
                 assert_eq!(
                     chunk.start_column, expected_start_col,
-                    "{name}: start_column mismatch at byte {}", chunk.start_byte
+                    "{name}: start_column mismatch at byte {}",
+                    chunk.start_byte
                 );
 
                 let before_end = &src[..chunk.end_byte];
-                let expected_end_line =
-                    before_end.bytes().filter(|&b| b == b'\n').count() + 1;
+                let expected_end_line = before_end.bytes().filter(|&b| b == b'\n').count() + 1;
                 let end_line_start = before_end.rfind('\n').map_or(0, |i| i + 1);
                 let expected_end_col = chunk.end_byte - end_line_start;
 
                 assert_eq!(
                     chunk.end_line, expected_end_line,
-                    "{name}: end_line mismatch at byte {}", chunk.end_byte
+                    "{name}: end_line mismatch at byte {}",
+                    chunk.end_byte
                 );
                 assert_eq!(
                     chunk.end_column, expected_end_col,
-                    "{name}: end_column mismatch at byte {}", chunk.end_byte
+                    "{name}: end_column mismatch at byte {}",
+                    chunk.end_byte
                 );
             }
         }
@@ -422,10 +435,8 @@ mod tests {
     fn chunks_do_not_overlap() {
         for (name, src) in all_source_files() {
             let chunks = slicer().parse(&src, CancellationToken::new()).unwrap();
-            let mut ranges: Vec<(usize, usize)> = chunks
-                .iter()
-                .map(|c| (c.start_byte, c.end_byte))
-                .collect();
+            let mut ranges: Vec<(usize, usize)> =
+                chunks.iter().map(|c| (c.start_byte, c.end_byte)).collect();
             ranges.sort_by_key(|&(start, _)| start);
             for w in ranges.windows(2) {
                 let (_, prev_end) = w[0];

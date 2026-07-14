@@ -1,10 +1,10 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{Request, Response};
 use axum::middleware::Next;
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
-use axum::http::{Request, Response};
 use bytes::{Buf, Bytes};
 use h3::server::RequestStream;
 use quinn::Endpoint;
@@ -97,24 +97,19 @@ impl Drop for CancellationGuard {
 
 /// Load cert + key PEMs into a `rustls::ServerConfig` with ALPN = `["h3"]`.
 /// Used only for the QUIC endpoint; the TCP path uses its own `RustlsConfig`.
-fn load_quic_tls(
-    cert: &Path,
-    key: &Path,
-) -> Result<Arc<TlsConfig>, Box<dyn std::error::Error>> {
+fn load_quic_tls(cert: &Path, key: &Path) -> Result<Arc<TlsConfig>, Box<dyn std::error::Error>> {
     let cert_pem = std::fs::read(cert)?;
     let key_pem = std::fs::read(key)?;
 
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|c| c.into_owned())
-            .collect();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|c| c.into_owned())
+        .collect();
 
-    let private_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut key_pem.as_slice())?
-            .ok_or_else(|| std::io::Error::other("no private key found in TLS key file"))?
-            .clone_key();
+    let private_key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_slice())?
+        .ok_or_else(|| std::io::Error::other("no private key found in TLS key file"))?
+        .clone_key();
 
     let mut config = TlsConfig::builder()
         .with_no_client_auth()
@@ -381,7 +376,9 @@ async fn send_axum_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (resp_parts, resp_body) = resp.into_parts();
-    stream.send_response(Response::from_parts(resp_parts, ())).await?;
+    stream
+        .send_response(Response::from_parts(resp_parts, ()))
+        .await?;
     let data = axum::body::to_bytes(resp_body, usize::MAX).await?;
     if !data.is_empty() {
         stream.send_data(data).await?;

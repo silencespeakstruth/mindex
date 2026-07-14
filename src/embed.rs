@@ -64,7 +64,10 @@ pub async fn embed_and_upsert(
             dense_vecs,
             sparse_vecs,
             colbert_vecs,
-        } = match embedder.encode(BGEm3EmbedRequest { texts }, token.clone()).await {
+        } = match embedder
+            .encode(BGEm3EmbedRequest { texts }, token.clone())
+            .await
+        {
             Ok(val) => val,
             Err(EncodeError::Cancelled) => return Err(EmbedUpsertError::Cancelled),
             Err(EncodeError::Request(e)) => return Err(EmbedUpsertError::Embed(e)),
@@ -120,8 +123,11 @@ mod tests {
     use crate::db::qdrant::SearchHit;
 
     /// Tuning used by the embed tests (small embed batch to exercise batching).
-    const TEST_TUNING: EmbedTuning =
-        EmbedTuning { embed_batch: 64, upsert_batch: 256, sparse_min_weight: 1e-5 };
+    const TEST_TUNING: EmbedTuning = EmbedTuning {
+        embed_batch: 64,
+        upsert_batch: 256,
+        sparse_min_weight: 1e-5,
+    };
 
     /// Embedder fake: returns deterministic vectors aligned to the input count, or
     /// `Cancelled` when configured to.
@@ -213,12 +219,22 @@ mod tests {
     #[tokio::test]
     async fn upserts_every_chunk_in_order() {
         let embedder = StubEmbedder { cancel: false };
-        let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
         let input = chunks(3);
 
-        embed_and_upsert(&embedder, &store, "c", &input, &CancellationToken::new(), TEST_TUNING)
-            .await
-            .expect("should succeed");
+        embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &input,
+            &CancellationToken::new(),
+            TEST_TUNING,
+        )
+        .await
+        .expect("should succeed");
 
         let upserted = store.upserted.lock().unwrap().clone();
         let expected: Vec<UUIDv4> = input.iter().map(|(g, _)| *g).collect();
@@ -228,11 +244,21 @@ mod tests {
     #[tokio::test]
     async fn empty_input_upserts_nothing() {
         let embedder = StubEmbedder { cancel: false };
-        let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
 
-        embed_and_upsert(&embedder, &store, "c", &[], &CancellationToken::new(), TEST_TUNING)
-            .await
-            .expect("empty is a no-op success");
+        embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &[],
+            &CancellationToken::new(),
+            TEST_TUNING,
+        )
+        .await
+        .expect("empty is a no-op success");
 
         assert!(store.upserted.lock().unwrap().is_empty());
     }
@@ -240,18 +266,40 @@ mod tests {
     #[tokio::test]
     async fn store_failure_maps_to_store_error() {
         let embedder = StubEmbedder { cancel: false };
-        let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: true };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: true,
+        };
 
-        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), TEST_TUNING).await;
+        let res = embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &chunks(1),
+            &CancellationToken::new(),
+            TEST_TUNING,
+        )
+        .await;
         assert!(matches!(res, Err(EmbedUpsertError::Store(_))));
     }
 
     #[tokio::test]
     async fn embedder_cancel_maps_to_cancelled() {
         let embedder = StubEmbedder { cancel: true };
-        let store = RecordingStore { upserted: Mutex::new(vec![]), fail_upsert: false };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
 
-        let res = embed_and_upsert(&embedder, &store, "c", &chunks(1), &CancellationToken::new(), TEST_TUNING).await;
+        let res = embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &chunks(1),
+            &CancellationToken::new(),
+            TEST_TUNING,
+        )
+        .await;
         assert!(matches!(res, Err(EmbedUpsertError::Cancelled)));
         // Nothing should have been upserted on the cancel path.
         assert!(store.upserted.lock().unwrap().is_empty());

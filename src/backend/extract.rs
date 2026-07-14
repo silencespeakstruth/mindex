@@ -117,14 +117,18 @@ mod tests {
                     .method("POST")
                     .uri("/")
                     .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"x":"far-longer-than-eight-bytes"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"x":"far-longer-than-eight-bytes"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["code"], "request.body_too_large");
     }

@@ -93,7 +93,9 @@ mod tests {
     /// entry status). Returns the pool.
     async fn pool_with_file(initial: &'static str) -> SQLite3Pool {
         let pool = migrated_pool().await;
-        insert_file(&pool, initial).await.expect("legal initial insert");
+        insert_file(&pool, initial)
+            .await
+            .expect("legal initial insert");
         pool
     }
 
@@ -143,12 +145,12 @@ mod tests {
 
     async fn log(pool: &SQLite3Pool) -> Vec<(Option<String>, String)> {
         pool.transaction(CancellationToken::new(), |tx| {
-            tx.prepare(
-                "SELECT old_status, new_status FROM project_file_status_log ORDER BY id",
-            )?
-            .query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(SQLite3PoolError::from)
+            tx.prepare("SELECT old_status, new_status FROM project_file_status_log ORDER BY id")?
+                .query_map([], |r| {
+                    Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
         })
         .await
         .unwrap()
@@ -158,7 +160,10 @@ mod tests {
     async fn indexing_reaches_each_terminal() {
         for terminal in ["indexed", "cancelled", "failed"] {
             let pool = pool_with_file("indexing").await;
-            assert!(transition(&pool, terminal).await.is_ok(), "indexing→{terminal} must be legal");
+            assert!(
+                transition(&pool, terminal).await.is_ok(),
+                "indexing→{terminal} must be legal"
+            );
         }
     }
 
@@ -167,21 +172,33 @@ mod tests {
         // indexed→indexing (reindex)
         let pool = pool_with_file("indexing").await;
         transition(&pool, "indexed").await.unwrap();
-        assert!(transition(&pool, "indexing").await.is_ok(), "indexed→indexing must be legal");
+        assert!(
+            transition(&pool, "indexing").await.is_ok(),
+            "indexed→indexing must be legal"
+        );
 
         // failed→indexing (retry)
         let pool = pool_with_file("indexing").await;
         transition(&pool, "failed").await.unwrap();
-        assert!(transition(&pool, "indexing").await.is_ok(), "failed→indexing must be legal");
+        assert!(
+            transition(&pool, "indexing").await.is_ok(),
+            "failed→indexing must be legal"
+        );
 
         // cancelled→indexing (re-push)
         let pool = pool_with_file("indexing").await;
         transition(&pool, "cancelled").await.unwrap();
-        assert!(transition(&pool, "indexing").await.is_ok(), "cancelled→indexing must be legal");
+        assert!(
+            transition(&pool, "indexing").await.is_ok(),
+            "cancelled→indexing must be legal"
+        );
 
         // idempotent indexing→indexing (concurrent upserts)
         let pool = pool_with_file("indexing").await;
-        assert!(transition(&pool, "indexing").await.is_ok(), "indexing→indexing must be legal");
+        assert!(
+            transition(&pool, "indexing").await.is_ok(),
+            "indexing→indexing must be legal"
+        );
     }
 
     #[tokio::test]
@@ -190,12 +207,12 @@ mod tests {
         let cases = [
             ("indexed", "failed"),
             ("indexed", "cancelled"),
-            ("indexed", "indexed"),   // non-indexing self-loop
-            ("failed", "indexed"),    // must go via indexing
+            ("indexed", "indexed"), // non-indexing self-loop
+            ("failed", "indexed"),  // must go via indexing
             ("failed", "failed"),
             ("failed", "cancelled"),
             ("cancelled", "indexed"),
-            ("just_uploaded", "indexed"),  // skips the work
+            ("just_uploaded", "indexed"), // skips the work
             ("just_uploaded", "failed"),
         ];
         for (from, to) in cases {
@@ -206,13 +223,21 @@ mod tests {
                     // can't transition *to* just_uploaded; re-seed instead
                     let pool = pool_with_file("just_uploaded").await;
                     let res = transition(&pool, to).await;
-                    assert!(is_trigger_rejection(&res), "{from}→{to} must be rejected, got {res:?}");
+                    assert!(
+                        is_trigger_rejection(&res),
+                        "{from}→{to} must be rejected, got {res:?}"
+                    );
                     continue;
                 }
-                transition(&pool, from).await.unwrap_or_else(|e| panic!("setup {from}: {e:?}"));
+                transition(&pool, from)
+                    .await
+                    .unwrap_or_else(|e| panic!("setup {from}: {e:?}"));
             }
             let res = transition(&pool, to).await;
-            assert!(is_trigger_rejection(&res), "{from}→{to} must be rejected, got {res:?}");
+            assert!(
+                is_trigger_rejection(&res),
+                "{from}→{to} must be rejected, got {res:?}"
+            );
         }
     }
 
@@ -227,7 +252,10 @@ mod tests {
         for terminal in ["indexed", "cancelled", "failed", "deleted"] {
             let pool = migrated_pool().await;
             let res = insert_file(&pool, terminal).await;
-            assert!(is_trigger_rejection(&res), "inserting initial {terminal} must be rejected, got {res:?}");
+            assert!(
+                is_trigger_rejection(&res),
+                "inserting initial {terminal} must be rejected, got {res:?}"
+            );
         }
     }
 
@@ -236,23 +264,35 @@ mod tests {
         // any → deleted is legal (DELETE /files marks the file for GC).
         let pool = pool_with_file("indexing").await;
         transition(&pool, "indexed").await.unwrap();
-        assert!(transition(&pool, "deleted").await.is_ok(), "indexed→deleted must be legal");
+        assert!(
+            transition(&pool, "deleted").await.is_ok(),
+            "indexed→deleted must be legal"
+        );
 
         let pool = pool_with_file("indexing").await;
         transition(&pool, "failed").await.unwrap();
-        assert!(transition(&pool, "deleted").await.is_ok(), "failed→deleted must be legal");
+        assert!(
+            transition(&pool, "deleted").await.is_ok(),
+            "failed→deleted must be legal"
+        );
 
         // deleted → indexing is legal: re-indexing a path pending deletion resurrects it.
         let pool = pool_with_file("indexing").await;
         transition(&pool, "deleted").await.unwrap();
-        assert!(transition(&pool, "indexing").await.is_ok(), "deleted→indexing must be legal");
+        assert!(
+            transition(&pool, "indexing").await.is_ok(),
+            "deleted→indexing must be legal"
+        );
 
         // deleted is otherwise terminal: no jump straight to a work-terminal.
         for to in ["indexed", "failed", "cancelled"] {
             let pool = pool_with_file("indexing").await;
             transition(&pool, "deleted").await.unwrap();
             let res = transition(&pool, to).await;
-            assert!(is_trigger_rejection(&res), "deleted→{to} must be rejected, got {res:?}");
+            assert!(
+                is_trigger_rejection(&res),
+                "deleted→{to} must be rejected, got {res:?}"
+            );
         }
     }
 
@@ -334,7 +374,10 @@ mod tests {
         // 64 chars of 'z' passes the v0.1.0 length CHECK; only the trigger stops it.
         let pool = migrated_pool().await;
         let res = insert_file_with_sha(&pool, "z".repeat(64)).await;
-        assert!(is_shape_rejection(&res, "hexadecimal"), "non-hex sha256 insert must be rejected, got {res:?}");
+        assert!(
+            is_shape_rejection(&res, "hexadecimal"),
+            "non-hex sha256 insert must be rejected, got {res:?}"
+        );
 
         let pool = pool_with_file("indexing").await;
         let res = pool
@@ -347,11 +390,18 @@ mod tests {
                 Ok(())
             })
             .await;
-        assert!(is_shape_rejection(&res, "hexadecimal"), "non-hex sha256 update must be rejected, got {res:?}");
+        assert!(
+            is_shape_rejection(&res, "hexadecimal"),
+            "non-hex sha256 update must be rejected, got {res:?}"
+        );
 
         // Mixed-case hex is legal (the guard is hex-ness, not case).
         let pool = migrated_pool().await;
-        assert!(insert_file_with_sha(&pool, "AbCdEf1234".repeat(6) + "abcd").await.is_ok());
+        assert!(
+            insert_file_with_sha(&pool, "AbCdEf1234".repeat(6) + "abcd")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -369,7 +419,10 @@ mod tests {
                 Ok(())
             })
             .await;
-        assert!(is_shape_rejection(&res, "non-negative"), "negative retry_count insert must be rejected, got {res:?}");
+        assert!(
+            is_shape_rejection(&res, "non-negative"),
+            "negative retry_count insert must be rejected, got {res:?}"
+        );
 
         let pool = pool_with_file("indexing").await;
         let res = pool
@@ -382,7 +435,10 @@ mod tests {
                 Ok(())
             })
             .await;
-        assert!(is_shape_rejection(&res, "non-negative"), "negative retry_count update must be rejected, got {res:?}");
+        assert!(
+            is_shape_rejection(&res, "non-negative"),
+            "negative retry_count update must be rejected, got {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -390,7 +446,11 @@ mod tests {
         let pool = pool_with_file("indexing").await;
 
         // A well-formed chunk (the control: the trigger must not over-fire).
-        assert!(insert_chunk(&pool, "fn main() {}", (1, 2), (0, 1)).await.is_ok());
+        assert!(
+            insert_chunk(&pool, "fn main() {}", (1, 2), (0, 1))
+                .await
+                .is_ok()
+        );
 
         let bad_shapes: &[(&'static str, (i64, i64), (i64, i64), &str)] = &[
             ("", (1, 2), (0, 1), "empty code"),
@@ -414,14 +474,41 @@ mod tests {
         let pool = pool_with_file("indexing").await;
 
         // A failure bumps retry_count.
-        set_file_status(&pool, PG, PATH, MODEL, "failed", true, CancellationToken::new()).await;
+        set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "failed",
+            true,
+            CancellationToken::new(),
+        )
+        .await;
         assert_eq!(current(&pool).await, ("failed".to_string(), 1));
 
         // Retry: failed→indexing (no change), then a success resets the counter.
-        set_file_status(&pool, PG, PATH, MODEL, "indexing", false, CancellationToken::new()).await;
+        set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "indexing",
+            false,
+            CancellationToken::new(),
+        )
+        .await;
         assert_eq!(current(&pool).await, ("indexing".to_string(), 1));
 
-        set_file_status(&pool, PG, PATH, MODEL, "indexed", false, CancellationToken::new()).await;
+        set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "indexed",
+            false,
+            CancellationToken::new(),
+        )
+        .await;
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
     }
 }

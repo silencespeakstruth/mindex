@@ -10,7 +10,6 @@ use crate::backend::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::backend::http3;
 use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
-use crate::backend::v0::validate;
 use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChunkCounts;
@@ -25,22 +24,23 @@ use crate::backend::v0::models::FileListQuery;
 use crate::backend::v0::models::FileListResponse;
 use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
-use crate::backend::v0::models::RetryRequest;
-use crate::backend::v0::models::RetryResponse;
-use crate::backend::v0::models::StatusResponse;
 use crate::backend::v0::models::HealthChecks;
 use crate::backend::v0::models::HealthResponse;
-use crate::backend::v0::models::ProjectListResponse;
-use crate::backend::v0::models::ProjectSummary;
-use crate::backend::v0::models::VersionResponse;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::ProgrammingLanguage;
+use crate::backend::v0::models::ProjectListResponse;
 use crate::backend::v0::models::ProjectStats;
+use crate::backend::v0::models::ProjectSummary;
+use crate::backend::v0::models::RetryRequest;
+use crate::backend::v0::models::RetryResponse;
 use crate::backend::v0::models::SearchFilter;
 use crate::backend::v0::models::SearchRequest;
 use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
+use crate::backend::v0::models::StatusResponse;
 use crate::backend::v0::models::UUIDv4;
+use crate::backend::v0::models::VersionResponse;
+use crate::backend::v0::validate;
 use crate::db::files::set_file_status;
 use crate::db::qdrant::SearchHit;
 use crate::db::qdrant::VectorStore;
@@ -293,7 +293,10 @@ impl IndexClaim {
         // membership table, no invariant is broken by a panicked holder.
         let mut set = locks.lock().unwrap_or_else(|e| e.into_inner());
         if set.insert(key.clone()) {
-            Some(IndexClaim { locks: Arc::clone(locks), key })
+            Some(IndexClaim {
+                locks: Arc::clone(locks),
+                key,
+            })
         } else {
             None
         }
@@ -982,7 +985,11 @@ async fn read_drift_baseline(
             )?;
             let rows = stmt
                 .query_map(params![project_guid], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
@@ -1830,7 +1837,11 @@ pub async fn get_files(
         .db_pool
         .transaction(guard.0.child_token(), move |tx| {
             let exists = tx
-                .query_row("SELECT 1 FROM projects WHERE guid = ?1", params![pg], |_| Ok(()))
+                .query_row(
+                    "SELECT 1 FROM projects WHERE guid = ?1",
+                    params![pg],
+                    |_| Ok(()),
+                )
                 .optional()?
                 .is_some();
             if !exists {
@@ -2086,7 +2097,8 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, A
     };
     let cg = http3::CancellationGuard(CancellationToken::new());
     let (chunks_removed, files_removed, status_log_pruned) =
-        crate::worker::gc::collect(&s.db_pool, &*s.qdrant, s.status_log_retention_days, &cg.0).await;
+        crate::worker::gc::collect(&s.db_pool, &*s.qdrant, s.status_log_retention_days, &cg.0)
+            .await;
     Ok(Json(GcResponse {
         chunks_removed,
         files_removed,
@@ -2105,7 +2117,10 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, A
 )]
 #[debug_handler]
 pub async fn get_version(State(s): State<RouterState>) -> Json<VersionResponse> {
-    Json(VersionResponse { version: env!("CARGO_PKG_VERSION"), db_schema_version: s.db_schema_version })
+    Json(VersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        db_schema_version: s.db_schema_version,
+    })
 }
 
 /// `GET /health` — a *smart* readiness check: confirms both stores (SQLite +
@@ -2164,7 +2179,11 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
         status,
         version: env!("CARGO_PKG_VERSION"),
         indexing_files,
-        checks: HealthChecks { sqlite, qdrant, embedder },
+        checks: HealthChecks {
+            sqlite,
+            qdrant,
+            embedder,
+        },
     })
 }
 
@@ -2405,8 +2424,7 @@ mod tests {
 
     #[test]
     fn include_path_glob_group_is_parenthesized() {
-        let (sql, _) =
-            build_search_query(guid(), &req(Some(paths(&["src/**", "tests/**"])), None));
+        let (sql, _) = build_search_query(guid(), &req(Some(paths(&["src/**", "tests/**"])), None));
         assert!(
             sql.contains("(c.file_path GLOB ?2 OR c.file_path GLOB ?3)"),
             "include glob group must be parenthesized so OR cannot leak past AND: {sql}"
@@ -2455,8 +2473,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (sql, binds) =
-            build_search_query(p1, &req(Some(paths(&["src/**", "tests/**"])), None));
+        let (sql, binds) = build_search_query(p1, &req(Some(paths(&["src/**", "tests/**"])), None));
         let got: Vec<UUIDv4> = pool
             .transaction(CancellationToken::new(), move |tx| {
                 tx.prepare(&sql)?
@@ -2515,7 +2532,13 @@ mod tests {
         pool.transaction(CancellationToken::new(), |tx| {
             tx.execute(
                 MARK_INDEXING_UPSERT_SQL,
-                params![guid(), "src/a.py", SHA_NEW, ProgrammingLanguage::Python, "BAAI/bge-m3"],
+                params![
+                    guid(),
+                    "src/a.py",
+                    SHA_NEW,
+                    ProgrammingLanguage::Python,
+                    "BAAI/bge-m3"
+                ],
             )?;
             Ok(())
         })
@@ -2571,7 +2594,10 @@ mod tests {
     // ── drift ────────────────────────────────────────────────────────────────
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(p, s)| (p.to_string(), s.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect()
     }
 
     fn set(items: &[&str]) -> HashSet<String> {
@@ -2583,11 +2609,11 @@ mod tests {
         let indexed = map(&[("same.rs", "h1"), ("changed.rs", "h2"), ("gone.rs", "h3")]);
         let in_flight = set(&["busy.rs"]);
         let local = map(&[
-            ("same.rs", "h1"),     // in sync → omitted
-            ("changed.rs", "hX"),  // hash differs → stale
-            ("new.rs", "h9"),      // not indexed → missing
-            ("busy.rs", "hY"),     // in flight → indexing
-            // gone.rs absent locally → orphaned
+            ("same.rs", "h1"),    // in sync → omitted
+            ("changed.rs", "hX"), // hash differs → stale
+            ("new.rs", "h9"),     // not indexed → missing
+            ("busy.rs", "hY"),    // in flight → indexing
+                                  // gone.rs absent locally → orphaned
         ]);
 
         let d = compute_drift(&indexed, &in_flight, &local);
@@ -2618,7 +2644,10 @@ mod tests {
         assert_eq!(d.indexing, vec!["f.rs"]);
         assert!(d.stale.is_empty());
         assert!(d.missing.is_empty());
-        assert!(d.orphaned.is_empty(), "in-flight file must not be called orphaned");
+        assert!(
+            d.orphaned.is_empty(),
+            "in-flight file must not be called orphaned"
+        );
     }
 
     // ── keyed indexing claim ─────────────────────────────────────────────────
@@ -2716,7 +2745,16 @@ mod tests {
         // an old status_updated_at directly — both are plain column writes, not status
         // transitions, so no trigger fires.
         let pg = guid().0.as_simple().to_string();
-        set_file_status(&pool, &pg, "a.rs", "BAAI/bge-m3", "failed", true, CancellationToken::new()).await;
+        set_file_status(
+            &pool,
+            &pg,
+            "a.rs",
+            "BAAI/bge-m3",
+            "failed",
+            true,
+            CancellationToken::new(),
+        )
+        .await;
         pool.transaction(CancellationToken::new(), |tx| {
             tx.execute(
                 "UPDATE project_files SET retry_count = 9, status_updated_at = 1000
@@ -2731,8 +2769,9 @@ mod tests {
         // Run exactly what `post_retry` runs: an empty selector (requeue all) plus the
         // constant `status = 'failed'`.
         let (where_sql, binds) = build_file_filter(guid(), &None, &None);
-        let update_sql =
-            format!("UPDATE project_files SET retry_count = 0 WHERE {where_sql} AND status = 'failed'");
+        let update_sql = format!(
+            "UPDATE project_files SET retry_count = 0 WHERE {where_sql} AND status = 'failed'"
+        );
         let n = pool
             .transaction(CancellationToken::new(), move |tx| {
                 Ok(tx.execute(&update_sql, params_from_iter(binds.iter()))?)
@@ -2754,9 +2793,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(status, "failed", "metadata-only write: status must stay 'failed'");
-        assert_eq!(retry_count, 0, "retry_count must be reset so the worker re-picks it");
-        assert_eq!(updated, 1000, "status_updated_at must NOT be bumped (else a +60s delay)");
+        assert_eq!(
+            status, "failed",
+            "metadata-only write: status must stay 'failed'"
+        );
+        assert_eq!(
+            retry_count, 0,
+            "retry_count must be reset so the worker re-picks it"
+        );
+        assert_eq!(
+            updated, 1000,
+            "status_updated_at must NOT be bumped (else a +60s delay)"
+        );
     }
 
     // ── phase-1 → phase-2 reconciliation (`drop_cancelled`) and batch recovery
@@ -2781,7 +2829,11 @@ mod tests {
     struct NoStore;
     #[async_trait]
     impl VectorStore for NoStore {
-        async fn insert_batch(&self, _c: &str, _v: Vec<ChunkAsVector>) -> Result<(), VectorStoreError> {
+        async fn insert_batch(
+            &self,
+            _c: &str,
+            _v: Vec<ChunkAsVector>,
+        ) -> Result<(), VectorStoreError> {
             unreachable!("drop_cancelled/recover_all must not touch Qdrant")
         }
         async fn ensure_project(&self, _c: &str) -> Result<(), VectorStoreError> {
@@ -2827,7 +2879,10 @@ mod tests {
 
     /// Migrated pool with the project and `paths` each inserted `indexing` with
     /// `n_chunks` active chunks — the exact state `prepare` leaves behind.
-    async fn pool_with_prepared_files(paths: &'static [&'static str], n_chunks: usize) -> SQLite3Pool {
+    async fn pool_with_prepared_files(
+        paths: &'static [&'static str],
+        n_chunks: usize,
+    ) -> SQLite3Pool {
         let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
         pool.transaction(CancellationToken::new(), move |tx| {
             for (_, m) in crate::MIGRATIONS {
@@ -2948,12 +3003,22 @@ mod tests {
         let kept = indexer(&pool, &locks, &fx).drop_cancelled(prepared).await;
         let mut paths: Vec<_> = kept.iter().map(|p| p.path.clone()).collect();
         paths.sort();
-        assert_eq!(paths, vec!["a.rs", "b.rs"], "untouched files must all survive");
+        assert_eq!(
+            paths,
+            vec!["a.rs", "b.rs"],
+            "untouched files must all survive"
+        );
         drop(kept); // release the claims before inspecting state
 
         // No collateral damage: both files still 'indexing', chunks still active.
-        assert_eq!(file_state(&pool, "a.rs").await, ("indexing".to_string(), 2, 0));
-        assert_eq!(file_state(&pool, "b.rs").await, ("indexing".to_string(), 2, 0));
+        assert_eq!(
+            file_state(&pool, "a.rs").await,
+            ("indexing".to_string(), 2, 0)
+        );
+        assert_eq!(
+            file_state(&pool, "b.rs").await,
+            ("indexing".to_string(), 2, 0)
+        );
     }
 
     #[tokio::test]
@@ -2964,18 +3029,36 @@ mod tests {
 
         // A concurrent POST /cancel lands between prepare and embed: indexing → cancelled.
         let pg = guid().0.as_simple().to_string();
-        set_file_status(&pool, &pg, "a.rs", MODEL, "cancelled", false, CancellationToken::new())
-            .await;
+        set_file_status(
+            &pool,
+            &pg,
+            "a.rs",
+            MODEL,
+            "cancelled",
+            false,
+            CancellationToken::new(),
+        )
+        .await;
 
         let fx = fixture();
         let kept = indexer(&pool, &locks, &fx).drop_cancelled(prepared).await;
         let paths: Vec<_> = kept.iter().map(|p| p.path.clone()).collect();
-        assert_eq!(paths, vec!["b.rs"], "the cancelled file must be dropped from the batch");
+        assert_eq!(
+            paths,
+            vec!["b.rs"],
+            "the cancelled file must be dropped from the batch"
+        );
 
         // The cancelled file's just-inserted chunks are handed to GC; the survivor
         // is untouched.
-        assert_eq!(file_state(&pool, "a.rs").await, ("cancelled".to_string(), 0, 2));
-        assert_eq!(file_state(&pool, "b.rs").await, ("indexing".to_string(), 2, 0));
+        assert_eq!(
+            file_state(&pool, "a.rs").await,
+            ("cancelled".to_string(), 0, 2)
+        );
+        assert_eq!(
+            file_state(&pool, "b.rs").await,
+            ("indexing".to_string(), 2, 0)
+        );
     }
 
     #[tokio::test]
@@ -2987,11 +3070,16 @@ mod tests {
         let prepared = vec![prepared_for(&locks, "a.rs"), prepared_for(&locks, "b.rs")];
 
         let fx = fixture();
-        indexer(&pool, &locks, &fx).recover_all(&prepared, "failed", true).await;
+        indexer(&pool, &locks, &fx)
+            .recover_all(&prepared, "failed", true)
+            .await;
 
         for path in ["a.rs", "b.rs"] {
             let (status, _, _) = file_state(&pool, path).await;
-            assert_eq!(status, "failed", "{path} must not be left 'indexing' after an aborted batch");
+            assert_eq!(
+                status, "failed",
+                "{path} must not be left 'indexing' after an aborted batch"
+            );
         }
 
         // The client-cancelled path: cancelled, without burning retry budget.
@@ -2999,7 +3087,9 @@ mod tests {
         let locks = Arc::new(Mutex::new(HashSet::new()));
         let prepared = vec![prepared_for(&locks, "c.rs")];
         let fx = fixture();
-        indexer(&pool, &locks, &fx).recover_all(&prepared, "cancelled", false).await;
+        indexer(&pool, &locks, &fx)
+            .recover_all(&prepared, "cancelled", false)
+            .await;
         assert_eq!(file_state(&pool, "c.rs").await.0, "cancelled");
     }
 }

@@ -218,7 +218,9 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             name: DEFAULT_MODEL_NAME.to_string(),
-            server_url: DEFAULT_MODEL_SERVER.parse().expect("valid default model url"),
+            server_url: DEFAULT_MODEL_SERVER
+                .parse()
+                .expect("valid default model url"),
             health_timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
             max_429_retries: DEFAULT_MAX_429_RETRIES,
             backoff_base_ms: DEFAULT_BACKOFF_BASE_MS,
@@ -230,7 +232,9 @@ impl Default for ModelConfig {
 impl Default for QdrantConfig {
     fn default() -> Self {
         Self {
-            server_url: DEFAULT_QDRANT_SERVER.parse().expect("valid default qdrant url"),
+            server_url: DEFAULT_QDRANT_SERVER
+                .parse()
+                .expect("valid default qdrant url"),
             upsert_batch_points: DEFAULT_UPSERT_BATCH_POINTS,
             dense_prefetch_limit: DEFAULT_DENSE_PREFETCH_LIMIT,
             sparse_prefetch_limit: DEFAULT_SPARSE_PREFETCH_LIMIT,
@@ -549,16 +553,41 @@ fn apply_cli_overrides(cfg: &mut Config, cli: &Cli) {
     over!(cli.bind, cfg.server.bind, "server.bind");
     over!(cli.cert_path, cfg.server.cert_path, "server.cert_path");
     over!(cli.key_path, cfg.server.key_path, "server.key_path");
-    over!(cli.max_body_mib, cfg.server.max_body_mib, "server.max_body_mib");
+    over!(
+        cli.max_body_mib,
+        cfg.server.max_body_mib,
+        "server.max_body_mib"
+    );
     over!(cli.model, cfg.model.name, "model.name");
     over!(cli.model_server, cfg.model.server_url, "model.server_url");
-    over!(cli.qdrant_server, cfg.qdrant.server_url, "qdrant.server_url");
+    over!(
+        cli.qdrant_server,
+        cfg.qdrant.server_url,
+        "qdrant.server_url"
+    );
     over!(cli.db_path, cfg.database.path, "database.path");
-    over!(cli.db_pool_size, cfg.database.pool_size, "database.pool_size");
-    over!(cli.embed_batch, cfg.indexing.embed_batch_chunks, "indexing.embed_batch_chunks");
-    over!(cli.stuck_grace_mins, cfg.indexing.stuck_grace_minutes, "indexing.stuck_grace_minutes");
+    over!(
+        cli.db_pool_size,
+        cfg.database.pool_size,
+        "database.pool_size"
+    );
+    over!(
+        cli.embed_batch,
+        cfg.indexing.embed_batch_chunks,
+        "indexing.embed_batch_chunks"
+    );
+    over!(
+        cli.stuck_grace_mins,
+        cfg.indexing.stuck_grace_minutes,
+        "indexing.stuck_grace_minutes"
+    );
     if cli.http3 {
-        info!(key = "server.http3", old = false, new = true, "Config value overridden by CLI flag.");
+        info!(
+            key = "server.http3",
+            old = false,
+            new = true,
+            "Config value overridden by CLI flag."
+        );
         cfg.server.http3 = true;
     }
 }
@@ -586,7 +615,10 @@ impl Config {
             ));
         }
         if self.model.backoff_base_ms < 1 {
-            e.push("[model].backoff_base_ms = 0 disables backoff. Fix: use at least 1 (ms), e.g. 200.".to_string());
+            e.push(
+                "[model].backoff_base_ms = 0 disables backoff. Fix: use at least 1 (ms), e.g. 200."
+                    .to_string(),
+            );
         }
         if self.model.health_timeout_ms < 1 {
             e.push("[model].health_timeout_ms = 0 would time out instantly. Fix: use at least 1 (ms), e.g. 2000.".to_string());
@@ -621,7 +653,10 @@ impl Config {
         }
 
         if self.database.pool_size < 1 {
-            e.push("[database].pool_size = 0 leaves no connections. Fix: use at least 1 (e.g. 4).".to_string());
+            e.push(
+                "[database].pool_size = 0 leaves no connections. Fix: use at least 1 (e.g. 4)."
+                    .to_string(),
+            );
         }
         let ps = self.database.page_size_bytes;
         if !(SQLITE_MIN_PAGE_SIZE..=SQLITE_MAX_PAGE_SIZE).contains(&ps) || !ps.is_power_of_two() {
@@ -660,7 +695,8 @@ impl Config {
                  in-flight indexing request or the retry worker can race a live batch. Default is 30."
             );
         }
-        if !(self.indexing.sparse_min_weight.is_finite() && self.indexing.sparse_min_weight >= 0.0) {
+        if !(self.indexing.sparse_min_weight.is_finite() && self.indexing.sparse_min_weight >= 0.0)
+        {
             e.push(format!(
                 "[indexing].sparse_min_weight = {} must be a finite, non-negative threshold. \
                  Fix: use a small positive value (e.g. 0.00001).",
@@ -669,7 +705,10 @@ impl Config {
         }
 
         if self.slicer.min_chunk_tokens < 1 {
-            e.push("[slicer].min_chunk_tokens = 0 is invalid. Fix: use at least 1 (default 128).".to_string());
+            e.push(
+                "[slicer].min_chunk_tokens = 0 is invalid. Fix: use at least 1 (default 128)."
+                    .to_string(),
+            );
         }
         if self.slicer.min_chunk_tokens >= self.slicer.max_chunk_tokens {
             e.push(format!(
@@ -686,7 +725,10 @@ impl Config {
         }
 
         if self.search.default_top_k < 1 {
-            e.push("[search].default_top_k = 0 returns nothing. Fix: use at least 1 (default 5).".to_string());
+            e.push(
+                "[search].default_top_k = 0 returns nothing. Fix: use at least 1 (default 5)."
+                    .to_string(),
+            );
         }
         if self.search.max_top_k < self.search.default_top_k {
             e.push(format!(
@@ -713,7 +755,10 @@ impl Config {
         }
 
         if self.workers.gc_interval_seconds < 1 {
-            e.push("[workers].gc_interval_seconds = 0 is invalid. Fix: use at least 1 (default 3600).".to_string());
+            e.push(
+                "[workers].gc_interval_seconds = 0 is invalid. Fix: use at least 1 (default 3600)."
+                    .to_string(),
+            );
         }
         if self.workers.retry_interval_seconds < 1 {
             e.push("[workers].retry_interval_seconds = 0 is invalid. Fix: use at least 1 (default 60).".to_string());
@@ -753,7 +798,10 @@ mod tests {
     fn empty_toml_yields_all_defaults() {
         let cfg = parse("").expect("empty TOML is valid");
         let def = Config::default();
-        assert_eq!(cfg.indexing.embed_batch_chunks, def.indexing.embed_batch_chunks);
+        assert_eq!(
+            cfg.indexing.embed_batch_chunks,
+            def.indexing.embed_batch_chunks
+        );
         assert_eq!(cfg.slicer.max_chunk_tokens, 512);
         assert_eq!(cfg.workers.gc_interval_seconds, 3600);
         cfg.validate().expect("defaults are valid");
@@ -806,8 +854,15 @@ mod tests {
         cfg.database.synchronous = "sometimes".into();
         cfg.qdrant.fusion_limit = 1; // below default_top_k=5
         let errs = cfg.validate().expect_err("should be invalid");
-        assert!(errs.len() >= 4, "expected several errors, got {}: {errs:?}", errs.len());
-        assert!(errs.iter().any(|m| m.contains("page") || m.contains("pool_size")));
+        assert!(
+            errs.len() >= 4,
+            "expected several errors, got {}: {errs:?}",
+            errs.len()
+        );
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("page") || m.contains("pool_size"))
+        );
         assert!(errs.iter().any(|m| m.contains("max_chunk_tokens")));
         assert!(errs.iter().any(|m| m.contains("synchronous")));
         assert!(errs.iter().any(|m| m.contains("fusion_limit")));
@@ -831,7 +886,10 @@ mod tests {
             std::env::set_var("XDG_CONFIG_DIRS", "/etc/xdg:/usr/etc/xdg");
         }
         let paths = candidate_paths(None);
-        assert_eq!(paths[0], PathBuf::from("/home/u/.config/mindex/config.toml"));
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/home/u/.config/mindex/config.toml")
+        );
         assert_eq!(paths[1], PathBuf::from("/etc/xdg/mindex/config.toml"));
         assert_eq!(paths[2], PathBuf::from("/usr/etc/xdg/mindex/config.toml"));
     }
