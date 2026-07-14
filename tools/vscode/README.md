@@ -20,12 +20,12 @@ Nothing runs in the background: every action is explicit.
   `/status` runtime counters, and the failed-file dead-letter list with per-file or
   all-at-once *Retry* (`POST /retry`; the retry worker picks requeued files up within
   ~60 s). The status bar item shows ok / degraded / unreachable and refreshes on click.
-- **Search** (`mindex: Search`, `ctrl+alt+/`). Query → the editor jumps straight to
-  the best match and opens the native peek widget over it with every result: real
-  file contents (syntax-highlighted) on the left, the result list on the right.
-  Click or F4 / Shift+F4 navigates between results; Esc closes the peek and leaves
-  the cursor on the current one. The result count and top score flash in the
-  status bar (the peek list itself groups by file and does not show scores).
+- **Search** (`mindex: Search`, `ctrl+alt+/`). Query → a QuickPick lists every
+  result in true rank order (score descending, as the server returns them): each
+  row shows `#rank score path`, the line span, and a one-line snippet of the
+  chunk. Moving through the list live-previews the location in the editor
+  underneath; typing filters by path/snippet; Enter opens the result with the
+  range selected, Esc closes the list and restores the editor you came from.
 - Errors are the server's problem+json rendered as `code — detail` toasts; infra
   failures (unreachable, 503) offer a *Retry* button; cancellations are silent.
 

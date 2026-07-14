@@ -4,10 +4,11 @@ import { MindexApi, SearchResult } from "./api";
 import { ProblemError, isCancellation, reportError } from "./errors";
 
 /**
- * Prompt for a query, POST /search, jump to the best match, and show every
- * result in the native peek widget (editor.action.peekLocations): full file
- * code on the left, the result list on the right; click / F4 / Shift+F4
- * navigate, Esc closes the peek and leaves the cursor on the current result.
+ * Prompt for a query, POST /search, and show every result in a QuickPick in
+ * server rank order (score descending): each item carries `#rank score path`,
+ * the line span, and a one-line code snippet. Moving through the list live
+ * previews the location in the editor; Enter opens it, Esc restores the
+ * editor state from before the search.
  */
 export async function runSearch(
     api: MindexApi,
@@ -54,24 +55,68 @@ export async function runSearch(
         return;
     }
 
-    // Server returns score-descending; keep that order (locations[0] = best).
-    const locations = results.map(
-        (r) => new vscode.Location(vscode.Uri.file(path.join(workspaceRoot, r.path)), resultRange(r))
-    );
+    await showResultsPicker(workspaceRoot, query, results);
+}
 
-    // Jump straight to the best match, then peek every result anchored there.
-    await openResult(workspaceRoot, results[0]);
-    await vscode.commands.executeCommand(
-        "editor.action.peekLocations",
-        locations[0].uri,
-        locations[0].range.start,
-        locations,
-        "peek"
-    );
-    vscode.window.setStatusBarMessage(
-        `mindex: ${results.length} result(s) for “${query}”, top score ${results[0].score.toFixed(2)}`,
-        5000
-    );
+interface ResultItem extends vscode.QuickPickItem {
+    result: SearchResult;
+}
+
+/** QuickPick over the results in server order (= rank order, score descending). */
+async function showResultsPicker(workspaceRoot: string, query: string, results: SearchResult[]): Promise<void> {
+    // Remember where the user was so Esc puts them back.
+    const before = vscode.window.activeTextEditor;
+    const beforeUri = before?.document.uri;
+    const beforeSelection = before?.selection;
+
+    const items: ResultItem[] = results.map((r, i) => ({
+        label: `#${i + 1}  ${r.score.toFixed(2)}  ${r.path}`,
+        description: `:${r.start_line}-${r.end_line}`,
+        detail: snippet(r.code),
+        result: r,
+    }));
+
+    const picker = vscode.window.createQuickPick<ResultItem>();
+    picker.title = `mindex: ${results.length} result(s) for “${query}”`;
+    picker.placeholder = "↑/↓ preview · Enter open · Esc back";
+    picker.matchOnDescription = true;
+    picker.matchOnDetail = true;
+    picker.ignoreFocusOut = true;
+    picker.items = items;
+    picker.activeItems = [items[0]];
+
+    let accepted = false;
+    picker.onDidChangeActive(async (active) => {
+        if (active.length > 0) {
+            // Preview silently: a stale-index miss here would spam warnings on scroll.
+            await openResult(workspaceRoot, active[0].result, { preview: true, quiet: true });
+        }
+    });
+    picker.onDidAccept(async () => {
+        const chosen = picker.selectedItems[0] ?? picker.activeItems[0];
+        accepted = true;
+        picker.hide();
+        if (chosen !== undefined) {
+            await openResult(workspaceRoot, chosen.result, { preview: false, quiet: false });
+        }
+    });
+    picker.onDidHide(async () => {
+        picker.dispose();
+        if (!accepted && beforeUri !== undefined) {
+            try {
+                await vscode.window.showTextDocument(beforeUri, { selection: beforeSelection });
+            } catch {
+                // The original document may be gone; nothing to restore.
+            }
+        }
+    });
+    picker.show();
+}
+
+/** First non-empty line of the chunk, trimmed and capped, as the item detail. */
+function snippet(code: string): string {
+    const line = code.split("\n").find((l) => l.trim() !== "")?.trim() ?? "";
+    return line.length > 100 ? `${line.slice(0, 100)}…` : line;
 }
 
 function resultRange(r: SearchResult): vscode.Range {
@@ -81,16 +126,23 @@ function resultRange(r: SearchResult): vscode.Range {
     return new vscode.Range(start, end);
 }
 
-async function openResult(workspaceRoot: string, r: SearchResult): Promise<void> {
+async function openResult(
+    workspaceRoot: string,
+    r: SearchResult,
+    opts: { preview: boolean; quiet: boolean }
+): Promise<void> {
     const uri = vscode.Uri.file(path.join(workspaceRoot, r.path));
     try {
         await vscode.window.showTextDocument(uri, {
-            preview: true,
+            preview: opts.preview,
+            preserveFocus: opts.preview,
             selection: resultRange(r),
         });
     } catch {
-        void vscode.window.showWarningMessage(
-            `mindex: ${r.path} not found in the working tree (index may be stale — run Check Drift).`
-        );
+        if (!opts.quiet) {
+            void vscode.window.showWarningMessage(
+                `mindex: ${r.path} not found in the working tree (index may be stale — run Check Drift).`
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@
   "name": "mindex-vscode",
   "displayName": "mindex",
   "description": "Drift check, selective reindex, status and semantic search for a mindex server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "mindex",
   "private": true,
   "license": "MIT",
