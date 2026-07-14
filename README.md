@@ -106,6 +106,7 @@ resurrects it).
 | **mindex-search.sh** (`tools/search/`) | Terminal search frontend: a query in, syntax-highlighted matches out. Configurable by flags or `MINDEX_*` env vars. |
 | **mindex** (`tools/mcp/mindex/`) | MCP stdio server exposing mindex search (+ live-index maintenance) to a coding agent like Claude Code — **the intended way to drive mindex from an agent.** See [`tools/mcp/mindex/README.md`](tools/mcp/mindex/README.md). |
 | **scout** (`tools/mcp/scout/`) | Second MCP server: a **token-saving** layer over the same search API. The agent sends a few decomposed sub-queries, a local LLM reads the chunks and returns only a compact summary + `file:line` pointers, so raw code never enters the agent's context — roughly an order-of-magnitude less context than raw search on a survey. Orient with its `digest` tool, then follow its pointers with raw `search` for exact code. See [`tools/mcp/scout/README.md`](tools/mcp/scout/README.md). |
+| **mindex-vscode** (`tools/vscode/`) | VS Code extension: on-demand drift check with selective reindex, server status + failed-file retry, and semantic search shown in the native peek widget (jumps to the best match, full code preview, F4/Shift+F4 navigation). See [`tools/vscode/README.md`](tools/vscode/README.md). |
 
 ## Install (native CLI)
 
@@ -119,6 +120,14 @@ cargo install --locked --path .             # mindex (server)
 cargo install --locked --path tools/indexer # mindex-index (separate crate)
 cargo install --locked --path tools/watcher # mindex-watch (separate crate)
 ln -sf "$PWD/tools/search/mindex-search.sh" ~/.cargo/bin/mindex-search
+```
+
+The VS Code extension is built and installed separately (Node, not cargo):
+
+```sh
+cd tools/vscode && npm install && npm run compile
+npx --yes @vscode/vsce package                  # → mindex-vscode-<version>.vsix
+code --install-extension mindex-vscode-*.vsix   # then: Developer: Reload Window
 ```
 
 Re-run the `cargo install` lines (add `--force`) after pulling changes to rebuild in

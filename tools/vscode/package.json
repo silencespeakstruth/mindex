@@ -1,0 +1,223 @@
+{
+  "name": "mindex-vscode",
+  "displayName": "mindex",
+  "description": "Drift check, selective reindex, status and semantic search for a mindex server",
+  "version": "0.1.2",
+  "publisher": "mindex",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:.mindex"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mindex",
+          "title": "mindex",
+          "icon": "$(database)"
+        }
+      ]
+    },
+    "views": {
+      "mindex": [
+        {
+          "id": "mindexDrift",
+          "name": "Drift",
+          "icon": "$(git-compare)"
+        },
+        {
+          "id": "mindexStatus",
+          "name": "Server Status",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "mindexDrift",
+        "contents": "No drift data yet.\n[Check Drift](command:mindex.checkDrift)\nCompares the working tree against the index (read-only)."
+      }
+    ],
+    "commands": [
+      {
+        "command": "mindex.checkDrift",
+        "title": "Check Drift",
+        "category": "mindex",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "mindex.reindexSelected",
+        "title": "Reindex Selected",
+        "category": "mindex",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "mindex.reindexAllDrift",
+        "title": "Reindex All Stale + Missing",
+        "category": "mindex"
+      },
+      {
+        "command": "mindex.deleteOrphanedSelected",
+        "title": "Delete Selected Orphaned from Index",
+        "category": "mindex",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "mindex.search",
+        "title": "Search",
+        "category": "mindex",
+        "icon": "$(search)"
+      },
+      {
+        "command": "mindex.refreshStatus",
+        "title": "Refresh Server Status",
+        "category": "mindex",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "mindex.retryAllFailed",
+        "title": "Retry All Failed Files",
+        "category": "mindex",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "mindex.retryFile",
+        "title": "Retry This File",
+        "category": "mindex",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "mindex.cancelIndexing",
+        "title": "Cancel In-Flight Indexing",
+        "category": "mindex"
+      },
+      {
+        "command": "mindex.reindexCurrentFile",
+        "title": "Reindex Current File",
+        "category": "mindex"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "mindex.search",
+          "when": "view == mindexDrift",
+          "group": "navigation@0"
+        },
+        {
+          "command": "mindex.search",
+          "when": "view == mindexStatus",
+          "group": "navigation@0"
+        },
+        {
+          "command": "mindex.checkDrift",
+          "when": "view == mindexDrift",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mindex.reindexSelected",
+          "when": "view == mindexDrift",
+          "group": "navigation@2"
+        },
+        {
+          "command": "mindex.deleteOrphanedSelected",
+          "when": "view == mindexDrift",
+          "group": "navigation@3"
+        },
+        {
+          "command": "mindex.reindexAllDrift",
+          "when": "view == mindexDrift"
+        },
+        {
+          "command": "mindex.cancelIndexing",
+          "when": "view == mindexDrift"
+        },
+        {
+          "command": "mindex.refreshStatus",
+          "when": "view == mindexStatus",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mindex.retryAllFailed",
+          "when": "view == mindexStatus",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "mindex.retryFile",
+          "when": "view == mindexStatus && viewItem == failedFile",
+          "group": "inline"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "mindex.retryFile",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "mindex.search",
+        "key": "ctrl+alt+/"
+      }
+    ],
+    "configuration": {
+      "title": "mindex",
+      "properties": {
+        "mindex.serverUrl": {
+          "type": "string",
+          "default": "https://127.0.0.1:11111",
+          "description": "Base URL of the mindex server."
+        },
+        "mindex.noVerify": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip TLS certificate verification (self-signed server cert)."
+        },
+        "mindex.caCert": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a CA certificate (PEM) to trust for the server, e.g. the mkcert root CA."
+        },
+        "mindex.topK": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of search results to request."
+        },
+        "mindex.batchSize": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Files per /index request when reindexing."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "picomatch": "^4.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/picomatch": "^3.0.1",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.5.0"
+  }
+}
