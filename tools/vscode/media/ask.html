@@ -1,0 +1,124 @@
+<!--
+  The Ask form's shell: mode switch, question box, five empty group containers and the
+  action row. Every control inside those containers is built by webview/ask.ts from
+  ASK_FIELDS, and every dynamic value arrives in the page-data block — so there is
+  nothing interpolated into this file, and nothing to escape.
+-->
+<div class="stack" id="form">
+    <div class="segmented" id="mode" role="tablist">
+        <button
+            type="button"
+            role="tab"
+            data-mode="search"
+            aria-selected="false"
+            title="Semantic code search — results open in a quick pick that previews each hit"
+        >
+            <span class="codicon codicon-search codicon-sm"></span>Search
+        </button>
+        <button
+            type="button"
+            role="tab"
+            data-mode="research"
+            aria-selected="true"
+            title="A local model investigates and writes a cited report"
+        >
+            <span class="codicon codicon-beaker codicon-sm"></span>Research
+        </button>
+    </div>
+
+    <div class="notice" id="ollama-notice" hidden>
+        <span class="codicon codicon-warning codicon-sm"></span>
+        <span>
+            The server's Ollama is not answering, so Research is unavailable. Search is
+            unaffected.
+            <button id="notice-status" class="linky" type="button">Open Server Status</button>
+        </span>
+    </div>
+
+    <!-- A required dependency is down: nothing here can be asked for, in either mode.
+         Distinct from the Ollama notice above in colour and in reach — that one costs
+         you one mode, this one costs you the server. -->
+    <div class="notice bad" id="degraded-notice" hidden>
+        <span class="codicon codicon-error codicon-sm"></span>
+        <span>
+            <span id="degraded-reason">The server is not answering.</span>
+            <button id="degraded-status" class="linky" type="button">
+                Open Server Status
+            </button>
+        </span>
+    </div>
+
+    <div id="group-query"></div>
+
+    <div class="options" id="group-search"></div>
+    <div class="options" id="group-research"></div>
+
+    <details class="panel" id="panel-budget">
+        <summary>
+            <span class="codicon codicon-settings codicon-sm"></span>
+            <span class="panel-name">Budget</span>
+            <span class="panel-summary dim" id="budget-summary"></span>
+        </summary>
+        <div class="panel-body" id="group-budget"></div>
+        <p class="hint" id="budget-hint"></p>
+    </details>
+
+    <details class="panel" id="panel-scope">
+        <summary>
+            <span class="codicon codicon-filter codicon-sm"></span>
+            <span class="panel-name">Scope</span>
+            <span class="panel-summary dim" id="scope-summary"></span>
+        </summary>
+        <div class="panel-body" id="group-scope"></div>
+        <div class="scope-actions">
+            <button
+                id="scope-folder"
+                class="secondary"
+                type="button"
+                title="Set the include globs to the folder of the file you are looking at"
+            >
+                <span class="codicon codicon-folder-opened codicon-sm"></span>Folder
+            </button>
+            <button
+                id="scope-mindex"
+                class="secondary"
+                type="button"
+                title="Reset to the project scope from .mindex"
+            >
+                <span class="codicon codicon-file-code codicon-sm"></span>.mindex
+            </button>
+            <button
+                id="scope-clear"
+                class="secondary"
+                type="button"
+                title="Clear the scope — look at the whole project"
+            >
+                <span class="codicon codicon-clear-all codicon-sm"></span>Clear
+            </button>
+        </div>
+        <p class="hint">
+            Globs are root-relative and <code>*</code> crosses <code>/</code> here, so
+            <code>src/*</code> also matches <code>src/db/x.rs</code> — wider than the same
+            pattern in <code>.mindex</code>. A scoped report can only speak about its scope.
+        </p>
+    </details>
+
+    <div class="actions">
+        <button id="submit" class="grow">
+            <span class="codicon codicon-beaker codicon-sm" id="submit-icon"></span>
+            <span id="submit-label">Research</span>
+        </button>
+        <button
+            id="cancel"
+            class="secondary"
+            type="button"
+            disabled
+            hidden
+            title="Drop the connection — that is the server-side cancel"
+        >
+            <span class="codicon codicon-close codicon-sm"></span>Stop
+        </button>
+    </div>
+
+    <div class="hint" id="hint"></div>
+</div>

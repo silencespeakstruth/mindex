@@ -1,7 +1,7 @@
 import * as https from "node:https";
 import * as http from "node:http";
 import * as fs from "node:fs";
-import { ProblemDetails, ProblemError, UnreachableError } from "./errors";
+import { ProblemDetails, ProblemError, UnreachableError } from "./problem";
 
 // ---- wire types (src/backend/v0/models.rs) ----
 
@@ -121,6 +121,30 @@ export interface ResearchConfigInfo {
     report_timeout_ms?: number;
     sampling?: ResearchSamplingInfo;
 }
+/**
+ * What `/search` accepts, from `GET /config`.
+ *
+ * The bounds the server's edge validator enforces, so a form built from them cannot
+ * offer an input that comes back a 400. Optional for the same reason `research` is:
+ * an older server does not publish it, and the fallbacks in `SEARCH_LIMITS` stand in.
+ */
+export interface SearchConfigInfo {
+    default_top_k: number;
+    max_top_k: number;
+    max_query_bytes: number;
+}
+
+/**
+ * What to assume when the server does not publish its search bounds. These are the
+ * server's own compiled defaults; a server that disagrees publishes the real ones,
+ * which is the whole reason the block exists.
+ */
+export const SEARCH_LIMITS: SearchConfigInfo = {
+    default_top_k: 5,
+    max_top_k: 100,
+    max_query_bytes: 32768,
+};
+
 export interface ConfigResponse {
     version: string;
     model_id: string;
@@ -129,6 +153,8 @@ export interface ConfigResponse {
      * project contains. What a project actually holds is `ProjectStatsResponse`.
      */
     languages: string[];
+    /** Optional: an older server does not publish its search bounds. */
+    search?: SearchConfigInfo;
     /** Optional: an older server does not publish its research budgets. */
     research?: ResearchConfigInfo;
 }

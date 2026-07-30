@@ -55,7 +55,7 @@ const SUGGESTED_EXCLUDES: readonly string[] = [
     '"**/*.pem"',
 ];
 
-const HEADER = `# mindex project marker (YAML). Read by mindex-index, mindex-watch, the VS Code
+const HEADER = `# MINDex project marker (YAML). Read by mindex-index, mindex-watch, the VS Code
 # extension and the post-commit hook; the MCP servers don't parse it — the agent
 # reads it and passes the GUID and filters as call arguments. One file, at the
 # repo root, no nesting.
@@ -107,7 +107,7 @@ export function renderMindexTemplate(opts: TemplateOptions): string {
         "# narrows indexing to what it matches.",
         "include_paths: []",
         "",
-        "# Empty means every language mindex supports; the canonical list is served",
+        "# Empty means every language MINDex supports; the canonical list is served",
         "# by the server at GET /config.",
         "languages: []",
         "",

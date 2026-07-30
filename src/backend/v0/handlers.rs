@@ -59,7 +59,9 @@ use crate::backend::v0::models::UUIDv4;
 use crate::backend::v0::models::VersionResponse;
 use crate::backend::v0::models::{GrepMatch, GrepResponse};
 use crate::backend::v0::models::{HistoryPruneQuery, HistoryPruneResponse, HistoryRequest};
-use crate::backend::v0::models::{ResearchConfigInfo, ResearchEffortLadder, ResearchSamplingInfo};
+use crate::backend::v0::models::{
+    ResearchConfigInfo, ResearchEffortLadder, ResearchSamplingInfo, SearchConfigInfo,
+};
 use crate::backend::v0::validate;
 use crate::db::files::set_file_status;
 use crate::db::qdrant::SearchHit;
@@ -4714,6 +4716,11 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
         db_pool_size: s.db_pool_size,
         stuck_grace_mins: s.stuck_grace_mins,
         max_retries: s.max_retries,
+        search: SearchConfigInfo {
+            default_top_k: s.default_top_k,
+            max_top_k: s.max_top_k,
+            max_query_bytes: s.max_query_bytes,
+        },
         research: ResearchConfigInfo {
             default_model: s.research_default_model.clone(),
             models: catalog.models,

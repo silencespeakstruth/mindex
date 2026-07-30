@@ -1648,7 +1648,7 @@ is wrong.
   project, the latter modal-confirmed) lives in the Drift view's overflow menu.
   **The form offers only what the server confirmed exists**: the language pickers are
   the project's `chunks_active > 0` languages and the model field is a `<select>` over
-  `research.models`, both arriving through `StatusTreeProvider.refresh()` — the one
+  `research.models`, both arriving through `StatusMonitor.refresh()` — the one
   place that already runs at activation, on `.mindex` change, and after every
   reindex/delete, so a new refresh site cannot forget them (it re-reads `/config` on
   every pass for the same reason: the model list is no longer static). Three rules
@@ -1662,6 +1662,41 @@ is wrong.
   never by reassigning `webview.html` — a re-render would discard the half-typed
   question, the restored `getState()` and a live run's Cancel state, on every status
   refresh.
+  **The form is also gated on what the server can currently do, and that gate needs a
+  clock.** `fetchStatus` publishes one `Availability {ask, research, reason}`, split
+  because the server has two classes of dependency: a *required* one takes everything
+  down and the server reports itself `degraded`, while Ollama takes only Research and
+  leaves health at `"ok"` deliberately — so `ask` reads `health.status` and `research`
+  additionally reads the one check. One flag would either kill Search whenever no local
+  model was running, or keep offering Research against a server that cannot serve it.
+  The reason names the *required* checks that are down and never Ollama, which cannot
+  be the cause. `!research` disables the Research **tab** and `!ask` disables every
+  control (Stop excepted — a live run still has a connection to drop) leaving the
+  half-typed question visible and inert; the mode is never switched out from under the
+  user. A degradation also aborts what is running — research and any in-flight search,
+  via `RunRegistry` — resetting the handles **before** reporting, since a notification's
+  thenable resolves only when the user dismisses it (the trap that once left Research
+  disabled behind an un-clicked toast), and reporting it as a failure rather than as a
+  cancellation, which would read as the user's own Stop. None of this is observable
+  without `[mindex.statusPollSeconds]` (default 30, `0` = off): every other refresh is
+  event-driven, so before the timer a dependency could die and the form would go on
+  offering work against it indefinitely.
+  **Language marks are vendored, two-toned and tested.** `esbuild.mjs` generates
+  `src/shared/langGlyphs.ts` from devicon's *monochrome* SVGs — fills stripped so CSS
+  `color` drives them — committed like the vendored tags queries, and `sql` alone falls
+  back to a codicon (devicon draws products, not the language). Each language declares
+  **two** colours in `media/lang.css`, not one: 13 of the 21 official brand colours fail
+  3:1 against one of VS Code's two default backgrounds (rust and markdown are black, C
+  is near-white), so the pair is derived by mixing toward white or black in 5% steps
+  until it clears — and `langIcons.test.ts` recomputes that derivation rather than
+  trusting it, alongside asserting no mark kept a hard-coded fill. Shipping devicon's
+  *font* instead was rejected on size: 1.5 MB for 21 glyphs against a 181 KB extension.
+  Drift's `Sync all` is a synthetic first tree row present **only** while there is
+  actionable drift, so "the list is empty" and "there is nothing to press" are one
+  statement; it reindexes before deleting, so a failure or a declined confirm still
+  leaves the index better off. Its explanatory prose lives in `viewsWelcome` and not in
+  `TreeView.message`, which VS Code renders *instead of* the welcome view when the tree
+  is empty — the message is therefore set only once a check has produced rows.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, and one tool — `research`,
   a thin SSE client over `POST /v0/{guid}/research`. The whole investigation runs on
   the server's local model, so scout itself holds no prompt, no chunk budget and no

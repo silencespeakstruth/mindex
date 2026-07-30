@@ -1,4 +1,4 @@
-// Extension → mindex language id. Mirrors tools/indexer/src/scanner.rs::detect_language —
+// Extension → MINDex language id. Mirrors tools/indexer/src/scanner.rs::detect_language —
 // keep the two maps in sync when adding a language (see CLAUDE.md "Languages" checklist).
 const EXT_TO_LANGUAGE: Record<string, string> = {
     rs: "rust",
@@ -45,7 +45,7 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
     markdown: "markdown",
 };
 
-/** mindex language id for a repo-relative path, or undefined if unsupported. */
+/** MINDex language id for a repo-relative path, or undefined if unsupported. */
 /** Every language the extension can label, sorted — the Search filter's options. */
 export const ALL_LANGUAGES: readonly string[] = [
     ...new Set(Object.values(EXT_TO_LANGUAGE)),

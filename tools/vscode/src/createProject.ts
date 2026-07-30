@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import { NOISE_DOT_DIRS, renderMindexTemplate } from "./mindexTemplate";
 import { reportError } from "./errors";
+import { BRAND } from "./brand";
 
 /**
  * Write a fresh `.mindex` at a workspace root and open it for editing.
@@ -58,7 +59,7 @@ async function pickFolder(): Promise<vscode.WorkspaceFolder | undefined> {
     // Multi-root: the first folder holding a marker wins at load time, so which one
     // gets the file is a real choice and cannot be guessed.
     return await vscode.window.showWorkspaceFolderPick({
-        placeHolder: "Which folder is the mindex project root?",
+        placeHolder: `Which folder is the ${BRAND} project root?`,
     });
 }
 

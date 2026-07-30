@@ -1,19 +1,29 @@
 # Everything the extension host does not run. `vsce` packages the whole folder by
 # default, so this file — not .gitignore — is what keeps sources, dev tooling and
 # node_modules out of the .vsix.
+#
+# What ships is `dist/extension.js` (one esbuild bundle) plus `media/`. Nothing is
+# resolved from `node_modules` at runtime any more — `yaml` and `picomatch` are bundled
+# into the host, `marked` into the Research page, and the codicon font and stylesheet
+# are copied into `media/codicons/` by the build. That is not tidiness: the previous
+# arrangement excluded `node_modules/**` wholesale while `mindexFile.ts` did
+# `require("yaml")`, so the published .vsix could not activate at all — a failure
+# invisible in development, where the directory is simply there. A bundle cannot fail
+# that way; an unresolved import is a build error.
 
 .vscode/**
 .gitignore
 .prettierignore
 .prettierrc.json
 eslint.config.mjs
+esbuild.mjs
 tsconfig.json
+tsconfig.webview.json
 node_modules/**
 src/**
 
-# Compiled test fixtures and sourcemaps: useful in the working tree, dead weight
-# in a published package. The activity-bar icon is SVG and IS shipped (media/**).
-dist/**/*.test.js
-dist/**/*.test.js.map
-dist/**/*.map
+# tsc's output. It exists only so `node --test` has something to run; the extension
+# runs the esbuild bundle in dist/.
+out/**
+
 **/*.vsix

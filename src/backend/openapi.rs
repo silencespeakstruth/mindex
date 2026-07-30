@@ -140,6 +140,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::RetryResponse,
         crate::backend::v0::models::StatusResponse,
         crate::backend::v0::models::ConfigResponse,
+        crate::backend::v0::models::SearchConfigInfo,
         crate::backend::v0::models::ResearchConfigInfo,
         crate::backend::v0::models::ResearchEffortLadder,
         crate::backend::v0::models::ResearchEffortInfo,

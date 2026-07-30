@@ -1083,10 +1083,28 @@ pub struct ConfigResponse {
     pub db_pool_size: usize,
     pub stuck_grace_mins: i64,
     pub max_retries: i64,
+    /// What `/search` accepts. Published for the reason the effort ladder is: a
+    /// client that renders a bound has to get the bound from the server or it is
+    /// guessing, and the VS Code form guessed `50` against a real ceiling of 100.
+    pub search: SearchConfigInfo,
     /// What `/research` grants and allows. Published so clients render the real
     /// numbers instead of copies: three of them had drifted from the server's
     /// budgets independently before this existed.
     pub research: ResearchConfigInfo,
+}
+
+/// The `/search` request bounds, as served by `GET /config`.
+///
+/// These are the values [`crate::backend::v0::validate`] enforces at the edge, so a
+/// client that renders a slider or a character counter from them cannot offer an
+/// input the server will reject. `default_top_k` is what an omitted `top_k` becomes,
+/// which is a different number from the one a client should preselect — it is
+/// published so a client can say "server default" rather than invent a value.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct SearchConfigInfo {
+    pub default_top_k: u64,
+    pub max_top_k: u64,
+    pub max_query_bytes: usize,
 }
 
 /// The `/research` budgets, as served by `GET /config`.
