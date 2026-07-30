@@ -109,6 +109,8 @@ const DEFAULT_MAX_DRIFT_FILES: usize = 200_000;
 const DEFAULT_MAX_SELECTOR_PATTERNS: usize = 256;
 const DEFAULT_MAX_SYMBOL_NAME_BYTES: usize = 512;
 const DEFAULT_MAX_SYMBOL_RESULTS: usize = 50;
+const DEFAULT_MAX_HISTORY_COMMITS: usize = 20_000;
+const DEFAULT_MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_RESEARCH_WORKER_THREADS: usize = 2;
@@ -335,6 +337,12 @@ pub struct LimitsConfig {
     pub max_symbol_name_bytes: usize,
     /// Upper bound a `/symbols` request may set for `limit` (per role).
     pub max_symbol_results: usize,
+    /// Maximum number of commits in one `/history` reconciliation request.
+    pub max_history_commits: usize,
+    /// Maximum size of one commit's `subject` + `body` in bytes. A commit
+    /// message is unbounded in git, so this is the `max_code_bytes` analogue for
+    /// the history channel.
+    pub max_commit_message_bytes: usize,
 }
 
 /// `/research` — the Ollama-driven iterative research endpoint. All TOML-only:
@@ -646,6 +654,8 @@ impl Default for LimitsConfig {
             max_selector_patterns: DEFAULT_MAX_SELECTOR_PATTERNS,
             max_symbol_name_bytes: DEFAULT_MAX_SYMBOL_NAME_BYTES,
             max_symbol_results: DEFAULT_MAX_SYMBOL_RESULTS,
+            max_history_commits: DEFAULT_MAX_HISTORY_COMMITS,
+            max_commit_message_bytes: DEFAULT_MAX_COMMIT_MESSAGE_BYTES,
         }
     }
 }
@@ -1228,6 +1238,12 @@ impl Config {
         }
         if self.limits.max_symbol_results < 1 {
             e.push("[limits].max_symbol_results = 0 rejects every symbol lookup. Fix: use at least 1 (default 50).".to_string());
+        }
+        if self.limits.max_history_commits < 1 {
+            e.push("[limits].max_history_commits = 0 rejects every history reconciliation. Fix: use at least 1 (default 20000).".to_string());
+        }
+        if self.limits.max_commit_message_bytes < 1 {
+            e.push("[limits].max_commit_message_bytes = 0 rejects every commit. Fix: use at least 1 (default 64 KiB).".to_string());
         }
         if self.research.worker_threads < 1 {
             e.push("[research].worker_threads = 0 leaves no thread to run research on. Fix: use at least 1 (default 2).".to_string());

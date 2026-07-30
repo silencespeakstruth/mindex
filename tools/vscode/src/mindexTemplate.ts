@@ -61,7 +61,7 @@ const HEADER = `# mindex project marker (YAML). Read by mindex-index, mindex-wat
 # repo root, no nesting.
 #
 # Keys: guid (required, dashed or dashless UUID), plus the optional scope lists
-# exclude_paths / include_paths / languages. An unknown key is an error, not a
+# exclude_paths / include_paths / languages / git_refs. An unknown key is an error, not a
 # silent no-op — a mistyped \`exclude_path:\` would otherwise index the tree it was
 # meant to keep out. Globs are root-relative with forward slashes; \`*\` stops at a
 # directory separator, \`**\` crosses them; excludes are applied before includes, so
@@ -110,6 +110,13 @@ export function renderMindexTemplate(opts: TemplateOptions): string {
         "# Empty means every language mindex supports; the canonical list is served",
         "# by the server at GET /config.",
         "languages: []",
+        "",
+        "# Ref patterns whose commits make up this project's history, e.g.",
+        '# ["master", "dev", "feat/*"]. Empty means the current branch alone —',
+        "# check that first if the default branch was ever squashed, since the prose",
+        "# then lives on the branches that were never merged. Only mindex-index reads",
+        "# this, and only when run with --history; it is off by default.",
+        "git_refs: []",
         ""
     );
 

@@ -344,7 +344,14 @@ window.addEventListener("message", (e) => {
             const div = document.createElement("div");
             div.className = "step";
             const arg =
-                msg.step.query ?? msg.step.name ?? msg.step.path ?? msg.step.glob ?? "";
+                msg.step.query ??
+                msg.step.pattern ??
+                msg.step.name ??
+                msg.step.path ??
+                msg.step.glob ??
+                msg.step.text ??
+                msg.step.plan ??
+                "";
             div.textContent = "#" + msg.step.n + " " + msg.step.action + " → " + arg + " ";
             const hits = document.createElement("span");
             hits.className = "hits";

@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use crate::backend::error::ApiError;
-use crate::backend::v0::models::{Code, DriftRequest, IndexRequest, SearchFilter};
+use crate::backend::v0::models::{
+    Code, DriftRequest, HistoryPruneQuery, HistoryRequest, IndexRequest, SearchFilter,
+};
 
 /// Mirror of the `project_files.path` CHECK plus a `..`-traversal guard: non-empty,
 /// repo-relative (no leading `/`), no empty component (`//`), no backslash, no `..`.
@@ -213,10 +215,98 @@ pub fn validate_drift_request(req: &DriftRequest, max_files: usize) -> Result<()
     Ok(())
 }
 
+/// A commit sha must be 40 (SHA-1) or 64 (SHA-256) hexadecimal characters.
+/// Mirrors the schema's length CHECK and adds the alphabet, which SQLite does
+/// not check — the same split as `validate_sha256_hex`.
+pub fn validate_git_sha(sha: &str) -> Result<(), ApiError> {
+    if matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ApiError::CommitInvalid {
+            sha: sha.to_string(),
+            reason: "a sha must be 40 or 64 hexadecimal characters",
+        })
+    }
+}
+
+/// Validate a `/history` body: commit-count cap, then per commit its sha, its
+/// message size, and every path it names.
+///
+/// The `old_path` rule is a biconditional rather than a "required for renames"
+/// check: a rename with no source is unusable (the lookup that follows the move
+/// is exactly what the column exists for), and a modification carrying one is a
+/// client that mis-parsed git's raw output — the arity trap in `--raw -z`, where
+/// a rename emits two paths and everything else emits one. Silently accepting
+/// the second would store a whole desynchronised stream.
+pub fn validate_history_request(
+    req: &HistoryRequest,
+    max_commits: usize,
+    max_message_bytes: usize,
+) -> Result<(), ApiError> {
+    if req.commits.len() > max_commits {
+        return Err(ApiError::TooManyCommits {
+            got: req.commits.len(),
+            max: max_commits,
+        });
+    }
+    for c in &req.commits {
+        validate_git_sha(&c.sha)?;
+        if c.subject.trim().is_empty() {
+            return Err(ApiError::CommitInvalid {
+                sha: c.sha.clone(),
+                reason: "the subject must not be empty",
+            });
+        }
+        let message_bytes = c.subject.len() + c.body.len();
+        if message_bytes > max_message_bytes {
+            return Err(ApiError::CommitMessageTooLarge {
+                sha: c.sha.clone(),
+                got: message_bytes,
+                max: max_message_bytes,
+            });
+        }
+        for p in &c.paths {
+            validate_path(&p.path)?;
+            match (&p.old_path, p.change_type.requires_old_path()) {
+                (Some(old), true) => validate_path(old)?,
+                (None, false) => {}
+                (None, true) => {
+                    return Err(ApiError::CommitInvalid {
+                        sha: c.sha.clone(),
+                        reason: "a renamed or copied path must carry its old_path",
+                    });
+                }
+                (Some(_), false) => {
+                    return Err(ApiError::CommitInvalid {
+                        sha: c.sha.clone(),
+                        reason: "old_path is only meaningful for a rename or a copy",
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `DELETE /v0/{guid}/history` — refuse a prune that names no bound.
+///
+/// The `require_nonempty_selector` rule, for a resource whose bounds are scalars
+/// rather than globs: a request that forgot its parameters and a request that
+/// means "drop everything" must not be the same request. `?keep_last=0` is the
+/// explicit spelling of the second.
+pub fn validate_history_prune(q: &HistoryPruneQuery) -> Result<(), ApiError> {
+    if q.keep_last.is_none() && q.older_than.is_none() {
+        return Err(ApiError::HistoryBoundMissing);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::v0::models::{GlobPattern, ProgrammingLanguage};
+    use crate::backend::v0::models::{
+        ChangeType, CommitEntry, CommitPath, GlobPattern, ProgrammingLanguage,
+    };
     use glob::Pattern;
 
     fn err_code(e: ApiError) -> &'static str {
@@ -418,6 +508,136 @@ mod tests {
         assert_eq!(
             err_code(validate_index_request(&req, 10, 5).unwrap_err()),
             "validation.code_too_large"
+        );
+    }
+
+    fn commit(paths: Vec<CommitPath>) -> CommitEntry {
+        CommitEntry {
+            sha: "a".repeat(40),
+            author_name: "T".into(),
+            author_email: "t@example.com".into(),
+            authored_at: 1,
+            committed_at: 1,
+            parent_count: 1,
+            subject: "subject".into(),
+            body: "body".into(),
+            paths,
+        }
+    }
+
+    fn touch(path: &str, change_type: ChangeType, old_path: Option<&str>) -> CommitPath {
+        CommitPath {
+            path: path.to_string(),
+            change_type,
+            old_path: old_path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn git_sha_must_be_40_or_64_hex() {
+        assert!(validate_git_sha(&"a".repeat(40)).is_ok());
+        assert!(validate_git_sha(&"F".repeat(64)).is_ok());
+        for bad in [
+            "a".repeat(39),
+            "a".repeat(41),
+            "a".repeat(63),
+            "g".repeat(40),
+            String::new(),
+        ] {
+            assert_eq!(
+                err_code(validate_git_sha(&bad).unwrap_err()),
+                "validation.commit_invalid",
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn history_request_caps() {
+        let req = HistoryRequest {
+            since: None,
+            commits: vec![commit(vec![touch("src/a.rs", ChangeType::Modified, None)])],
+        };
+        assert!(validate_history_request(&req, 10, 100).is_ok());
+        assert_eq!(
+            err_code(validate_history_request(&req, 0, 100).unwrap_err()),
+            "validation.too_many_commits"
+        );
+        assert_eq!(
+            err_code(validate_history_request(&req, 10, 3).unwrap_err()),
+            "validation.commit_message_too_large"
+        );
+    }
+
+    /// A prune with no bound is refused, and `keep_last=0` is how "everything"
+    /// is spelled — the two must not be the same request, which is exactly the
+    /// argument `require_nonempty_selector` makes for the file endpoints.
+    #[test]
+    fn a_history_prune_must_name_at_least_one_bound() {
+        assert_eq!(
+            err_code(validate_history_prune(&HistoryPruneQuery::default()).unwrap_err()),
+            "validation.history_bound_missing"
+        );
+        assert!(
+            validate_history_prune(&HistoryPruneQuery {
+                keep_last: Some(0),
+                older_than: None,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_history_prune(&HistoryPruneQuery {
+                keep_last: None,
+                older_than: Some(0),
+            })
+            .is_ok()
+        );
+    }
+
+    /// The `old_path` biconditional. The `Some`-on-a-modification half is the one
+    /// worth pinning: it is how a client that mis-parsed git's `--raw -z` arity
+    /// (a rename emits two paths, everything else emits one) is caught at the
+    /// edge rather than storing a whole desynchronised stream.
+    #[test]
+    fn old_path_is_required_exactly_for_renames_and_copies() {
+        let cases = [
+            (touch("b.rs", ChangeType::Renamed, Some("a.rs")), true),
+            (touch("b.rs", ChangeType::Copied, Some("a.rs")), true),
+            (touch("a.rs", ChangeType::Modified, None), true),
+            (touch("b.rs", ChangeType::Renamed, None), false),
+            (touch("a.rs", ChangeType::Modified, Some("z.rs")), false),
+            (touch("a.rs", ChangeType::Added, Some("z.rs")), false),
+        ];
+        for (path, ok) in cases {
+            let label = format!("{:?} old_path={:?}", path.change_type, path.old_path);
+            let req = HistoryRequest {
+                since: None,
+                commits: vec![commit(vec![path])],
+            };
+            let got = validate_history_request(&req, 10, 1000);
+            if ok {
+                assert!(got.is_ok(), "{label} should be accepted");
+            } else {
+                assert_eq!(
+                    err_code(got.unwrap_err()),
+                    "validation.commit_invalid",
+                    "{label} should be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_request_rejects_an_empty_subject() {
+        let mut c = commit(vec![]);
+        c.subject = "   ".into();
+        let req = HistoryRequest {
+            since: None,
+            commits: vec![c],
+        };
+        assert_eq!(
+            err_code(validate_history_request(&req, 10, 1000).unwrap_err()),
+            "validation.commit_invalid"
         );
     }
 }

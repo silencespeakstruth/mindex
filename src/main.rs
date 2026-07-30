@@ -31,8 +31,10 @@ type BoxError = Box<dyn Error + Send + Sync>;
 // Applied in order on startup: only migrations whose version exceeds the
 // current `PRAGMA user_version` are run, inside one transaction. `pub(crate)`
 // so test modules build a schema-identical `:memory:` pool from the same source.
-pub(crate) const MIGRATIONS: &[(i32, &str)] =
-    &[(1, include_str!("db/migrations/v1.0.0_schema.sql"))];
+pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("db/migrations/v1.0.0_schema.sql")),
+    (2, include_str!("db/migrations/v1.1.0_git_history.sql")),
+];
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
 /// then stamps `user_version` to the highest applied version. Returns the resulting
@@ -401,6 +403,8 @@ async fn main() -> Result<(), BoxError> {
                 max_code_bytes: cfg.limits.max_code_bytes,
                 max_files_per_request: cfg.limits.max_files_per_request,
                 max_drift_files: cfg.limits.max_drift_files,
+                max_history_commits: cfg.limits.max_history_commits,
+                max_commit_message_bytes: cfg.limits.max_commit_message_bytes,
                 max_selector_patterns: cfg.limits.max_selector_patterns,
                 max_symbol_name_bytes: cfg.limits.max_symbol_name_bytes,
                 max_symbol_results: cfg.limits.max_symbol_results,

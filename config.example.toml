@@ -96,6 +96,8 @@ max_drift_files = 200000      # max entries in one /drift path→sha256 map
 max_selector_patterns = 256   # max globs+languages combined in one include/exclude
 max_symbol_name_bytes = 512   # max /symbols name length in bytes
 max_symbol_results = 50       # upper bound a /symbols request may set for limit (per role)
+max_history_commits = 20000   # max commits in one /history reconciliation request
+max_commit_message_bytes = 65536 # max subject+body of one commit, in bytes
 
 # /research — the Ollama-driven iterative research endpoint (SSE). Talks to a
 # local Ollama; each request names its model (or falls back to default_model).

@@ -1,13 +1,16 @@
 -- ============================================================
 -- mindex schema
 -- ============================================================
--- The whole schema, in one migration. Every statement is `IF NOT EXISTS`, so a
--- cold re-run is a no-op — `every_migration_sql_is_idempotent` enforces that and
--- is what forbids `ALTER TABLE ... ADD COLUMN`, which has no `IF NOT EXISTS`
--- form. Until 1.0.0 ships a released schema this file is edited in place; after
--- that, a new field arrives as a new migration file appended to the `MIGRATIONS`
--- slice in `src/main.rs` — and there, `ADD COLUMN` being unavailable, as a 1:1
--- side table with `ON DELETE CASCADE`.
+-- The 1.0.0 schema. Every statement is `IF NOT EXISTS`, so a cold re-run is a
+-- no-op — `every_migration_sql_is_idempotent` enforces that and is what forbids
+-- `ALTER TABLE ... ADD COLUMN`, which has no `IF NOT EXISTS` form.
+--
+-- This file is now FROZEN: 1.0.0's schema is in use, so editing it in place
+-- would not reach a database already stamped at version 1 (the migration filter
+-- is `version > user_version`), and the change would be skipped in silence. A
+-- new table goes in a new migration file appended to the `MIGRATIONS` slice in
+-- `src/main.rs` — v1.1.0_git_history.sql is the first — and a new *field*, with
+-- `ADD COLUMN` unavailable, as a 1:1 side table with `ON DELETE CASCADE`.
 --
 -- Statement order is load-bearing: SQLite needs a table to exist before a
 -- trigger or a foreign key can name it.

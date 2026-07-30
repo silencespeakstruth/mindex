@@ -8,6 +8,8 @@
 //       - tools/**
 //     include_paths: []
 //     languages: []
+//     git_refs:
+//       - master
 
 import { parse as parseYaml } from "yaml";
 
@@ -18,9 +20,16 @@ export interface MindexFile {
     excludePaths: string[];
     /** Lowercase mindex language ids; empty means all languages. */
     languages: string[];
+    /**
+     * Ref patterns bounding the git-history walk. The extension is not a history
+     * producer — `mindex-index` is the only one, deliberately — so this is parsed
+     * and carried rather than used: without it `deny_unknown_fields`' mirror here
+     * would reject every `.mindex` that names the key.
+     */
+    gitRefs: string[];
 }
 
-const KNOWN_KEYS = ["guid", "include_paths", "exclude_paths", "languages"];
+const KNOWN_KEYS = ["guid", "include_paths", "exclude_paths", "languages", "git_refs"];
 const HYPHENATED = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DASHLESS = /^[0-9a-f]{32}$/;
 
@@ -36,7 +45,7 @@ export function parseMindexFile(text: string): MindexFile {
     if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
         throw new Error(
             ".mindex must be a YAML mapping with a `guid:` key and optional " +
-                "`include_paths:`/`exclude_paths:`/`languages:` lists"
+                "`include_paths:`/`exclude_paths:`/`languages:`/`git_refs:` lists"
         );
     }
     const map = doc as Record<string, unknown>;
@@ -55,6 +64,7 @@ export function parseMindexFile(text: string): MindexFile {
         includePaths: stringList(map.include_paths, "include_paths"),
         excludePaths: stringList(map.exclude_paths, "exclude_paths"),
         languages: stringList(map.languages, "languages"),
+        gitRefs: stringList(map.git_refs, "git_refs"),
     };
 }
 

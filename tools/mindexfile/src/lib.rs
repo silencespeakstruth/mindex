@@ -51,6 +51,17 @@ pub struct MindexFile {
     pub exclude_paths: Vec<String>,
     /// Lowercase mindex language ids; empty means all languages.
     pub languages: Vec<String>,
+    /// Ref *patterns* bounding the git-history walk, e.g. `master`, `dev`,
+    /// `feat/*`. Empty means the client's own default (the current branch).
+    ///
+    /// This is a scope key like the three above, not a feature switch: whether a
+    /// project's history is indexed at all is the client's `--history` flag. What
+    /// belongs in the committed file is *which* refs carry that project's
+    /// history — an answer about the project, not about one machine. It matters
+    /// more than it looks: a repository whose default branch was squashed keeps
+    /// its prose on the feature branches, and walking `HEAD` there finds two
+    /// commits.
+    pub git_refs: Vec<String>,
 }
 
 /// The wire shape. Separate from [`MindexFile`] so the public type can hold the
@@ -65,6 +76,8 @@ struct Raw {
     exclude_paths: Vec<String>,
     #[serde(default)]
     languages: Vec<String>,
+    #[serde(default)]
+    git_refs: Vec<String>,
 }
 
 /// Reads and parses `path`. A missing file is an error — callers that treat
@@ -80,7 +93,7 @@ pub fn parse(path: &Path) -> Result<MindexFile> {
 pub fn parse_str(text: &str) -> Result<MindexFile> {
     let raw: Raw = serde_yaml_ng::from_str(text).context(
         "the file must be YAML with a `guid:` key and optional \
-         `include_paths:`/`exclude_paths:`/`languages:` lists",
+         `include_paths:`/`exclude_paths:`/`languages:`/`git_refs:` lists",
     )?;
 
     Ok(MindexFile {
@@ -88,6 +101,7 @@ pub fn parse_str(text: &str) -> Result<MindexFile> {
         include_paths: raw.include_paths,
         exclude_paths: raw.exclude_paths,
         languages: raw.languages,
+        git_refs: raw.git_refs,
     })
 }
 
@@ -161,13 +175,15 @@ mod tests {
              guid: 123e4567-e89b-42d3-a456-426614174000\n\
              include_paths:\n  - src/**\n  - tools/mcp/**\n\
              exclude_paths:\n  - target/**\n  - docs/**\n\
-             languages:\n  - rust\n  - python\n",
+             languages:\n  - rust\n  - python\n\
+             git_refs:\n  - master\n  - \"feat/*\"\n",
         )
         .unwrap();
         assert_eq!(f.guid, GUID);
         assert_eq!(f.include_paths, vec!["src/**", "tools/mcp/**"]);
         assert_eq!(f.exclude_paths, vec!["target/**", "docs/**"]);
         assert_eq!(f.languages, vec!["rust", "python"]);
+        assert_eq!(f.git_refs, vec!["master", "feat/*"]);
     }
 
     #[test]
@@ -177,6 +193,7 @@ mod tests {
         assert!(f.include_paths.is_empty());
         assert!(f.exclude_paths.is_empty());
         assert!(f.languages.is_empty());
+        assert!(f.git_refs.is_empty());
     }
 
     #[test]

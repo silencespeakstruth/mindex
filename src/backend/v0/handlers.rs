@@ -17,11 +17,13 @@ use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChunkExcerpt;
 use crate::backend::v0::models::Code;
+use crate::backend::v0::models::CommitSummary;
 use crate::backend::v0::models::ConfigResponse;
 use crate::backend::v0::models::DeleteFilesRequest;
 use crate::backend::v0::models::DeleteFilesResponse;
 use crate::backend::v0::models::DriftRequest;
 use crate::backend::v0::models::DriftResponse;
+use crate::backend::v0::models::FileHistoryResponse;
 use crate::backend::v0::models::FileInfo;
 use crate::backend::v0::models::FileListQuery;
 use crate::backend::v0::models::FileListResponse;
@@ -30,6 +32,7 @@ use crate::backend::v0::models::FileStatusCounts;
 use crate::backend::v0::models::GcResponse;
 use crate::backend::v0::models::HealthChecks;
 use crate::backend::v0::models::HealthResponse;
+use crate::backend::v0::models::HistoryResponse;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::LanguageStats;
 use crate::backend::v0::models::ListFilesResponse;
@@ -55,6 +58,7 @@ use crate::backend::v0::models::SymbolsResponse;
 use crate::backend::v0::models::UUIDv4;
 use crate::backend::v0::models::VersionResponse;
 use crate::backend::v0::models::{GrepMatch, GrepResponse};
+use crate::backend::v0::models::{HistoryPruneQuery, HistoryPruneResponse, HistoryRequest};
 use crate::backend::v0::models::{ResearchConfigInfo, ResearchEffortLadder, ResearchSamplingInfo};
 use crate::backend::v0::validate;
 use crate::db::files::set_file_status;
@@ -1632,6 +1636,331 @@ pub async fn post_drift(
     Ok(Json(res))
 }
 
+/// Reconcile one project's git history against the posted commit set.
+///
+/// The whole operation is a **set difference on shas**, and that is the design
+/// rather than an implementation detail: a sha is the hash of its own content,
+/// so unlike a file there is no "same identity, different bytes" case to detect.
+/// A commit the server holds and the request does not name is gone from the refs
+/// the client tracks, whatever the reason — merged and pruned, rebased away,
+/// force-pushed over. That is why history needs no equivalent of `/drift` and no
+/// special handling for a rewritten branch.
+///
+/// `since` bounds the *deletion* half. Without it a client walking a window
+/// ("the last month") would silently wipe everything older on every pass, since
+/// from the server's side an unmentioned commit and a commit outside the walk
+/// look identical.
+async fn history_core(
+    s: &RouterState,
+    project_guid: UUIDv4,
+    payload: HistoryRequest,
+    token: &CancellationToken,
+) -> Result<HistoryResponse, ApiError> {
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.clone();
+
+    s.db_pool
+        .transaction(token.child_token(), move |tx| {
+            reconcile_history(tx, project_guid, &model_id, &payload)
+        })
+        .with_cancellation_token(token)
+        .await
+        .from_cancelled()
+        .map_err(|err| {
+            error!(
+                error = ?err,
+                project_guid = %project_guid.0,
+                "Failed to reconcile the project's git history. Check the DB is writable."
+            );
+            ApiError::from(err)
+        })
+}
+
+/// The reconciliation itself, over one transaction. Split out from
+/// [`history_core`] so it can be exercised against a real `:memory:` pool —
+/// `SQLite3Pool` is deliberately not a trait, so this is how the SQL gets
+/// tested.
+fn reconcile_history(
+    tx: &rusqlite::Transaction,
+    project_guid: UUIDv4,
+    model_id: &str,
+    payload: &HistoryRequest,
+) -> Result<HistoryResponse, SQLite3PoolError> {
+    // History may arrive before any file has been indexed — the git walk does
+    // not depend on the working tree — so the project row cannot be assumed to
+    // exist. Same ON CONFLICT DO NOTHING as `post_index`, and for the same
+    // reason: two concurrent creators must not 500.
+    tx.execute(
+        "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)
+         ON CONFLICT (guid, model_id) DO NOTHING",
+        params![project_guid, model_id],
+    )?;
+
+    let mut indexed = 0usize;
+    {
+        let mut insert_commit = tx.prepare(
+            "INSERT INTO project_commits
+                 (project_guid, model_id, sha, author_name, author_email,
+                  authored_at, committed_at, parent_count, subject, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT (project_guid, model_id, sha) DO NOTHING",
+        )?;
+        let mut insert_path = tx.prepare(
+            "INSERT INTO project_commit_paths
+                 (project_guid, model_id, sha, path, change_type, old_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (project_guid, model_id, sha, path) DO NOTHING",
+        )?;
+        for c in &payload.commits {
+            // A commit's content is immutable, so a row that already exists is
+            // the same row: DO NOTHING makes a re-post a genuine no-op and this
+            // count a real "new", not a euphemism for "attempted".
+            indexed += insert_commit.execute(params![
+                project_guid,
+                model_id,
+                c.sha,
+                c.author_name,
+                c.author_email,
+                c.authored_at,
+                c.committed_at,
+                c.parent_count as i64,
+                c.subject,
+                c.body,
+            ])?;
+            for p in &c.paths {
+                insert_path.execute(params![
+                    project_guid,
+                    model_id,
+                    c.sha,
+                    p.path,
+                    p.change_type,
+                    p.old_path,
+                ])?;
+            }
+        }
+    }
+
+    // The posted set goes into a temp table rather than a `NOT IN (?, ?, …)`
+    // list: that list is one bind per commit and would hit SQLite's variable
+    // limit somewhere around 32k, which is inside the range
+    // `[limits].max_history_commits` is allowed to permit. A temp table has no
+    // such ceiling.
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.posted_shas;
+         CREATE TEMP TABLE posted_shas (sha TEXT NOT NULL PRIMARY KEY);",
+    )?;
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO temp.posted_shas (sha) VALUES (?1) ON CONFLICT DO NOTHING")?;
+        for c in &payload.commits {
+            stmt.execute(params![c.sha])?;
+        }
+    }
+
+    // Paths go with their commit through ON DELETE CASCADE. Hard delete, not
+    // soft: these rows own nothing outside SQLite, so there is no vector for a
+    // GC pass to confirm gone first.
+    let removed = tx.execute(
+        "DELETE FROM project_commits
+         WHERE project_guid = ?1
+           AND model_id = ?2
+           AND (?3 IS NULL OR committed_at >= ?3)
+           AND sha NOT IN (SELECT sha FROM temp.posted_shas)",
+        params![project_guid, model_id, payload.since],
+    )?;
+    tx.execute_batch("DROP TABLE IF EXISTS temp.posted_shas;")?;
+
+    Ok(HistoryResponse {
+        indexed,
+        unchanged: payload.commits.len().saturating_sub(indexed),
+        removed,
+    })
+}
+
+/// `POST /v0/{guid}/history` — reconcile the project's commit history against
+/// the set the client just walked out of git.
+///
+/// A **full-set replace within `since`**: commits the request names are inserted
+/// if absent, and commits the server holds inside the window that the request
+/// does not name are deleted. Because a sha is its own content hash there is no
+/// update case at all, and a force-push, a rebase or any other history rewrite
+/// is simply a reconciliation in which many shas orphan at once.
+///
+/// The commit rows deliberately do **not** become `project_files` rows — see the
+/// schema comment above `project_commits`. The consequence worth stating at the
+/// route: nothing posted here can ever appear in `POST /drift`, which is what
+/// keeps `mindex-index --check` from reporting permanent, unclearable drift.
+///
+/// **Concurrency:** takes no `IndexClaim` and no locks — it touches neither
+/// `project_files` nor Qdrant, so it cannot race indexing. One transaction, so a
+/// failed request leaves the previous history intact.
+#[utoipa::path(
+    post,
+    path = "/v0/{project_guid}/history",
+    tag = "Indexing",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = HistoryRequest,
+    responses(
+        (status = 200, description = "Reconciliation counts (inserted / already held / dropped).", body = HistoryResponse),
+        (status = 400, description = "Validation failed (bad sha, empty subject, oversized message, too many commits, bad path, old_path mismatch).", body = ProblemDetails),
+        (status = 499, description = "Client closed the connection.", body = ProblemDetails),
+        (status = 500, description = "SQLite write failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn post_history(
+    ApiPath(project_guid): ApiPath<UUIDv4>,
+    State(s): State<RouterState>,
+    ApiJson(payload): ApiJson<HistoryRequest>,
+) -> Result<Json<HistoryResponse>, ApiError> {
+    validate::validate_history_request(
+        &payload,
+        s.max_history_commits,
+        s.max_commit_message_bytes,
+    )?;
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let posted = payload.commits.len();
+    let since = payload.since;
+    let res = history_core(&s, project_guid, payload, &guard.0).await?;
+
+    // Worth a log line for the same reason `/drift` is: the set being reconciled
+    // against is one only the client can see, so this is the only server-side
+    // record of what it claimed the tracked refs contain. `removed` is the
+    // interesting column — a large value is a history rewrite, and nothing else
+    // on the server would ever say one happened.
+    info!(
+        project_guid = %project_guid.0,
+        posted,
+        since,
+        indexed = res.indexed,
+        unchanged = res.unchanged,
+        removed = res.removed,
+        "Reconciled a git history manifest against the index."
+    );
+
+    Ok(Json(res))
+}
+
+/// The prune itself, over one transaction. Split out from [`delete_history`] for
+/// the same reason [`reconcile_history`] is — `SQLite3Pool` is deliberately not
+/// a trait, so a real `:memory:` pool is how this SQL gets tested.
+///
+/// The two bounds **intersect**: a commit dies only if `older_than` condemns it
+/// *and* it is not among the newest `keep_last`. An absent bound is written as a
+/// no-op rather than as a second query — `?3 IS NULL` disables the clock and
+/// `LIMIT 0` protects nothing — so one statement serves all three shapes.
+fn prune_history(
+    tx: &rusqlite::Transaction,
+    project_guid: UUIDv4,
+    model_id: &str,
+    q: &HistoryPruneQuery,
+) -> Result<HistoryPruneResponse, SQLite3PoolError> {
+    let removed = tx.execute(
+        "DELETE FROM project_commits
+         WHERE project_guid = ?1
+           AND model_id = ?2
+           AND (?3 IS NULL OR committed_at < ?3)
+           AND sha NOT IN (
+               SELECT sha FROM project_commits
+               WHERE project_guid = ?1 AND model_id = ?2
+               -- `sha` breaks the tie so a run is reproducible: same-second
+               -- commits are common (a rebase stamps a whole branch at once),
+               -- and an unordered LIMIT would keep an arbitrary one of them.
+               ORDER BY committed_at DESC, sha DESC
+               LIMIT ?4
+           )",
+        params![
+            project_guid,
+            model_id,
+            q.older_than,
+            q.keep_last.unwrap_or(0) as i64,
+        ],
+    )?;
+
+    let remaining: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM project_commits WHERE project_guid = ?1 AND model_id = ?2",
+        params![project_guid, model_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(HistoryPruneResponse {
+        removed,
+        remaining: remaining as usize,
+    })
+}
+
+/// `DELETE /v0/{guid}/history` — prune the git-history channel by retention.
+///
+/// The counterpart to `POST`, which can only ever *reconcile*: it deletes what
+/// the tracked refs no longer reach, so history that is still reachable never
+/// ages out however old it gets. This is the handle for that — a retention
+/// policy an operator or a cron applies, not something the indexer calls.
+///
+/// `keep_last=N` keeps the newest N commits; `older_than=<unix seconds>` deletes
+/// what was committed before that instant; both together keep a commit that
+/// *either* rule protects. Naming neither is a **400**, not a wipe.
+///
+/// Deleting is cheap and reversible in the only sense that matters: the source
+/// of truth is the repository, so `mindex-index --history-only` rebuilds
+/// whatever the refs still reach.
+///
+/// **Concurrency:** takes no `IndexClaim` and no locks — these rows own nothing
+/// in Qdrant and are invisible to `/drift`, so this cannot race indexing. Hard
+/// delete in one transaction, cascading to `project_commit_paths`; there is no
+/// GC pass to wait for.
+#[utoipa::path(
+    delete,
+    path = "/v0/{project_guid}/history",
+    tag = "Indexing",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        HistoryPruneQuery,
+    ),
+    responses(
+        (status = 200, description = "Commits deleted and commits still held.", body = HistoryPruneResponse),
+        (status = 400, description = "Neither `keep_last` nor `older_than` was given.", body = ProblemDetails),
+        (status = 499, description = "Client closed the connection.", body = ProblemDetails),
+        (status = 500, description = "SQLite write failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn delete_history(
+    ApiPath(project_guid): ApiPath<UUIDv4>,
+    State(s): State<RouterState>,
+    ApiQuery(q): ApiQuery<HistoryPruneQuery>,
+) -> Result<Json<HistoryPruneResponse>, ApiError> {
+    validate::validate_history_prune(&q)?;
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.clone();
+
+    let res = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            prune_history(tx, project_guid, &model_id, &q)
+        })
+        .with_cancellation_token(&guard.0)
+        .await
+        .from_cancelled()
+        .map_err(|err| {
+            error!(
+                error = ?err,
+                project_guid = %project_guid.0,
+                "Failed to prune the project's git history. Check the DB is writable."
+            );
+            ApiError::from(err)
+        })?;
+
+    info!(
+        project_guid = %project_guid.0,
+        removed = res.removed,
+        remaining = res.remaining,
+        "Pruned a project's git history."
+    );
+
+    Ok(Json(res))
+}
+
 /// Hybrid semantic + lexical code search within one project.
 ///
 /// The query is embedded with BGE-M3 (dense + sparse + ColBERT). Candidate chunks are
@@ -2620,6 +2949,170 @@ pub(crate) async fn read_chunks_core(
     })
 }
 
+/// Commits per `file_history` call.
+///
+/// Small where `outline`'s is large, and for the opposite reason: an outline is a
+/// list of names and this is a list of prose. Twenty commit messages of this
+/// repository's median length is already ~5k tokens of transcript, and the recent
+/// ones are what answer "why is this the way it is" — a longer tail buys
+/// archaeology nobody asked for at the price of the budget that would have read
+/// the code. Transcript shape, not tuning, so it is a const like `GREP_LIMIT`.
+const FILE_HISTORY_LIMIT: usize = 20;
+
+/// The commits that touched one path, newest first — the git channel's only
+/// model-facing lookup.
+///
+/// Pure SQL over `project_commit_paths ⋈ project_commits`, covered by
+/// `idx_project_commit_paths_path`: no embedder, no Qdrant, no HTTP handler of
+/// its own, exactly like `outline_core` and `list_files_core`.
+///
+/// **Three flags, because an empty list has three different meanings** and the
+/// bare `[]` reads as the least alarming one. The project's history may never
+/// have been reconciled (`history_indexed: false` — not "this file is
+/// uninteresting"); the run may not be allowed to read here (`in_scope: false` —
+/// a refusal, since this is a path-keyed lookup); and the path may be one the
+/// code channel does not hold (`path_indexed: false`), which is *normal* here
+/// and nowhere else: a commit legitimately names files deleted years ago,
+/// excluded by `.mindex`, or in an unsupported language. That last one is why
+/// `project_commit_paths.path` carries no foreign key.
+pub(crate) async fn file_history_core(
+    s: &RouterState,
+    project_guid: UUIDv4,
+    path: &str,
+    scope: &crate::research::ToolScope,
+    token: &CancellationToken,
+) -> Result<FileHistoryResponse, ApiError> {
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.clone();
+    let owned_path = path.to_string();
+
+    // Path-keyed, so an out-of-scope path is refused rather than silently
+    // emptied: an empty answer would tell the model this file has no history,
+    // and send it hunting for other spellings of a path it simply may not read.
+    if !path_in_scope(s, project_guid, path, scope, token).await? {
+        return Ok(FileHistoryResponse {
+            path: path.to_string(),
+            history_indexed: true,
+            in_scope: false,
+            path_indexed: false,
+            commits: vec![],
+            total: 0,
+        });
+    }
+
+    let (history_indexed, path_indexed, total, commits) = s
+        .db_pool
+        .transaction(token.child_token(), move |tx| {
+            read_file_history(tx, project_guid, &model_id, &owned_path)
+        })
+        .with_cancellation_token(token)
+        .await
+        .from_cancelled()
+        .map_err(|err| {
+            error!(
+                error = ?err,
+                project_guid = %project_guid.0,
+                path = %path,
+                "Failed to read a file's commit history. Check the DB is writable."
+            );
+            ApiError::from(err)
+        })?;
+
+    Ok(FileHistoryResponse {
+        path: path.to_string(),
+        history_indexed,
+        in_scope: true,
+        path_indexed,
+        commits,
+        total,
+    })
+}
+
+/// The three reads behind [`file_history_core`], over one transaction. Split out
+/// for the same reason [`reconcile_history`] is: `SQLite3Pool` is deliberately
+/// not a trait, so a real `:memory:` pool is the only way to test the SQL.
+#[allow(clippy::type_complexity)]
+fn read_file_history(
+    tx: &rusqlite::Transaction,
+    project_guid: UUIDv4,
+    model_id: &str,
+    owned_path: &str,
+) -> Result<(bool, bool, usize, Vec<CommitSummary>), SQLite3PoolError> {
+    // Does this project have a history channel at all? One indexed
+    // existence check, and the single most load-bearing read here:
+    // without it, "nobody reconciled this repository's commits" and
+    // "nothing ever touched this file" are the same answer.
+    let history_indexed: bool = tx
+        .query_row(
+            "SELECT 1 FROM project_commits
+                     WHERE project_guid = ?1 AND model_id = ?2 LIMIT 1",
+            params![project_guid, model_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    // Whether the code channel currently holds the path, so the answer
+    // can distinguish "gone from the tree" from "never there".
+    let path_indexed: bool = tx
+        .query_row(
+            "SELECT 1 FROM project_files
+                     WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3
+                       AND status != 'deleted' LIMIT 1",
+            params![project_guid, model_id, owned_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    // Counted before the cap so truncation is visible rather than
+    // implied by a list that happens to be exactly as long as the cap.
+    let total: usize = tx.query_row(
+        "SELECT COUNT(*) FROM project_commit_paths
+                 WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
+        params![project_guid, model_id, owned_path],
+        |r| r.get::<_, i64>(0),
+    )? as usize;
+
+    let mut stmt = tx.prepare(
+        "SELECT c.sha, c.authored_at, c.author_name, c.subject, c.body,
+                        p.change_type, p.old_path
+                 FROM project_commit_paths p
+                 JOIN project_commits c
+                   ON c.project_guid = p.project_guid
+                  AND c.model_id = p.model_id
+                  AND c.sha = p.sha
+                 WHERE p.project_guid = ?1 AND p.model_id = ?2 AND p.path = ?3
+                 ORDER BY c.committed_at DESC
+                 LIMIT ?4",
+    )?;
+    let commits = stmt
+        .query_map(
+            params![
+                project_guid,
+                model_id,
+                owned_path,
+                FILE_HISTORY_LIMIT as i64
+            ],
+            |r| {
+                let sha: String = r.get(0)?;
+                Ok(CommitSummary {
+                    short_sha: sha.chars().take(8).collect(),
+                    sha,
+                    authored_at: r.get(1)?,
+                    author_name: r.get(2)?,
+                    subject: r.get(3)?,
+                    body: r.get(4)?,
+                    change_type: r.get(5)?,
+                    old_path: r.get(6)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok((history_indexed, path_indexed, total, commits))
+}
+
 /// Indexed paths matching a glob — the other half of orientation (see
 /// [`outline_core`]).
 ///
@@ -3025,6 +3518,15 @@ impl crate::research::ResearchTools for StateResearchTools {
         token: &CancellationToken,
     ) -> Result<ListFilesResponse, ApiError> {
         list_files_core(&self.state, self.project_guid, &glob, scope, token).await
+    }
+
+    async fn file_history(
+        &self,
+        path: String,
+        scope: &crate::research::ToolScope,
+        token: &CancellationToken,
+    ) -> Result<FileHistoryResponse, ApiError> {
+        file_history_core(&self.state, self.project_guid, &path, scope, token).await
     }
 
     async fn grep(
@@ -4442,7 +4944,9 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::v0::models::{GlobPattern, SearchFilter};
+    use crate::backend::v0::models::{
+        ChangeType, CommitEntry, CommitPath, CommitSummary, GlobPattern, SearchFilter,
+    };
     use glob::Pattern;
     use uuid::Uuid;
 
@@ -6129,5 +6633,522 @@ mod tests {
             assert!(sites.is_empty(), "{name} must yield no call sites");
             assert_eq!((total_sites, total_refs), (0, 0));
         }
+    }
+
+    // ── git history reconciliation ──────────────────────────────────────
+    // The channel's whole sync story is a set difference on shas, so these
+    // pin the three shapes that difference takes: a re-post (nothing moves),
+    // a windowed post (nothing outside the window moves) and a rewrite (the
+    // old shas go, and their paths go with them).
+
+    const HISTORY_MODEL: &str = "BAAI/bge-m3";
+
+    async fn history_pool() -> SQLite3Pool {
+        // Pool size 1 so the ":memory:" connection — and therefore the schema —
+        // is the same one every later transaction gets.
+        let p = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        p.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        p
+    }
+
+    fn commit_at(sha_byte: char, committed_at: i64, paths: &[&str]) -> CommitEntry {
+        CommitEntry {
+            sha: sha_byte.to_string().repeat(40),
+            author_name: "T".into(),
+            author_email: "t@example.com".into(),
+            authored_at: committed_at,
+            committed_at,
+            parent_count: 1,
+            subject: format!("commit {sha_byte}"),
+            body: String::new(),
+            paths: paths
+                .iter()
+                .map(|p| CommitPath {
+                    path: (*p).to_string(),
+                    change_type: ChangeType::Modified,
+                    old_path: None,
+                })
+                .collect(),
+        }
+    }
+
+    async fn reconcile(
+        p: &SQLite3Pool,
+        since: Option<i64>,
+        commits: Vec<CommitEntry>,
+    ) -> HistoryResponse {
+        p.transaction(CancellationToken::new(), move |tx| {
+            reconcile_history(
+                tx,
+                guid(),
+                HISTORY_MODEL,
+                &HistoryRequest { since, commits },
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn stored_shas(p: &SQLite3Pool) -> Vec<String> {
+        p.transaction(CancellationToken::new(), move |tx| {
+            let mut stmt = tx.prepare("SELECT sha FROM project_commits ORDER BY committed_at")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn path_row_count(p: &SQLite3Pool) -> i64 {
+        p.transaction(CancellationToken::new(), move |tx| {
+            Ok(
+                tx.query_row("SELECT COUNT(*) FROM project_commit_paths", [], |r| {
+                    r.get::<_, i64>(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A commit's content is its identity, so posting the same set twice must be
+    /// a genuine no-op — that is what lets a client re-post its whole window on
+    /// every run instead of negotiating a diff with the server first.
+    #[tokio::test]
+    async fn reposting_the_same_history_changes_nothing() {
+        let p = history_pool().await;
+        let commits = vec![
+            commit_at('a', 100, &["src/a.rs"]),
+            commit_at('b', 200, &["src/b.rs", "src/a.rs"]),
+        ];
+
+        let first = reconcile(&p, None, commits.clone()).await;
+        assert_eq!(
+            first,
+            HistoryResponse {
+                indexed: 2,
+                unchanged: 0,
+                removed: 0
+            }
+        );
+
+        let second = reconcile(&p, None, commits).await;
+        assert_eq!(
+            second,
+            HistoryResponse {
+                indexed: 0,
+                unchanged: 2,
+                removed: 0
+            }
+        );
+        assert_eq!(stored_shas(&p).await.len(), 2);
+        assert_eq!(path_row_count(&p).await, 3);
+    }
+
+    /// `since` bounds the deletion half. Without it a client walking only the
+    /// recent window would wipe everything older on every pass — from the
+    /// server's side an unmentioned commit and one outside the walk look
+    /// identical, and only the client knows which it meant.
+    #[tokio::test]
+    async fn a_windowed_post_leaves_everything_older_alone() {
+        let p = history_pool().await;
+        reconcile(
+            &p,
+            None,
+            vec![
+                commit_at('a', 100, &["src/a.rs"]),
+                commit_at('b', 500, &["src/b.rs"]),
+            ],
+        )
+        .await;
+
+        // A run walking only from t=400 names just the newer commit.
+        let res = reconcile(&p, Some(400), vec![commit_at('b', 500, &["src/b.rs"])]).await;
+        assert_eq!(res.removed, 0, "the older commit is outside the window");
+        assert_eq!(stored_shas(&p).await.len(), 2);
+
+        // The same post with no window claims to speak for all of history.
+        let res = reconcile(&p, None, vec![commit_at('b', 500, &["src/b.rs"])]).await;
+        assert_eq!(res.removed, 1);
+        assert_eq!(stored_shas(&p).await, vec!["b".repeat(40)]);
+    }
+
+    /// Force-push, rebase and any other rewrite are not special cases: the new
+    /// refs simply reach a disjoint set of shas, and reconciliation drops the
+    /// old ones. Their path rows go with them through ON DELETE CASCADE — the
+    /// one thing that would otherwise leave orphans behind.
+    #[tokio::test]
+    async fn a_rewritten_history_orphans_the_old_shas_and_their_paths() {
+        let p = history_pool().await;
+        reconcile(
+            &p,
+            None,
+            vec![
+                commit_at('a', 100, &["src/a.rs"]),
+                commit_at('b', 200, &["src/b.rs"]),
+            ],
+        )
+        .await;
+        assert_eq!(path_row_count(&p).await, 2);
+
+        // Same window, entirely new shas: what a rebase looks like from here.
+        let res = reconcile(
+            &p,
+            None,
+            vec![
+                commit_at('c', 100, &["src/a.rs"]),
+                commit_at('d', 200, &["src/b.rs"]),
+            ],
+        )
+        .await;
+        assert_eq!(
+            res,
+            HistoryResponse {
+                indexed: 2,
+                unchanged: 0,
+                removed: 2
+            }
+        );
+        assert_eq!(stored_shas(&p).await, vec!["c".repeat(40), "d".repeat(40)]);
+        assert_eq!(
+            path_row_count(&p).await,
+            2,
+            "the dropped commits' paths must cascade away, not orphan"
+        );
+    }
+
+    async fn prune(p: &SQLite3Pool, q: HistoryPruneQuery) -> HistoryPruneResponse {
+        p.transaction(CancellationToken::new(), move |tx| {
+            prune_history(tx, guid(), HISTORY_MODEL, &q)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Retention is the half reconciliation structurally cannot do: a commit
+    /// still reachable from the tracked refs is never dropped by a `POST`,
+    /// however old it gets. Each bound alone, and `keep_last=0` as the explicit
+    /// spelling of "drop the channel".
+    #[tokio::test]
+    async fn each_retention_bound_prunes_on_its_own_axis() {
+        let p = history_pool().await;
+        let all = vec![
+            commit_at('a', 100, &["src/a.rs"]),
+            commit_at('b', 200, &["src/b.rs"]),
+            commit_at('c', 300, &["src/c.rs"]),
+        ];
+        reconcile(&p, None, all.clone()).await;
+
+        // Rank alone: keep the two newest.
+        let res = prune(
+            &p,
+            HistoryPruneQuery {
+                keep_last: Some(2),
+                older_than: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            res,
+            HistoryPruneResponse {
+                removed: 1,
+                remaining: 2
+            }
+        );
+        assert_eq!(stored_shas(&p).await, vec!["b".repeat(40), "c".repeat(40)]);
+        assert_eq!(
+            path_row_count(&p).await,
+            2,
+            "the pruned commit's paths must cascade away, not orphan"
+        );
+
+        // Clock alone.
+        let res = prune(
+            &p,
+            HistoryPruneQuery {
+                keep_last: None,
+                older_than: Some(250),
+            },
+        )
+        .await;
+        assert_eq!(res.removed, 1);
+        assert_eq!(stored_shas(&p).await, vec!["c".repeat(40)]);
+
+        // `keep_last=0` is how "everything" is spelled out loud.
+        reconcile(&p, None, all).await;
+        let res = prune(
+            &p,
+            HistoryPruneQuery {
+                keep_last: Some(0),
+                older_than: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            res,
+            HistoryPruneResponse {
+                removed: 3,
+                remaining: 0
+            }
+        );
+        assert_eq!(path_row_count(&p).await, 0);
+    }
+
+    /// The bounds **intersect**, and that is the load-bearing choice: given two
+    /// rules a destructive endpoint must take the conservative reading, so
+    /// `keep_last` is a floor the clock cannot cut through. Union semantics here
+    /// would make "prune anything older than a year, but never leave me with
+    /// fewer than N" silently mean "delete everything older than a year".
+    #[tokio::test]
+    async fn the_two_bounds_intersect_so_keep_last_is_a_floor() {
+        let p = history_pool().await;
+        reconcile(
+            &p,
+            None,
+            vec![
+                commit_at('a', 100, &["src/a.rs"]),
+                commit_at('b', 200, &["src/b.rs"]),
+                commit_at('c', 300, &["src/c.rs"]),
+            ],
+        )
+        .await;
+
+        // The clock condemns all three; the floor saves the two newest.
+        let res = prune(
+            &p,
+            HistoryPruneQuery {
+                keep_last: Some(2),
+                older_than: Some(1_000),
+            },
+        )
+        .await;
+        assert_eq!(
+            res,
+            HistoryPruneResponse {
+                removed: 1,
+                remaining: 2
+            }
+        );
+        assert_eq!(stored_shas(&p).await, vec!["b".repeat(40), "c".repeat(40)]);
+
+        // And a floor wider than the history protects all of it — the caller
+        // sees that from `remaining` without a second request.
+        let res = prune(
+            &p,
+            HistoryPruneQuery {
+                keep_last: Some(99),
+                older_than: Some(1_000),
+            },
+        )
+        .await;
+        assert_eq!(
+            res,
+            HistoryPruneResponse {
+                removed: 0,
+                remaining: 2
+            }
+        );
+    }
+
+    /// A prune leaves the channel in a state the next ordinary indexer run
+    /// simply refills — the repository is the source of truth, so this handle is
+    /// destructive without being lossy. Pinned because it is the reason the
+    /// endpoint can be blunt: reconciliation re-inserts what the refs still
+    /// reach, and `unchanged` proves the rest was untouched.
+    #[tokio::test]
+    async fn a_pruned_history_is_rebuilt_by_the_next_reconciliation() {
+        let p = history_pool().await;
+        let all = vec![
+            commit_at('a', 100, &["src/a.rs"]),
+            commit_at('b', 200, &["src/b.rs"]),
+        ];
+        reconcile(&p, None, all.clone()).await;
+        prune(
+            &p,
+            HistoryPruneQuery {
+                keep_last: Some(1),
+                older_than: None,
+            },
+        )
+        .await;
+
+        let res = reconcile(&p, None, all).await;
+        assert_eq!(
+            res,
+            HistoryResponse {
+                indexed: 1,
+                unchanged: 1,
+                removed: 0
+            }
+        );
+    }
+
+    /// The regression guard for the whole two-table decision. A commit names
+    /// paths the working tree may not contain — deleted long ago, excluded by
+    /// `.mindex`, or in a language the enum does not carry. Had these been
+    /// modelled as `project_files` rows, every one of them would be reported
+    /// `orphaned` by every drift check forever, `mindex-index --check` would
+    /// exit non-zero on a clean tree, and the watcher would keep trying to
+    /// delete them.
+    #[tokio::test]
+    async fn commit_rows_are_invisible_to_drift() {
+        let p = history_pool().await;
+        reconcile(
+            &p,
+            None,
+            vec![commit_at(
+                'a',
+                100,
+                &["deleted/long/ago.rs", "vendor/excluded.rs"],
+            )],
+        )
+        .await;
+
+        // What read_drift_baseline reads: project_files, which history never touches.
+        let files = p
+            .transaction(CancellationToken::new(), move |tx| {
+                Ok(tx.query_row("SELECT COUNT(*) FROM project_files", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(files, 0, "history must not create project_files rows");
+
+        let res = compute_drift(&HashMap::new(), &HashSet::new(), &HashMap::new());
+        assert!(
+            res.orphaned.is_empty(),
+            "a commit's paths must never surface as working-tree drift"
+        );
+    }
+
+    /// Deleting a project takes its history with it — the FK to `projects` is
+    /// the one place commit rows are attached to anything.
+    #[tokio::test]
+    async fn deleting_a_project_cascades_to_its_history() {
+        let p = history_pool().await;
+        reconcile(&p, None, vec![commit_at('a', 100, &["src/a.rs"])]).await;
+
+        p.transaction(CancellationToken::new(), move |tx| {
+            tx.execute("DELETE FROM projects WHERE guid = ?1", params![guid()])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(stored_shas(&p).await.is_empty());
+        assert_eq!(path_row_count(&p).await, 0);
+    }
+
+    async fn read_history(
+        p: &SQLite3Pool,
+        path: &'static str,
+    ) -> (bool, bool, usize, Vec<CommitSummary>) {
+        p.transaction(CancellationToken::new(), move |tx| {
+            read_file_history(tx, guid(), HISTORY_MODEL, path)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The single most load-bearing read in the tool. Without the channel probe,
+    /// "nobody ever reconciled this repository's commits" and "nothing ever
+    /// touched this file" are byte-for-byte the same answer — and the model
+    /// reports the second, which is a claim about the file that nothing supports.
+    #[tokio::test]
+    async fn an_unreconciled_project_is_distinguishable_from_a_file_with_no_commits() {
+        let p = history_pool().await;
+
+        let (history_indexed, _, total, commits) = read_history(&p, "src/a.rs").await;
+        assert!(!history_indexed, "no channel at all");
+        assert_eq!((total, commits.len()), (0, 0));
+
+        reconcile(&p, None, vec![commit_at('a', 100, &["src/other.rs"])]).await;
+
+        let (history_indexed, _, total, commits) = read_history(&p, "src/a.rs").await;
+        assert!(history_indexed, "the channel exists now");
+        assert_eq!(
+            (total, commits.len()),
+            (0, 0),
+            "but this particular file still has no commits"
+        );
+    }
+
+    /// A commit names paths the code index does not hold — deleted years ago,
+    /// excluded by `.mindex`, in an unsupported language. `path_indexed` is what
+    /// keeps "gone from the tree" and "never there" apart, and the absence of a
+    /// foreign key on `project_commit_paths.path` is what makes such a row
+    /// storable at all.
+    #[tokio::test]
+    async fn a_commit_path_the_code_index_never_held_is_stored_and_flagged() {
+        let p = history_pool().await;
+        reconcile(
+            &p,
+            None,
+            vec![commit_at('a', 100, &["deleted/long/ago.rs"])],
+        )
+        .await;
+
+        let (_, path_indexed, total, commits) = read_history(&p, "deleted/long/ago.rs").await;
+        assert!(!path_indexed, "the code channel does not hold it");
+        assert_eq!(total, 1, "its history is real regardless");
+        assert_eq!(commits[0].short_sha, "aaaaaaaa");
+    }
+
+    /// Newest first, capped, with the pre-cap total reported separately — so a
+    /// truncated answer is visibly truncated rather than a list that happens to
+    /// be exactly as long as the cap.
+    #[tokio::test]
+    async fn commits_come_back_newest_first_and_truncation_is_visible() {
+        let p = history_pool().await;
+        let shas: Vec<char> = ('a'..='z').take(FILE_HISTORY_LIMIT + 3).collect();
+        let commits: Vec<_> = shas
+            .iter()
+            .enumerate()
+            .map(|(i, c)| commit_at(*c, 100 + i as i64, &["src/a.rs"]))
+            .collect();
+        reconcile(&p, None, commits).await;
+
+        let (_, _, total, got) = read_history(&p, "src/a.rs").await;
+        assert_eq!(
+            total,
+            FILE_HISTORY_LIMIT + 3,
+            "the pre-cap count is reported"
+        );
+        assert_eq!(got.len(), FILE_HISTORY_LIMIT);
+        assert_eq!(
+            got[0].sha,
+            shas.last().unwrap().to_string().repeat(40),
+            "newest first"
+        );
+    }
+
+    /// A file that was moved carries its earlier history under its old name.
+    /// Without `old_path` the trail simply stops at the rename with nothing
+    /// saying why, which reads as "this file has no earlier history".
+    #[tokio::test]
+    async fn a_rename_is_stored_with_its_source_path() {
+        let p = history_pool().await;
+        let mut c = commit_at('a', 100, &[]);
+        c.paths = vec![CommitPath {
+            path: "src/new.rs".into(),
+            change_type: ChangeType::Renamed,
+            old_path: Some("src/old.rs".into()),
+        }];
+        reconcile(&p, None, vec![c]).await;
+
+        let (_, _, total, got) = read_history(&p, "src/new.rs").await;
+        assert_eq!(total, 1);
+        assert_eq!(got[0].change_type, ChangeType::Renamed);
+        assert_eq!(got[0].old_path.as_deref(), Some("src/old.rs"));
     }
 }

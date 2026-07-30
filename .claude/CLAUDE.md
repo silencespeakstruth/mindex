@@ -89,13 +89,17 @@ flag) — tuning them in a container means mounting a `config.toml`.
   kernel**, which returns NaN for padded rows in fp16 and still answers 200. That is
   `attention_backend()` in `__main__.py`; removing it silently corrupts every batch of
   more than one text.
-- Migrations live in `src/db/migrations/`. At 1.0.0 there is exactly **one**,
-  `v1.0.0_schema.sql` — the whole schema, in the order SQLite needs (tables before
-  the triggers and foreign keys that name them). The applied set is the `MIGRATIONS`
-  slice in `main.rs`, keyed by the integer that lands in `PRAGMA user_version`; the
-  filename's version is documentation. Six tables: `projects`, `project_files`,
-  `project_file_chunks`, `project_file_status_log`, `project_file_symbols`,
-  `research_runs`. There are **no 1:1 side tables** — the three that existed were
+- Migrations live in `src/db/migrations/`. **Two**: `v1.0.0_schema.sql` (version 1)
+  — the whole 1.0.0 schema, in the order SQLite needs (tables before the triggers
+  and foreign keys that name them) — and `v1.1.0_git_history.sql` (version 2),
+  which adds `project_commits` + `project_commit_paths`. The applied set is the
+  `MIGRATIONS` slice in `main.rs`, keyed by the integer that lands in
+  `PRAGMA user_version`; the filename's version is documentation. **v1.0.0 is now
+  frozen** — editing it in place no longer reaches a database stamped at 1, since
+  the filter is `version > user_version`, so the edit would be skipped in silence.
+  Eight tables: `projects`, `project_files`, `project_file_chunks`,
+  `project_file_status_log`, `project_file_symbols`, `research_runs`,
+  `project_commits`, `project_commit_paths`. There are **no 1:1 side tables** — the three that existed were
   artefacts of `ADD COLUMN` having no `IF NOT EXISTS` form, and folding them back
   into their parents removed a JOIN from the prepare-phase skip and two INSERTs
   from every journalled run. Note `sqlfluff` skips files over its default 20 kB and
@@ -320,7 +324,8 @@ Non-obvious invariants:
   as text so the `research.model_lacks_tools` path is covered. It finds its place in
   the script by counting `role: "tool"` messages.
 - **Model protocol = Ollama's native tool calling.** The ten tools
-  (search/grep/symbols/outline/callers/list_files/read_chunks/note/revise_plan/finalize)
+  (search/grep/symbols/outline/callers/list_files/read_chunks/file_history/note/
+  revise_plan/finalize)
   are passed as `tools` JSON Schemas
   (`tool_specs`) and arrive back in `message.tool_calls` — a field distinct from
   `content` and `thinking`, which is the whole point: a model cannot put its
@@ -1012,6 +1017,155 @@ sampling, not the prompt. 2 of 12 glm runs had a turn exceeding 600 s — a 17 %
 failure rate at the old `turn_timeout_ms`, which is why that key now must sit above
 every budget.
 
+## Git history channel
+
+The working tree says what the code **is**; `project_commits` +
+`project_commit_paths` say **why** it became that way. Opt-in
+(`mindex-index --history`, off by default), metadata-only: **no embeddings, no
+Qdrant, no chunks, no derivation version**, and one model-facing tool
+(`file_history`) the run reaches for when it decides the question is historical.
+The channel is complete at that: **commit metadata is the whole feature**, not a
+first instalment of one, because the high-value history questions ("what touched
+this file and why", "what changed recently") are SQL questions, not similarity
+questions — and the tool is offered, never imposed, so a run that has no use for
+history simply never calls it.
+
+**Semantic search over commit messages is not part of it, and the cost is why.**
+Vectors here are not one more column: commit points cannot live in the project's
+collection (isolation is a `has_id` filter built over `project_file_chunks`, and
+widening it hands commits to `/search` and to every client expecting
+`path:start-end`), so it means a second collection per project, doubling
+`COLLECTION_SCHEMA_VERSION`'s no-self-healing hazard; the hard-delete lifecycle
+below would have to invert to soft-delete + GC in three places; a sha is a content
+hash and so is structurally incapable of noticing a changed message-composition
+rule, which forces a derivation version of its own; and `POST /history` would grow
+an embed phase — a first reconciliation of 20 000 commits is ~78 GPU batches inside
+one request that today returns in milliseconds. That is more than the whole channel
+cost. If message *search* is ever wanted, the ladder is `LIKE` (the `grep_core`
+precedent) → FTS5 → vectors, each rung having to be measured insufficient before
+the next; FTS5 is unusually cheap here because commit messages are immutable and are
+only ever replaced wholesale by reconciliation, so the invalidation surface that
+makes FTS5 a project for chunks is nearly absent. A text-keyed commit tool carries
+one non-obvious defect to solve first: a message hit shows the model **no file**, so
+its `shown` evidence is empty, and a run whose only tool was that one lands in the
+ungrounded-report gate's *exemption* — the hole the 2026-07-30 measurement closed.
+
+**Not pseudo-files, and `/drift` is the reason.** A commit modelled as a
+`project_files` row would need a `programming_language` passing that CHECK and a
+path passing the path CHECK — and would then be reported `orphaned` by every
+drift check forever (the working-tree manifest can never contain it),
+`mindex-index --check` would exit non-zero on a clean tree, and the watcher would
+keep trying to delete it. Exactly the `research_runs` argument. Living in their
+own tables also excludes commit rows from `build_search_query`'s candidate set
+**by construction** rather than by a filter someone must remember to write, which
+is why this is two tables rather than a `channel` column on
+`project_file_chunks`. Pinned by `commit_rows_are_invisible_to_drift` and
+`test_commit_paths_never_surface_in_drift`.
+
+**`project_commit_paths.path` carries no FK, deliberately.** A commit names paths
+deleted years ago, paths `.mindex` excludes, and paths in languages the enum does
+not carry: `RESTRICT` would refuse the insert, `CASCADE` would erase history when
+`prune_deleted_files` runs. The join into the code channel is therefore a *soft*
+join by equality, and `file_history` must report an un-indexed path as such — the
+`outline.indexed` failure again.
+
+**Hard delete, no GC.** These rows own nothing outside SQLite, so their lifecycle
+is `project_file_symbols`' (delete and be done), not `project_file_chunks`'. That
+inverts if commit messages ever gain vectors.
+
+**Sync is set reconciliation, and that is the whole design.** `POST
+/v0/{guid}/history` is a **full-set replace within `since`**: a sha is the hash of
+its own content, so there is no "same identity, different bytes" case and no
+update path at all. Force-push, rebase and history rewrite are therefore *not*
+special cases — each is one reconciliation in which many shas orphan at once.
+`since` bounds only the **deletion** half and is load-bearing: without it a client
+walking a window would wipe everything older on every pass, since from the
+server's side an unmentioned commit and one outside the walk look identical. The
+posted set goes through a temp table, not a `NOT IN (?, …)` list, whose bind count
+would hit SQLite's variable limit inside the range `max_history_commits` permits.
+
+**Retention is `DELETE /v0/{guid}/history`, and it is the half reconciliation
+structurally cannot do.** A `POST` drops only what the tracked refs no longer
+reach, so a commit still on `master` never ages out however old it gets — the age
+window bounds *ingestion*, not retention, which is easy to misread as a retention
+policy that is quietly not one. The bounds are `keep_last=N` (newest by
+`committed_at`, `sha DESC` breaking the tie so a rebase's same-second commits
+prune reproducibly) and `older_than=<unix seconds>`, and they **intersect**: a
+commit dies only if both condemn it, so `keep_last` is a floor the clock cannot
+cut through and "prune anything older than a year, but never leave me fewer than
+N" means what it reads as. Naming neither is a 400
+(`validation.history_bound_missing`), the `require_nonempty_selector` rule for a
+resource whose bounds are scalars — a wipe is asked for (`keep_last=0`), never
+arrived at by forgetting a parameter. It is deliberately **operator-facing and
+called by no client**: the endpoint is a handle, and giving `mindex-index` a
+retention flag would make every ordinary indexing run a potential deleter. Unlike
+`DELETE /files` this is destructive without being lossy — the repository is the
+source of truth, so the next `--history-only` run refills whatever the refs still
+reach.
+
+**One producer: `mindex-index`.** Rule 10 (**Four clients**) does **not** fire —
+its trigger is what a file set is, what a path spells, what bytes get hashed,
+which files a client refuses, and a commit list is none of those. So the watcher,
+the VS Code extension and the MCP `index_files` tool are deliberately *not*
+producers; replicating a git walk four times would add the surface that rule
+exists to shrink. `--history-only` restricts a run to the history phase **without
+switching the channel on** — that split is what lets the post-commit hook pass it
+unconditionally without enabling history behind the operator's back. A missing
+`git` or a non-repo root is a WARN that skips the phase, never a failed run (the
+`SymbolExtractor` degradation rule).
+
+**`--relative` is not optional.** `git log --raw` reports paths relative to the
+**repository** root while `--root` may be a subdirectory of it, so without it a
+run scoped to `src/` indexes `db/qdrant.rs` as a file and `src/db/qdrant.rs` as a
+commit path — the soft join is then empty for every file in the project and
+`file_history` answers "no commit touches this" with nothing erroring. At the
+repository root the flag is a no-op; below it, it also drops commits that touched
+nothing under `--root`, which is the right scoping. Pinned by
+`the_walk_asks_git_for_root_relative_paths`.
+
+**Four traps in `git log --format=<sep> --raw -M -z`**, each pinned by a test in
+`tools/indexer/src/git.rs`. `%s` is **not** requested: it is the first *paragraph*
+of `%B` joined, so asking for both invites disagreement on a wrapped subject — the
+subject is derived instead. `-z` plus `%x1e`/`%x1f` is mandatory, not tidiness: a
+body contains newlines and may contain tabs and anything else (a body containing
+`\x1f` itself costs that one commit its paths and nothing else, because records
+split on `\x1e` first). And **the raw block's arity depends on its status letter**:
+an ordinary change emits one path, a rename or copy emits *two* — a parser
+assuming one desynchronises for the rest of the stream and silently files every
+later path under the wrong commit. And **git separates the format output from the
+diff with a newline**, so the first raw header arrives as `"\n:100644 …"`: a
+parser that tests `starts_with(':')` without trimming stops at the first token and
+returns **no paths at all**, for every commit, with no error — which is how it
+shipped past eight unit tests whose fixture was tidier than git's real bytes. A
+commit legitimately having no paths (a merge) is what makes that silent. That is also what `old_path`'s biconditional
+validation catches at the edge: `Some` on a modification is the signature of a
+mis-parsed stream, so it is a 400 rather than a stored desync.
+
+**Four client-side drops, all announced.** Age **and** count bounds together (one
+alone breaks on a repo idle for a year, or on one having a furious month);
+messages under `history_min_message_bytes`; merge commits whose subject is
+git-generated **and** whose body is empty **and** which have >1 parent — the
+conjunction is what spares a GitHub squash-merge, which is single-parent and
+carries the PR description, often the best prose in a repo; and commits all of
+whose paths are outside the project's globs. An over-cap message is **truncated
+with a marker**, not dropped: the server would 400 the whole reconciliation, and
+dropping would take the commit's path list with it. A channel that quietly indexes
+a third of what it walked is indistinguishable from a repository that small.
+
+**`file_history` reports three flags because an empty list has three meanings**
+(`history_indexed` / `in_scope` / `path_indexed`), and a bare `[]` reads as the
+one that is never true. Path-keyed, so out of scope is an explicit **refusal**.
+Its `shown` evidence is **only the asked path, span-less**: recording the commit's
+other touched paths would mark files the model never saw as shown, quietly
+promoting a later invented citation from `unverified` to `path_only`. **No commit
+citation grammar, deliberately** — a sha is content-addressed and `git show`
+verifies it, so it is the one class needing no server-side gate; the prompt
+requires a historical claim be anchored to a `path:start-end` in the code with the
+sha named in prose, and every result repeats that. A report citing only shas
+therefore parses to `total: 0` and correctly trips the ungrounded-report gate.
+Shipping the tool without its `system_prompt` paragraph would repeat the markdown
+lesson exactly: the corpus half is invisible without the prompt half.
+
 ## Retrieval pipeline
 
 Three named vectors per collection: `dense` (1024-d cosine), `sparse`
@@ -1437,6 +1591,12 @@ it is the one Rust parser and now also holds the shared size cap; the TypeScript
 mirror (`mindexFile.ts` + `globContract.test.ts`'s shared fixture table) is the
 only sanctioned copy.
 
+**Git history is deliberately outside this rule**, and single-producer for that
+reason — see **Git history channel**. The rule's trigger is what a file set is,
+what a path spells, what bytes get hashed, and which files a client refuses; a
+commit list is none of those, so `mindex-index` walks git and nothing else does.
+Do not "fix" that by teaching the watcher or the extension to walk it too.
+
 And the client is only as fresh as its build: the extension runs `dist/`, so a
 change to `src/` that was never `npm run compile`d leaves a plugin scanning by
 yesterday's rules against today's server. Recompile before concluding the plugin
@@ -1455,7 +1615,12 @@ is wrong.
   derivation versions) — an escape hatch for what versioning can't see, not a
   routine flag; scope it with `--include`/`--exclude`. `--symbols-only` rebuilds
   just the symbol table (no GPU, no Qdrant); its summary counts symbol rows, not
-  chunks, and reports no "too short" (that is a slicer verdict).
+  chunks, and reports no "too short" (that is a slicer verdict). `--history`
+  additionally reconciles the git channel (off by default; `git_refs` in `.mindex`
+  picks the refs, and `--git-ref` replaces that list like every other scope flag);
+  `--history-only` restricts a run to that phase *without* switching the channel
+  on, which is how the post-commit hook passes it unconditionally. Watch the drop
+  counts it prints — see **Git history channel**.
 - `mindex-watch`: inotify daemon keeping the index live — debounced reindex/delete
   (`--debounce-ms`, 1000) + full drift sweep every `--drift-interval` (300 s) to
   catch offline changes. Reads `.mindex`. `--dry-run` makes no mutating call but
@@ -1508,7 +1673,7 @@ is wrong.
   layer.
 - `.mindex` (repo-root, committed — index scope is part of the project): **YAML**,
   required `guid:` (either UUID spelling, normalized to hyphenated) + optional
-  `exclude_paths:`/`include_paths:`/`languages:` **lists**. Unknown key = error
+  `exclude_paths:`/`include_paths:`/`languages:`/`git_refs:` **lists**. Unknown key = error
   (`deny_unknown_fields`), scalar-instead-of-list = error: a mistyped
   `exclude_path:` would otherwise index the tree it was meant to keep out. One file,
   repo root, no nesting. **`tools/mindexfile` is the only Rust parser** (indexer +
@@ -1621,12 +1786,14 @@ is wrong.
    drop). New *columns* are equally
    blocked: `ADD COLUMN` has no `IF NOT EXISTS` form, so it fails the idempotency
    test — a later migration must add the field as a 1:1 side table with
-   `CREATE TABLE IF NOT EXISTS` and `ON DELETE CASCADE`. Do that only once 1.0.0's
-   schema is in someone else's hands; **until then edit `v1.0.0_schema.sql` in
-   place**, because a side table is a permanent seam paid to avoid a migration
-   nobody needs yet. That is why the schema has none: three were folded back into
-   their parents before release. No migration *upgrade* path is maintained beyond
-   that: the DB may be dropped and recreated freely.
+   `CREATE TABLE IF NOT EXISTS` and `ON DELETE CASCADE`. **v1.0.0 is frozen** —
+   its schema is in use, so an in-place edit is skipped in silence on any database
+   already stamped at 1 (`version > user_version`), and the first symptom is a 500
+   with `no such table`/`no such column` on the request that needs it. New *tables*
+   are the easy case and need no side table: `v1.1.0_git_history.sql` adds two, and
+   the upgrade is verified non-destructive on a copy of a real database. A new
+   *field* still costs a 1:1 side table, which is why the schema has none today —
+   three were folded back into their parents before release.
 9. Changing how chunks or symbols are derived → bump the matching const under
    **Derivation versions**. That is what makes the change reach files already
    indexed; skipping it leaves them stale behind a matching hash, silently.

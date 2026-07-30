@@ -42,6 +42,102 @@ pub struct DriftResponse {
     pub indexing: Vec<String>,
 }
 
+/// How a commit touched one path. Mirrors the server's `ChangeType`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeType {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct CommitPath {
+    pub path: String,
+    pub change_type: ChangeType,
+    /// Source of a rename or copy. The server enforces the biconditional —
+    /// present exactly for `renamed`/`copied` — because a `Some` here on a
+    /// modification is the signature of a mis-parsed `--raw -z` stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct CommitEntry {
+    pub sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: i64,
+    pub committed_at: i64,
+    pub parent_count: usize,
+    pub subject: String,
+    pub body: String,
+    pub paths: Vec<CommitPath>,
+}
+
+/// `POST /v0/{guid}/history` body. A full-set replace **within `since`**: the
+/// server drops anything inside that window this request does not name, which is
+/// what makes a force-push or a rebase need no special handling. Omitting
+/// `since` claims to speak for the whole history.
+#[derive(Serialize)]
+pub struct HistoryRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    pub commits: Vec<CommitEntry>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct HistoryResponse {
+    pub indexed: usize,
+    pub unchanged: usize,
+    pub removed: usize,
+}
+
+/// `POST /{protocol}/{guid}/history` — an ingestion route like `/index`, so
+/// unlike `/drift` the URL carries the protocol segment.
+pub async fn post_history(
+    client: &Client,
+    server: &str,
+    protocol: &str,
+    project: &str,
+    request: HistoryRequest,
+    cancel: &CancellationToken,
+) -> Result<HistoryResponse> {
+    let url = format!(
+        "{}/{}/{}/history",
+        server.trim_end_matches('/'),
+        protocol,
+        project
+    );
+
+    let resp = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("cancelled"),
+        r = client.post(&url).json(&request).send() => {
+            r.with_context(|| format!("POST {url}"))?
+        }
+    };
+
+    let status = resp.status();
+    if status.as_u16() == 499 {
+        bail!("cancelled");
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("server {status}: {body}");
+    }
+
+    let parsed = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("cancelled"),
+        r = resp.json::<HistoryResponse>() => r.context("invalid response JSON")?,
+    };
+
+    Ok(parsed)
+}
+
 /// `POST /projects/{guid}/drift`. The drift route is a management endpoint, so the
 /// URL has no `{protocol}` segment (unlike `/index`).
 pub async fn check_drift(

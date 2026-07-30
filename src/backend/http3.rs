@@ -28,9 +28,9 @@ use crate::backend::metrics::{
 };
 use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
-    delete_files, delete_project, get_config, get_files, get_health, get_metrics,
+    delete_files, delete_history, delete_project, get_config, get_files, get_health, get_metrics,
     get_project_stats, get_projects, get_status, get_version, post_cancel, post_drift, post_gc,
-    post_index, post_research, post_retry, post_search, post_symbols,
+    post_history, post_index, post_research, post_retry, post_search, post_symbols,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -87,6 +87,10 @@ pub struct RouterState {
     pub max_symbol_name_bytes: usize,
     /// Upper bound a `/symbols` request may set for `limit` (`[limits]` config).
     pub max_symbol_results: usize,
+    /// Commit-count cap for one `/history` request (`[limits]` config).
+    pub max_history_commits: usize,
+    /// Byte cap for one commit's subject + body (`[limits]` config).
+    pub max_commit_message_bytes: usize,
     /// Paths per batch on soft-delete / cancel (`[indexing]` config).
     pub path_batch_size: usize,
     /// Status-log retention for the synchronous `POST /gc` pass (`[workers]` config).
@@ -412,6 +416,10 @@ fn build_router(
         .route("/v0/{project_guid}/search", post(post_search))
         .route("/v0/{project_guid}/symbols", post(post_symbols))
         .route("/v0/{project_guid}/research", post(post_research))
+        .route(
+            "/v0/{project_guid}/history",
+            post(post_history).delete(delete_history),
+        )
         .route("/projects", get(get_projects))
         .route(
             "/projects/{project_guid}",

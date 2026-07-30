@@ -17,6 +17,9 @@ max_drift_files = 50
 # Small /symbols caps so test_symbols.py can trip the 400s cheaply.
 max_symbol_name_bytes = 64
 max_symbol_results = 10
+# Small history caps so test_history.py can trip the 400s cheaply.
+max_history_commits = 50
+max_commit_message_bytes = 4096
 
 # /research against the scripted mock-ollama. max_concurrent = 1 lets
 # test_research.py exercise 429 research.busy and slot release with two requests.

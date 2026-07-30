@@ -65,7 +65,9 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.too_many_files`, `validation.selector_too_large`, \
 `validation.symbol_name_empty`, `validation.symbol_name_too_long`, \
 `validation.symbol_limit_out_of_range`, `validation.research_budget_out_of_range`, \
-`research.busy`, `research.model_missing`.",
+`validation.too_many_commits`, `validation.commit_message_too_large`, \
+`validation.commit_invalid`, `validation.history_bound_missing`, `research.busy`, \
+`research.model_missing`.",
     ),
     paths(
         // Indexing
@@ -74,6 +76,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::post_cancel,
         handlers::post_retry,
         handlers::post_drift,
+        handlers::post_history,
+        handlers::delete_history,
         // Search
         handlers::post_search,
         handlers::post_symbols,
@@ -120,6 +124,12 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ProjectListResponse,
         crate::backend::v0::models::DriftRequest,
         crate::backend::v0::models::DriftResponse,
+        crate::backend::v0::models::ChangeType,
+        crate::backend::v0::models::CommitPath,
+        crate::backend::v0::models::CommitEntry,
+        crate::backend::v0::models::HistoryRequest,
+        crate::backend::v0::models::HistoryResponse,
+        crate::backend::v0::models::HistoryPruneResponse,
         crate::backend::v0::models::GcResponse,
         crate::backend::v0::models::VersionResponse,
         crate::backend::v0::models::HealthChecks,
@@ -169,12 +179,13 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (15 routes; two carry two methods each).
+        // Every routed path is documented (16 routes; two carry two methods each).
         for p in [
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",
             "/v0/{project_guid}/symbols",
             "/v0/{project_guid}/research",
+            "/v0/{project_guid}/history",
             "/projects",
             "/projects/{project_guid}",
             "/projects/{project_guid}/files",
@@ -189,7 +200,7 @@ mod tests {
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 15, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 16, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak

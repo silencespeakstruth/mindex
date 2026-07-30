@@ -189,6 +189,7 @@ export interface ResearchStep {
         | "callers"
         | "list_files"
         | "read_chunks"
+        | "file_history"
         | "note"
         | "revise_plan";
     /** Exactly one of these is present, per action: see the SSE contract. */

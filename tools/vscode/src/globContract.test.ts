@@ -50,12 +50,13 @@ const GUID = "123e4567-e89b-42d3-a456-426614174000";
 
 void test("parses guid, scope lists and comments", () => {
     const f = parseMindexFile(
-        `# a comment\n\nguid: ${GUID}\ninclude_paths:\n  - src/**\nexclude_paths:\n  - target/**\nlanguages:\n  - rust\n`
+        `# a comment\n\nguid: ${GUID}\ninclude_paths:\n  - src/**\nexclude_paths:\n  - target/**\nlanguages:\n  - rust\ngit_refs:\n  - master\n`
     );
     assert.equal(f.guid, GUID);
     assert.deepEqual(f.includePaths, ["src/**"]);
     assert.deepEqual(f.excludePaths, ["target/**"]);
     assert.deepEqual(f.languages, ["rust"]);
+    assert.deepEqual(f.gitRefs, ["master"]);
 });
 
 void test("guid-only file has empty scope", () => {
@@ -63,6 +64,7 @@ void test("guid-only file has empty scope", () => {
     assert.deepEqual(f.includePaths, []);
     assert.deepEqual(f.excludePaths, []);
     assert.deepEqual(f.languages, []);
+    assert.deepEqual(f.gitRefs, []);
 });
 
 void test("a dashless guid is normalized to hyphenated", () => {

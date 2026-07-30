@@ -92,6 +92,18 @@ pub enum ApiError {
     SymbolNameTooLong { got: usize, max: usize },
     /// The symbols `limit` was outside `1..=max`. 400.
     SymbolLimitOutOfRange { got: usize, max: usize },
+    /// Too many commits in one `/history` request. 400.
+    TooManyCommits { got: usize, max: usize },
+    /// One commit's `subject` + `body` exceeded `max` bytes. 400.
+    CommitMessageTooLarge { sha: String, got: usize, max: usize },
+    /// A commit sha was not 40 or 64 hex chars, or a commit's shape was
+    /// otherwise unusable (empty subject, a rename with no source path). 400.
+    CommitInvalid { sha: String, reason: &'static str },
+    /// `DELETE /history` named neither `keep_last` nor `older_than`. 400.
+    /// The `selector.empty` rule for a resource whose bounds are scalars: a
+    /// destructive endpoint must not wipe a channel because a parameter was
+    /// forgotten.
+    HistoryBoundMissing,
     /// All research slots are taken (`[research].max_concurrent`). 429.
     ResearchBusy,
     /// A research request named no model and `[research].default_model` is unset. 400.
@@ -133,6 +145,10 @@ impl ApiError {
             ApiError::SymbolNameEmpty => "validation.symbol_name_empty",
             ApiError::SymbolNameTooLong { .. } => "validation.symbol_name_too_long",
             ApiError::SymbolLimitOutOfRange { .. } => "validation.symbol_limit_out_of_range",
+            ApiError::TooManyCommits { .. } => "validation.too_many_commits",
+            ApiError::CommitMessageTooLarge { .. } => "validation.commit_message_too_large",
+            ApiError::CommitInvalid { .. } => "validation.commit_invalid",
+            ApiError::HistoryBoundMissing => "validation.history_bound_missing",
             ApiError::ResearchBusy => "research.busy",
             ApiError::ResearchModelMissing => "research.model_missing",
             ApiError::ResearchBudgetOutOfRange { .. } => "validation.research_budget_out_of_range",
@@ -182,6 +198,10 @@ impl ApiError {
             ApiError::SymbolNameEmpty => "Empty symbol name",
             ApiError::SymbolNameTooLong { .. } => "Symbol name too long",
             ApiError::SymbolLimitOutOfRange { .. } => "Invalid symbols limit",
+            ApiError::HistoryBoundMissing => "Missing retention bound",
+            ApiError::TooManyCommits { .. } => "Too many commits",
+            ApiError::CommitMessageTooLarge { .. } => "Commit message too large",
+            ApiError::CommitInvalid { .. } => "Invalid commit",
             ApiError::ResearchBusy => "Research capacity exhausted",
             ApiError::ResearchModelMissing => "No research model",
             ApiError::ResearchBudgetOutOfRange { .. } => "Invalid research budget",
@@ -200,6 +220,10 @@ impl ApiError {
             ApiError::SelectorEmpty | ApiError::SelectorTooLarge { .. } => Some("include/exclude"),
             ApiError::SymbolNameEmpty | ApiError::SymbolNameTooLong { .. } => Some("name"),
             ApiError::SymbolLimitOutOfRange { .. } => Some("limit"),
+            ApiError::TooManyCommits { .. }
+            | ApiError::CommitMessageTooLarge { .. }
+            | ApiError::CommitInvalid { .. } => Some("commits"),
+            ApiError::HistoryBoundMissing => Some("keep_last/older_than"),
             ApiError::ResearchModelMissing => Some("model"),
             ApiError::ResearchBudgetOutOfRange { field, .. } => Some(field),
             _ => None,
@@ -268,6 +292,21 @@ impl ApiError {
             ApiError::SymbolLimitOutOfRange { got, max } => {
                 format!("limit must be between 1 and {max} (got {got}).")
             }
+            ApiError::TooManyCommits { got, max } => format!(
+                "The request carries {got} commits, exceeding the limit of {max}. Narrow the \
+                 history window ([limits].max_history_commits raises the cap)."
+            ),
+            ApiError::CommitMessageTooLarge { sha, got, max } => {
+                format!("Commit {sha} has a {got}-byte message, exceeding the limit of {max}.")
+            }
+            ApiError::CommitInvalid { sha, reason } => {
+                format!("Commit {sha} is unusable: {reason}.")
+            }
+            ApiError::HistoryBoundMissing => {
+                "At least one of `keep_last` or `older_than` is required; deleting a project's \
+                 whole history must be asked for explicitly (`?keep_last=0`)."
+                    .into()
+            }
             ApiError::ResearchBusy => {
                 "All research slots are in use ([research].max_concurrent); retry later.".into()
             }
@@ -302,6 +341,13 @@ impl ApiError {
             | ApiError::SymbolNameTooLong { got, max } => Some(json!({ "got": got, "max": max })),
             ApiError::SymbolLimitOutOfRange { got, max } => {
                 Some(json!({ "got": got, "min": 1, "max": max }))
+            }
+            ApiError::TooManyCommits { got, max } => Some(json!({ "got": got, "max": max })),
+            ApiError::CommitMessageTooLarge { sha, got, max } => {
+                Some(json!({ "sha": sha, "got": got, "max": max }))
+            }
+            ApiError::CommitInvalid { sha, reason } => {
+                Some(json!({ "sha": sha, "reason": reason }))
             }
             ApiError::ResearchBudgetOutOfRange { field, got, max } => {
                 Some(json!({ "field": field, "got": got, "min": 1, "max": max }))
@@ -435,6 +481,17 @@ mod tests {
             ApiError::SymbolNameEmpty,
             ApiError::SymbolNameTooLong { got: 0, max: 0 },
             ApiError::SymbolLimitOutOfRange { got: 0, max: 0 },
+            ApiError::TooManyCommits { got: 0, max: 0 },
+            ApiError::CommitMessageTooLarge {
+                sha: String::new(),
+                got: 0,
+                max: 0,
+            },
+            ApiError::CommitInvalid {
+                sha: String::new(),
+                reason: "",
+            },
+            ApiError::HistoryBoundMissing,
             ApiError::ResearchBusy,
             ApiError::ResearchModelMissing,
             ApiError::ResearchBudgetOutOfRange {
@@ -462,6 +519,9 @@ mod tests {
             "search.no_match",
             "selector.empty",
             "validation.code_too_large",
+            "validation.commit_invalid",
+            "validation.commit_message_too_large",
+            "validation.history_bound_missing",
             "validation.path_invalid",
             "validation.query_empty",
             "validation.query_too_long",
@@ -471,6 +531,7 @@ mod tests {
             "validation.symbol_limit_out_of_range",
             "validation.symbol_name_empty",
             "validation.symbol_name_too_long",
+            "validation.too_many_commits",
             "validation.too_many_files",
             "validation.top_k_out_of_range",
         ];

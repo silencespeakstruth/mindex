@@ -749,6 +749,203 @@ pub struct DriftResponse {
     pub indexing: Vec<String>,
 }
 
+/// How a commit touched one path. Mirrors git's raw status letters, narrowed to
+/// the five that name a path change; the SQLite CHECK carries the same set.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeType {
+    Added,
+    Modified,
+    Deleted,
+    /// `old_path` carries the source. Git detects these heuristically (`-M`), so
+    /// a rename is a good guess, not a fact.
+    Renamed,
+    /// `old_path` carries the source, same caveat as `Renamed`.
+    Copied,
+}
+
+impl ChangeType {
+    pub fn name(self) -> &'static str {
+        match self {
+            ChangeType::Added => "added",
+            ChangeType::Modified => "modified",
+            ChangeType::Deleted => "deleted",
+            ChangeType::Renamed => "renamed",
+            ChangeType::Copied => "copied",
+        }
+    }
+
+    /// Whether this change type must carry an `old_path`. Validation enforces
+    /// the biconditional: a rename without a source is unusable, and a
+    /// modification with one is a client bug worth surfacing.
+    pub fn requires_old_path(self) -> bool {
+        matches!(self, ChangeType::Renamed | ChangeType::Copied)
+    }
+}
+
+impl rusqlite::ToSql for ChangeType {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.name()))
+    }
+}
+
+impl rusqlite::types::FromSql for ChangeType {
+    fn column_result(
+        value: rusqlite::types::ValueRef<'_>,
+    ) -> rusqlite::types::FromSqlResult<ChangeType> {
+        match value.as_str()? {
+            "added" => Ok(ChangeType::Added),
+            "modified" => Ok(ChangeType::Modified),
+            "deleted" => Ok(ChangeType::Deleted),
+            "renamed" => Ok(ChangeType::Renamed),
+            "copied" => Ok(ChangeType::Copied),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
+        }
+    }
+}
+
+/// One path a commit touched.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, ToSchema)]
+pub struct CommitPath {
+    /// Repo-relative, forward slashes — the same spelling `/index` uses, so the
+    /// join back into the code channel is plain equality.
+    pub path: UnixPath,
+    pub change_type: ChangeType,
+    /// Source path of a rename or copy; absent for every other change type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<UnixPath>,
+}
+
+/// One commit, as the client read it out of git.
+#[derive(Deserialize, Serialize, Debug, Clone, ToSchema)]
+pub struct CommitEntry {
+    /// Full hex sha (40 for SHA-1 repositories, 64 for SHA-256), lowercase.
+    pub sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// When the work was done. A rebase preserves this and moves `committed_at`.
+    pub authored_at: i64,
+    /// When this sha came to exist. Reconciliation windows are cut on this.
+    pub committed_at: i64,
+    /// Number of parents; `> 1` means a merge.
+    pub parent_count: usize,
+    /// First line of the message.
+    pub subject: String,
+    /// Everything after the first line; `""` when there is none.
+    #[serde(default)]
+    pub body: String,
+    pub paths: Vec<CommitPath>,
+}
+
+/// `POST /v0/{guid}/history` body: the commits reachable from the refs the
+/// client tracks, within `since`.
+///
+/// This is a **full-set replace within the window**, not an append: whatever the
+/// server holds inside the window and this request does not name is dropped. A
+/// sha is the hash of its own content, so there is no "same commit, different
+/// bytes" case to detect — reconciliation is a set difference, and a force-push
+/// or a rebase is simply one in which many shas orphan at once.
+#[derive(Deserialize, Debug, ToSchema)]
+pub struct HistoryRequest {
+    /// Lower bound (unix seconds, on `committed_at`) of the window this request
+    /// speaks for. `null` means "this is the whole history": anything the
+    /// request does not name is dropped.
+    ///
+    /// Load-bearing for any windowed client: without it a run walking only the
+    /// last month would delete everything older on every pass.
+    #[serde(default)]
+    pub since: Option<i64>,
+    pub commits: Vec<CommitEntry>,
+}
+
+#[derive(Serialize, Debug, Default, PartialEq, Eq, ToSchema)]
+pub struct HistoryResponse {
+    /// Commits stored for the first time by this request.
+    pub indexed: usize,
+    /// Commits the server already held. Immutable content makes a re-post a
+    /// no-op, so this is a real count and not a euphemism for "skipped".
+    pub unchanged: usize,
+    /// Commits dropped because the request did not name them — the force-push
+    /// and history-rewrite signal.
+    pub removed: usize,
+}
+
+/// `DELETE /v0/{guid}/history` query string — the retention bounds.
+///
+/// At least one is required, and that is the same rule the destructive file
+/// endpoints follow: a wipe must be asked for, never arrived at by omitting a
+/// parameter. `keep_last=0` is how you spell "drop the whole channel" out loud.
+///
+/// Given both, the bounds are **intersected, not unioned**: a commit is deleted
+/// only when *both* condemn it. That is what makes `keep_last=200&older_than=…`
+/// mean "prune old history but never leave me with fewer than 200 commits",
+/// which is the reading a destructive endpoint should take when two rules
+/// disagree.
+#[derive(Deserialize, Debug, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct HistoryPruneQuery {
+    /// Keep the newest N commits by `committed_at` whatever else is asked.
+    /// Absent means no rank floor; `0` means keep none.
+    pub keep_last: Option<usize>,
+    /// Delete only commits committed strictly before this instant (unix
+    /// seconds, UTC — the same clock `committed_at` and `since` are on, because
+    /// two time spellings on one resource is worse than one unfriendly one).
+    pub older_than: Option<i64>,
+}
+
+#[derive(Serialize, Debug, Default, PartialEq, Eq, ToSchema)]
+pub struct HistoryPruneResponse {
+    /// Commits deleted; their path rows went with them through CASCADE.
+    pub removed: usize,
+    /// Commits this project still holds — so the caller can see the effect
+    /// without a second request, and see a bound that protected everything.
+    pub remaining: usize,
+}
+
+/// One commit as `file_history` reports it.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, ToSchema)]
+pub struct CommitSummary {
+    pub sha: String,
+    /// First 8 characters of `sha` — what a human pastes into `git show`.
+    pub short_sha: String,
+    pub authored_at: i64,
+    pub author_name: String,
+    pub subject: String,
+    pub body: String,
+    /// How this commit touched the path that was asked about.
+    pub change_type: ChangeType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<UnixPath>,
+}
+
+/// What `file_history` returns for one path.
+///
+/// The three flags exist so that an empty `commits` list is never ambiguous —
+/// the same reason `outline` reports `indexed` separately from an empty symbol
+/// list. Empty because nothing touched this file, empty because the project's
+/// history was never reconciled, and empty because the run may not read here are
+/// three different answers, and a bare `[]` reads as the first one.
+#[derive(Serialize, Debug, PartialEq, Eq, ToSchema)]
+pub struct FileHistoryResponse {
+    pub path: UnixPath,
+    /// Whether this project has **any** commits at all. `false` means the
+    /// history channel was never reconciled for it — not that this file has no
+    /// history.
+    pub history_indexed: bool,
+    /// Whether the path is inside the run's scope. `false` means the lookup was
+    /// refused, not that it found nothing.
+    pub in_scope: bool,
+    /// Whether the path currently has a row in the code channel. A commit
+    /// legitimately names paths the index does not hold — deleted long ago,
+    /// excluded by `.mindex`, or in an unsupported language — and saying so is
+    /// the difference between "gone" and "never there".
+    pub path_indexed: bool,
+    /// Newest first, capped; `total` says whether that cap bit.
+    pub commits: Vec<CommitSummary>,
+    /// Commits touching this path before the cap was applied.
+    pub total: usize,
+}
+
 #[derive(Serialize, Debug, ToSchema)]
 pub struct GcResponse {
     /// Soft-deleted chunks physically removed (vectors confirmed gone from Qdrant first).

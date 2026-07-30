@@ -21,9 +21,9 @@ use tracing::{info, warn};
 use crate::backend::error::ApiError;
 use crate::backend::v0::handlers::GREP_MIN_PATTERN_CHARS;
 use crate::backend::v0::models::{
-    CallDirection, CallersResponse, GrepResponse, ListFilesResponse, OutlineResponse,
-    ReadChunksResponse, SearchFilter, SearchRequest, SearchResult, SymbolRoleFilter,
-    SymbolsRequest, SymbolsResponse,
+    CallDirection, CallersResponse, ChangeType, FileHistoryResponse, GrepResponse,
+    ListFilesResponse, OutlineResponse, ReadChunksResponse, SearchFilter, SearchRequest,
+    SearchResult, SymbolRoleFilter, SymbolsRequest, SymbolsResponse,
 };
 use crate::models::ollama::{
     ChatDelta, ChatMessage, ChatOutcome, OllamaError, OllamaModel, Sampling, ToolCall, ToolSpec,
@@ -53,7 +53,7 @@ use crate::models::ollama::{
 /// Nothing ever compares this one — it is pure provenance — so the split between
 /// the two numbers is the only thing that gives it meaning: MINOR for reworded
 /// instructions, MAJOR for a run that asks the model to do a different job.
-pub const PROMPT_VERSION: &str = "1.0";
+pub const PROMPT_VERSION: &str = "1.1";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -433,6 +433,7 @@ pub enum StepCall {
     ListFiles { glob: String },
     ReadChunks { path: String },
     Grep { pattern: String },
+    FileHistory { path: String },
     Note { text: String },
     RevisePlan { plan: String },
 }
@@ -448,6 +449,7 @@ impl StepCall {
             StepCall::ListFiles { .. } => "list_files",
             StepCall::ReadChunks { .. } => "read_chunks",
             StepCall::Grep { .. } => "grep",
+            StepCall::FileHistory { .. } => "file_history",
             StepCall::Note { .. } => "note",
             StepCall::RevisePlan { .. } => "revise_plan",
         }
@@ -463,6 +465,7 @@ impl StepCall {
             StepCall::ListFiles { glob } => ("glob", glob),
             StepCall::ReadChunks { path } => ("path", path),
             StepCall::Grep { pattern } => ("pattern", pattern),
+            StepCall::FileHistory { path } => ("path", path),
             StepCall::Note { text } => ("text", text),
             StepCall::RevisePlan { plan } => ("plan", plan),
         }
@@ -592,6 +595,16 @@ pub trait ResearchTools: Send + Sync {
         scope: &ToolScope,
         token: &CancellationToken,
     ) -> Result<ListFilesResponse, ApiError>;
+
+    /// The commits that touched one path, newest first — the git channel's only
+    /// model-facing lookup. Path-keyed, so out of scope is an explicit refusal
+    /// (`in_scope: false`) rather than an empty list.
+    async fn file_history(
+        &self,
+        path: String,
+        scope: &ToolScope,
+        token: &CancellationToken,
+    ) -> Result<FileHistoryResponse, ApiError>;
 
     /// Exact literal search over the indexed chunk text — what `search` cannot do,
     /// because it matches meaning rather than bytes.
@@ -725,6 +738,18 @@ impl ResearchTools for MeteredResearchTools {
         let t = Instant::now();
         let r = self.inner.list_files(glob, scope, token).await;
         self.record("list_files", t, &r);
+        r
+    }
+
+    async fn file_history(
+        &self,
+        path: String,
+        scope: &ToolScope,
+        token: &CancellationToken,
+    ) -> Result<FileHistoryResponse, ApiError> {
+        let t = Instant::now();
+        let r = self.inner.file_history(path, scope, token).await;
+        self.record("file_history", t, &r);
         r
     }
 
@@ -947,6 +972,12 @@ enum Action {
         #[serde(default)]
         glob: Option<String>,
     },
+    // As with `list_files`, `rename_all = "lowercase"` would spell this
+    // `filehistory`.
+    #[serde(rename = "file_history")]
+    FileHistory {
+        path: String,
+    },
     /// A conclusion the model wants to still have next turn.
     Note {
         text: String,
@@ -1115,6 +1146,31 @@ fn tool_specs() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::function(
+            "file_history",
+            "The commits that changed this file, newest first, with their messages. \
+             This is the only tool that answers WHY the code is the way it is rather \
+             than WHAT it does: the reasoning behind a decision is written in the \
+             commit that made it, and nowhere in the file itself. Reach for it when the \
+             question is why something exists, why it is done this odd way, what was \
+             tried before, or what changed recently around a place you are reading — \
+             after `outline` or `symbols` has told you which file to ask about. \
+             Commit messages are prose, so read them as prose. Two honest limits: the \
+             history is walked over a bounded window, so an empty answer may mean \
+             \"nothing recent\" rather than \"nothing ever\"; and a file that was moved \
+             carries its earlier history under its old name, which the result names \
+             when it knows it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Exact repo-relative path, as returned by another tool."
+                    }
+                },
+                "required": ["path"]
+            }),
+        ),
+        ToolSpec::function(
             "note",
             "Write down a conclusion you want to still have later. YOUR REASONING IS \
              NOT KEPT: everything you think is discarded after each turn, and only tool \
@@ -1268,6 +1324,10 @@ READ THIS — it decides whether you succeed. `search` matches *text*, and this 
   list_files → outline → (now you have exact names) → symbols / search / callers → read_chunks
 
 That rule governs CODE. The index also contains this project's DOCUMENTATION — `*.md` files: `README.md`, `CLAUDE.md`, the per-tool READMEs — and there the rule inverts, because documentation is written in the same plain English you think in. Ask those questions in plain English, in the words you would use with a colleague. Documentation is where a project states what it does not say in code: why a design was chosen over the alternative, which steps a change must touch, what an invariant is for. When your question is "why", "what are all the places", or "what is the rule for", search the prose FIRST — it is often a single hit against many steps of reading code, and it will hand you the identifiers to search for next. `list_files` with glob `**/*.md` shows you what documentation exists.
+
+A third channel answers what neither code nor documentation can: the project's GIT HISTORY, through `file_history`. Code says what it does now; documentation says what the project means to do; the commit that made a change says WHY it was made — the alternative that was rejected, the bug that forced it, the measurement behind a number. That reasoning exists nowhere else, so when the question is "why is this like this", "what was tried before", "what changed here recently", or you are staring at code whose shape makes no sense, ask the file's history. Its place in the pipeline is after you know the filename: `outline`/`symbols` tells you WHICH file, then `file_history` tells you why it is that way, and `read_chunks` shows you what it now says. Commit messages are prose, so read them as prose, in plain English — the same inversion documentation gets.
+
+When you take a claim from a commit, cite the CODE it is about — a `path:start-end` you were shown — and name the short sha in your sentence ("added in a1b2c3d4 to ..."). A sha alone is not a citation and will not verify.
 
 `outline`, `list_files` and `callers` are metadata lookups — cheap, and they cost the same as any other step, so spending your first step or two on them pays for itself. When `symbols` or `outline` hands you a location, READ IT with `read_chunks` — do not search for its line numbers, that never works. If you know which directory the answer lives in, pass `path_prefix` to `search` rather than re-asking the same query and hoping.
 
@@ -1543,6 +1603,7 @@ struct RunState {
     globs: Vec<String>,
     greps: Vec<String>,
     reads: Vec<String>,
+    histories: Vec<String>,
 }
 
 impl RunState {
@@ -1569,6 +1630,7 @@ impl RunState {
                 start_line,
                 end_line,
             } => self.reads.push(format!("{path}:{start_line}-{end_line}")),
+            Action::FileHistory { path } => self.histories.push(path.clone()),
             Action::Grep { pattern, glob } => self.greps.push(match glob {
                 Some(g) => format!("{pattern} (in {g})"),
                 None => pattern.clone(),
@@ -1639,7 +1701,7 @@ fn tally_tool_use(tools: &mut RunTools, action: &Action, reply: &str, hits: usiz
         // `out_of_scope_reply`; hidden rows are counted in the name-keyed formatters,
         // which is why both are matched on the reply rather than on a response field —
         // the field lives on four different response types.
-        Action::Outline { .. } | Action::ReadChunks { .. }
+        Action::Outline { .. } | Action::ReadChunks { .. } | Action::FileHistory { .. }
             if reply.contains("outside this run's scope") =>
         {
             tools.out_of_scope_refusals += 1;
@@ -1829,6 +1891,12 @@ fn format_state_note(
         &mut out,
         "Line ranges already read",
         &state.reads,
+        STATE_NOTE_MAX_ITEMS,
+    );
+    state_note_line(
+        &mut out,
+        "Files whose history you already have",
+        &state.histories,
         STATE_NOTE_MAX_ITEMS,
     );
 
@@ -2768,6 +2836,82 @@ fn format_read_chunks(
     out
 }
 
+/// One file's commits, as prose the model is meant to read as prose.
+///
+/// The three empty cases are spelled out rather than collapsed into one, because
+/// they call for three different next moves: reconcile the channel, ask about a
+/// path the run may read, or accept that the file predates the window. A single
+/// "no results" would send the model looking for a spelling problem in all three.
+fn format_file_history(path: &str, resp: &FileHistoryResponse, scope: &ToolScope) -> String {
+    if !resp.in_scope {
+        return out_of_scope_reply(path, scope);
+    }
+    if !resp.history_indexed {
+        return format!(
+            "This project has NO indexed git history at all, so nothing can be said \
+             about {path} from commits — this is not a fact about {path}. The history \
+             channel is opt-in and was never reconciled for this project. Do not ask \
+             for another file's history; use the code tools instead, and if the \
+             question needs the reasoning behind a change, say in your report that it \
+             is not reachable from this index."
+        );
+    }
+    if resp.commits.is_empty() {
+        return format!(
+            "No indexed commit touches {path}. The project HAS an indexed history, so \
+             this means the file changed only outside the walked window, or under an \
+             earlier name — a rename is followed only when git detected it. {}",
+            if resp.path_indexed {
+                "The file itself is indexed and readable with the code tools."
+            } else {
+                "The file is also absent from the code index, so check the path first."
+            }
+        );
+    }
+
+    let mut out = if resp.total > resp.commits.len() {
+        format!(
+            "{} of {} indexed commits touching {path}, newest first:\n",
+            resp.commits.len(),
+            resp.total
+        )
+    } else {
+        format!(
+            "{} indexed commit(s) touching {path}, newest first:\n",
+            resp.commits.len()
+        )
+    };
+    if !resp.path_indexed {
+        out.push_str(
+            "\n(This path has history but is NOT in the code index — deleted, excluded \
+             from this project's scope, or in an unsupported language. Its commits are \
+             still real; its current contents are not readable here.)\n",
+        );
+    }
+    for c in &resp.commits {
+        out.push_str(&format!("\n--- {} · {}", c.short_sha, c.author_name));
+        match (&c.old_path, c.change_type) {
+            (Some(old), ChangeType::Renamed) => {
+                out.push_str(&format!(" · renamed from {old}"));
+            }
+            (Some(old), ChangeType::Copied) => out.push_str(&format!(" · copied from {old}")),
+            _ => out.push_str(&format!(" · {}", c.change_type.name())),
+        }
+        out.push_str(&format!("\n{}\n", c.subject));
+        if !c.body.trim().is_empty() {
+            out.push_str(&format!("{}\n", c.body.trim()));
+        }
+    }
+    // Said on every result, not only in the tool description: by the time this is
+    // read the description is thousands of tokens back, and a sha reads as a
+    // citation unless something says it is not one.
+    out.push_str(
+        "\n(Cite what you take from these by the `path:start-end` in the CODE that the \
+         claim is about, naming the short sha in your prose. A sha is not a citation.)\n",
+    );
+    out
+}
+
 fn format_list_files(glob: &str, resp: &ListFilesResponse) -> String {
     if resp.files.is_empty() {
         return format!(
@@ -3039,6 +3183,31 @@ async fn execute(
                 .collect();
             Ok(Executed {
                 call: StepCall::ReadChunks { path: path.clone() },
+                hits,
+                text,
+                shown,
+            })
+        }
+        Action::FileHistory { path } => {
+            let resp = tools
+                .file_history(path.clone(), &params.scope, token)
+                .await
+                .map_err(ResearchAbort::from)?;
+            let hits = resp.commits.len();
+            let text = format_file_history(path, &resp, &params.scope);
+            // ONLY the asked path, and span-less. A commit touched other files,
+            // but the model was not shown them — recording them here would mark
+            // files it never read as "shown", quietly promoting a later invented
+            // citation from `unverified` to `path_only` and blinding the gate.
+            // Span-less because a commit has no line range at all; the citation
+            // it grounds is the file, not a region of it.
+            let shown = if resp.in_scope && !resp.commits.is_empty() {
+                vec![(resp.path.clone(), None)]
+            } else {
+                vec![]
+            };
+            Ok(Executed {
+                call: StepCall::FileHistory { path: path.clone() },
                 hits,
                 text,
                 shown,
@@ -3701,6 +3870,9 @@ async fn research_inner(
                         format!("callers\u{0}{}\u{0}{direction:?}", name.trim())
                     }
                     Action::ListFiles { glob } => format!("list_files\u{0}{}", glob.trim()),
+                    Action::FileHistory { path } => {
+                        format!("file_history\u{0}{}", path.trim())
+                    }
                     Action::ReadChunks {
                         path,
                         start_line,
@@ -5229,6 +5401,31 @@ mod tests {
             })
         }
 
+        async fn file_history(
+            &self,
+            path: String,
+            _scope: &ToolScope,
+            _token: &CancellationToken,
+        ) -> Result<FileHistoryResponse, ApiError> {
+            Ok(FileHistoryResponse {
+                path,
+                history_indexed: true,
+                in_scope: true,
+                path_indexed: true,
+                commits: vec![crate::backend::v0::models::CommitSummary {
+                    sha: "a".repeat(40),
+                    short_sha: "aaaaaaaa".into(),
+                    authored_at: 1,
+                    author_name: "T".into(),
+                    subject: "gc: delete only confirmed rows".into(),
+                    body: "Deleting the SQLite row first would orphan the vector.".into(),
+                    change_type: ChangeType::Modified,
+                    old_path: None,
+                }],
+                total: 1,
+            })
+        }
+
         /// One match in the same file the other fakes use, so a citation to it can
         /// verify.
         async fn grep(
@@ -5656,6 +5853,7 @@ mod tests {
             names,
             vec![
                 "callers",
+                "file_history",
                 "finalize",
                 "grep",
                 "list_files",
@@ -5676,6 +5874,7 @@ mod tests {
                 "list_files" => json!({"glob": "x"}),
                 "read_chunks" => json!({"path": "x", "start_line": 1, "end_line": 2}),
                 "grep" => json!({"pattern": "xyz"}),
+                "file_history" => json!({"path": "x"}),
                 "note" => json!({"text": "x"}),
                 "revise_plan" => json!({"plan": "x"}),
                 _ => json!({}),
@@ -8102,5 +8301,171 @@ mod tests {
             ResearchEvent::Error { code, .. } => assert_eq!(code, "ollama.unavailable"),
             other => panic!("expected an error event, got {other:?}"),
         }
+    }
+
+    fn history_resp(
+        history_indexed: bool,
+        in_scope: bool,
+        path_indexed: bool,
+        commits: Vec<crate::backend::v0::models::CommitSummary>,
+    ) -> FileHistoryResponse {
+        FileHistoryResponse {
+            path: "src/worker/gc.rs".into(),
+            history_indexed,
+            in_scope,
+            path_indexed,
+            total: commits.len(),
+            commits,
+        }
+    }
+
+    fn summary(
+        change_type: ChangeType,
+        old_path: Option<&str>,
+    ) -> crate::backend::v0::models::CommitSummary {
+        crate::backend::v0::models::CommitSummary {
+            sha: "a1b2c3d4".repeat(5),
+            short_sha: "a1b2c3d4".into(),
+            authored_at: 1,
+            author_name: "T".into(),
+            subject: "gc: delete only confirmed rows".into(),
+            body: "Deleting the SQLite row first would orphan the vector forever.".into(),
+            change_type,
+            old_path: old_path.map(str::to_string),
+        }
+    }
+
+    /// An empty commit list means three different things and each calls for a
+    /// different next move. Collapsed into one "no results" they read as the
+    /// least alarming of the three — "this file is uninteresting" — which is the
+    /// only one that is never true.
+    #[test]
+    fn the_three_empty_answers_read_differently() {
+        let scope = ToolScope::default();
+
+        // 1. The channel was never reconciled: not a fact about this file.
+        let no_channel = format_file_history(
+            "src/worker/gc.rs",
+            &history_resp(false, true, true, vec![]),
+            &scope,
+        );
+        assert!(
+            no_channel.contains("NO indexed git history at all"),
+            "{no_channel}"
+        );
+        assert!(
+            no_channel.contains("not a fact about"),
+            "must not read as a verdict on the file: {no_channel}"
+        );
+
+        // 2. The channel exists; this path simply has no commits in the window.
+        let no_commits = format_file_history(
+            "src/worker/gc.rs",
+            &history_resp(true, true, true, vec![]),
+            &scope,
+        );
+        assert!(
+            no_commits.contains("No indexed commit touches"),
+            "{no_commits}"
+        );
+        assert!(
+            no_commits.contains("walked window") && no_commits.contains("earlier name"),
+            "must name both honest explanations: {no_commits}"
+        );
+
+        // 3. Refused, not empty — otherwise the model reads a wall as an absence
+        // and spends calls guessing at spellings of a path it may not read.
+        let refused = format_file_history(
+            "src/worker/gc.rs",
+            &history_resp(true, false, false, vec![]),
+            &scope,
+        );
+        assert!(refused.contains("outside this run's scope"), "{refused}");
+
+        // All three must be distinguishable from one another, not just from a hit.
+        assert_ne!(no_channel, no_commits);
+        assert_ne!(no_commits, refused);
+    }
+
+    /// A commit legitimately names a path the code index does not hold — deleted
+    /// years ago, excluded by `.mindex`, or in an unsupported language. That is
+    /// why `project_commit_paths.path` carries no foreign key, and the result has
+    /// to say so or the model will keep trying to read the file.
+    #[test]
+    fn a_path_with_history_but_no_code_row_says_which_half_is_missing() {
+        let out = format_file_history(
+            "src/worker/gc.rs",
+            &history_resp(true, true, false, vec![summary(ChangeType::Modified, None)]),
+            &ToolScope::default(),
+        );
+        assert!(out.contains("NOT in the code index"), "{out}");
+        assert!(out.contains("commits are still real"), "{out}");
+    }
+
+    /// A rename is where the tool earns the `old_path` column: without naming it,
+    /// a file's history simply stops at the move with no explanation.
+    #[test]
+    fn a_rename_names_the_old_path() {
+        let out = format_file_history(
+            "src/worker/gc.rs",
+            &history_resp(
+                true,
+                true,
+                true,
+                vec![summary(ChangeType::Renamed, Some("src/gc.rs"))],
+            ),
+            &ToolScope::default(),
+        );
+        assert!(out.contains("renamed from src/gc.rs"), "{out}");
+    }
+
+    /// Every result repeats that a sha is not a citation. The tool description
+    /// says it too, but by the time a result is read the description is thousands
+    /// of tokens back, and a list of shas reads as provenance unless something
+    /// present says otherwise.
+    #[test]
+    fn every_result_says_a_sha_is_not_a_citation() {
+        let out = format_file_history(
+            "src/worker/gc.rs",
+            &history_resp(true, true, true, vec![summary(ChangeType::Modified, None)]),
+            &ToolScope::default(),
+        );
+        assert!(out.contains("A sha is not a citation"), "{out}");
+        assert!(out.contains("path:start-end"), "{out}");
+    }
+
+    /// The evidence trap. A commit touched many files; the model was shown only
+    /// the one it asked about. Recording the rest as "shown" would quietly
+    /// promote a later invented citation from `unverified` to `path_only` — that
+    /// is, it would blind the very gate that exists because a model once cited 18
+    /// locations it had never seen.
+    #[tokio::test]
+    async fn file_history_records_only_the_asked_path_as_evidence() {
+        let tools = FakeTools::default();
+        let executed = match execute(
+            &tools,
+            &params(8),
+            &Action::FileHistory {
+                path: "src/worker/gc.rs".into(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        {
+            Ok(e) => e,
+            Err(_) => panic!("file_history must execute against the fake tools"),
+        };
+
+        assert_eq!(
+            executed.shown,
+            vec![("src/worker/gc.rs".to_string(), None)],
+            "only the asked path, and with no span: a commit has no line range"
+        );
+        assert_eq!(
+            executed.call,
+            StepCall::FileHistory {
+                path: "src/worker/gc.rs".into()
+            }
+        );
     }
 }
