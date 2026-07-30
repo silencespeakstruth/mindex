@@ -1,0 +1,81 @@
+[package]
+name        = "mindex"
+version     = "1.0.0"
+edition     = "2024"
+authors     = ["Сергей Боголюбов"]
+license     = "MIT"
+repository  = "https://github.com/silencespeakstruth/mindex"
+readme      = "README.md"
+description = "Local-first semantic code search: hybrid BGE-M3 retrieval, tree-sitter symbols and agent research over your own repositories."
+keywords    = ["code-search", "rag", "embeddings", "tree-sitter", "mcp"]
+categories  = ["development-tools"]
+
+[dependencies]
+axum = { version = "0.8.9", features = ["json", "macros"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+bytes = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+rustls-pemfile = "2"
+tokio = { version = "1.52.3", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tree-sitter            = "0.26.9"
+tree-sitter-tags       = "0.26.11"
+tree-sitter-rust       = "0.24.2"
+# Block grammar only (`LANGUAGE`); the inline grammar is not used. Documentation
+# has no tags query, so this grammar carries chunking and nothing else.
+tree-sitter-md         = { version = "0.5.3", features = ["parser"] }
+tree-sitter-python     = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go         = "0.25.0"
+tree-sitter-c          = "0.24.2"
+tree-sitter-cpp        = "0.23.4"
+tree-sitter-java       = "0.23.5"
+tree-sitter-c-sharp    = "0.23.5"
+tree-sitter-ruby       = "0.23.1"
+tree-sitter-php        = "0.24.2"
+tree-sitter-bash       = "0.25.1"
+tree-sitter-html       = "0.23.2"
+tree-sitter-css        = "0.25.0"
+tree-sitter-json       = "0.24.8"
+tree-sitter-scala      = "0.26.0"
+tree-sitter-haskell    = "0.23.1"
+tree-sitter-ocaml      = "0.25.0"
+tree-sitter-zig        = "1.1.2"
+tree-sitter-sequel     = "0.3.11"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokenizers = { version = "0.23.1", features = ["http"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7.18", features = ["rt", "futures-util"] }
+rusqlite = { version = "0.40.0", features = ["bundled", "hooks", "uuid"] }
+uuid = { version = "1.23.2", features = ["serde", "v4"] }
+sha2 = "0.11.0"
+hex = "0.4.3"
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+async-trait = "0.1.89"
+url = { version = "2.5.8", features = ["serde"] }
+bytemuck = "1.25.0"
+clap = { version = "4.6.1", features = ["derive"] }
+toml = "0.9"
+qdrant-client = "1.18.0"
+glob = "0.3.3"
+# OpenAPI/Swagger. `axum_extras` lets the `#[utoipa::path]` macro infer Path/Query/Json
+# extractors; `vendored` bundles the Swagger UI assets into the binary so the build
+# (incl. the offline `cargo fetch --locked` Docker layer) never reaches the network.
+utoipa = { version = "5.5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0", default-features = false, features = ["axum", "vendored"] }
+# Metrics. Chosen over `metrics` + `metrics-exporter-prometheus` because its
+# `Registry` is a plain value threaded through constructors, not a process-global
+# recorder — the same rule config follows, and the only shape under which two
+# unit tests in one binary can each own an independent metric set.
+prometheus-client = "0.25.0"
+
+[dev-dependencies]

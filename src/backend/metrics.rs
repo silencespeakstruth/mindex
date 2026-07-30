@@ -1,0 +1,1370 @@
+//! Prometheus/OpenMetrics instrumentation.
+//!
+//! One owned [`Registry`] threaded as `Arc<Metrics>` through constructors — the
+//! same rule config follows (never a global). That is also what lets two unit
+//! tests in one binary each own an independent metric set, which a process-wide
+//! recorder could not.
+//!
+//! Two things about this crate that shape the code below and the tests:
+//! `prometheus-client` appends `_total` to counter names itself (a family
+//! registered as `http_requests` is exposed as `mindex_http_requests_total`), and
+//! `encoding::text::encode` writes OpenMetrics, `# EOF` terminator included — so
+//! the body must be served as [`CONTENT_TYPE`], not `text/plain`.
+//!
+//! **Cardinality rule.** Every label value comes from a set the *server* defines:
+//! `MatchedPath` (router-owned), [`ApiError::code`](crate::backend::error::ApiError::code),
+//! `ProgrammingLanguage::name`, `DoneReason::as_str`, the tool names, the file
+//! statuses. `project_guid` is the sole open-ended label; it is UUID-validated
+//! before it becomes one, and on the HTTP families it is off by default. Never a
+//! raw URI, path, query, or model-supplied string without a bound.
+
+use prometheus_client::encoding::{EncodeLabelSet, text::encode};
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets, linear_buckets};
+use prometheus_client::registry::Registry;
+
+/// The exposition content type. OpenMetrics, because `encode` emits `# EOF`;
+/// serving that as `text/plain` is a parse error at a strict scraper and a
+/// success at build time, which is the worst possible ordering.
+pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+// ─── Bucket sets ─────────────────────────────────────────────────────────────
+//
+// Chosen per shape rather than shared: a SQLite transaction and a research run
+// differ by six orders of magnitude, and one bucket set spanning both resolves
+// neither.
+
+/// 1 ms → ~33 s. HTTP requests, index phases, Qdrant ops, search stages.
+fn request_hist() -> Histogram {
+    Histogram::new(exponential_buckets(0.001, 2.0, 16))
+}
+
+/// 100 µs → ~6 s. SQLite transactions, which are meant to be short.
+fn db_hist() -> Histogram {
+    Histogram::new(exponential_buckets(0.0001, 3.0, 10))
+}
+
+/// 0.5 s → ~34 min. Research runs, GC passes and embed calls, which are not.
+fn long_hist() -> Histogram {
+    Histogram::new(exponential_buckets(0.5, 2.0, 12))
+}
+
+/// 256 B → ~16 MiB, the `[limits].max_code_bytes` neighbourhood.
+fn size_hist() -> Histogram {
+    Histogram::new(exponential_buckets(256.0, 4.0, 9))
+}
+
+/// 1 → 8192. Chunks per file, embed batch sizes, candidates, results, steps.
+fn count_hist() -> Histogram {
+    Histogram::new(exponential_buckets(1.0, 2.0, 14))
+}
+
+/// 0.0 → 1.0 in tenths.
+fn ratio_hist() -> Histogram {
+    Histogram::new(linear_buckets(0.0, 0.1, 11))
+}
+
+/// Shorthand for a histogram family. The constructor is a plain function
+/// pointer (the `Family` default) rather than a boxed closure, because a boxed
+/// closure is not `Clone` and every group here has to be.
+type HistFamily<S> = Family<S, Histogram>;
+
+fn hist_family<S: Clone + std::hash::Hash + Eq>(ctor: fn() -> Histogram) -> HistFamily<S> {
+    Family::new_with_constructor(ctor)
+}
+
+// ─── Label sets ──────────────────────────────────────────────────────────────
+//
+// This block *is* the cardinality audit: every label in the system is on one
+// screen. Keep it that way.
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RequestLabels {
+    pub route: String,
+    pub method: &'static str,
+    pub status: u16,
+    /// The `ApiError` code, empty on success.
+    pub code: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RouteLabels {
+    pub route: String,
+    pub method: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RouteProjectLabels {
+    pub route: String,
+    pub project_guid: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProtoLabels {
+    pub proto: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectLabels {
+    pub project_guid: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectLangLabels {
+    pub project_guid: String,
+    pub language: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectLangOutcomeLabels {
+    pub project_guid: String,
+    pub language: &'static str,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LangLabels {
+    pub language: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PhaseLabels {
+    pub phase: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EmbedderLabels {
+    /// `index` or `query` — the two BGE-M3 instances, which may be one server.
+    pub embedder: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EmbedderOutcomeLabels {
+    pub embedder: &'static str,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OpLabels {
+    pub op: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OpOutcomeLabels {
+    pub op: &'static str,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StageLabels {
+    pub stage: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectOutcomeLabels {
+    pub project_guid: String,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectClassLabels {
+    pub project_guid: String,
+    pub class: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectStatusLabels {
+    pub project_guid: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ProjectRoleLabels {
+    pub project_guid: String,
+    pub role: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ModelLabels {
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ModelReasonLabels {
+    pub model: String,
+    pub done_reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ModelEffortLabels {
+    pub model: String,
+    pub effort: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ModelKindLabels {
+    pub model: String,
+    /// `prompt` or `eval`.
+    pub kind: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ToolOutcomeLabels {
+    pub tool: &'static str,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ClassLabels {
+    pub class: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TriggerOutcomeLabels {
+    pub trigger: &'static str,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OutcomeLabels {
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DependencyLabels {
+    pub dependency: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BuildLabels {
+    pub version: &'static str,
+    pub db_schema_version: String,
+    pub model_id: String,
+}
+
+// ─── Metric groups ───────────────────────────────────────────────────────────
+//
+// Field names carry no metric-name prefix: the registered name is the contract,
+// and prefixed fields trip clippy's `struct_field_names`. Every group is `Clone`
+// (the handles are internally `Arc`-backed), so a consumer can take just its own.
+
+#[derive(Clone)]
+pub struct HttpMetrics {
+    pub requests: Family<RequestLabels, Counter>,
+    pub duration: HistFamily<RouteLabels>,
+    pub in_flight: Family<RouteLabels, Gauge>,
+    /// Only written when `[metrics].per_project_http_labels` is on. Deliberately
+    /// carries neither status nor code, so projects never multiply the expensive
+    /// dimensions.
+    pub by_project: Family<RouteProjectLabels, Counter>,
+    pub by_proto: Family<ProtoLabels, Counter>,
+}
+
+#[derive(Clone)]
+pub struct IndexMetrics {
+    pub files: Family<ProjectLangOutcomeLabels, Counter>,
+    pub chunks: Family<ProjectLangLabels, Counter>,
+    pub symbols: Family<ProjectLangLabels, Counter>,
+    pub code_bytes: Family<ProjectLangLabels, Counter>,
+    /// Language only, no project: a histogram is 13-19 exposition lines and
+    /// multiplying that by the project count buys a breakdown nobody reads.
+    pub file_size: HistFamily<LangLabels>,
+    pub file_chunks: HistFamily<LangLabels>,
+    pub phase_duration: HistFamily<PhaseLabels>,
+    /// `IndexClaim` contention. Counted where the error is swallowed — the HTTP
+    /// middleware can never see it, since the request still 200s.
+    pub claim_conflicts: Counter,
+    pub drift_checks: Family<ProjectLabels, Counter>,
+    /// Counters, not gauges: `/drift` compares against a *client-posted* manifest,
+    /// so there is no server-side drift level to gauge. See the module docs in
+    /// `worker/metrics.rs`.
+    pub drift_files: Family<ProjectClassLabels, Counter>,
+}
+
+#[derive(Clone)]
+pub struct EmbedMetrics {
+    pub requests: Family<EmbedderOutcomeLabels, Counter>,
+    pub duration: HistFamily<EmbedderLabels>,
+    pub batch_size: HistFamily<EmbedderLabels>,
+    pub texts: Family<EmbedderLabels, Counter>,
+    /// Incremented inside `BGEm3HttpClient::encode`: from outside the client,
+    /// three retries then a success is indistinguishable from one success.
+    pub retries: Family<EmbedderLabels, Counter>,
+}
+
+#[derive(Clone)]
+pub struct QdrantMetrics {
+    pub ops: Family<OpOutcomeLabels, Counter>,
+    pub duration: HistFamily<OpLabels>,
+    pub points: Family<OpLabels, Counter>,
+}
+
+#[derive(Clone)]
+pub struct SearchMetrics {
+    pub requests: Family<ProjectOutcomeLabels, Counter>,
+    pub stage_duration: HistFamily<StageLabels>,
+    pub candidates: Histogram,
+    pub results: Histogram,
+}
+
+#[derive(Clone)]
+pub struct ResearchMetrics {
+    /// Split from `runs_by_effort` rather than crossed with it: `model` is a
+    /// client-supplied string, and effort × done_reason × model is the one
+    /// genuine cardinality hazard in the set.
+    pub runs: Family<ModelReasonLabels, Counter>,
+    pub runs_by_effort: Family<ModelEffortLabels, Counter>,
+    pub duration: HistFamily<ModelLabels>,
+    pub steps: HistFamily<ModelLabels>,
+    pub turns: HistFamily<ModelLabels>,
+    pub tokens: Family<ModelKindLabels, Counter>,
+    pub context_used: HistFamily<ModelLabels>,
+    pub tool_calls: Family<ToolOutcomeLabels, Counter>,
+    pub tool_duration: HistFamily<ToolOutcomeLabels>,
+    pub citations: Family<ClassLabels, Counter>,
+    pub revalidations: Counter,
+    /// Reports the *server* wrote because the report window expired before the model
+    /// produced one. The operational symptom of `[research].report_timeout_ms` set too
+    /// tight, and the one thing a dashboard needs from this generation's changes: the
+    /// rest of what a run did with the new tools is a per-run question and lives in
+    /// the journal.
+    pub forced_syntheses: Counter,
+    pub parse_retries: Counter,
+    /// Ollama trimmed an over-long prompt and streamed on. Today the only other
+    /// symptom is one `warn!`.
+    pub truncations: Counter,
+    /// Turns abandoned because the model ran away in its thinking channel. Counted
+    /// here because the abandonment is returned as an ordinary empty reply — the one
+    /// shape every caller already recovers from — so nothing downstream can tell it
+    /// apart from a model that simply said nothing.
+    pub runaway_thinking_turns: Counter,
+}
+
+#[derive(Clone)]
+pub struct GcMetrics {
+    pub runs: Family<TriggerOutcomeLabels, Counter>,
+    pub duration: Histogram,
+    pub chunks_removed: Counter,
+    pub files_pruned: Counter,
+    pub status_log_pruned: Counter,
+    pub running: Gauge,
+}
+
+#[derive(Clone)]
+pub struct RetryMetrics {
+    pub sweeps: Counter,
+    pub files: Family<OutcomeLabels, Counter>,
+}
+
+#[derive(Clone)]
+pub struct DbMetrics {
+    pub transaction_duration: Histogram,
+    pub transactions: Family<OutcomeLabels, Counter>,
+    /// `PoolEmpty`, which collapses into an opaque `ApiError::Internal` on the
+    /// wire and is otherwise invisible.
+    pub pool_acquire_failures: Counter,
+    pub pool_size: Gauge,
+    pub pool_available: Gauge,
+}
+
+/// Gauges describing *current state*, owned exclusively by
+/// [`crate::worker::metrics`].
+///
+/// Nothing in a handler writes to this group, and every family in it is a gauge.
+/// Both facts are load-bearing: the collector `clear()`s each family every tick
+/// and repopulates it from a fresh query, because a `Family` retains a label set
+/// for the life of the process — a deleted project would otherwise report its
+/// last known file count forever. Clearing a *counter* would read as a process
+/// restart to Prometheus and permanently re-baseline every `rate()` over it,
+/// which is why counters never live here.
+#[derive(Clone)]
+pub struct StateMetrics {
+    pub project_files: Family<ProjectStatusLabels, Gauge>,
+    pub project_files_by_language: Family<ProjectLangLabels, Gauge>,
+    pub project_chunks_active: Family<ProjectLangLabels, Gauge>,
+    /// The GC backlog. Language is cut deliberately — nobody dashboards a
+    /// backlog by language, and it halves the family.
+    pub project_chunks_deleted: Family<ProjectLabels, Gauge>,
+    pub project_symbols: Family<ProjectRoleLabels, Gauge>,
+    pub project_last_indexed: Family<ProjectLabels, Gauge>,
+    pub project_files_permanently_failed: Family<ProjectLabels, Gauge>,
+    pub projects: Gauge,
+    pub db_size_bytes: Gauge,
+    pub status_log_rows: Gauge,
+    pub dependency_up: Family<DependencyLabels, Gauge>,
+    // ── Process state, refreshed on scrape rather than on tick (all free reads) ──
+    pub indexing_claims: Gauge,
+    pub research_active: Gauge,
+    pub research_permits_available: Gauge,
+    pub research_worker_threads: Gauge,
+    pub build_info: Family<BuildLabels, Gauge>,
+    pub start_time: Gauge,
+}
+
+// ─── The registry ────────────────────────────────────────────────────────────
+
+/// Every metric mindex exposes, plus the registry that renders them.
+///
+/// Always constructed and always written into: `[metrics].enabled` gates whether
+/// the endpoint is *served* and whether the collector runs, never whether a
+/// counter is incremented. A counter increment is a relaxed atomic add, and the
+/// alternative is an `Option` check at sixty call sites.
+pub struct Metrics {
+    registry: Registry,
+    pub http: HttpMetrics,
+    pub index: IndexMetrics,
+    pub embed: EmbedMetrics,
+    pub qdrant: QdrantMetrics,
+    pub search: SearchMetrics,
+    pub research: ResearchMetrics,
+    pub gc: GcMetrics,
+    pub retry: RetryMetrics,
+    pub db: DbMetrics,
+    pub state: StateMetrics,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Metrics {
+    /// Build and register everything. The one place a metric name is chosen.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat registration block is the point: every name, help text \
+                  and bucket set is readable in one pass, which is what makes the \
+                  cardinality audit and the stability test reviewable."
+    )]
+    pub fn new() -> Self {
+        let mut registry = Registry::with_prefix("mindex");
+
+        // ── HTTP ──
+        let http = HttpMetrics {
+            requests: Family::default(),
+            duration: hist_family(request_hist),
+            in_flight: Family::default(),
+            by_project: Family::default(),
+            by_proto: Family::default(),
+        };
+        registry.register(
+            "http_requests",
+            "HTTP requests completed, by matched route, method, status and error code",
+            http.requests.clone(),
+        );
+        registry.register(
+            "http_request_duration_seconds",
+            "HTTP request latency by matched route",
+            http.duration.clone(),
+        );
+        registry.register(
+            "http_requests_in_flight",
+            "HTTP requests currently being served",
+            http.in_flight.clone(),
+        );
+        registry.register(
+            "http_requests_by_project",
+            "HTTP requests completed, by matched route and project (opt-in)",
+            http.by_project.clone(),
+        );
+        registry.register(
+            "http_requests_by_proto",
+            "HTTP requests completed, by transport version",
+            http.by_proto.clone(),
+        );
+
+        // ── Indexing ──
+        let index = IndexMetrics {
+            files: Family::default(),
+            chunks: Family::default(),
+            symbols: Family::default(),
+            code_bytes: Family::default(),
+            file_size: hist_family(size_hist),
+            file_chunks: hist_family(count_hist),
+            phase_duration: hist_family(request_hist),
+            claim_conflicts: Counter::default(),
+            drift_checks: Family::default(),
+            drift_files: Family::default(),
+        };
+        registry.register(
+            "index_files",
+            "Files seen by an index pass, by outcome",
+            index.files.clone(),
+        );
+        registry.register(
+            "index_chunks",
+            "Chunks produced by indexing",
+            index.chunks.clone(),
+        );
+        registry.register(
+            "index_symbols",
+            "Symbol rows produced by indexing",
+            index.symbols.clone(),
+        );
+        registry.register(
+            "index_code_bytes",
+            "Source bytes accepted by indexing",
+            index.code_bytes.clone(),
+        );
+        registry.register(
+            "index_file_size_bytes",
+            "Size distribution of files submitted for indexing",
+            index.file_size.clone(),
+        );
+        registry.register(
+            "index_file_chunks",
+            "Distribution of chunks produced per file",
+            index.file_chunks.clone(),
+        );
+        registry.register(
+            "index_phase_duration_seconds",
+            "Duration of an index request's prepare, embed and mark phases",
+            index.phase_duration.clone(),
+        );
+        registry.register(
+            "index_claim_conflicts",
+            "Files skipped because another writer held the in-process claim",
+            index.claim_conflicts.clone(),
+        );
+        registry.register(
+            "drift_checks",
+            "Working-tree drift comparisons requested by a client",
+            index.drift_checks.clone(),
+        );
+        registry.register(
+            "drift_files_reported",
+            "Files a drift check classified as stale, missing, orphaned or indexing",
+            index.drift_files.clone(),
+        );
+
+        // ── Embedder ──
+        let embed = EmbedMetrics {
+            requests: Family::default(),
+            duration: hist_family(long_hist),
+            batch_size: hist_family(count_hist),
+            texts: Family::default(),
+            retries: Family::default(),
+        };
+        registry.register(
+            "embed_requests",
+            "Calls to a BGE-M3 /encode endpoint, by outcome",
+            embed.requests.clone(),
+        );
+        registry.register(
+            "embed_duration_seconds",
+            "Latency of a BGE-M3 /encode call",
+            embed.duration.clone(),
+        );
+        registry.register(
+            "embed_batch_texts",
+            "Texts per /encode call",
+            embed.batch_size.clone(),
+        );
+        registry.register("embed_texts", "Texts embedded", embed.texts.clone());
+        registry.register(
+            "embed_retries",
+            "Embed calls resent after an HTTP 429 from the embedder",
+            embed.retries.clone(),
+        );
+
+        // ── Qdrant ──
+        let qdrant = QdrantMetrics {
+            ops: Family::default(),
+            duration: hist_family(request_hist),
+            points: Family::default(),
+        };
+        registry.register(
+            "qdrant_ops",
+            "Vector-store operations, by op and outcome",
+            qdrant.ops.clone(),
+        );
+        registry.register(
+            "qdrant_op_duration_seconds",
+            "Vector-store operation latency",
+            qdrant.duration.clone(),
+        );
+        registry.register(
+            "qdrant_points",
+            "Points upserted into or deleted from Qdrant",
+            qdrant.points.clone(),
+        );
+
+        // ── Search ──
+        let search = SearchMetrics {
+            requests: Family::default(),
+            stage_duration: hist_family(request_hist),
+            candidates: count_hist(),
+            results: count_hist(),
+        };
+        registry.register(
+            "search_requests",
+            "Search requests, by outcome",
+            search.requests.clone(),
+        );
+        registry.register(
+            "search_stage_duration_seconds",
+            "Search latency split by stage: embed, candidates, qdrant, fetch",
+            search.stage_duration.clone(),
+        );
+        registry.register(
+            "search_candidates",
+            "Candidate chunks the SQLite filter handed to Qdrant",
+            search.candidates.clone(),
+        );
+        registry.register(
+            "search_results",
+            "Results returned to the caller",
+            search.results.clone(),
+        );
+
+        // ── Research ──
+        let research = ResearchMetrics {
+            runs: Family::default(),
+            runs_by_effort: Family::default(),
+            duration: hist_family(long_hist),
+            steps: hist_family(count_hist),
+            turns: hist_family(count_hist),
+            tokens: Family::default(),
+            context_used: hist_family(ratio_hist),
+            tool_calls: Family::default(),
+            tool_duration: hist_family(request_hist),
+            citations: Family::default(),
+            revalidations: Counter::default(),
+            forced_syntheses: Counter::default(),
+            parse_retries: Counter::default(),
+            truncations: Counter::default(),
+            runaway_thinking_turns: Counter::default(),
+        };
+        registry.register(
+            "research_runs",
+            "Research runs finished, by model and why they stopped",
+            research.runs.clone(),
+        );
+        registry.register(
+            "research_runs_by_effort",
+            "Research runs finished, by model and effort preset",
+            research.runs_by_effort.clone(),
+        );
+        registry.register(
+            "research_duration_seconds",
+            "Wall-clock duration of a research run",
+            research.duration.clone(),
+        );
+        registry.register(
+            "research_steps",
+            "Executed tool steps per research run",
+            research.steps.clone(),
+        );
+        registry.register(
+            "research_turns",
+            "Model turns per research run",
+            research.turns.clone(),
+        );
+        registry.register(
+            "research_tokens",
+            "Tokens a research run made the model process, by prompt or eval",
+            research.tokens.clone(),
+        );
+        registry.register(
+            "research_context_used_ratio",
+            "Peak prompt tokens as a fraction of the run's num_ctx",
+            research.context_used.clone(),
+        );
+        registry.register(
+            "research_tool_calls",
+            "Tool calls executed by a research run, by tool and outcome",
+            research.tool_calls.clone(),
+        );
+        registry.register(
+            "research_tool_duration_seconds",
+            "Latency of a research tool call",
+            research.tool_duration.clone(),
+        );
+        registry.register(
+            "research_citations",
+            "Citations in a finished report, by provenance verdict",
+            research.citations.clone(),
+        );
+        registry.register(
+            "research_revalidations",
+            "Reports sent back to the model because their citations did not check out",
+            research.revalidations.clone(),
+        );
+        registry.register(
+            "research_forced_syntheses",
+            "Reports written by the server because the report window expired first",
+            research.forced_syntheses.clone(),
+        );
+        registry.register(
+            "research_tool_call_parse_retries",
+            "Turns resent at a new seed after Ollama failed to parse a tool call",
+            research.parse_retries.clone(),
+        );
+        registry.register(
+            "research_transcript_truncations",
+            "Turns whose prompt reached num_ctx, so Ollama silently trimmed the transcript",
+            research.truncations.clone(),
+        );
+        registry.register(
+            "research_runaway_thinking_turns",
+            "Turns abandoned after the model streamed past the thinking-volume guard",
+            research.runaway_thinking_turns.clone(),
+        );
+
+        // ── GC ──
+        let gc = GcMetrics {
+            runs: Family::default(),
+            duration: long_hist(),
+            chunks_removed: Counter::default(),
+            files_pruned: Counter::default(),
+            status_log_pruned: Counter::default(),
+            running: Gauge::default(),
+        };
+        registry.register(
+            "gc_runs",
+            "Garbage-collection passes, by trigger and outcome",
+            gc.runs.clone(),
+        );
+        registry.register(
+            "gc_duration_seconds",
+            "Duration of a garbage-collection pass",
+            gc.duration.clone(),
+        );
+        registry.register(
+            "gc_chunks_removed",
+            "Chunk rows hard-deleted after Qdrant confirmed the vector delete",
+            gc.chunks_removed.clone(),
+        );
+        registry.register(
+            "gc_files_pruned",
+            "Deleted file rows dropped once their chunks were gone",
+            gc.files_pruned.clone(),
+        );
+        registry.register(
+            "gc_status_log_pruned",
+            "Status-log rows dropped past the retention window",
+            gc.status_log_pruned.clone(),
+        );
+        registry.register(
+            "gc_running",
+            "1 while a garbage-collection pass holds the process-wide guard",
+            gc.running.clone(),
+        );
+
+        // ── Retry worker ──
+        let retry = RetryMetrics {
+            sweeps: Counter::default(),
+            files: Family::default(),
+        };
+        registry.register(
+            "retry_sweeps",
+            "Retry-worker sweeps that found at least one candidate",
+            retry.sweeps.clone(),
+        );
+        registry.register(
+            "retry_files",
+            "Files the retry worker handled, by outcome",
+            retry.files.clone(),
+        );
+
+        // ── SQLite pool ──
+        let db = DbMetrics {
+            transaction_duration: db_hist(),
+            transactions: Family::default(),
+            pool_acquire_failures: Counter::default(),
+            pool_size: Gauge::default(),
+            pool_available: Gauge::default(),
+        };
+        registry.register(
+            "db_transaction_duration_seconds",
+            "Time a SQLite transaction held its connection",
+            db.transaction_duration.clone(),
+        );
+        registry.register(
+            "db_transactions",
+            "SQLite transactions, by outcome",
+            db.transactions.clone(),
+        );
+        registry.register(
+            "db_pool_acquire_failures",
+            "Transactions refused because the connection pool was empty",
+            db.pool_acquire_failures.clone(),
+        );
+        registry.register(
+            "db_pool_size",
+            "Connections in the SQLite pool",
+            db.pool_size.clone(),
+        );
+        registry.register(
+            "db_pool_available",
+            "Idle connections in the SQLite pool",
+            db.pool_available.clone(),
+        );
+
+        // ── State (collector-owned; see `StateMetrics`) ──
+        let state = StateMetrics {
+            project_files: Family::default(),
+            project_files_by_language: Family::default(),
+            project_chunks_active: Family::default(),
+            project_chunks_deleted: Family::default(),
+            project_symbols: Family::default(),
+            project_last_indexed: Family::default(),
+            project_files_permanently_failed: Family::default(),
+            projects: Gauge::default(),
+            db_size_bytes: Gauge::default(),
+            status_log_rows: Gauge::default(),
+            dependency_up: Family::default(),
+            indexing_claims: Gauge::default(),
+            research_active: Gauge::default(),
+            research_permits_available: Gauge::default(),
+            research_worker_threads: Gauge::default(),
+            build_info: Family::default(),
+            start_time: Gauge::default(),
+        };
+        registry.register(
+            "project_files",
+            "Files known to a project, by status",
+            state.project_files.clone(),
+        );
+        registry.register(
+            "project_files_by_language",
+            "Files known to a project, by language",
+            state.project_files_by_language.clone(),
+        );
+        registry.register(
+            "project_chunks_active",
+            "Active chunks in a project, by language",
+            state.project_chunks_active.clone(),
+        );
+        registry.register(
+            "project_chunks_deleted",
+            "Soft-deleted chunks in a project awaiting garbage collection",
+            state.project_chunks_deleted.clone(),
+        );
+        registry.register(
+            "project_symbols",
+            "Symbol rows in a project, by role",
+            state.project_symbols.clone(),
+        );
+        registry.register(
+            "project_last_indexed_timestamp_seconds",
+            "Unix time of the most recent file to reach 'indexed' in a project",
+            state.project_last_indexed.clone(),
+        );
+        registry.register(
+            "project_files_permanently_failed",
+            "Files that exhausted their retries and will not be retried again",
+            state.project_files_permanently_failed.clone(),
+        );
+        registry.register(
+            "projects",
+            "Projects in the database",
+            state.projects.clone(),
+        );
+        registry.register(
+            "db_size_bytes",
+            "Size of the SQLite database file",
+            state.db_size_bytes.clone(),
+        );
+        registry.register(
+            "status_log_rows",
+            "Rows in the file status-transition log",
+            state.status_log_rows.clone(),
+        );
+        registry.register(
+            "dependency_up",
+            "1 when a dependency answered its health probe",
+            state.dependency_up.clone(),
+        );
+        registry.register(
+            "indexing_claims",
+            "Files currently held by an in-process indexing claim",
+            state.indexing_claims.clone(),
+        );
+        registry.register(
+            "research_active",
+            "Research runs holding a concurrency permit",
+            state.research_active.clone(),
+        );
+        registry.register(
+            "research_permits_available",
+            "Free research concurrency permits",
+            state.research_permits_available.clone(),
+        );
+        registry.register(
+            "research_worker_threads",
+            "Worker threads on the dedicated research runtime",
+            state.research_worker_threads.clone(),
+        );
+        registry.register(
+            "build_info",
+            "Build and schema identity of this process",
+            state.build_info.clone(),
+        );
+        registry.register(
+            "start_time_seconds",
+            "Unix time this process started serving",
+            state.start_time.clone(),
+        );
+
+        Self {
+            registry,
+            http,
+            index,
+            embed,
+            qdrant,
+            search,
+            research,
+            gc,
+            retry,
+            db,
+            state,
+        }
+    }
+
+    /// Render the exposition body. Serve it as [`CONTENT_TYPE`].
+    pub fn render(&self) -> Result<String, std::fmt::Error> {
+        let mut out = String::new();
+        encode(&mut out, &self.registry)?;
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Touch every family once, so `render()` emits every name. A family with no
+    /// observations still emits its `# TYPE` line, but touching them also proves
+    /// each label set encodes.
+    fn touched() -> Metrics {
+        let m = Metrics::new();
+
+        m.http
+            .requests
+            .get_or_create(&RequestLabels {
+                route: "/status".into(),
+                method: "GET",
+                status: 200,
+                code: "",
+            })
+            .inc();
+        m.http
+            .duration
+            .get_or_create(&RouteLabels {
+                route: "/status".into(),
+                method: "GET",
+            })
+            .observe(0.01);
+        m.http
+            .in_flight
+            .get_or_create(&RouteLabels {
+                route: "/status".into(),
+                method: "GET",
+            })
+            .set(0);
+        m.http
+            .by_project
+            .get_or_create(&RouteProjectLabels {
+                route: "/v0/{project_guid}/search".into(),
+                project_guid: "p".into(),
+            })
+            .inc();
+        m.http
+            .by_proto
+            .get_or_create(&ProtoLabels { proto: "HTTP/1.1" })
+            .inc();
+
+        let pl = ProjectLangLabels {
+            project_guid: "p".into(),
+            language: "rust",
+        };
+        m.index
+            .files
+            .get_or_create(&ProjectLangOutcomeLabels {
+                project_guid: "p".into(),
+                language: "rust",
+                outcome: "indexed",
+            })
+            .inc();
+        m.index.chunks.get_or_create(&pl).inc();
+        m.index.symbols.get_or_create(&pl).inc();
+        m.index.code_bytes.get_or_create(&pl).inc();
+        m.index
+            .file_size
+            .get_or_create(&LangLabels { language: "rust" })
+            .observe(1024.0);
+        m.index
+            .file_chunks
+            .get_or_create(&LangLabels { language: "rust" })
+            .observe(4.0);
+        m.index
+            .phase_duration
+            .get_or_create(&PhaseLabels { phase: "prepare" })
+            .observe(0.1);
+        m.index.claim_conflicts.inc();
+        m.index
+            .drift_checks
+            .get_or_create(&ProjectLabels {
+                project_guid: "p".into(),
+            })
+            .inc();
+        m.index
+            .drift_files
+            .get_or_create(&ProjectClassLabels {
+                project_guid: "p".into(),
+                class: "stale",
+            })
+            .inc();
+
+        let emb = EmbedderLabels { embedder: "index" };
+        m.embed
+            .requests
+            .get_or_create(&EmbedderOutcomeLabels {
+                embedder: "index",
+                outcome: "ok",
+            })
+            .inc();
+        m.embed.duration.get_or_create(&emb).observe(1.0);
+        m.embed.batch_size.get_or_create(&emb).observe(256.0);
+        m.embed.texts.get_or_create(&emb).inc();
+        m.embed.retries.get_or_create(&emb).inc();
+
+        m.qdrant
+            .ops
+            .get_or_create(&OpOutcomeLabels {
+                op: "search",
+                outcome: "ok",
+            })
+            .inc();
+        m.qdrant
+            .duration
+            .get_or_create(&OpLabels { op: "search" })
+            .observe(0.02);
+        m.qdrant
+            .points
+            .get_or_create(&OpLabels { op: "insert_batch" })
+            .inc();
+
+        m.search
+            .requests
+            .get_or_create(&ProjectOutcomeLabels {
+                project_guid: "p".into(),
+                outcome: "hit",
+            })
+            .inc();
+        m.search
+            .stage_duration
+            .get_or_create(&StageLabels { stage: "qdrant" })
+            .observe(0.03);
+        m.search.candidates.observe(900.0);
+        m.search.results.observe(5.0);
+
+        let model = ModelLabels {
+            model: "glm".into(),
+        };
+        m.research
+            .runs
+            .get_or_create(&ModelReasonLabels {
+                model: "glm".into(),
+                done_reason: "finalized",
+            })
+            .inc();
+        m.research
+            .runs_by_effort
+            .get_or_create(&ModelEffortLabels {
+                model: "glm".into(),
+                effort: "medium",
+            })
+            .inc();
+        m.research.duration.get_or_create(&model).observe(120.0);
+        m.research.steps.get_or_create(&model).observe(8.0);
+        m.research.turns.get_or_create(&model).observe(10.0);
+        m.research
+            .tokens
+            .get_or_create(&ModelKindLabels {
+                model: "glm".into(),
+                kind: "prompt",
+            })
+            .inc();
+        m.research.context_used.get_or_create(&model).observe(0.2);
+        m.research
+            .tool_calls
+            .get_or_create(&ToolOutcomeLabels {
+                tool: "search",
+                outcome: "ok",
+            })
+            .inc();
+        m.research
+            .tool_duration
+            .get_or_create(&ToolOutcomeLabels {
+                tool: "search",
+                outcome: "ok",
+            })
+            .observe(0.5);
+        m.research
+            .citations
+            .get_or_create(&ClassLabels { class: "verified" })
+            .inc();
+        m.research.revalidations.inc();
+        m.research.parse_retries.inc();
+        m.research.truncations.inc();
+        m.research.runaway_thinking_turns.inc();
+
+        m.gc.runs
+            .get_or_create(&TriggerOutcomeLabels {
+                trigger: "worker",
+                outcome: "ok",
+            })
+            .inc();
+        m.gc.duration.observe(2.0);
+        m.gc.chunks_removed.inc();
+        m.gc.files_pruned.inc();
+        m.gc.status_log_pruned.inc();
+        m.gc.running.set(0);
+
+        m.retry.sweeps.inc();
+        m.retry
+            .files
+            .get_or_create(&OutcomeLabels { outcome: "indexed" })
+            .inc();
+
+        m.db.transaction_duration.observe(0.001);
+        m.db.transactions
+            .get_or_create(&OutcomeLabels { outcome: "ok" })
+            .inc();
+        m.db.pool_acquire_failures.inc();
+        m.db.pool_size.set(4);
+        m.db.pool_available.set(4);
+
+        let s = &m.state;
+        s.project_files
+            .get_or_create(&ProjectStatusLabels {
+                project_guid: "p".into(),
+                status: "indexed".into(),
+            })
+            .set(1);
+        s.project_files_by_language.get_or_create(&pl).set(1);
+        s.project_chunks_active.get_or_create(&pl).set(1);
+        s.project_chunks_deleted
+            .get_or_create(&ProjectLabels {
+                project_guid: "p".into(),
+            })
+            .set(0);
+        s.project_symbols
+            .get_or_create(&ProjectRoleLabels {
+                project_guid: "p".into(),
+                role: "definition".into(),
+            })
+            .set(1);
+        s.project_last_indexed
+            .get_or_create(&ProjectLabels {
+                project_guid: "p".into(),
+            })
+            .set(1);
+        s.project_files_permanently_failed
+            .get_or_create(&ProjectLabels {
+                project_guid: "p".into(),
+            })
+            .set(0);
+        s.projects.set(1);
+        s.db_size_bytes.set(1);
+        s.status_log_rows.set(1);
+        s.dependency_up
+            .get_or_create(&DependencyLabels {
+                dependency: "qdrant",
+            })
+            .set(1);
+        s.indexing_claims.set(0);
+        s.research_active.set(0);
+        s.research_permits_available.set(2);
+        s.research_worker_threads.set(2);
+        s.build_info
+            .get_or_create(&BuildLabels {
+                version: "1.0.0",
+                db_schema_version: "1".into(),
+                model_id: "BAAI/bge-m3".into(),
+            })
+            .set(1);
+        s.start_time.set(1);
+
+        m
+    }
+
+    /// Every family as a dashboard would *query* it, with its type, sorted.
+    ///
+    /// OpenMetrics puts the `_total` suffix on a counter's sample lines, not on
+    /// its `# TYPE` line — the family is `mindex_gc_runs`, the series Prometheus
+    /// stores is `mindex_gc_runs_total`. The series name is the contract, so it
+    /// is what this reconstructs and what the list below pins.
+    fn rendered_families(text: &str) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let name = it.next()?;
+                let ty = it.next()?;
+                let queried = if ty == "counter" {
+                    format!("{name}_total")
+                } else {
+                    name.to_string()
+                };
+                Some((queried, ty.to_string()))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The dashboard is a client and a metric name is as much a contract as an
+    /// `ApiError` code — this is the `codes_are_stable` mirror. The *type* is
+    /// pinned alongside the name because a counter→gauge flip renames nothing
+    /// and silently breaks every `rate()` built on it.
+    #[test]
+    fn metric_names_are_stable() {
+        let text = touched().render().expect("registry renders");
+        let got = rendered_families(&text);
+
+        let mut want: Vec<(String, String)> = [
+            ("mindex_build_info", "gauge"),
+            ("mindex_db_pool_acquire_failures_total", "counter"),
+            ("mindex_db_pool_available", "gauge"),
+            ("mindex_db_pool_size", "gauge"),
+            ("mindex_db_size_bytes", "gauge"),
+            ("mindex_db_transaction_duration_seconds", "histogram"),
+            ("mindex_db_transactions_total", "counter"),
+            ("mindex_dependency_up", "gauge"),
+            ("mindex_drift_checks_total", "counter"),
+            ("mindex_drift_files_reported_total", "counter"),
+            ("mindex_embed_batch_texts", "histogram"),
+            ("mindex_embed_duration_seconds", "histogram"),
+            ("mindex_embed_requests_total", "counter"),
+            ("mindex_embed_retries_total", "counter"),
+            ("mindex_embed_texts_total", "counter"),
+            ("mindex_gc_chunks_removed_total", "counter"),
+            ("mindex_gc_duration_seconds", "histogram"),
+            ("mindex_gc_files_pruned_total", "counter"),
+            ("mindex_gc_running", "gauge"),
+            ("mindex_gc_runs_total", "counter"),
+            ("mindex_gc_status_log_pruned_total", "counter"),
+            ("mindex_http_request_duration_seconds", "histogram"),
+            ("mindex_http_requests_by_project_total", "counter"),
+            ("mindex_http_requests_by_proto_total", "counter"),
+            ("mindex_http_requests_in_flight", "gauge"),
+            ("mindex_http_requests_total", "counter"),
+            ("mindex_index_chunks_total", "counter"),
+            ("mindex_index_claim_conflicts_total", "counter"),
+            ("mindex_index_code_bytes_total", "counter"),
+            ("mindex_index_file_chunks", "histogram"),
+            ("mindex_index_file_size_bytes", "histogram"),
+            ("mindex_index_files_total", "counter"),
+            ("mindex_index_phase_duration_seconds", "histogram"),
+            ("mindex_index_symbols_total", "counter"),
+            ("mindex_indexing_claims", "gauge"),
+            ("mindex_project_chunks_active", "gauge"),
+            ("mindex_project_chunks_deleted", "gauge"),
+            ("mindex_project_files", "gauge"),
+            ("mindex_project_files_by_language", "gauge"),
+            ("mindex_project_files_permanently_failed", "gauge"),
+            ("mindex_project_last_indexed_timestamp_seconds", "gauge"),
+            ("mindex_project_symbols", "gauge"),
+            ("mindex_projects", "gauge"),
+            ("mindex_qdrant_op_duration_seconds", "histogram"),
+            ("mindex_qdrant_ops_total", "counter"),
+            ("mindex_qdrant_points_total", "counter"),
+            ("mindex_research_active", "gauge"),
+            ("mindex_research_citations_total", "counter"),
+            ("mindex_research_context_used_ratio", "histogram"),
+            ("mindex_research_duration_seconds", "histogram"),
+            ("mindex_research_permits_available", "gauge"),
+            ("mindex_research_revalidations_total", "counter"),
+            ("mindex_research_forced_syntheses_total", "counter"),
+            ("mindex_research_runs_by_effort_total", "counter"),
+            ("mindex_research_runs_total", "counter"),
+            ("mindex_research_steps", "histogram"),
+            ("mindex_research_tokens_total", "counter"),
+            ("mindex_research_tool_call_parse_retries_total", "counter"),
+            ("mindex_research_tool_calls_total", "counter"),
+            ("mindex_research_tool_duration_seconds", "histogram"),
+            ("mindex_research_runaway_thinking_turns_total", "counter"),
+            ("mindex_research_transcript_truncations_total", "counter"),
+            ("mindex_research_turns", "histogram"),
+            ("mindex_research_worker_threads", "gauge"),
+            ("mindex_retry_files_total", "counter"),
+            ("mindex_retry_sweeps_total", "counter"),
+            ("mindex_search_candidates", "histogram"),
+            ("mindex_search_requests_total", "counter"),
+            ("mindex_search_results", "histogram"),
+            ("mindex_search_stage_duration_seconds", "histogram"),
+            ("mindex_start_time_seconds", "gauge"),
+            ("mindex_status_log_rows", "gauge"),
+        ]
+        .iter()
+        .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+        .collect();
+        want.sort();
+
+        assert_eq!(
+            got, want,
+            "metric names/types are a contract with the Grafana dashboard — \
+             update the dashboard in the same change, then this list"
+        );
+    }
+
+    /// Mirrors the config convention that a key carries its unit. A metric whose
+    /// name does not say what it measures is a panel someone will mislabel.
+    #[test]
+    fn every_metric_name_carries_its_unit() {
+        // Bare gauges: a count of things right now, where a unit suffix would lie.
+        const BARE: &[&str] = &[
+            "mindex_build_info",
+            "mindex_db_pool_available",
+            "mindex_db_pool_size",
+            "mindex_dependency_up",
+            "mindex_embed_batch_texts",
+            "mindex_gc_running",
+            "mindex_http_requests_in_flight",
+            "mindex_index_file_chunks",
+            "mindex_indexing_claims",
+            "mindex_project_chunks_active",
+            "mindex_project_chunks_deleted",
+            "mindex_project_files",
+            "mindex_project_files_by_language",
+            "mindex_project_files_permanently_failed",
+            "mindex_project_symbols",
+            "mindex_projects",
+            "mindex_research_active",
+            "mindex_research_context_used_ratio",
+            "mindex_research_permits_available",
+            "mindex_research_steps",
+            "mindex_research_turns",
+            "mindex_research_worker_threads",
+            "mindex_search_candidates",
+            "mindex_search_results",
+            "mindex_status_log_rows",
+        ];
+
+        let text = touched().render().expect("registry renders");
+        for (name, _) in rendered_families(&text) {
+            let ok = name.ends_with("_total")
+                || name.ends_with("_seconds")
+                || name.ends_with("_bytes")
+                || BARE.contains(&name.as_str());
+            assert!(ok, "{name} carries no unit and is not a listed bare gauge");
+        }
+    }
+
+    /// The body is OpenMetrics, not Prometheus text — `# EOF` is the tell, and a
+    /// content-type that disagrees fails at the scraper, never at build time.
+    #[test]
+    fn the_registry_renders_openmetrics() {
+        let text = touched().render().expect("registry renders");
+        assert!(text.ends_with("# EOF\n"), "missing OpenMetrics terminator");
+        assert!(CONTENT_TYPE.starts_with("application/openmetrics-text"));
+        assert!(text.contains("mindex_http_requests_total{"));
+    }
+}

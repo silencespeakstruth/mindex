@@ -1,0 +1,6 @@
+# Files executed by a shebang must keep LF in the working tree on every platform.
+# A Windows clone with the default core.autocrlf=true rewrites them to CRLF, and the
+# Docker image then fails with a bare "exec /entrypoint.sh failed: No such file or
+# directory" — the kernel is looking for the interpreter "/bin/sh\r".
+*.sh        text eol=lf
+tools/hooks/* text eol=lf

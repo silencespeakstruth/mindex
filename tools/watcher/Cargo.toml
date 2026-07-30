@@ -1,0 +1,33 @@
+[package]
+name        = "mindex-watch"
+version     = "1.0.0"
+edition     = "2024"
+authors     = ["Сергей Боголюбов"]
+license     = "MIT"
+repository  = "https://github.com/silencespeakstruth/mindex"
+description = "inotify daemon that keeps a mindex index live: debounced reindex on change plus a periodic drift sweep."
+keywords    = ["code-search", "rag", "watcher", "inotify", "mindex"]
+categories  = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+anyhow             = "1"
+clap               = { version = "4", features = ["derive"] }
+globset            = "0.4"
+hex                = "0.4"
+mindexfile         = { path = "../mindexfile" }
+notify             = "6"
+# rustls-tls-native-roots: trust the OS store, not only reqwest's bundled Mozilla
+# roots — see tools/indexer/Cargo.toml for why (both clients must agree).
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+sha2               = "0.10"
+tokio              = { version = "1", features = ["full"] }
+tokio-util         = "0.7"
+toml               = "0.9"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir            = "2"
+
+[dev-dependencies]
+tempfile = "3"

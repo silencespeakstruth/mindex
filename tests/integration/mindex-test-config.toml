@@ -1,0 +1,45 @@
+# Test-stack config for the mindex container (docker-compose.test.yml mounts it and
+# passes --config). It shrinks the request-shape limits — which are TOML-only, no CLI
+# flag — to sizes the limit tests in test_validation.py can trip cheaply. The values
+# must stay far above what any *other* test posts (a few files of a few KiB each).
+# Everything not set here keeps its compiled default.
+
+[server]
+# 2 MiB body cap: lets the 413 test post ~3 MiB instead of the 256 MiB default.
+max_body_mib = 2
+
+[limits]
+# 64 KiB per file: the oversized-code test posts ~70 KiB.
+max_code_bytes = 65536
+# 50 files per /index request / 50 entries per /drift manifest.
+max_files_per_request = 50
+max_drift_files = 50
+# Small /symbols caps so test_symbols.py can trip the 400s cheaply.
+max_symbol_name_bytes = 64
+max_symbol_results = 10
+
+# /research against the scripted mock-ollama. max_concurrent = 1 lets
+# test_research.py exercise 429 research.busy and slot release with two requests.
+[research]
+ollama_url = "http://mock-ollama:11434"
+default_model = "mock-model"
+worker_threads = 1
+max_concurrent = 1
+# Request-budget ceilings pinned to exactly what effort = "high" grants, so
+# test_research.py can exercise the over-ceiling rejection with a small number.
+# Startup refuses a ceiling below the high preset, so these move with it.
+max_request_seconds = 3600
+max_request_tokens = 6000000
+max_request_steps = 64
+# A short catalog refresh, for the same reason [metrics].refresh_interval_seconds is
+# short: test_research.py asserts GET /config publishes the mock's model list, and a
+# five-minute default would mean waiting for it.
+models_refresh_interval_seconds = 5
+
+# A short refresh so test_metrics.py can watch a project appear in the state
+# gauges without a minute-long wait. Dependency probing is off: the mock embedder
+# and mock ollama are healthy by construction, so probing them measures nothing
+# and only slows the tick.
+[metrics]
+refresh_interval_seconds = 5
+probe_dependencies = false

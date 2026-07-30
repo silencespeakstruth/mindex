@@ -1,0 +1,85 @@
+# Integration-test stack (does NOT extend docker-compose.yml): Qdrant + a deterministic
+# mock embedder (no GPU) + mindex + a pytest runner that drives the HTTPS API. This is
+# mindex's primary containerized use. Run:
+#
+#   docker compose -f docker-compose.test.yml up --build \
+#       --exit-code-from test-runner --abort-on-container-exit
+#
+# Migrations are additive (CREATE ... IF NOT EXISTS), so a re-run against the persisted
+# test_mindex_db volume needs no reset. Each test uses a fresh project GUID.
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  mock-embedder:
+    build:
+      context: tests/mock_embedder
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:11211/docs')"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  mock-ollama:
+    build:
+      context: tests/mock_ollama
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:11434/docs')"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  mindex:
+    build: .
+    volumes:
+      - test_mindex_db:/data
+      - test_mindex_certs:/certs
+      - hf_cache:/root/.cache/huggingface
+      # Request-shape limits are TOML-only (no CLI flag); the limit tests in
+      # test_validation.py rely on the shrunken values in this file.
+      - ./tests/integration/mindex-test-config.toml:/config/mindex-test-config.toml:ro
+    environment:
+      RUST_LOG: info
+    command:
+      - --config=/config/mindex-test-config.toml
+      - --bind=0.0.0.0:11111
+      - --db-path=/data/mindex.db
+      - --cert-path=/certs/cert.pem
+      - --key-path=/certs/key.pem
+      - --qdrant-server=http://qdrant:6334
+      - --model-server=http://mock-embedder:11211
+      # The concurrency tests fire several simultaneous /index requests; each takes a
+      # pool connection for its first (project-row) transaction before the per-file
+      # claim, so the pool must comfortably exceed test concurrency. The default (4)
+      # is a deployment tuning knob, not a correctness boundary — with too few
+      # connections the pool returns PoolEmpty (→ 500) rather than queueing.
+      - --db-pool-size=16
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      mock-embedder:
+        condition: service_healthy
+      mock-ollama:
+        condition: service_healthy
+
+  test-runner:
+    build:
+      context: tests/integration
+    environment:
+      MINDEX_URL: https://mindex:11111
+      MOCK_EMBEDDER_URL: http://mock-embedder:11211
+      MOCK_OLLAMA_URL: http://mock-ollama:11434
+    depends_on:
+      - mindex
+
+volumes:
+  test_mindex_db:
+  test_mindex_certs:
+  hf_cache:

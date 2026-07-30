@@ -1,0 +1,65 @@
+# Turnkey stack: Qdrant + the mindex server (the embedder runs on the HOST — see
+# README "Running"). This is the canonical reference for the server's flags and also
+# the perf-benchmark harness: the command flags read from the environment, so a profile
+# swaps in with `docker compose --env-file perf/env/<f>.env up -d` (see .env.example).
+#
+# No host ports are published: the whole stack lives on the internal compose network and
+# talks to itself there. The only host boundary it crosses is OUTBOUND — reaching the
+# embedder on the host (host.docker.internal:11211, via extra_hosts below). Integration
+# tests use docker-compose.test.yml instead (not this file).
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # No ports published — Qdrant has no auth and must not be exposed on the host.
+    # mindex reaches it over the internal compose network (http://qdrant:6334).
+    restart: unless-stopped
+
+  mindex:
+    build: .
+    volumes:
+      - mindex_db:/data
+      - hf_cache:/root/.cache/huggingface
+      # Optional: mount a directory with real certs.
+      # If absent, a self-signed cert is generated automatically on first start.
+      #   mkdir -p certs && openssl req -x509 -newkey rsa:4096 -nodes \
+      #     -keyout certs/key.pem -out certs/cert.pem -days 3650 \
+      #     -subj "/CN=mindex"
+      - mindex_certs:/certs
+    environment:
+      RUST_LOG: ${MINDEX_RUST_LOG:-info}
+    # Allows the container to reach the embedder running on the host.
+    # host-gateway resolves to the Docker host IP on Linux.
+    # On Docker Desktop (Mac/Windows) this mapping is not needed but is harmless.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # The perf-tunable flags read from the environment (see .env.example and
+    # perf/env/*.env). Swap a profile with:  docker compose --env-file <file> up -d
+    # NOTE: the embedder runs on the HOST (not in compose), so its --batch /
+    # --max-inflight / --maxlen are NOT set here — restart the host embedder to change
+    # them. .env only covers the mindex side of the matrix.
+    command:
+      - --bind=0.0.0.0:11111
+      - --db-path=/data/mindex.db
+      - --cert-path=/certs/cert.pem
+      - --key-path=/certs/key.pem
+      - --qdrant-server=http://qdrant:6334
+      - --model-server=${MINDEX_MODEL_SERVER:-http://host.docker.internal:11211}
+      # Chunks per /encode call — the GPU-batch lever; keep >= the embedder's --batch.
+      - --embed-batch=${MINDEX_EMBED_BATCH:-1024}
+      # Connection pool: the indexer's --concurrency must stay <= this (the pool
+      # errors when exhausted, it doesn't block).
+      - --db-pool-size=${MINDEX_DB_POOL_SIZE:-32}
+      - --max-body-mib=${MINDEX_MAX_BODY_MIB:-256}
+      - --stuck-grace-mins=${MINDEX_STUCK_GRACE_MINS:-30}
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  mindex_db:
+  mindex_certs:
+  hf_cache:

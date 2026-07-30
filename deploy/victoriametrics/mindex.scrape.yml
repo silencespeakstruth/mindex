@@ -1,0 +1,19 @@
+# EXAMPLE — the mindex scrape job as one deployment configured it. Append this
+# block to your `scrape_configs:` (VictoriaMetrics: /etc/victoriametrics/scrape.yml;
+# Prometheus reads the same shape) and restart the collector.
+#
+# HTTPS with no `tls_config` is deliberate and not laziness: mindex is TLS-only,
+# its leaf carries `DNS:localhost, IP:127.0.0.1`, and the mkcert root that signed
+# it is installed in the system trust store — which VictoriaMetrics' Go client
+# reads. A `ca_file` under $HOME would not work anyway, because the unit runs
+# with `ProtectHome=true`.
+#
+# 15s rather than the file's implicit 1m: the histograms only resolve a single
+# indexing pass at that rate. Keep it at or above `[metrics].refresh_interval_seconds`
+# (default 60) — inverting the two makes the per-project gauges render as a staircase.
+
+  - job_name: 'mindex'
+    scheme: https
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:11111']

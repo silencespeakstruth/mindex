@@ -1,0 +1,20 @@
+[package]
+name        = "mindexfile"
+version     = "1.0.0"
+edition     = "2024"
+authors     = ["Сергей Боголюбов"]
+license     = "MIT"
+repository  = "https://github.com/silencespeakstruth/mindex"
+description = "Parser for the .mindex project file: GUID, include/exclude globs and language scope, shared by every mindex client."
+keywords    = ["code-search", "config", "glob", "yaml", "mindex"]
+categories  = ["development-tools", "config"]
+
+[dependencies]
+anyhow        = "1"
+globset       = "0.4"
+serde         = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+uuid          = "1"
+
+[dev-dependencies]
+tempfile = "3"

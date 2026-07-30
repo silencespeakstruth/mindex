@@ -1,0 +1,329 @@
+{
+  "name": "mindex-vscode",
+  "displayName": "mindex",
+  "description": "Semantic code search, symbol lookup and local-model research over a mindex index, plus drift checks and selective reindexing.",
+  "version": "1.0.0",
+  "publisher": "mindex",
+  "license": "MIT",
+  "author": {
+    "name": "Сергей Боголюбов"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/silencespeakstruth/mindex.git",
+    "directory": "tools/vscode"
+  },
+  "homepage": "https://github.com/silencespeakstruth/mindex",
+  "bugs": {
+    "url": "https://github.com/silencespeakstruth/mindex/issues"
+  },
+  "keywords": [
+    "code-search",
+    "semantic-search",
+    "rag",
+    "embeddings",
+    "mindex"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:.mindex"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mindex",
+          "title": "mindex",
+          "icon": "media/mindex-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "mindex": [
+        {
+          "id": "mindexAsk",
+          "name": "Ask",
+          "type": "webview",
+          "icon": "$(comment-discussion)",
+          "when": "mindex.hasProject"
+        },
+        {
+          "id": "mindexDrift",
+          "name": "Drift",
+          "icon": "$(git-compare)"
+        },
+        {
+          "id": "mindexStatus",
+          "name": "Server Status",
+          "icon": "$(pulse)",
+          "when": "mindex.hasProject"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "mindexDrift",
+        "when": "mindex.hasProject",
+        "contents": "No drift data yet.\n[Check Drift](command:mindex.checkDrift)\nCompares the working tree against the index (read-only)."
+      },
+      {
+        "view": "mindexDrift",
+        "when": "!mindex.hasProject",
+        "contents": "No usable .mindex project file at the workspace root.\n[Create .mindex File](command:mindex.createProjectFile)\nGenerates a GUID and a commented template — edit the excludes, save, and the extension picks it up."
+      }
+    ],
+    "commands": [
+      {
+        "command": "mindex.createProjectFile",
+        "title": "Create a .mindex Project File",
+        "category": "mindex",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "mindex.ask",
+        "title": "Ask: Search or Research",
+        "icon": "$(comment-discussion)",
+        "category": "mindex"
+      },
+      {
+        "command": "mindex.search",
+        "title": "Search the Index",
+        "category": "mindex",
+        "icon": "$(search)"
+      },
+      {
+        "command": "mindex.research",
+        "title": "Research a Question",
+        "category": "mindex",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "mindex.checkDrift",
+        "title": "Check Drift Against Working Tree",
+        "category": "mindex",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "mindex.reindexSelected",
+        "title": "Reindex Checked Files",
+        "category": "mindex",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "mindex.reindexAllDrift",
+        "title": "Reindex All Stale and Missing",
+        "category": "mindex",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "mindex.reindexCurrentFile",
+        "title": "Reindex This File",
+        "category": "mindex",
+        "icon": "$(save)"
+      },
+      {
+        "command": "mindex.forceReindexCurrentFile",
+        "title": "Force Reindex This File",
+        "category": "mindex",
+        "icon": "$(debug-rerun)"
+      },
+      {
+        "command": "mindex.forceReindexProject",
+        "title": "Force Reindex Whole Project",
+        "category": "mindex",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "mindex.deleteOrphanedSelected",
+        "title": "Delete Checked Orphans from Index",
+        "category": "mindex",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "mindex.cancelIndexing",
+        "title": "Cancel In-Flight Indexing",
+        "category": "mindex",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "mindex.refreshStatus",
+        "title": "Refresh Server Status",
+        "category": "mindex",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "mindex.retryAllFailed",
+        "title": "Retry All Failed Files",
+        "category": "mindex",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "mindex.retryFile",
+        "title": "Retry This File",
+        "category": "mindex",
+        "icon": "$(debug-restart)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "mindex.createProjectFile",
+          "when": "view == mindexDrift && !mindex.hasProject",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mindex.checkDrift",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mindex.reindexSelected",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "navigation@2"
+        },
+        {
+          "command": "mindex.deleteOrphanedSelected",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "navigation@3"
+        },
+        {
+          "command": "mindex.reindexAllDrift",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "1_reindex@1"
+        },
+        {
+          "command": "mindex.reindexCurrentFile",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "1_reindex@2"
+        },
+        {
+          "command": "mindex.cancelIndexing",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "1_reindex@3"
+        },
+        {
+          "command": "mindex.forceReindexCurrentFile",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "9_force@1"
+        },
+        {
+          "command": "mindex.forceReindexProject",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "9_force@2"
+        },
+        {
+          "command": "mindex.refreshStatus",
+          "when": "view == mindexStatus && mindex.hasProject",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mindex.retryAllFailed",
+          "when": "view == mindexStatus && mindex.hasProject",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "mindex.retryFile",
+          "when": "view == mindexStatus && viewItem == failedFile",
+          "group": "inline"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "mindex.retryFile",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "mindex.search",
+        "key": "ctrl+alt+/"
+      }
+    ],
+    "configuration": {
+      "title": "mindex",
+      "properties": {
+        "mindex.serverUrl": {
+          "type": "string",
+          "default": "https://127.0.0.1:11111",
+          "description": "Base URL of the mindex server."
+        },
+        "mindex.noVerify": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip TLS certificate verification (self-signed server cert)."
+        },
+        "mindex.caCert": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a CA certificate (PEM) to trust for the server, e.g. the mkcert root CA."
+        },
+        "mindex.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key sent as X-Api-Key on every request. mindex itself has no authentication and ignores this — set it only when a reverse proxy in front of the server requires a key. Leave empty when connecting straight to a local mindex.",
+          "scope": "machine-overridable"
+        },
+        "mindex.topK": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of search results to request."
+        },
+        "mindex.batchSize": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Files per /index request when reindexing."
+        },
+        "mindex.researchModel": {
+          "type": "string",
+          "default": "",
+          "description": "Default Ollama model for Research (pre-fills the form; empty = use the server's [research].default_model)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "tsc -p . && node --test dist/*.test.js",
+    "watch": "tsc -watch -p .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run format:check && npm run lint && npm run test",
+    "package": "npm run compile && vsce package",
+    "icons": "rsvg-convert -w 128 -h 128 media/icon.svg -o media/icon.png"
+  },
+  "dependencies": {
+    "marked": "^16.4.2",
+    "picomatch": "^4.0.2",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^20.11.0",
+    "@types/picomatch": "^3.0.1",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "3.9.2",
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.5",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.64.0"
+  },
+  "icon": "media/icon.png"
+}

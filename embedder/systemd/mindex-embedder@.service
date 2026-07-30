@@ -1,0 +1,57 @@
+[Unit]
+Description=BGE-M3 embedding server for mindex (%i)
+Documentation=https://github.com/silencespeakstruth/mindex/blob/master/embedder/README.md
+After=network-online.target
+Wants=network-online.target
+# mindex degrades gracefully when the embedder is down (files go `failed`, the
+# retry worker re-attempts), so this is not a hard dependency — but starting it
+# first avoids a burst of failures on boot.
+Before=mindex.service
+
+# Exactly one instance may run: both bind port 11211 and both want the whole
+# model resident. Conflicts= does the excluding (starting one enqueues a stop of
+# the other in the same transaction); After= orders that stop *before* this
+# start, so the port is free by the time we bind. systemd drops the
+# self-reference on each line, so one symmetric list serves both instances —
+# verify with `systemctl --user show mindex-embedder@igpu.service -p Conflicts`.
+# There is no cycle: the reverse ordering constrains jobs that are never in the
+# same transaction, since Conflicts= forbids starting both at once.
+Conflicts=mindex-embedder@egpu.service mindex-embedder@igpu.service
+After=mindex-embedder@egpu.service mindex-embedder@igpu.service
+
+[Service]
+Type=exec
+# EXAMPLE UNIT — the two absolute paths below are the only things you must
+# edit. systemd requires them literal: %h expands, but a relative path and a
+# shell variable do not, and the first token of ExecStart= must be absolute.
+WorkingDirectory=/path/to/mindex/embedder
+# What differs between instances is exactly two things: which torch build runs
+# (ROCm vs XPU — a whole separate venv, selected by %i) and which device string
+# it is handed. The venv has to travel in the path because the first token of
+# ExecStart= must be a literal absolute path; everything else can be a variable.
+EnvironmentFile=%h/.config/mindex/embedder-%i.env
+# --idle-timeout 86400 (was the 600 s default): keeping BGE-M3 resident beats
+# paying a cold load on the first search of every research run. Binds 0.0.0.0
+# (not 127.0.0.1) so the mindex container reaches it via the bridge gateway.
+ExecStart=/path/to/mindex/embedder/.venv-%i/bin/python -m bge_m3_api \
+    --port 11211 --device ${EMBEDDER_DEVICE} --batch ${EMBEDDER_BATCH} \
+    --idle-timeout 86400
+Restart=on-failure
+RestartSec=5
+# Model load is slow on a cold page cache; don't let systemd call it a failure.
+TimeoutStartSec=300
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+# Writable holes in the read-only tree. Listed for both instances even though
+# each uses only its own: an unused ReadWritePath costs nothing, a missing one
+# fails silently (a JIT cache that cannot be written is recompiled every start).
+#   huggingface       — the weights (~48 G, already populated)
+#   miopen            — ROCm kernel perf DB
+#   neo_compiler_cache — intel-compute-runtime's compiled-kernel cache
+ReadWritePaths=%h/.cache/huggingface
+ReadWritePaths=%h/.config/miopen
+ReadWritePaths=%h/.cache/neo_compiler_cache
+
+[Install]
+WantedBy=default.target

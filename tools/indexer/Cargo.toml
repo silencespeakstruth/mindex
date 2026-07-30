@@ -1,0 +1,34 @@
+[package]
+name        = "mindex-index"
+version     = "1.0.0"
+edition     = "2024"
+authors     = ["Сергей Боголюбов"]
+license     = "MIT"
+repository  = "https://github.com/silencespeakstruth/mindex"
+description = "Bulk indexer for a mindex server: scans a repository per its .mindex scope, hashes, and uploads only what changed."
+keywords    = ["code-search", "rag", "indexer", "cli", "mindex"]
+categories  = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+console    = "0.15"
+globset    = "0.4"
+hex        = "0.4"
+indicatif  = "0.17"
+mindexfile = { path = "../mindexfile" }
+# rustls-tls-native-roots: trust the OS store, not only reqwest's bundled Mozilla
+# roots — a local mindex is typically fronted by a locally-issued cert (mkcert, a
+# corporate CA), which lives there and nowhere else. Without it every request dies
+# with `UnknownIssuer` and the only way through is `--no-verify`.
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+tokio      = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml       = "0.9"
+walkdir    = "2"
+
+[dev-dependencies]
+tempfile = "3"

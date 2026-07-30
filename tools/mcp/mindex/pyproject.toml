@@ -1,0 +1,22 @@
+[project]
+name = "mindex"
+version = "1.0.0"
+description = "MCP server exposing mindex semantic search, symbol lookup and index upkeep to a coding agent."
+authors = [{ name = "Сергей Боголюбов" }]
+license = "MIT"
+keywords = ["mcp", "code-search", "rag", "agent", "mindex"]
+requires-python = ">=3.13,<3.14"
+dependencies = ["mcp>=1.2", "httpx>=0.27"]
+
+[project.urls]
+Repository = "https://github.com/silencespeakstruth/mindex"
+
+[project.scripts]
+mindex = "mindex.server:main"
+
+[tool.poetry]
+packages = [{ include = "mindex", from = "src" }]
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,44 @@
+[project]
+name = "bge-m3-api"
+version = "1.0.0"
+description = "BGE-M3 embedding server exposing all three heads (dense, sparse, ColBERT) over a compact binary wire format."
+authors = [{ name = "Сергей Боголюбов" }]
+license = "MIT"
+keywords = ["bge-m3", "embeddings", "colbert", "splade", "mindex"]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastapi>=0.136.3,<0.137",
+    "uvicorn[standard]>=0.48.0,<0.49",
+    "FlagEmbedding>=1.4.0,<2",
+    "transformers>=4.40.0",
+    "accelerate>=0.30.0",
+    "orjson>=3.11.9,<4",
+    # torch's pure-python runtime deps. torch itself is supplied out-of-band via
+    # symlink (see [tool.uv] below), so uv doesn't pull it — and therefore wouldn't
+    # pull these either. Declared here so `import torch` (and torch._dynamo, which
+    # transformers triggers) has them. The heavy binary deps (nvidia-*/ROCm libs)
+    # live inside the symlinked torch and are NOT listed.
+    "sympy",
+    "networkx",
+    "jinja2",
+    "filelock",
+    "fsspec",
+]
+
+[project.urls]
+Repository = "https://github.com/silencespeakstruth/mindex"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+
+[tool.uv]
+# torch is provided OUT-OF-BAND, not by uv. The accelerator build is per-machine
+# (here: AMD ROCm 7.2 for gfx1201), and the ~8 GB wheel is shared, not duplicated:
+# .venv's torch is a symlink to a shared ROCm venv (see README "GPU / torch build").
+# This never-true marker drops torch from resolution entirely, so uv neither pulls
+# the default CUDA wheel (with its nvidia-* libs) nor reverts the symlink on sync.
+override-dependencies = ["torch ; sys_platform == 'no-such-platform'"]

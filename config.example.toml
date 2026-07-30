@@ -1,0 +1,259 @@
+# mindex server configuration (example).
+#
+# Copy to $XDG_CONFIG_HOME/mindex/config.toml (defaults to
+# ~/.config/mindex/config.toml), or point at it with `--config <path>` /
+# $MINDEX_CONFIG. Every key is OPTIONAL: anything omitted falls back to the
+# built-in default shown below. CLI flags override the file; the file overrides
+# the defaults. At startup mindex logs which file it loaded and every value a flag
+# overrode.
+#
+# Keys carry their unit in the name (_ms, _seconds, _minutes, _days, _chunks,
+# _tokens, _bytes, _points, _mib) so there is never a question of what a number
+# means. Invalid values abort startup with an explanation.
+
+[server]
+bind = "127.0.0.1:11111"   # interface:port to listen on
+cert_path = "cert.pem"     # TLS certificate (PEM)
+key_path = "key.pem"       # TLS private key (PEM)
+max_body_mib = 256         # max /index request body (MiB); posts carry many files
+
+[model]
+name = "BAAI/bge-m3"                 # embedding model id (one model supported today)
+server_url = "http://localhost:11211" # the BGE-M3 embedder
+health_timeout_ms = 2000             # /health ping timeout
+max_429_retries = 3                  # retries when the embedder returns 429 (busy)
+backoff_base_ms = 200                # first 429 backoff; doubles each retry
+encode_timeout_ms = 600000           # per-attempt /encode request timeout (ms); 10 min
+
+# OPTIONAL second embedder instance serving only the QUERY path (/search, and every
+# search a /research run makes). Commented out = one instance does both, which is
+# the default.
+#
+# Why split: the two workloads have opposite profiles and only one needs the GPU.
+# Indexing sends batches of hundreds and is throughput-bound. A query is one text
+# of ~20 tokens and is latency-bound — a few hundred ms on CPU, against a research
+# turn of tens of seconds. What the split buys is the ~6 GiB of VRAM the resident
+# fp32 model otherwise holds permanently; on a 32 GiB card that is the difference
+# between a 23 GB local LLM running on the GPU and running half on the CPU.
+#
+# Start it as another instance of the SAME server with `--device cpu`: identical
+# code, identical fp32 numerics. That matters — reduced precision on one side flips
+# low-weight token ids in and out of the sparse set, and a query-side sparse head
+# that disagrees with the index-side one degrades lexical recall in a way that
+# presents as "search sometimes can't find the obvious thing".
+# query_server_url = "http://localhost:11212"
+
+[qdrant]
+server_url = "http://localhost:6334" # Qdrant gRPC endpoint
+upsert_batch_points = 256            # points per Qdrant upsert
+dense_prefetch_limit = 200           # dense candidates before RRF fusion
+sparse_prefetch_limit = 200          # sparse candidates before RRF fusion
+fusion_limit = 200                   # candidates after fusion, before ColBERT rerank
+# Invariant: dense/sparse_prefetch_limit >= fusion_limit >= search.default_top_k.
+
+[database]
+path = "mindex.db"      # SQLite file (use ":memory:" for ephemeral)
+pool_size = 4           # connection pool size; the indexer's --concurrency must be <= this
+page_size_bytes = 16384 # SQLite page size; power of two in 512..=65536
+synchronous = "normal"  # SQLite synchronous mode: off / normal / full / extra
+# Note: journal_mode=WAL and foreign_keys=ON are fixed (correctness invariants).
+
+[indexing]
+embed_batch_chunks = 256   # chunks per /encode call — the GPU batch lever
+stuck_grace_minutes = 30   # how long a file may sit in 'indexing' before the retry
+                           # worker treats it as crash-orphaned; MUST exceed the
+                           # longest legitimate in-flight indexing request
+path_batch_size = 500      # paths per batch on soft-delete/cancel (SQLite bind limit; 1..=999)
+sparse_min_weight = 0.00001 # sparse weights at or below this are dropped before upsert
+
+[slicer]
+min_chunk_tokens = 128  # smallest node token-span that becomes a chunk
+max_chunk_tokens = 512  # largest; must be <= 512 (top of BGE-M3's measured sweet spot)
+# Documentation is chunked by block structure, not by the AST walk, and has no
+# minimum — a short section is a complete claim. 512 measurably cuts explanations
+# away from what they explain; past 1024 nothing improves and each hit costs more
+# of a /research transcript. Hard ceiling is the embedder's --maxlen (8192).
+max_doc_chunk_tokens = 1024
+# How much embedding distance refines where documentation is cut, against the
+# heading structure (which always wins outright at heading levels 1-2). 0 turns
+# it off along with the one /encode per document; 1 is the default; above ~4 the
+# segmentation collapses toward one block per chunk. On a densely-headed corpus
+# this measurably changes nothing — it earns its keep on documents whose headings
+# are sparse or absent, where structure alone can only pack up to the cap.
+doc_semantic_weight = 1.0
+
+[search]
+default_top_k = 5       # results returned when a /search request omits top_k
+max_top_k = 100         # upper bound a request may set for top_k (400 above this)
+max_query_bytes = 32768 # max search-query length in bytes (400 above this)
+
+# Request-shape limits enforced at the API edge; each violation is a 400 with a
+# stable error code. Raise them if a legitimate workload needs more.
+[limits]
+max_code_bytes = 16777216    # per-file source size cap on /index (16 MiB)
+max_files_per_request = 10000 # max files in one /index request
+max_drift_files = 200000      # max entries in one /drift path→sha256 map
+max_selector_patterns = 256   # max globs+languages combined in one include/exclude
+max_symbol_name_bytes = 512   # max /symbols name length in bytes
+max_symbol_results = 50       # upper bound a /symbols request may set for limit (per role)
+
+# /research — the Ollama-driven iterative research endpoint (SSE). Talks to a
+# local Ollama; each request names its model (or falls back to default_model).
+# Ollama is an OPTIONAL dependency: omit this whole section and mindex still runs
+# (only /research fails, per request). Its liveness shows up as `checks.ollama` in
+# GET /health without ever making `status` "degraded".
+[research]
+ollama_url = "http://127.0.0.1:11434" # local Ollama server
+default_model = ""                    # model when a request omits one; "" = required per request
+worker_threads = 2                    # threads in the dedicated research runtime
+max_concurrent = 2                    # research jobs beyond this get 429 research.busy
+turn_timeout_ms = 3900000             # DEAD-SOCKET guard only, NOT the run's bound, and it must
+                                      # stay ABOVE max_request_seconds. A turn timeout is a
+                                      # transport error: it fails the whole run as
+                                      # ollama.unavailable, while the wall-clock deadline below
+                                      # cancels the same turn and still ships a report. A model
+                                      # looping in its thinking channel is exactly what the
+                                      # deadline is for, so letting this fire first inverts the
+                                      # design. Startup refuses a value that would.
+max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking channel has streamed
+                                      # this many characters; 0 disables. Catches the pathology
+                                      # turn_timeout_ms structurally cannot see: a model that
+                                      # loops in the channel discarded from the transcript keeps
+                                      # the socket healthy and the tokens flowing, so only the
+                                      # deadline stops it — after the run is spent. Two measured
+                                      # variants, both caught here: a wedged INVESTIGATION turn
+                                      # generates ~18 chars/s and is dropped at ~445 s of a 900 s
+                                      # deadline, leaving enough budget to still investigate; a
+                                      # wedged REPORT turn generates ~310 chars/s and is dropped
+                                      # in seconds. The cost is a 3.1x margin over the busiest
+                                      # healthy turn measured here (2642 characters) rather than
+                                      # the order of magnitude an earlier 20000 had — which was
+                                      # safe and never tripped on the slow variant at all.
+                                      # The abandoned turn comes back as an empty reply,
+                                      # which every phase already recovers from (the plan turn
+                                      # degrades to a plan-less run, the tool loop charges a
+                                      # bounded parse retry). Startup refuses a small non-zero
+                                      # value, which would abandon healthy turns instead.
+report_timeout_ms = 120000            # how long the report phase gets AFTER the investigation
+                                      # deadline. A window of its own, because the run that most
+                                      # needs to synthesise what it found is the one that ran out
+                                      # of time. So the longest a caller waits is
+                                      # max_seconds + report_timeout_ms. If it expires with a draft
+                                      # in hand the draft ships; with nothing, the server writes an
+                                      # honest "cut short after N minutes" notice.
+health_timeout_ms = 2000              # /health liveness-ping timeout for Ollama (GET /api/tags)
+models_refresh_interval_seconds = 300 # how often the local Ollama model registry is re-read for
+                                      # the research.models list GET /config publishes. A catalog
+                                      # refresh, not a health probe: a model pulled or removed
+                                      # after startup has to reach clients without restarting
+                                      # mindex. One GET per tick, bounded by health_timeout_ms.
+                                      # A failed tick keeps the previously published list (and its
+                                      # models_refreshed_at), so an Ollama that blips does not
+                                      # empty a client's model picker; an unreachable Ollama just
+                                      # leaves the list empty with models_refreshed_at null.
+
+# CEILING on the context window, not the window itself. Each request names its own
+# model, and a model's trained context length is discoverable (/api/show), so that
+# length is what mindex requests — capped here. The cap exists because num_ctx
+# allocates KV cache up front: measured ~30 KiB/token with
+# OLLAMA_KV_CACHE_TYPE=q8_0 and ~54 KiB at f16, so an unguarded 262144-token model
+# would ask for ~7.5 GiB of VRAM. Lower it if num_ctx crowds out your embedder.
+max_num_ctx_tokens = 131072
+
+# Ceilings on a request's optional `budget` override (the effort levels below are
+# the defaults; these are the most any single request may ask for). A request over
+# a ceiling is a 400 validation.research_budget_out_of_range. Each must be at least
+# what [research.effort.high] grants.
+max_request_seconds = 3600
+max_request_tokens = 8000000
+max_request_steps = 200
+
+# Sampling, applied to every research turn. Commented out = each model's OWN
+# Modelfile default is used, which is the right production behaviour and the wrong
+# setting for comparing models: those defaults differ per model (measured here,
+# temperature 1 for both glm-4.7-flash and qwen3.6, the latter also carrying
+# presence_penalty 1.5), so an unpinned comparison measures Modelfiles and sampling
+# noise. Pin temperature low before comparing models at all: unpinned, the
+# comparison is between Modelfiles. `seed` is a default a request's own `seed`
+# overrides — that is the axis a harness varies to get repetitions worth
+# averaging. All three are published in `GET /config` (`research.sampling`), so a
+# client records what was in force rather than what it asked for.
+# temperature = 0.2
+# top_p = 0.9
+# seed = 1
+
+# What each `effort` level buys. Four axes with different jobs, and a run stops at
+# whichever is reached first — `done.reason` says which.
+#
+# max_seconds is the budget: it is a HARD monotonic deadline for the investigation,
+# polled between turns for a graceful stop and enforced by cancelling the turn in
+# flight when a turn overruns it. What the run found by then goes to the report
+# phase, which has its own report_timeout_ms above. max_tokens is the COST
+# axis — every turn resends the whole transcript, so the token sum is what the run
+# actually makes the GPU do; a step is not a unit of anything (`outline` is one
+# indexed SELECT while `search` is a GPU embed plus a vector query, and one turn may
+# ask for several), so max_steps is a backstop only. context_fraction is a GUARD,
+# not a lever: it stops a small-window model before Ollama silently trims the
+# transcript, and at the deepest setting a real run's largest prompt was ~12k
+# against a 65k window (18%), so it does not end a normal run. It is the one axis a
+# request cannot override — raising it buys truncation, nothing else.
+#
+# The wall-clock ladder is 5 / 15 / 60 minutes, set from use: medium at 240 s was
+# observed cutting glm off mid-investigation on real questions about this repo.
+#
+# The token budgets scale WITH the clock, and that is not optional. Every turn resends
+# the whole transcript, so cost grows super-linearly — glm spent ~160k prompt tokens
+# in a 120 s run, which puts an hour well north of 5M. Raise max_seconds without
+# raising max_tokens and tokens_exhausted becomes the universal stop: the ladder looks
+# deeper and behaves exactly as before. max_steps barely moves, because raising medium
+# 20 -> 48 was measured to change nothing (median depth 16 -> 16, citations 60 -> 32).
+#
+# search_top_k is the evidence width per `search` call. It is the same at all three
+# levels on purpose: measured on this repo, the runs that missed an answer were
+# already getting five hits per search and losing on query FORMULATION, not on
+# width — so raising it buys transcript (every hit is resent every later turn) and
+# not coverage. It is a knob so a harness can sweep it, not a lever to reach for.
+# Must not exceed [search].max_top_k; startup refuses if it does.
+[research.effort.low]
+max_seconds = 300
+max_tokens = 400000
+context_fraction = 0.5
+max_steps = 8
+search_top_k = 5
+
+[research.effort.medium]
+max_seconds = 900
+max_tokens = 1200000
+context_fraction = 0.7
+max_steps = 20
+search_top_k = 5
+
+[research.effort.high]
+max_seconds = 3600
+max_tokens = 6000000
+context_fraction = 0.85
+max_steps = 64
+search_top_k = 5
+
+[workers]
+gc_interval_seconds = 3600          # how often the GC sweep runs
+status_log_retention_days = 30      # how long status-transition log rows are kept
+retry_interval_seconds = 60         # how often the retry worker sweeps (also the
+                                    # post-failure grace before a 'failed' file is retried)
+failed_warn_interval_seconds = 3600 # how often the permanently-failed warning re-fires
+max_retries = 3                     # retry budget before a file stays 'failed' for good
+
+[metrics]
+# Prometheus/OpenMetrics exposition at GET /metrics, plus the worker that
+# recomputes the per-project state gauges. `enabled` gates *exposure*: the
+# registry is always built and always written into, so turning this off costs
+# nothing and gains nothing but a closed endpoint.
+enabled = true
+refresh_interval_seconds = 60   # per-project gauge refresh; keep it at or below
+                                # your scrape interval, or consecutive scrapes
+                                # report the same value and render as a staircase
+probe_dependencies = true       # sample qdrant/embedder/ollama liveness each refresh
+per_project_http_labels = false # add {project_guid} to the HTTP request counter.
+                                # Off by default: it is the one label a client
+                                # chooses, and the domain metrics already break
+                                # down per project without crossing it with route

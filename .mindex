@@ -1,0 +1,73 @@
+# mindex project marker (YAML). Read by mindex-index, mindex-watch, the VS Code
+# extension and the post-commit hook; the MCP servers don't parse it — the agent
+# reads it and passes the GUID and filters as call arguments. One file, at the
+# repo root, no nesting.
+#
+# Keys: guid (required, dashed or dashless UUID), plus the optional scope lists
+# exclude_paths / include_paths / languages. An unknown key is an error, not a
+# silent no-op — a mistyped `exclude_path:` would otherwise index the tree it was
+# meant to keep out. Globs are root-relative with forward slashes; `*` stops at a
+# directory separator, `**` crosses them; excludes are applied before includes, so
+# an include cannot re-admit what an exclude dropped.
+#
+# Scope policy for this repo: index everything that is written, exclude only what
+# is generated, fetched or secret. That deliberately includes the tooling — the
+# indexer, watcher, mindexfile, both MCP servers, the VS Code extension, the
+# embedder, the shell scripts, the SQL migrations and the documentation — because
+# all of it is code someone has to answer questions about.
+
+guid: c2d7e2c1-3165-42f5-9366-0ff1492b4bab
+
+exclude_paths:
+  # Git internals.
+  - .git/**
+  # Rust build output: the root workspace plus the three tools/ crates, which are
+  # separate workspaces with their own target/ each.
+  - target/**
+  - "**/target/**"
+  # VS Code extension: npm deps, the tsc output that duplicates every src/ file,
+  # and packaged builds.
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "**/*.vsix"
+  # Python environments and tool caches. The embedder's venvs are per-backend
+  # (.venv-egpu / .venv-igpu), so the plain `.venv` glob does not reach them.
+  - "**/.venv/**"
+  - "**/.venv-*/**"
+  - "**/__pycache__/**"
+  - "**/.ruff_cache/**"
+  - "**/.mypy_cache/**"
+  - "**/.pytest_cache/**"
+  - "**/.ipynb_checkpoints/**"
+  # Lockfiles: machine-generated dependency graphs, no prose, and large enough to
+  # crowd out real code. `*.lock` covers Cargo.lock, poetry.lock and uv.lock;
+  # npm's is not matched by it and sliced to 117 chunks — a sixth of the whole
+  # index — before it was excluded by name.
+  - "**/*.lock"
+  - "**/package-lock.json"
+  # The perf harness's benchmark corpus: cloned third-party repositories, i.e.
+  # foreign source code and the single biggest polluter of this index. The
+  # harness itself (fetch.sh, run.sh, repos.txt) stays in.
+  - perf/corpus/.clones/**
+  - perf/corpus/data/**
+  # Benchmark output: one CSV per run, plus generated plots.
+  - perf/results/**
+  - perf/plots/**
+  # Secrets and generated certificates.
+  - "**/*.pem"
+  - certs/**
+  # Agent configuration. Not all of .claude/**: CLAUDE.md is this project's
+  # densest documentation and answers "why is it built this way" about as well as
+  # the source does, so it is indexed. Settings and agent definitions are
+  # configuration for a tool that reads this repo, not a description of it.
+  - .claude/settings*.json
+  - .claude/agents/**
+
+# Empty means the whole tree (minus the excludes above) — which is the point:
+# nothing here is narrowed to a subset.
+include_paths: []
+
+# Empty means every language mindex supports, which is what this repo needs: Rust,
+# Python, TypeScript, JavaScript, bash, SQL, YAML/TOML/JSON and Markdown all carry
+# something worth retrieving. The canonical list is served at GET /config.
+languages: []

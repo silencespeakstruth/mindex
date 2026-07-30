@@ -1,0 +1,19 @@
+# Everything the extension host does not run. `vsce` packages the whole folder by
+# default, so this file — not .gitignore — is what keeps sources, dev tooling and
+# node_modules out of the .vsix.
+
+.vscode/**
+.gitignore
+.prettierignore
+.prettierrc.json
+eslint.config.mjs
+tsconfig.json
+node_modules/**
+src/**
+
+# Compiled test fixtures and sourcemaps: useful in the working tree, dead weight
+# in a published package. The activity-bar icon is SVG and IS shipped (media/**).
+dist/**/*.test.js
+dist/**/*.test.js.map
+dist/**/*.map
+**/*.vsix

@@ -1,0 +1,22 @@
+# Opt-in port-publishing overlay for the turnkey stack. The base docker-compose.yml
+# publishes NO host ports (everything talks over the internal compose network); merge
+# this file on top when you want to drive the API from the host or open the Qdrant
+# dashboard. Use it explicitly — it is NOT auto-merged like a docker-compose.override.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.exposed.yml up -d
+#
+# All ports bind to 127.0.0.1 only: mindex has no API auth and Qdrant has none either,
+# so neither may be reachable on other interfaces.
+services:
+
+  mindex:
+    # mindex HTTPS API (self-signed cert on first start) — host tools (mindex-index,
+    # mindex-search.sh, the MCP servers) reach it here at https://localhost:11111.
+    ports:
+      - "127.0.0.1:11111:11111"
+
+  qdrant:
+    # Qdrant dashboard/REST UI at http://localhost:6333/dashboard. mindex itself does
+    # NOT use this — it talks gRPC over the internal network; this is only for you.
+    ports:
+      - "127.0.0.1:6333:6333"
