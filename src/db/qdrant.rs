@@ -45,7 +45,7 @@ const COLLECTION_SCHEMA_VERSION: &str = "v1";
 /// Dense / ColBERT vector width. **Structural, not configurable**: it is dictated by
 /// the BGE-M3 model and baked into every collection's schema — changing it without a
 /// matching model + collection rebuild silently breaks search.
-const VECTOR_DIM: u64 = 1024;
+pub(crate) const VECTOR_DIM: u64 = 1024;
 
 /// Production [`VectorStore`] backed by a Qdrant client plus the retrieval prefetch
 /// limits from `[qdrant]` config. Wrapping the external `Qdrant` (rather than impl'ing

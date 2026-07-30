@@ -1091,6 +1091,27 @@ therefore asserts 128–512 ±`WINDOW_SLACK`; without the slack the test is a tr
 on whichever source file happens to land on a boundary (`src/research.rs` did),
 not a guard on the window.
 
+**A line is not bounded by anything, so neither pass may cut only at line
+boundaries.** A minified file is one line for its whole length, and one paragraph
+of prose can be too, so the structural boundary both slicers prefer simply is not
+there — and what came out was a chunk of *any* size. That is not a coarse chunk,
+it is an unstorable one: a Qdrant multivector point holds at most 1 048 576
+elements, ColBERT emits one 1024-wide row per token, and the embedder adds
+`[CLS]`/`[SEP]`, so anything above `STORABLE_TOKENS_CEILING` (1022 tokens) is
+**refused — failing the whole upsert batch, not the offending file**, while a
+large one first exhausts the embedder's GPU memory and fails the batch that way.
+Hence `token_boundary` (`slicing/traits.rs`), the last resort of both passes: cut
+on a boundary the tokenizer itself reported. Two things about the ceiling are
+easy to get wrong. It is `min`-clamped **in both constructors** rather than
+enforced by config validation, because `[slicer].max_doc_chunk_tokens` **defaults
+to 1024** — over the ceiling before a single chunk is cut — and rejecting that at
+startup would refuse a config the operator never chose; the code window (512) is
+far below it and unaffected. And a slicer must aim `RETOKENIZATION_SLACK` *under*
+it, for the whole-file-offsets reason above: a cut measured at 1022 re-encodes at
+1023. Documentation blocks are truncated to the same ceiling before they are
+embedded for the semantic term — a block is not a chunk and has no size bound,
+and its opening is what that vector is for.
+
 **Documentation is chunked by a second slicer, and every rule above inverts.**
 `MarkdownSlicer` (`slicing/markdown.rs`, `markdown` only) walks tree-sitter-md's
 **block** grammar to atomic blocks — descending into `list_item`, because one list in
