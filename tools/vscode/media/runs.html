@@ -1,0 +1,58 @@
+<main class="runs-page">
+    <aside class="runs-list">
+        <header class="runs-head">
+            <div class="row">
+                <span class="codicon codicon-search dim"></span>
+                <input
+                    id="runs-search"
+                    type="search"
+                    class="runs-search"
+                    placeholder="Search titles, questions and reports…"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+            </div>
+            <div class="row runs-filters">
+                <label class="dim" for="runs-freshness">Show</label>
+                <select id="runs-freshness" class="runs-select">
+                    <option value="all">All</option>
+                    <option value="fresh">Still current</option>
+                    <option value="stale">Outdated</option>
+                </select>
+                <select
+                    id="runs-validity"
+                    class="runs-select"
+                    title="Validity — a report is valid when its own files are current and every report it built on is still valid"
+                >
+                    <option value="all">Any validity</option>
+                    <option value="valid">Valid</option>
+                    <option value="invalid">Invalid</option>
+                </select>
+                <span class="runs-spinner dim" id="runs-loading" hidden>
+                    <span class="codicon codicon-loading codicon-modifier-spin"></span>
+                </span>
+            </div>
+        </header>
+
+        <div class="runs-error" id="runs-error" hidden></div>
+
+        <ul class="runs-items" id="runs-items"></ul>
+
+        <p class="runs-empty dim" id="runs-empty" hidden>
+            No stored research matches. A run is stored when it finishes; ask a question from
+            the Ask sidebar to create one.
+        </p>
+
+        <footer class="runs-foot">
+            <button id="runs-more" class="ghost" hidden>Load more</button>
+            <button id="runs-use" class="primary" disabled>
+                <span class="codicon codicon-references"></span>
+                <span id="runs-use-label">Use as context</span>
+            </button>
+        </footer>
+    </aside>
+
+    <section class="runs-preview" id="runs-preview">
+        <p class="runs-placeholder dim">Select a run to read its report.</p>
+    </section>
+</main>

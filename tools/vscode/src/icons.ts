@@ -32,6 +32,8 @@ export const ICON = {
 
     /** The status panel and the command that opens it. */
     status: "pulse",
+    /** The Research History panel and the command that opens it. */
+    researchHistory: "history",
     /** Jump to the extension's own settings. */
     settings: "gear",
     /** Refresh whatever the surface is showing. */

@@ -43,7 +43,15 @@ use crate::backend::v0::models::ProjectListResponse;
 use crate::backend::v0::models::ProjectStats;
 use crate::backend::v0::models::ProjectSummary;
 use crate::backend::v0::models::ReadChunksResponse;
+use crate::backend::v0::models::ResearchFreshness;
+use crate::backend::v0::models::ResearchListQuery;
+use crate::backend::v0::models::ResearchPinRequest;
 use crate::backend::v0::models::ResearchRequest;
+use crate::backend::v0::models::ResearchRunDependency;
+use crate::backend::v0::models::ResearchRunDetail;
+use crate::backend::v0::models::ResearchRunFile;
+use crate::backend::v0::models::ResearchRunListResponse;
+use crate::backend::v0::models::ResearchRunSummary;
 use crate::backend::v0::models::RetryRequest;
 use crate::backend::v0::models::RetryResponse;
 use crate::backend::v0::models::SearchFilter;
@@ -3436,11 +3444,486 @@ pub(crate) async fn file_versions_core(
     Ok(rows)
 }
 
+/// How many stored reports one `list_research` call may return.
+///
+/// Deliberately a `const`, not a config knob: the bound exists because the reply
+/// is prompt tokens on every later turn, which is a property of the tool-loop
+/// design and not of any deployment's hardware. The stored corpus itself is
+/// bounded by retention, so 50 rows is "everything recent" in practice.
+const LIST_RESEARCH_LIMIT: usize = 50;
+
+/// The `list_research` tool's core: valid stored runs of one project, newest
+/// first. Invalid runs (stale, or resting on a deleted/stale run) are excluded
+/// here rather than flagged — a model has no business reading prose the validity
+/// graph has already condemned.
+pub(crate) async fn list_research_core(
+    s: &RouterState,
+    project_guid: UUIDv4,
+    query: Option<String>,
+    token: &CancellationToken,
+) -> Result<Vec<crate::research::ResearchListing>, ApiError> {
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid.0.simple().to_string();
+
+    let rows = s
+        .db_pool
+        .transaction(token.child_token(), move |tx| {
+            let filter = query
+                .as_deref()
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .map(|q| format!("%{}%", like_escape(q)));
+            let sql = format!(
+                "{ctes}
+                 SELECT r.id, r.seq, r.title, r.question, r.created_at
+                   FROM research_runs r
+                  WHERE r.project_guid = ?1
+                    AND NOT EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id)
+                    {q_clause}
+                  ORDER BY r.seq DESC
+                  LIMIT {limit}",
+                ctes = research_validity_ctes("?1", "?2"),
+                q_clause = if filter.is_some() {
+                    "AND (r.title LIKE ?3 ESCAPE '\\' OR r.question LIKE ?3 ESCAPE '\\')"
+                } else {
+                    ""
+                },
+                limit = LIST_RESEARCH_LIMIT,
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
+            if let Some(f) = &filter {
+                binds.push(f);
+            }
+            let out = stmt
+                .query_map(binds.as_slice(), |row| {
+                    Ok(crate::research::ResearchListing {
+                        id: row.get(0)?,
+                        seq: row.get(1)?,
+                        title: row.get(2)?,
+                        question: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to list stored research for the research loop. Check the \
+                 database is readable."
+            );
+            ApiError::from(e)
+        })?;
+    Ok(rows)
+}
+
+/// The `read_research` tool's core: one stored run's report, by per-project seq —
+/// but only when the validity graph still vouches for it.
+pub(crate) async fn read_research_core(
+    s: &RouterState,
+    project_guid: UUIDv4,
+    seq: i64,
+    token: &CancellationToken,
+) -> Result<crate::research::StoredReport, ApiError> {
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid.0.simple().to_string();
+
+    let found = s
+        .db_pool
+        .transaction(token.child_token(), move |tx| {
+            let sql = format!(
+                "{ctes}
+                 SELECT r.question, r.report,
+                        EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id)
+                   FROM research_runs r
+                  WHERE r.project_guid = ?1 AND r.seq = ?3",
+                ctes = research_validity_ctes("?1", "?2"),
+            );
+            let row = tx
+                .query_row(&sql, rusqlite::params![pg, model_id, seq], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                seq,
+                "Failed to read a stored research report for the research loop. \
+                 Check the database is readable."
+            );
+            ApiError::from(e)
+        })?;
+    Ok(match found {
+        None => crate::research::StoredReport::Missing { seq },
+        Some((_, _, true)) => crate::research::StoredReport::Invalid { seq },
+        Some((question, report, false)) => crate::research::StoredReport::Found {
+            seq,
+            question,
+            report,
+        },
+    })
+}
+
 /// Production [`ResearchTools`]: the research loop's index lookups are direct
 /// internal calls to the `/search` and `/symbols` cores — no HTTP back to self.
 struct StateResearchTools {
     state: RouterState,
     project_guid: UUIDv4,
+}
+
+/// Longest derived title, in characters. This is the *fallback* rendering, cut
+/// from the question rather than stored: nothing joins or sorts on it, the search
+/// already runs over the whole `question`, and deriving keeps it true forever — a
+/// stored copy of a *truncation* would go stale the day the rule changed. The
+/// preferred title is `research_runs.title`, the report's own heading, which IS
+/// stored because it is the model's output and not a derivation.
+const RESEARCH_TITLE_CHARS: usize = 72;
+
+/// A run's fallback display title: the question's first line, collapsed and cut at
+/// a word boundary. Used when the run journalled no title of its own.
+///
+/// Cutting at a word boundary rather than mid-token is not decoration — a list of
+/// titles is scanned, and a truncation that severs an identifier ("post_ind…") reads
+/// as a different symbol.
+pub(crate) fn research_title(question: &str) -> String {
+    let line = question
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= RESEARCH_TITLE_CHARS {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(RESEARCH_TITLE_CHARS).collect();
+    let head = match cut.rfind(' ') {
+        // Only honour the word boundary if it leaves something to read; a question
+        // whose first word is longer than the cap would otherwise become "…".
+        Some(i) if i >= RESEARCH_TITLE_CHARS / 2 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    format!("{}…", head.trim_end())
+}
+
+/// How many of a stored run's baseline files no longer match the index, and how many
+/// it read in total.
+///
+/// This is the whole staleness computation, and it is the same comparison
+/// [`Evidence::apply_versions`](crate::research::Evidence) makes during a live run —
+/// asked later, of a run that has already finished. `sha256 IS NULL` folds "the file
+/// was deleted" into "the file changed" on purpose: to a reader of a stored report
+/// they are one fact, that what it describes no longer holds, which is exactly what
+/// `Evidence::is_stale` means by `changed || removed`.
+///
+/// The `model_id` bind is load-bearing and easy to omit: `project_files` is keyed
+/// `(project_guid, model_id, path)`, so joining on the path alone would match a run's
+/// baseline against every embedding model the database has ever held.
+/// `model_bind` is the positional placeholder (`"?2"`) the caller has bound the
+/// embedding model id to; the two readers number their parameters differently, and a
+/// hardcoded index here would silently mis-bind one of them.
+fn research_staleness_columns(model_bind: &str) -> String {
+    format!(
+        "(SELECT COUNT(*) FROM research_run_files rf WHERE rf.run_id = r.id) AS files_total,
+         (SELECT COUNT(*)
+            FROM research_run_files rf
+            LEFT JOIN project_files pf
+                   ON pf.project_guid = r.project_guid
+                  AND pf.model_id     = {model_bind}
+                  AND pf.path         = rf.path
+                  AND pf.status      != 'deleted'
+           WHERE rf.run_id = r.id
+             AND (pf.sha256 IS NULL OR pf.sha256 <> rf.sha256)) AS files_moved"
+    )
+}
+
+/// The `WITH` block computing per-run *validity* for one project's stored research.
+///
+/// A run is valid when its own evidence still matches the index AND every run in
+/// its context chain still exists and is itself valid. Nothing is materialized:
+/// staleness can heal (a file reindexed back to the same bytes), and a deleted
+/// parent — hard `DELETE` or the GC retention sweep, the two are the same event
+/// here — is a dangling id in `context_run_ids_json`, so the cascade is immediate
+/// by construction rather than by a write someone must remember to make.
+///
+/// The recursion cannot loop: a run's context is validated to exist at launch and
+/// its own row does not exist yet, so every edge points to a strictly earlier row;
+/// SQLite's recursive `UNION` deduplicates besides. `json_each` over
+/// `context_run_ids_json` is the sanctioned exception to "read whole, never joined
+/// on": the corpus is one project's retained runs, two orders of magnitude smaller
+/// than anything the search path touches.
+///
+/// `guid_bind`/`model_bind` are the caller's positional placeholders for the
+/// project guid (simple form) and the EMBEDDING model id — `"?1"`/`"?2"` for every
+/// reader today, parameterised for the reason `research_staleness_columns` is.
+/// Ids are compared exactly as stored (hyphenated `Uuid::to_string()` on both
+/// sides); do not normalise them here.
+fn research_validity_ctes(guid_bind: &str, model_bind: &str) -> String {
+    format!(
+        "WITH moved AS (
+             SELECT r.id AS run_id,
+                    (SELECT COUNT(*)
+                       FROM research_run_files rf
+                       LEFT JOIN project_files pf
+                              ON pf.project_guid = r.project_guid
+                             AND pf.model_id     = {model_bind}
+                             AND pf.path         = rf.path
+                             AND pf.status      != 'deleted'
+                      WHERE rf.run_id = r.id
+                        AND (pf.sha256 IS NULL OR pf.sha256 <> rf.sha256)) AS files_moved
+               FROM research_runs r
+              WHERE r.project_guid = {guid_bind}
+         ),
+         edges AS (
+             SELECT r.id AS child_id, je.value AS parent_id
+               FROM research_runs r, json_each(r.context_run_ids_json) je
+              WHERE r.project_guid = {guid_bind}
+         ),
+         invalid (run_id) AS (
+             SELECT run_id FROM moved WHERE files_moved > 0
+             UNION
+             SELECT e.child_id FROM edges e
+              WHERE NOT EXISTS (SELECT 1 FROM research_runs p
+                                 WHERE p.id = e.parent_id
+                                   AND p.project_guid = {guid_bind})
+             UNION
+             SELECT e.child_id FROM edges e
+               JOIN invalid i ON i.run_id = e.parent_id
+         )"
+    )
+}
+
+/// The flat transitive ancestry for a set of runs, in one recursive query.
+///
+/// Returns, per asked run id, every run its context chain reaches — deduplicated,
+/// ascending by seq, deleted entries last. An ancestor that no longer exists keeps
+/// its recorded id and reports `state: "deleted"` with no title or seq: the edge
+/// is the child's own record of what it was fed, and it survives the parent.
+fn research_dependencies(
+    tx: &rusqlite::Transaction<'_>,
+    pg: &str,
+    model_id: &str,
+    run_ids: &[String],
+) -> rusqlite::Result<std::collections::HashMap<String, Vec<ResearchRunDependency>>> {
+    let mut out: std::collections::HashMap<String, Vec<ResearchRunDependency>> =
+        std::collections::HashMap::new();
+    if run_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = (0..run_ids.len())
+        .map(|i| format!("?{}", i + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // One WITH list: `ancestors` joins the validity CTEs rather than opening a
+    // second block, which SQLite would refuse.
+    let sql = format!(
+        "{ctes},
+         ancestors (root_id, anc_id) AS (
+             SELECT e.child_id, e.parent_id FROM edges e
+              WHERE e.child_id IN ({placeholders})
+             UNION
+             SELECT a.root_id, e.parent_id
+               FROM ancestors a JOIN edges e ON e.child_id = a.anc_id
+         )
+         SELECT a.root_id, a.anc_id, p.seq, p.title, p.question,
+                p.id IS NULL AS deleted,
+                EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = a.anc_id) AS anc_invalid
+           FROM ancestors a
+           LEFT JOIN research_runs p
+                  ON p.id = a.anc_id AND p.project_guid = ?1
+          ORDER BY a.root_id, (p.seq IS NULL), p.seq",
+        ctes = research_validity_ctes("?1", "?2"),
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
+    for id in run_ids {
+        binds.push(id);
+    }
+    let rows = stmt.query_map(binds.as_slice(), |row| {
+        let root: String = row.get(0)?;
+        let anc_id: String = row.get(1)?;
+        let seq: Option<i64> = row.get(2)?;
+        let stored_title: Option<String> = row.get(3)?;
+        let question: Option<String> = row.get(4)?;
+        let deleted: bool = row.get(5)?;
+        let anc_invalid: bool = row.get(6)?;
+        let state = if deleted {
+            "deleted"
+        } else if anc_invalid {
+            "invalid"
+        } else {
+            "valid"
+        };
+        Ok((
+            root,
+            ResearchRunDependency {
+                id: anc_id,
+                seq,
+                title: (!deleted).then(|| {
+                    stored_title
+                        .unwrap_or_else(|| research_title(question.as_deref().unwrap_or_default()))
+                }),
+                state,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (root, dep) = row?;
+        out.entry(root).or_default().push(dep);
+    }
+    Ok(out)
+}
+
+/// Fold a run's ancestry into its summary: the `context` list and, when the run is
+/// invalid, which of the three causes applies. Own staleness wins the naming —
+/// a run that is both stale and resting on a deleted parent is reported `stale`,
+/// since that is the defect the caller can act on from this row alone.
+fn fill_validity(summary: &mut ResearchRunSummary, deps: Vec<ResearchRunDependency>) {
+    if !summary.valid {
+        summary.invalid_reason = if summary.files_moved > 0 {
+            Some("stale")
+        } else if deps.iter().any(|d| d.state == "deleted") {
+            Some("context_deleted")
+        } else {
+            Some("context_invalid")
+        };
+    }
+    summary.context = deps;
+}
+
+/// Load the earlier runs a request named, in the order it named them, with each
+/// one's staleness measured against the index as it stands now.
+///
+/// Every id must be a run **of this project**: without that check one project could
+/// read another's research by guessing a UUID, and the whole point of
+/// `collection_for` isolation would be undone by a field on a request body. An id
+/// that resolves to nothing is a 404 rather than a silent omission — a run answered
+/// against context the caller believes it supplied, but did not, is unreproducible.
+///
+/// An id that resolves to an **invalid** run — stale itself, or resting
+/// (transitively) on a deleted or stale run — is a 400: injecting it would hand the
+/// new run confident, obsolete prose, which is precisely what the validity graph
+/// exists to prevent. The client saw `valid` on the list before offering the pick,
+/// so this trips only when the index moved between the pick and the submit.
+async fn load_prior_reports(
+    s: &RouterState,
+    project_guid: &UUIDv4,
+    ids: &[String],
+    token: &CancellationToken,
+) -> Result<Vec<crate::research::PriorReport>, ApiError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    // The 32-char simple form, matching `UUIDv4`'s own `ToSql` and every other table
+    // in the schema. `Uuid::to_string()` is hyphenated and would match nothing.
+    let pg = project_guid.0.simple().to_string();
+    let wanted: Vec<String> = ids.to_vec();
+
+    let rows = s
+        .db_pool
+        .transaction(token.child_token(), move |tx| {
+            let placeholders = (0..wanted.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "{ctes}
+                 SELECT r.id, r.seq, r.question, r.report, {cols},
+                        EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id)
+                            AS run_invalid,
+                        EXISTS (SELECT 1 FROM edges e
+                                 WHERE e.child_id = r.id
+                                   AND NOT EXISTS (SELECT 1 FROM research_runs p
+                                                    WHERE p.id = e.parent_id
+                                                      AND p.project_guid = ?1))
+                            AS dangling_parent
+                   FROM research_runs r
+                  WHERE r.project_guid = ?1 AND r.id IN ({placeholders})",
+                ctes = research_validity_ctes("?1", "?2"),
+                cols = research_staleness_columns("?2"),
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
+            for id in &wanted {
+                binds.push(id);
+            }
+            let out = stmt
+                .query_map(binds.as_slice(), |row| {
+                    Ok((
+                        crate::research::PriorReport {
+                            id: row.get(0)?,
+                            seq: row.get(1)?,
+                            question: row.get(2)?,
+                            report: row.get(3)?,
+                            files_total: row.get::<_, i64>(4)? as usize,
+                            files_moved: row.get::<_, i64>(5)? as usize,
+                        },
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, bool>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                "Failed to read the prior research runs a request asked for. Check the \
+                 database is readable."
+            );
+            ApiError::from(e)
+        })?;
+
+    // Re-order to the request's order and surface the first id that resolved to
+    // nothing. A HashMap rather than a scan per id: the cap is small, but the shape
+    // says the lookup is by id and does not invite someone to raise the cap later.
+    // The unknown-id 404 keeps precedence over the invalid-run 400: "no such run"
+    // is the sharper answer, and a client that mixed projects up should hear that
+    // rather than a validity verdict about a run it never meant.
+    let mut by_id: std::collections::HashMap<String, (crate::research::PriorReport, bool, bool)> =
+        rows.into_iter().map(|r| (r.0.id.clone(), r)).collect();
+    let resolved = ids
+        .iter()
+        .map(|id| {
+            by_id
+                .remove(id)
+                .ok_or_else(|| ApiError::ResearchRunNotFound { run_id: id.clone() })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let offenders: Vec<(String, &'static str)> = resolved
+        .iter()
+        .filter(|(_, run_invalid, _)| *run_invalid)
+        .map(|(report, _, dangling)| {
+            let reason = if report.files_moved > 0 {
+                "stale"
+            } else if *dangling {
+                "context_deleted"
+            } else {
+                "context_invalid"
+            };
+            (report.id.clone(), reason)
+        })
+        .collect();
+    if !offenders.is_empty() {
+        return Err(ApiError::ResearchContextInvalid { runs: offenders });
+    }
+    Ok(resolved.into_iter().map(|(report, _, _)| report).collect())
 }
 
 /// The production [`ResearchJournal`](crate::research::ResearchJournal): one
@@ -3456,7 +3939,10 @@ struct SqliteResearchJournal {
 
 #[async_trait::async_trait]
 impl crate::research::ResearchJournal for SqliteResearchJournal {
-    async fn record(&self, record: crate::research::RunRecord) {
+    async fn record(
+        &self,
+        record: crate::research::RunRecord,
+    ) -> Option<crate::research::RecordedRun> {
         // A fresh token: the request's own is cancelled the moment the client
         // disconnects, and a run that completed still deserves its record —
         // "the client stopped reading" is not "this never happened".
@@ -3466,7 +3952,7 @@ impl crate::research::ResearchJournal for SqliteResearchJournal {
             record,
             CancellationToken::new(),
         )
-        .await;
+        .await
     }
 }
 
@@ -3571,6 +4057,22 @@ impl crate::research::ResearchTools for StateResearchTools {
         .await
     }
 
+    async fn list_research(
+        &self,
+        query: Option<String>,
+        token: &CancellationToken,
+    ) -> Result<Vec<crate::research::ResearchListing>, ApiError> {
+        list_research_core(&self.state, self.project_guid, query, token).await
+    }
+
+    async fn read_research(
+        &self,
+        seq: i64,
+        token: &CancellationToken,
+    ) -> Result<crate::research::StoredReport, ApiError> {
+        read_research_core(&self.state, self.project_guid, seq, token).await
+    }
+
     async fn file_versions(
         &self,
         paths: Vec<String>,
@@ -3624,10 +4126,13 @@ impl futures_core::Stream for ResearchEventStream {
 /// configured (or request-named) Ollama model asks the index one question per
 /// turn — internal lookups against the index cores, **every one of them scoped by
 /// the request's `include`/`exclude`** — then must write a final report. The scope is
-/// enforced on all nine tools, not only on retrieval: a path outside it is refused by
-/// name, and name-keyed lookups drop the rows it hides and report how many. So a
-/// scoped run cannot read its way out of its scope, and its report can only speak
-/// about what it was given. Events (`text/event-stream`, named events with JSON
+/// enforced on all nine file-keyed tools, not only on retrieval: a path outside it is
+/// refused by name, and name-keyed lookups drop the rows it hides and report how
+/// many. So a scoped run cannot read its way out of its scope, and its report can
+/// only speak about what it was given. The two stored-report tools
+/// (`list_research`/`read_research`) are the deliberate non-file exception: reports
+/// are not files, they are never citable (hearsay — nothing they show seeds the
+/// citation evidence), and only *valid* runs are offered. Events (`text/event-stream`, named events with JSON
 /// `data`):
 ///
 /// - `thinking` `{text}` — deltas of the model's thinking (thinking models only);
@@ -3674,12 +4179,16 @@ impl futures_core::Stream for ResearchEventStream {
 ///   rather than by budget, the tools briefly re-opened so it could read what it
 ///   had cited blindly or what had moved. Their presence is what distinguishes a
 ///   report that was right the first time from one that was repaired;
-/// - `done` `{reason, prompt_version, …every `progress` field}` — completion
+/// - `done` `{reason, prompt_version, run_id, seq, …every `progress` field}` — completion
 ///   (closes the stream), carrying the run's final cost as well as
 ///   `steps`/`elapsed_ms`. `prompt_version` identifies the generation of the
 ///   server's research instructions that drove the run: reports written under
 ///   different prompts are not comparable, and nothing else on the stream says
-///   which was in force.
+///   which was in force. `run_id`/`seq` name the stored run this became, so a client
+///   that just watched it can offer it back as context for a later question
+///   (`GET /projects/{project_guid}/research/{run_id}`); both are **null** when the
+///   journal write failed, since the journal is best-effort and a fabricated id would
+///   name a run nothing can fetch.
 ///   `reason` says *why* the loop stopped asking: `finalized` (the model judged the
 ///   evidence sufficient) or one of the cut-short outcomes — `time_exhausted` (the
 ///   wall-clock budget), `tokens_exhausted` (the local-token budget),
@@ -3722,8 +4231,32 @@ impl futures_core::Stream for ResearchEventStream {
     params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
     request_body = ResearchRequest,
     responses(
-        (status = 200, description = "SSE stream of research events (thinking/step/progress/summary/citations/done/error). `citations` reports the server's provenance check on the report's `path:start-end` references — `verified`/`path_only`/`unverified` counts plus the invented paths — scored against the locations this run's own tool calls returned, and its freshness check beside it: `stale`/`stale_paths` count the citations pointing into files the index rewrote or dropped while the run was reading (indexing is never blocked by research, so a verified citation can still describe replaced code). Its `draft_unverified`/`draft_path_only`/`draft_stale`/`revalidation_steps` fields are null unless the first draft failed those checks and was sent back for correction. `progress` reports budget consumption during the run (steps/time/tokens/context plus `binding`, the axis closest to exhaustion); `done` repeats those fields and adds a `reason` — `finalized`, or one of `time_exhausted`/`tokens_exhausted`/`budget_exhausted`/`context_exhausted`/`unparseable`/`repeated_calls` when the report was cut short — plus `prompt_version`, the generation of the server's research instructions that produced the report. `max_seconds` is a hard deadline enforced by cancellation, and the report phase has its own `[research].report_timeout_ms` on top, so the longest a caller waits is the sum of the two; a run stopped by its deadline still ships a report that says so. Every lookup the model makes is scoped by the request's `include`/`exclude`, on all nine tools — an out-of-scope path is refused by name rather than answered empty.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, out-of-range budget).", body = ProblemDetails),
+        (status = 200, description = "SSE stream of research events \
+(thinking/step/progress/summary/citations/done/error). `citations` reports the server's \
+provenance check on the report's `path:start-end` references — \
+`verified`/`path_only`/`unverified` counts plus the invented paths — scored against the \
+locations this run's own tool calls returned, and its freshness check beside it: \
+`stale`/`stale_paths` count the citations pointing into files the index rewrote or dropped \
+while the run was reading (indexing is never blocked by research, so a verified citation can \
+still describe replaced code). Its \
+`draft_unverified`/`draft_path_only`/`draft_stale`/`revalidation_steps` fields are null \
+unless the first draft failed those checks and was sent back for correction. `progress` \
+reports budget consumption during the run (steps/time/tokens/context plus `binding`, the \
+axis closest to exhaustion); `done` repeats those fields and adds a `reason` — `finalized`, \
+or one of \
+`time_exhausted`/`tokens_exhausted`/`budget_exhausted`/`context_exhausted`/`unparseable`/`repeated_calls` \
+when the report was cut short — plus `prompt_version`, the generation of the server's \
+research instructions that produced the report, and `run_id`/`seq` naming the stored run it \
+became (null if the best-effort journal write failed) so a client can offer it back as \
+context for a later question. `max_seconds` is a hard deadline enforced by cancellation, and \
+the report phase has its own `[research].report_timeout_ms` on top, so the longest a caller \
+waits is the sum of the two; a run stopped by its deadline still ships a report that says \
+so. Every file lookup the model makes is scoped by the request's `include`/`exclude` — an \
+out-of-scope path is refused by name rather than answered empty; the stored-report browse \
+tools (`list_research`/`read_research`) are the one unscoped exception, offer only valid \
+runs, and their content is hearsay that cannot be cited. A run whose `context_run_ids` name \
+an invalid run is refused up front with 400 `validation.research_context_invalid`.", content_type = "text/event-stream"),
+        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, out-of-range budget, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
     ),
 )]
@@ -3744,11 +4277,20 @@ pub async fn post_research(
             max_steps: s.research_max_request_steps,
         },
     )?;
+    let mut context_run_ids = req.context_run_ids.clone().unwrap_or_default();
+    validate::research_context(&mut context_run_ids, s.research_max_context_runs)?;
     let model = match req.model.as_deref().map(str::trim) {
         Some(m) if !m.is_empty() => m.to_string(),
         _ if !s.research_default_model.is_empty() => s.research_default_model.clone(),
         _ => return Err(ApiError::ResearchModelMissing),
     };
+
+    // Loaded before the permit is taken: a request naming an unknown run is a 400/404
+    // that should not first occupy one of `max_concurrent` slots, and the read is a
+    // single indexed lookup.
+    let load_guard = http3::CancellationGuard(CancellationToken::new());
+    let prior_reports =
+        load_prior_reports(&s, &project_guid, &context_run_ids, &load_guard.0).await?;
 
     let permit = s
         .research_semaphore
@@ -3771,6 +4313,8 @@ pub async fn post_research(
         report_timeout_ms: s.research_report_timeout_ms,
         max_turn_thinking_chars: s.research_max_turn_thinking_chars,
         metrics: Some(s.metrics.clone()),
+        prior_reports,
+        max_context_chars: s.research_max_context_chars,
     };
     info!(
         project_guid = %project_guid.0,
@@ -3809,13 +4353,18 @@ pub async fn post_research(
             Arc::new(SqliteResearchJournal {
                 db_pool: s.db_pool.clone(),
                 context: crate::db::research::RunContext {
-                    project_guid: project_guid.0.to_string(),
+                    // Simple form, like every other table. `Uuid::to_string()` is
+                    // hyphenated, which nothing else in the schema uses — and a
+                    // per-project metric label in that spelling would never line up
+                    // with `project_files`'.
+                    project_guid: project_guid.0.simple().to_string(),
                     effort,
                     seed: params.sampling.seed,
                     temperature: params.sampling.temperature,
                     // Rendered by the same one renderer the model reads, so the
                     // journal and the prompt can never describe the scope differently.
                     scope_json: params.scope.is_scoped().then(|| params.scope.describe()),
+                    retention_days: s.research_retention_days,
                 },
             }),
             s.metrics.clone(),
@@ -4745,6 +5294,495 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
     })
 }
 
+/// The columns a summary is built from, shared by the list and the detail so the two
+/// can never describe the same run differently. `?2` is the embedding model id.
+/// Any query selecting these must prepend [`research_validity_ctes`] — `invalid` is
+/// one of its CTEs, not a table.
+fn research_summary_columns() -> String {
+    format!(
+        "r.id, r.seq, r.question, r.created_at, r.expires_at, r.model, r.effort,
+         r.done_reason, r.citations_total, r.citations_verified, r.citations_unverified,
+         r.steps, r.elapsed_ms, {}, r.title,
+         EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS invalid_flag",
+        research_staleness_columns("?2")
+    )
+}
+
+/// Build a summary from a row selected with [`research_summary_columns`].
+///
+/// `context` and `invalid_reason` are left for [`fill_validity`]: they need the
+/// ancestry query, which runs once per page rather than per row.
+fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResearchRunSummary> {
+    let question: String = row.get(2)?;
+    let expires_at: Option<i64> = row.get(4)?;
+    let files_moved: i64 = row.get(14)?;
+    let stored_title: Option<String> = row.get(15)?;
+    let invalid_flag: bool = row.get(16)?;
+    Ok(ResearchRunSummary {
+        id: row.get(0)?,
+        seq: row.get(1)?,
+        // The stored title — the report's own heading — when the run journalled
+        // one; the derived question truncation otherwise. One non-null field on
+        // the wire either way: `question` rides beside it, so a client that wants
+        // the distinction has it.
+        title: stored_title.unwrap_or_else(|| research_title(&question)),
+        question,
+        created_at: row.get(3)?,
+        expires_at,
+        pinned: expires_at.is_none(),
+        model: row.get(5)?,
+        effort: row.get(6)?,
+        done_reason: row.get(7)?,
+        citations_total: row.get(8)?,
+        citations_verified: row.get(9)?,
+        citations_unverified: row.get(10)?,
+        steps: row.get(11)?,
+        elapsed_ms: row.get(12)?,
+        files_total: row.get(13)?,
+        files_moved,
+        stale: files_moved > 0,
+        valid: !invalid_flag,
+        invalid_reason: None,
+        context: Vec::new(),
+    })
+}
+
+/// `GET /projects/{project_guid}/research` — the stored-research index, newest first.
+///
+/// **Keyset, never `OFFSET`.** Pages resume from `before_seq` against the unique
+/// `(project_guid, seq)` index, which serves the equality, the range and the
+/// `ORDER BY … DESC` in one backwards index scan with no sort. Offset paging over a
+/// table that GC prunes and every run appends to would skip and repeat rows.
+///
+/// **The report body is never selected**, only searched — that is the whole reason
+/// this is a separate endpoint from the detail one.
+///
+/// Every summary carries the run's derived `valid` verdict and its flat transitive
+/// `context` ancestry (see [`research_validity_ctes`]); `valid=true|false` filters
+/// on it, orthogonally to `freshness`, which stays the run's *own* staleness.
+///
+/// `q` is a `LIKE` over the title, the question and the report body, with
+/// [`like_escape`], for the reason `grep` needs it: `_` is a
+/// wildcard and this corpus's questions are full of identifiers. No index serves it;
+/// the scan is bounded by one project's retained runs and stopped by `limit`. FTS5 is
+/// the next rung of the documented ladder and is deliberately not taken — nothing has
+/// measured `LIKE` insufficient over a corpus two orders of magnitude smaller than
+/// `project_file_chunks`, which is the table that ladder was written about.
+///
+/// **Concurrency:** safe — read-only, takes no locks.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_guid}/research",
+    tag = "Research",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ResearchListQuery,
+    ),
+    responses(
+        (status = 200, description = "One keyset page of stored runs, newest first, without their reports.", body = ResearchRunListResponse),
+        (status = 400, description = "Malformed query parameter, or `limit` above `[research].list_page_limit`.", body = ProblemDetails),
+        (status = 404, description = "The project has never been seen.", body = ProblemDetails),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn get_research_runs(
+    ApiPath(project_guid): ApiPath<UUIDv4>,
+    State(s): State<RouterState>,
+    ApiQuery(q): ApiQuery<ResearchListQuery>,
+) -> Result<Json<ResearchRunListResponse>, ApiError> {
+    validate::research_list_limit(q.limit, s.research_list_page_limit)?;
+    let limit = q.limit.unwrap_or(s.research_list_page_limit);
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid;
+    let pg_simple = project_guid.0.simple().to_string();
+
+    let result = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM projects WHERE guid = ?1",
+                    rusqlite::params![pg],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok(None);
+            }
+
+            let mut where_parts = vec!["r.project_guid = ?1".to_string()];
+            let mut binds: Vec<Bind> = vec![Bind::Guid(pg), Bind::Path(model_id.clone())];
+            let mut n = 3usize;
+            if let Some(pattern) = q.q.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                // NULL title in the OR is harmless: `NULL LIKE x` is NULL, and the
+                // question clause still decides.
+                where_parts.push(format!(
+                    "(r.title LIKE ?{n} ESCAPE '\\' OR r.question LIKE ?{n} ESCAPE '\\' \
+                      OR r.report LIKE ?{n} ESCAPE '\\')"
+                ));
+                binds.push(Bind::Path(format!("%{}%", like_escape(pattern))));
+                n += 1;
+            }
+            if let Some(before) = q.before_seq {
+                where_parts.push(format!("r.seq < ?{n}"));
+                binds.push(Bind::Path(before.to_string()));
+                n += 1;
+            }
+            if let Some(pinned) = q.pinned {
+                where_parts.push(
+                    if pinned {
+                        "r.expires_at IS NULL"
+                    } else {
+                        "r.expires_at IS NOT NULL"
+                    }
+                    .to_string(),
+                );
+            }
+
+            // The freshness and validity filters are applied INSIDE, against the
+            // derived columns, and before the LIMIT. Filtering a page after cutting
+            // it would return fewer rows than asked for while the cursor still
+            // advanced, so "a short page means there is no more" — the inference
+            // the client draws — would be wrong.
+            let mut outer = Vec::new();
+            match q.freshness.unwrap_or(ResearchFreshness::All) {
+                ResearchFreshness::All => {}
+                ResearchFreshness::Fresh => outer.push("files_moved = 0"),
+                ResearchFreshness::Stale => outer.push("files_moved > 0"),
+            }
+            match q.valid {
+                Some(true) => outer.push("invalid_flag = 0"),
+                Some(false) => outer.push("invalid_flag = 1"),
+                None => {}
+            }
+            let outer_where = if outer.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", outer.join(" AND "))
+            };
+            let sql = format!(
+                "{ctes}
+                 SELECT * FROM (
+                     SELECT {cols}
+                       FROM research_runs r
+                      WHERE {where_clause}
+                 ) {outer_where}
+                 ORDER BY seq DESC
+                 LIMIT ?{n}",
+                ctes = research_validity_ctes("?1", "?2"),
+                cols = research_summary_columns(),
+                where_clause = where_parts.join(" AND "),
+            );
+            binds.push(Bind::Path(limit.to_string()));
+
+            let mut stmt = tx.prepare(&sql)?;
+            let mut runs = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    research_summary_from_row(row)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+
+            // The ancestry, once for the whole page rather than per row.
+            let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &ids)?;
+            for run in &mut runs {
+                fill_validity(run, deps.remove(&run.id).unwrap_or_default());
+            }
+            Ok(Some(runs))
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to list stored research runs. Check the database is readable."
+            );
+            ApiError::from(e)
+        })?;
+
+    let runs = result.ok_or(ApiError::ProjectNotFound)?;
+    // Only a full page can have more behind it. Saying so here costs nothing and
+    // saves the client a request whose only answer is "no".
+    let next_before_seq = (runs.len() == limit)
+        .then(|| runs.last().map(|r| r.seq))
+        .flatten();
+    Ok(Json(ResearchRunListResponse {
+        runs,
+        next_before_seq,
+    }))
+}
+
+/// `GET /projects/{project_guid}/research/{run_id}` — one stored run in full.
+///
+/// Carries the Markdown report and the per-file freshness detail behind the list's
+/// `stale` boolean: a file that was *edited* and one that was *deleted* call for
+/// different reading, and a single flag cannot say which happened.
+///
+/// **Concurrency:** safe — read-only, takes no locks.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_guid}/research/{run_id}",
+    tag = "Research",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ("run_id" = String, Path, description = "The run's stable id (from `done.run_id` or the list)."),
+    ),
+    responses(
+        (status = 200, description = "The stored run, including its Markdown report and per-file freshness.", body = ResearchRunDetail),
+        (status = 404, description = "This project has no such run.", body = ProblemDetails),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn get_research_run(
+    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    State(s): State<RouterState>,
+) -> Result<Json<ResearchRunDetail>, ApiError> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid;
+    let pg_simple = project_guid.0.simple().to_string();
+    let rid = run_id.clone();
+
+    let found = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let sql = format!(
+                "{ctes}
+                 SELECT {cols}, r.report, r.prompt_version, r.context_run_ids_json, r.scope_json
+                   FROM research_runs r
+                  WHERE r.project_guid = ?1 AND r.id = ?3",
+                ctes = research_validity_ctes("?1", "?2"),
+                cols = research_summary_columns(),
+            );
+            let row = tx
+                .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                    let summary = research_summary_from_row(row)?;
+                    let context_json: String = row.get(19)?;
+                    Ok((
+                        summary,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
+                        context_json,
+                        row.get::<_, Option<String>>(20)?,
+                    ))
+                })
+                .optional()?;
+            let Some((mut summary, report, prompt_version, context_json, scope)) = row else {
+                return Ok(None);
+            };
+            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &[summary.id.clone()])?;
+            let own_deps = deps.remove(&summary.id).unwrap_or_default();
+            fill_validity(&mut summary, own_deps);
+
+            // The baselines, joined against the index as it stands. LEFT JOIN, because
+            // a file that has left the index is a *result* here and not a missing row.
+            let mut stmt = tx.prepare(
+                "SELECT rf.path, rf.sha256, pf.sha256
+                   FROM research_run_files rf
+                   LEFT JOIN project_files pf
+                          ON pf.project_guid = ?1
+                         AND pf.model_id     = ?2
+                         AND pf.path         = rf.path
+                         AND pf.status      != 'deleted'
+                  WHERE rf.run_id = ?3
+                  ORDER BY rf.path",
+            )?;
+            // `model_id` is the EMBEDDING model, which is what project_files is keyed
+            // by. `summary.model` is the Ollama model that drove the run — a different
+            // thing entirely, and binding it here made every file read as `removed`.
+            let files = stmt
+                .query_map(rusqlite::params![pg, &model_id, &summary.id], |row| {
+                    let sha256: String = row.get(1)?;
+                    let current: Option<String> = row.get(2)?;
+                    let state = match &current {
+                        None => "removed",
+                        Some(now) if now.eq_ignore_ascii_case(&sha256) => "fresh",
+                        Some(_) => "changed",
+                    };
+                    Ok(ResearchRunFile {
+                        path: row.get(0)?,
+                        sha256,
+                        current_sha256: current,
+                        state,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(Some(ResearchRunDetail {
+                summary,
+                report,
+                prompt_version,
+                context_run_ids: serde_json::from_str(&context_json).unwrap_or_default(),
+                scope,
+                files,
+            }))
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to read a stored research run. Check the database is readable."
+            );
+            ApiError::from(e)
+        })?;
+
+    found
+        .map(Json)
+        .ok_or(ApiError::ResearchRunNotFound { run_id })
+}
+
+/// `POST /projects/{project_guid}/research/{run_id}/pin` — exempt a run from the
+/// retention sweep, or return it to it.
+///
+/// The **one** mutation on a row that is otherwise append-only, and it writes a
+/// single column. `pinned: true` clears `expires_at`; `pinned: false` restores
+/// `created_at + [research].retention_days`, which means unpinning a run older than
+/// the window makes it eligible at the very next GC pass. That is deliberate:
+/// stamping `now + retention` instead would turn "let it age normally" into a way of
+/// *extending* a run's life, and a client toggling a checkbox twice would silently
+/// renew everything it touched.
+///
+/// **Concurrency:** safe — one row, one statement, no locks.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_guid}/research/{run_id}/pin",
+    tag = "Research",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ("run_id" = String, Path, description = "The run's stable id."),
+    ),
+    request_body = ResearchPinRequest,
+    responses(
+        (status = 200, description = "The updated run summary, so the client renders the server's answer rather than its own guess.", body = ResearchRunSummary),
+        (status = 404, description = "This project has no such run.", body = ProblemDetails),
+        (status = 500, description = "SQLite write failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn post_research_pin(
+    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    State(s): State<RouterState>,
+    ApiJson(req): ApiJson<ResearchPinRequest>,
+) -> Result<Json<ResearchRunSummary>, ApiError> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid;
+    let pg_simple = project_guid.0.simple().to_string();
+    let rid = run_id.clone();
+    let retention_secs = (s.research_retention_days as i64).saturating_mul(24 * 3600);
+
+    let found = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let changed = tx.execute(
+                "UPDATE research_runs
+                    SET expires_at = CASE WHEN ?3 THEN NULL ELSE created_at + ?4 END
+                  WHERE project_guid = ?1 AND id = ?2",
+                rusqlite::params![pg, rid, req.pinned, retention_secs],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let sql = format!(
+                "{ctes}
+                 SELECT {cols} FROM research_runs r WHERE r.project_guid = ?1 AND r.id = ?3",
+                ctes = research_validity_ctes("?1", "?2"),
+                cols = research_summary_columns(),
+            );
+            let summary = tx
+                .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                    research_summary_from_row(row)
+                })
+                .optional()?;
+            let Some(mut summary) = summary else {
+                return Ok(None);
+            };
+            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &[summary.id.clone()])?;
+            let own_deps = deps.remove(&summary.id).unwrap_or_default();
+            fill_validity(&mut summary, own_deps);
+            Ok(Some(summary))
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to change a stored research run's pin state. Check the database is \
+                 writable."
+            );
+            ApiError::from(e)
+        })?;
+
+    found
+        .map(Json)
+        .ok_or(ApiError::ResearchRunNotFound { run_id })
+}
+
+/// `DELETE /projects/{project_guid}/research/{run_id}` — drop one stored run.
+///
+/// Immediate hard delete; `research_run_files` cascades. Idempotent **204**, matching
+/// `DELETE /projects/{guid}`: deleting something already gone is the outcome the
+/// caller asked for. It exists because waiting out a TTL is not a workflow — a report
+/// you know to be wrong should be removable the moment you know it.
+///
+/// Deleting a run also invalidates, at read time, every run whose context chain
+/// reaches it: the survivors keep its id in `context_run_ids_json`, the id now
+/// dangles, and [`research_validity_ctes`] reads a dangling reference as invalid,
+/// transitively. No write happens anywhere but this row.
+///
+/// **Concurrency:** safe — one row, no locks, no Qdrant contact (a run owns no
+/// vectors).
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_guid}/research/{run_id}",
+    tag = "Research",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ("run_id" = String, Path, description = "The run's stable id."),
+    ),
+    responses(
+        (status = 204, description = "The run is gone (idempotent — also returned when it never existed)."),
+        (status = 500, description = "SQLite write failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn delete_research_run(
+    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    State(s): State<RouterState>,
+) -> Result<StatusCode, ApiError> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+
+    s.db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            tx.execute(
+                "DELETE FROM research_runs WHERE project_guid = ?1 AND id = ?2",
+                rusqlite::params![pg, run_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to delete a stored research run. Check the database is writable."
+            );
+            ApiError::from(e)
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `POST /gc` — runs a full GC pass synchronously and returns what it removed:
 /// hard-deletes soft-deleted chunks (whose vectors are confirmed gone from Qdrant),
 /// then the now-empty `deleted` file rows, then prunes the old status log. Blocking
@@ -4772,19 +5810,21 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, A
         return Err(ApiError::GcRunning);
     };
     let cg = http3::CancellationGuard(CancellationToken::new());
-    let (chunks_removed, files_removed, status_log_pruned) = crate::worker::gc::collect(
-        &s.db_pool,
-        &*s.qdrant,
-        s.status_log_retention_days,
-        &s.metrics,
-        "manual",
-        &cg.0,
-    )
-    .await;
+    let (chunks_removed, files_removed, status_log_pruned, research_runs_pruned) =
+        crate::worker::gc::collect(
+            &s.db_pool,
+            &*s.qdrant,
+            s.status_log_retention_days,
+            &s.metrics,
+            "manual",
+            &cg.0,
+        )
+        .await;
     Ok(Json(GcResponse {
         chunks_removed,
         files_removed,
         status_log_pruned,
+        research_runs_pruned,
     }))
 }
 
@@ -4958,6 +5998,42 @@ mod tests {
     };
     use glob::Pattern;
     use uuid::Uuid;
+
+    /// A title is cut from the question at a **word** boundary, because a list of
+    /// titles is scanned rather than read: a cut through an identifier
+    /// (`post_ind…`) reads as a different symbol, which is exactly the confusion the
+    /// list exists to prevent.
+    #[test]
+    fn a_title_is_the_question_cut_at_a_word_boundary() {
+        assert_eq!(research_title("How does GC work?"), "How does GC work?");
+        // Collapsed, and only the first non-empty line.
+        assert_eq!(
+            research_title("\n  How   does\tGC work?\nsecond line"),
+            "How does GC work?"
+        );
+
+        let long = "How does the prepare phase of post_index decide which files to \
+                    skip and which to reslice completely";
+        let title = research_title(long);
+        assert!(title.ends_with('…'), "{title}");
+        assert!(
+            title.chars().count() <= RESEARCH_TITLE_CHARS + 1,
+            "over the cap: {title}"
+        );
+        assert!(
+            !title.trim_end_matches('…').ends_with(' '),
+            "the ellipsis should follow a word, not a space: {title}"
+        );
+        // The cut fell between words, so every word before it survives whole.
+        assert!(long.starts_with(title.trim_end_matches('…')), "{title}");
+
+        // A single word longer than the cap has no boundary to honour; it is cut
+        // anyway rather than collapsing to a bare ellipsis.
+        let one_word = "a".repeat(200);
+        let cut = research_title(&one_word);
+        assert_eq!(cut.chars().count(), RESEARCH_TITLE_CHARS + 1);
+        assert_eq!(research_title(""), "");
+    }
 
     fn guid() -> UUIDv4 {
         UUIDv4(Uuid::nil())

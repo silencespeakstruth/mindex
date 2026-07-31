@@ -28,9 +28,10 @@ use crate::backend::metrics::{
 };
 use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
-    delete_files, delete_history, delete_project, get_config, get_files, get_health, get_metrics,
-    get_project_stats, get_projects, get_status, get_version, post_cancel, post_drift, post_gc,
-    post_history, post_index, post_research, post_retry, post_search, post_symbols,
+    delete_files, delete_history, delete_project, delete_research_run, get_config, get_files,
+    get_health, get_metrics, get_project_stats, get_projects, get_research_run, get_research_runs,
+    get_status, get_version, post_cancel, post_drift, post_gc, post_history, post_index,
+    post_research, post_research_pin, post_retry, post_search, post_symbols,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -130,6 +131,19 @@ pub struct RouterState {
     /// (`[research].max_turn_thinking_chars`, `0` = off). Not published by
     /// `GET /config`: it changes nothing a caller renders, waits for or may set.
     pub research_max_turn_thinking_chars: usize,
+    /// How long a finished run is kept before `/gc` reaps it
+    /// (`[research].retention_days`). Stamped onto the row at insert as an absolute
+    /// `expires_at`, so this governs new runs only.
+    pub research_retention_days: u64,
+    /// How many earlier runs one request may name in `context_run_ids`
+    /// (`[research].max_context_runs`; `0` switches the feature off).
+    pub research_max_context_runs: usize,
+    /// Total characters of prior reports injected into one run
+    /// (`[research].max_context_chars`). A real budget axis: the transcript is
+    /// resent every turn, so this is paid per turn.
+    pub research_max_context_chars: usize,
+    /// Page-size ceiling for the stored-research list (`[research].list_page_limit`).
+    pub research_list_page_limit: usize,
     /// Server-configured sampling (`[research].temperature`/`top_p`/`seed`). A
     /// request's `seed` is applied over it per run.
     pub research_sampling: crate::models::ollama::Sampling,
@@ -432,6 +446,18 @@ fn build_router(
         .route("/projects/{project_guid}/cancel", post(post_cancel))
         .route("/projects/{project_guid}/retry", post(post_retry))
         .route("/projects/{project_guid}/drift", post(post_drift))
+        // Browsing stored research is management, not the versioned data plane: it
+        // reads server state the same way `/projects/{guid}/files` does. The run that
+        // *produces* a report stays at `POST /v0/{guid}/research`.
+        .route("/projects/{project_guid}/research", get(get_research_runs))
+        .route(
+            "/projects/{project_guid}/research/{run_id}",
+            get(get_research_run).delete(delete_research_run),
+        )
+        .route(
+            "/projects/{project_guid}/research/{run_id}/pin",
+            post(post_research_pin),
+        )
         .route("/gc", post(post_gc))
         .route("/status", get(get_status))
         .route("/config", get(get_config))

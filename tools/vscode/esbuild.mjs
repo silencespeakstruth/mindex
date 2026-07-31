@@ -181,6 +181,7 @@ const webviews = {
         ask: "src/webview/ask.ts",
         status: "src/webview/status.ts",
         research: "src/webview/research.ts",
+        runs: "src/webview/runs.ts",
     },
     outdir: "media/js",
     platform: "browser",

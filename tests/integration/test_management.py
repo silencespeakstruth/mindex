@@ -296,6 +296,7 @@ def test_concurrent_gc_is_serialized(client: httpx.Client, project: str) -> None
                 "chunks_removed",
                 "files_removed",
                 "status_log_pruned",
+                "research_runs_pruned",
             }
 
 

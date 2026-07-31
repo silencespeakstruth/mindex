@@ -27,6 +27,8 @@ export interface ResearchSubmission {
      */
     include?: SearchFilter;
     exclude?: SearchFilter;
+    /** Stored runs handed to the model as background; picked in Research History. */
+    contextRunIds?: string[];
 }
 
 /**

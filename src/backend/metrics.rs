@@ -340,6 +340,21 @@ pub struct ResearchMetrics {
     /// shape every caller already recovers from — so nothing downstream can tell it
     /// apart from a model that simply said nothing.
     pub runaway_thinking_turns: Counter,
+    /// Runs that were given at least one earlier report as context, by model.
+    ///
+    /// The question this answers is "does prior-research context get used, and with
+    /// which models" — the only thing that can justify keeping the feature or tuning
+    /// its caps. Labelled by model rather than crossed with anything: a run either had
+    /// context or did not, and the model is the axis the caps are felt through.
+    pub runs_with_context: Family<ModelLabels, Counter>,
+    /// Earlier reports injected, summed over runs. Unlabelled — the interesting
+    /// number is the total against `runs_with_context`, i.e. how many reports a
+    /// typical run is given, and a label would only split a sum nobody reads apart.
+    pub context_runs_used: Counter,
+    /// Context blocks that hit `[research].max_context_chars` and had their last
+    /// report truncated. Without it that cap is untunable from evidence — the same
+    /// argument `report_window_ms` granted-vs-taken makes.
+    pub context_truncations: Counter,
 }
 
 #[derive(Clone)]
@@ -349,6 +364,9 @@ pub struct GcMetrics {
     pub chunks_removed: Counter,
     pub files_pruned: Counter,
     pub status_log_pruned: Counter,
+    /// Stored research runs reaped for having passed their `expires_at`. Pinned runs
+    /// (`expires_at IS NULL`) are unreachable by the sweep and never counted here.
+    pub research_pruned: Counter,
     pub running: Gauge,
 }
 
@@ -393,6 +411,14 @@ pub struct StateMetrics {
     pub projects: Gauge,
     pub db_size_bytes: Gauge,
     pub status_log_rows: Gauge,
+    /// Stored research runs per project, and the two cuts a reader actually asks for:
+    /// how many are pinned (exempt from the retention sweep) and how many describe a
+    /// tree that has since moved. Split into three families rather than crossed with a
+    /// `state` label because a run can be pinned *and* stale, so one labelled family
+    /// would have to double-count or pick a winner.
+    pub project_research_runs: Family<ProjectLabels, Gauge>,
+    pub project_research_pinned: Family<ProjectLabels, Gauge>,
+    pub project_research_stale: Family<ProjectLabels, Gauge>,
     pub dependency_up: Family<DependencyLabels, Gauge>,
     // ── Process state, refreshed on scrape rather than on tick (all free reads) ──
     pub indexing_claims: Gauge,
@@ -637,6 +663,9 @@ impl Metrics {
             parse_retries: Counter::default(),
             truncations: Counter::default(),
             runaway_thinking_turns: Counter::default(),
+            runs_with_context: Family::default(),
+            context_runs_used: Counter::default(),
+            context_truncations: Counter::default(),
         };
         registry.register(
             "research_runs",
@@ -713,6 +742,21 @@ impl Metrics {
             "Turns abandoned after the model streamed past the thinking-volume guard",
             research.runaway_thinking_turns.clone(),
         );
+        registry.register(
+            "research_runs_with_context",
+            "Research runs given at least one earlier report as context, by model",
+            research.runs_with_context.clone(),
+        );
+        registry.register(
+            "research_context_runs_used",
+            "Earlier reports injected into a research run, summed over runs",
+            research.context_runs_used.clone(),
+        );
+        registry.register(
+            "research_context_truncations",
+            "Context blocks whose last report was truncated to fit max_context_chars",
+            research.context_truncations.clone(),
+        );
 
         // ── GC ──
         let gc = GcMetrics {
@@ -721,6 +765,7 @@ impl Metrics {
             chunks_removed: Counter::default(),
             files_pruned: Counter::default(),
             status_log_pruned: Counter::default(),
+            research_pruned: Counter::default(),
             running: Gauge::default(),
         };
         registry.register(
@@ -747,6 +792,11 @@ impl Metrics {
             "gc_status_log_pruned",
             "Status-log rows dropped past the retention window",
             gc.status_log_pruned.clone(),
+        );
+        registry.register(
+            "gc_research_pruned",
+            "Stored research runs reaped for having passed their expiry",
+            gc.research_pruned.clone(),
         );
         registry.register(
             "gc_running",
@@ -816,6 +866,9 @@ impl Metrics {
             projects: Gauge::default(),
             db_size_bytes: Gauge::default(),
             status_log_rows: Gauge::default(),
+            project_research_runs: Family::default(),
+            project_research_pinned: Family::default(),
+            project_research_stale: Family::default(),
             dependency_up: Family::default(),
             indexing_claims: Gauge::default(),
             research_active: Gauge::default(),
@@ -873,6 +926,21 @@ impl Metrics {
             "status_log_rows",
             "Rows in the file status-transition log",
             state.status_log_rows.clone(),
+        );
+        registry.register(
+            "project_research_runs",
+            "Stored research runs per project",
+            state.project_research_runs.clone(),
+        );
+        registry.register(
+            "project_research_pinned",
+            "Stored research runs exempt from the retention sweep",
+            state.project_research_pinned.clone(),
+        );
+        registry.register(
+            "project_research_stale",
+            "Stored research runs at least one of whose files has changed since",
+            state.project_research_stale.clone(),
         );
         registry.register(
             "dependency_up",
@@ -1111,8 +1179,25 @@ mod tests {
             .inc();
         m.research.revalidations.inc();
         m.research.parse_retries.inc();
+        m.gc.research_pruned.inc();
+        for f in [
+            &m.state.project_research_runs,
+            &m.state.project_research_pinned,
+            &m.state.project_research_stale,
+        ] {
+            f.get_or_create(&ProjectLabels {
+                project_guid: "p".into(),
+            })
+            .set(1);
+        }
         m.research.truncations.inc();
         m.research.runaway_thinking_turns.inc();
+        m.research
+            .runs_with_context
+            .get_or_create(&ModelLabels { model: "m".into() })
+            .inc();
+        m.research.context_runs_used.inc();
+        m.research.context_truncations.inc();
 
         m.gc.runs
             .get_or_create(&TriggerOutcomeLabels {
@@ -1250,6 +1335,10 @@ mod tests {
             ("mindex_gc_files_pruned_total", "counter"),
             ("mindex_gc_running", "gauge"),
             ("mindex_gc_runs_total", "counter"),
+            ("mindex_gc_research_pruned_total", "counter"),
+            ("mindex_project_research_pinned", "gauge"),
+            ("mindex_project_research_runs", "gauge"),
+            ("mindex_project_research_stale", "gauge"),
             ("mindex_gc_status_log_pruned_total", "counter"),
             ("mindex_http_request_duration_seconds", "histogram"),
             ("mindex_http_requests_by_project_total", "counter"),
@@ -1291,6 +1380,9 @@ mod tests {
             ("mindex_research_tool_calls_total", "counter"),
             ("mindex_research_tool_duration_seconds", "histogram"),
             ("mindex_research_runaway_thinking_turns_total", "counter"),
+            ("mindex_research_runs_with_context_total", "counter"),
+            ("mindex_research_context_runs_used_total", "counter"),
+            ("mindex_research_context_truncations_total", "counter"),
             ("mindex_research_transcript_truncations_total", "counter"),
             ("mindex_research_turns", "histogram"),
             ("mindex_research_worker_threads", "gauge"),
@@ -1335,6 +1427,9 @@ mod tests {
             "mindex_project_files",
             "mindex_project_files_by_language",
             "mindex_project_files_permanently_failed",
+            "mindex_project_research_pinned",
+            "mindex_project_research_runs",
+            "mindex_project_research_stale",
             "mindex_project_symbols",
             "mindex_projects",
             "mindex_research_active",

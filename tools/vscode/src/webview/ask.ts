@@ -70,6 +70,18 @@ let running = false;
 /** What the server can currently be asked for; optimistic until health first lands. */
 let available = { ask: true, research: true, reason: "" };
 let researchConfig: ResearchConfig | undefined;
+/**
+ * Stored runs picked in Research History, to be handed to the next question as
+ * background. Owned by the host — the panel is the only place they can be chosen —
+ * so this is a render cache, and the submit payload takes them from the host too.
+ */
+let contextRuns: {
+    id: string;
+    seq: number;
+    title: string;
+    stale: boolean;
+    valid: boolean;
+}[] = [];
 let searchConfig: SearchConfig | undefined;
 
 const COPY = {
@@ -316,6 +328,48 @@ function applyModels(models: string[] | undefined, defaultModel: string): void {
 
 // ── rendering ────────────────────────────────────────────────────────────────
 
+/**
+ * The picked runs, as removable chips.
+ *
+ * Shown only in Research: Search takes no prior context, and a control that does
+ * nothing in the active mode is worse than an absent one. Staleness is marked on the
+ * chip because it is the one thing that changes what a report is worth, and the user
+ * chose these before they could see whether the tree had moved under them.
+ */
+function renderContextRuns(): void {
+    const box = el("context-runs");
+    box.hidden = mode !== "research" || contextRuns.length === 0;
+    if (box.hidden) {
+        return;
+    }
+    el("context-runs-label").textContent =
+        contextRuns.length === 1
+            ? "1 earlier report as context"
+            : `${contextRuns.length} earlier reports as context`;
+    const pills = el("context-runs-pills");
+    pills.replaceChildren();
+    for (const run of contextRuns) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        // Invalidity outranks staleness: the server will refuse the submit.
+        chip.className = `pill${!run.valid ? " pill-invalid" : run.stale ? " pill-stale" : ""}`;
+        chip.textContent = `#${run.seq} ${run.title}`;
+        chip.title = !run.valid
+            ? "This report is no longer valid (its files or a report it built on " +
+              "moved or was deleted); the server will refuse it as context. Remove it."
+            : run.stale
+              ? "Files this report was written against have changed since. It is still " +
+                "useful for names, and its specifics may not hold. Click to remove."
+              : "Click to remove from the next question's context.";
+        chip.addEventListener("click", () => {
+            contextRuns = contextRuns.filter((r) => r.id !== run.id);
+            api.postMessage({ type: "contextRuns", ids: contextRuns.map((r) => r.id) });
+            renderContextRuns();
+        });
+        pills.appendChild(chip);
+    }
+}
+
 function renderPanels(): void {
     const budget = researchConfig?.effort[effortValue()];
 
@@ -371,6 +425,7 @@ function render(): void {
     el("group-research").hidden = !groupApplies("research", mode);
     el("panel-budget").hidden = !groupApplies("budget", mode);
     el("panel-scope").hidden = !groupApplies("scope", mode);
+    renderContextRuns();
 
     // Stop is a Research affordance: a search round-trip is short, and the quick
     // pick's own Esc already dismisses it.
@@ -539,6 +594,12 @@ el("scope-clear").addEventListener("click", () => {
     renderPanels();
 });
 
+el("context-runs-clear").addEventListener("click", () => {
+    contextRuns = [];
+    api.postMessage({ type: "contextRuns", ids: [] });
+    renderContextRuns();
+});
+
 // Enter submits; Shift+Enter keeps the newline (the question box is multiline).
 el("text").addEventListener("keydown", (key) => {
     if (key.key === "Enter" && !key.shiftKey) {
@@ -587,6 +648,10 @@ window.addEventListener("message", (e: MessageEvent<Record<string, unknown>>) =>
             languagePills.setOptions((msg.languages as string[] | undefined) ?? []);
             persist();
             renderPanels();
+            break;
+        case "contextRuns":
+            contextRuns = (msg.runs ?? []) as typeof contextRuns;
+            renderContextRuns();
             break;
         case "mode":
             if (!running) {

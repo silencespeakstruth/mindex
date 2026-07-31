@@ -115,6 +115,22 @@ pub enum ApiError {
         got: u64,
         max: u64,
     },
+    /// A request named more prior runs in `context_run_ids` than
+    /// `[research].max_context_runs` allows. 400.
+    ResearchContextTooMany { got: usize, max: usize },
+    /// `context_run_ids` named a run that is no longer valid — stale itself, or
+    /// resting (transitively) on a deleted or stale run. 400. `meta.runs` names
+    /// each offender with its reason (`stale` / `context_deleted` /
+    /// `context_invalid`), so the client can drop exactly those picks.
+    ResearchContextInvalid { runs: Vec<(String, &'static str)> },
+    /// A stored run was named that this project does not have. 404.
+    ///
+    /// One code for "no such run" and "a run of another project", deliberately: the
+    /// distinction is not something the caller can act on, and separating them would
+    /// let one project probe another's run ids by their error codes.
+    ResearchRunNotFound { run_id: String },
+    /// The `limit` on the stored-research list was outside `1..=[research].list_page_limit`. 400.
+    ResearchListLimitOutOfRange { got: usize, max: usize },
 }
 
 impl ApiError {
@@ -152,6 +168,12 @@ impl ApiError {
             ApiError::ResearchBusy => "research.busy",
             ApiError::ResearchModelMissing => "research.model_missing",
             ApiError::ResearchBudgetOutOfRange { .. } => "validation.research_budget_out_of_range",
+            ApiError::ResearchContextTooMany { .. } => "validation.research_context_too_many",
+            ApiError::ResearchContextInvalid { .. } => "validation.research_context_invalid",
+            ApiError::ResearchRunNotFound { .. } => "research.run_not_found",
+            ApiError::ResearchListLimitOutOfRange { .. } => {
+                "validation.research_list_limit_out_of_range"
+            }
         }
     }
 
@@ -165,7 +187,9 @@ impl ApiError {
             }
             ApiError::GcRunning => StatusCode::CONFLICT,
             ApiError::FileInFlight | ApiError::ResearchBusy => StatusCode::TOO_MANY_REQUESTS,
-            ApiError::ProjectNotFound | ApiError::NoMatch => StatusCode::NOT_FOUND,
+            ApiError::ProjectNotFound
+            | ApiError::NoMatch
+            | ApiError::ResearchRunNotFound { .. } => StatusCode::NOT_FOUND,
             ApiError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             // Everything else is a client input error.
             _ => StatusCode::BAD_REQUEST,
@@ -205,6 +229,10 @@ impl ApiError {
             ApiError::ResearchBusy => "Research capacity exhausted",
             ApiError::ResearchModelMissing => "No research model",
             ApiError::ResearchBudgetOutOfRange { .. } => "Invalid research budget",
+            ApiError::ResearchContextTooMany { .. } => "Too much prior research",
+            ApiError::ResearchContextInvalid { .. } => "Research context run is invalid",
+            ApiError::ResearchRunNotFound { .. } => "No such research run",
+            ApiError::ResearchListLimitOutOfRange { .. } => "Invalid page size",
         }
     }
 
@@ -226,6 +254,10 @@ impl ApiError {
             ApiError::HistoryBoundMissing => Some("keep_last/older_than"),
             ApiError::ResearchModelMissing => Some("model"),
             ApiError::ResearchBudgetOutOfRange { field, .. } => Some(field),
+            ApiError::ResearchContextTooMany { .. } | ApiError::ResearchContextInvalid { .. } => {
+                Some("context_run_ids")
+            }
+            ApiError::ResearchListLimitOutOfRange { .. } => Some("limit"),
             _ => None,
         }
     }
@@ -320,6 +352,24 @@ impl ApiError {
                 // without its own `max_` prefix.
                 field.trim_start_matches("max_")
             ),
+            ApiError::ResearchContextTooMany { got, max } => format!(
+                "context_run_ids names {got} earlier runs, but at most {max} may be given \
+                 ([research].max_context_runs). Each one is resent on every turn, so the cap is \
+                 a token budget rather than a formality."
+            ),
+            ApiError::ResearchContextInvalid { runs } => format!(
+                "{} of the named context runs are no longer valid — stale, or resting on a \
+                 deleted or stale run; injecting them would feed the new run obsolete prose. \
+                 Pick valid runs from GET /projects/{{guid}}/research?valid=true.",
+                runs.len()
+            ),
+            ApiError::ResearchRunNotFound { run_id } => {
+                format!("This project has no research run {run_id}.")
+            }
+            ApiError::ResearchListLimitOutOfRange { got, max } => format!(
+                "limit must be between 1 and {max} (got {got}); the ceiling is \
+                 [research].list_page_limit."
+            ),
         }
     }
 
@@ -351,6 +401,19 @@ impl ApiError {
             }
             ApiError::ResearchBudgetOutOfRange { field, got, max } => {
                 Some(json!({ "field": field, "got": got, "min": 1, "max": max }))
+            }
+            ApiError::ResearchContextTooMany { got, max } => {
+                Some(json!({ "got": got, "max": max }))
+            }
+            ApiError::ResearchContextInvalid { runs } => Some(json!({
+                "runs": runs
+                    .iter()
+                    .map(|(id, reason)| json!({ "id": id, "reason": reason }))
+                    .collect::<Vec<_>>()
+            })),
+            ApiError::ResearchRunNotFound { run_id } => Some(json!({ "run_id": run_id })),
+            ApiError::ResearchListLimitOutOfRange { got, max } => {
+                Some(json!({ "got": got, "min": 1, "max": max }))
             }
             _ => None,
         }
@@ -499,6 +562,12 @@ mod tests {
                 got: 0,
                 max: 0,
             },
+            ApiError::ResearchContextTooMany { got: 0, max: 0 },
+            ApiError::ResearchContextInvalid { runs: Vec::new() },
+            ApiError::ResearchRunNotFound {
+                run_id: String::new(),
+            },
+            ApiError::ResearchListLimitOutOfRange { got: 0, max: 0 },
         ];
         let mut codes: Vec<&str> = all.iter().map(ApiError::code).collect();
         codes.sort_unstable();
@@ -516,6 +585,7 @@ mod tests {
             "request.malformed_path",
             "research.busy",
             "research.model_missing",
+            "research.run_not_found",
             "search.no_match",
             "selector.empty",
             "validation.code_too_large",
@@ -526,6 +596,9 @@ mod tests {
             "validation.query_empty",
             "validation.query_too_long",
             "validation.research_budget_out_of_range",
+            "validation.research_context_invalid",
+            "validation.research_context_too_many",
+            "validation.research_list_limit_out_of_range",
             "validation.selector_too_large",
             "validation.sha256_invalid",
             "validation.symbol_limit_out_of_range",

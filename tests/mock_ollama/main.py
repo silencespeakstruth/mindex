@@ -54,6 +54,13 @@ _config: dict[str, float] = {
 # way to exercise actions the heuristic never emits, such as outline/list_files.
 _script: list[dict[str, Any]] = []
 
+# Report-turn override, consumed in order (draft, then rewrite); the last entry
+# repeats. Empty = the fixed SUMMARY_CHUNKS. This is the only way to exercise the
+# server's markdown gate (a broken draft) and the stored-title extraction (a
+# custom heading). Cleared by every /script call that does not set it.
+_report_chunks: list[list[str]] = []
+_reports_served = 0
+
 SUMMARY_CHUNKS = [
     "# Mock Report\n\n",
     "The research question was answered from the indexed code.\n\n",
@@ -69,10 +76,15 @@ async def config(body: dict[str, float]) -> dict[str, float]:
 
 @app.post("/script")
 async def script(body: dict[str, Any]) -> dict[str, int]:
-    """Set (or clear, with an empty list) the scripted action sequence."""
+    """Set (or clear, with an empty list) the scripted action sequence, and
+    optionally the report turns' texts (a list of strings, one per report turn)."""
+    global _reports_served
     _script.clear()
     _script.extend(body.get("actions", []))
-    return {"actions": len(_script)}
+    _report_chunks.clear()
+    _report_chunks.extend([[text] for text in body.get("reports", [])])
+    _reports_served = 0
+    return {"actions": len(_script), "reports": len(_report_chunks)}
 
 
 @app.post("/api/show")
@@ -178,8 +190,15 @@ async def chat(body: dict[str, Any]) -> StreamingResponse:
 
     # The report turn. The text check stays as a belt for the fallback path.
     if not body.get("tools") or "final report" in last_user:
+        global _reports_served
+        if _report_chunks:
+            idx = min(_reports_served, len(_report_chunks) - 1)
+            chunks = _report_chunks[idx]
+            _reports_served += 1
+        else:
+            chunks = SUMMARY_CHUNKS
         lines = [_chunk(thinking="composing the report")]
-        lines += [_chunk(content=c) for c in SUMMARY_CHUNKS]
+        lines += [_chunk(content=c) for c in chunks]
         lines.append(_chunk(done=True))
         return StreamingResponse(_stream(lines), media_type="application/x-ndjson")
 

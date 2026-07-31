@@ -170,6 +170,27 @@ max_request_seconds = 3600
 max_request_tokens = 8000000
 max_request_steps = 200
 
+# Stored research. A finished run is journalled with an `expires_at` of
+# created_at + retention_days, and /gc reaps it once that passes. The deadline is
+# stamped AT INSERT, so changing this affects future runs only — and a PINNED run
+# has no expiry at all (expires_at IS NULL) and is never reaped, which is how a
+# report worth keeping outlives whatever retention you pick here.
+retention_days = 90
+
+# Prior research as context for a new run. A request may name earlier runs in
+# `context_run_ids`; their reports are injected into the transcript before the plan
+# turn. Both caps are real budget knobs rather than politeness: the whole transcript
+# is resent every turn, so an injected block is paid on EVERY turn and multiplies
+# against max_tokens and context_fraction. The last report included is truncated to
+# fit max_context_chars, with a visible marker — never silently. Set
+# max_context_runs = 0 to switch the feature off.
+max_context_runs = 3
+max_context_chars = 24000
+
+# Page size ceiling for GET /projects/{guid}/research, which is keyset-paginated by
+# the per-project `seq` rather than by offset.
+list_page_limit = 50
+
 # Sampling, applied to every research turn. Commented out = each model's OWN
 # Modelfile default is used, which is the right production behaviour and the wrong
 # setting for comparing models: those defaults differ per model (measured here,

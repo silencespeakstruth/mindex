@@ -596,6 +596,20 @@ pub struct ResearchRequest {
     /// per turn — so two runs of one question differ. Set it to make a run
     /// repeatable, or vary it deliberately to measure a model's own spread.
     pub seed: Option<i64>,
+    /// Earlier runs of this project whose reports are handed to this one as
+    /// background, in the order given. Ids come from `done.run_id` or from
+    /// `GET /projects/{guid}/research`.
+    ///
+    /// The reports are injected into the transcript before the model plans, so they
+    /// can supply the identifiers a cold run would have to spend steps discovering.
+    /// They are **not** evidence: nothing in them can be cited, and a citation copied
+    /// out of one is reported to the reader as `unverified`, exactly as if the model
+    /// had invented it.
+    ///
+    /// Capped by `[research].max_context_runs` (400
+    /// `validation.research_context_too_many`); an id that is not a run of this
+    /// project is a 404 `research.run_not_found`.
+    pub context_run_ids: Option<Vec<String>>,
 }
 
 /// Per-request overrides for the `effort` preset.
@@ -964,6 +978,154 @@ pub struct GcResponse {
     pub files_removed: usize,
     /// `project_file_status_log` rows pruned past the retention window.
     pub status_log_pruned: usize,
+    /// Stored research runs reaped for having passed their `expires_at`. A **pinned**
+    /// run (`expires_at` null) has no expiry and is never counted here.
+    pub research_runs_pruned: usize,
+}
+
+/// `GET /projects/{guid}/research` query. **Keyset**, not offset: pages are
+/// resumed from `before_seq`, so a run written or reaped between two pages cannot
+/// make the reader skip or repeat a row the way `OFFSET` would.
+#[derive(Deserialize, Debug, Default, IntoParams)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchListQuery {
+    /// Case-insensitive substring of the title, the question **or** the report
+    /// body. Literal — `_` and `%` are escaped, so searching for `read_chunks`
+    /// cannot also match `readXchunks`.
+    pub q: Option<String>,
+    /// Return runs whose `seq` is strictly below this. Absent = the newest page.
+    /// Take it from the previous response's `next_before_seq`.
+    pub before_seq: Option<i64>,
+    /// Page size, capped by `[research].list_page_limit` (400
+    /// `validation.research_list_limit_out_of_range` above it).
+    pub limit: Option<usize>,
+    /// `all` (default), `fresh`, or `stale` — filtered before the page is cut, so a
+    /// full page always means there may be more.
+    pub freshness: Option<ResearchFreshness>,
+    /// Restrict to pinned (`true`) or unpinned (`false`) runs.
+    pub pinned: Option<bool>,
+    /// Restrict to fully-valid (`true`) or invalid (`false`) runs — validity being
+    /// the transitive verdict, not just the run's own staleness (that is
+    /// `freshness`). Filtered before the page is cut, like `freshness`.
+    pub valid: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchFreshness {
+    All,
+    Fresh,
+    Stale,
+}
+
+/// One stored run, without its report. The list is a separate endpoint precisely so
+/// that a page of fifty runs does not carry fifty reports.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchRunSummary {
+    /// Stable identity — what every per-run endpoint keys on.
+    pub id: String,
+    /// Per-project ordinal: short enough to type, and the keyset cursor. **Not**
+    /// identity: it is renumbered if a project's runs are ever wiped entirely.
+    pub seq: i64,
+    /// The report's own heading when the run stored one, else derived from
+    /// `question` — see the handler. Never null on the wire.
+    pub title: String,
+    pub question: String,
+    pub created_at: i64,
+    /// When `/gc` may reap this run. `null` = **pinned**, never reaped.
+    pub expires_at: Option<i64>,
+    pub pinned: bool,
+    pub model: String,
+    pub effort: String,
+    pub done_reason: String,
+    pub citations_total: i64,
+    pub citations_verified: i64,
+    pub citations_unverified: i64,
+    pub steps: i64,
+    pub elapsed_ms: i64,
+    /// Files the run read and recorded a baseline for.
+    pub files_total: i64,
+    /// How many of those have changed or left the index since. `0` means the report
+    /// still describes what is there.
+    pub files_moved: i64,
+    /// `files_moved > 0` — the same `changed || removed` the live run's own freshness
+    /// probe means by stale.
+    pub stale: bool,
+    /// Derived validity, never stored: the run itself is fresh AND every run in its
+    /// transitive context still exists and is itself valid. A deleted or GC-reaped
+    /// ancestor therefore invalidates the whole chain the moment it goes, with no
+    /// write anywhere.
+    pub valid: bool,
+    /// Why `valid` is false: `stale` (its own files moved), `context_deleted` (a
+    /// run in its context chain was deleted or reaped), or `context_invalid` (an
+    /// ancestor is itself stale or broken). `null` when valid.
+    pub invalid_reason: Option<&'static str>,
+    /// The run's transitive context ancestry, flattened and deduplicated —
+    /// ascending `seq`, deleted entries last. What lets a human pick context with
+    /// confidence: every report this one leaned on, each with its own state.
+    pub context: Vec<ResearchRunDependency>,
+}
+
+/// One run in another run's context chain (direct or transitive).
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchRunDependency {
+    /// The id as recorded at launch — always present, even when the run is gone.
+    pub id: String,
+    /// `null` when the run no longer exists.
+    pub seq: Option<i64>,
+    /// Stored-or-derived title; `null` when the run no longer exists (render a
+    /// "deleted report" marker).
+    pub title: Option<String>,
+    /// `valid`, `invalid`, or `deleted`.
+    pub state: &'static str,
+}
+
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchRunListResponse {
+    pub runs: Vec<ResearchRunSummary>,
+    /// Pass as `before_seq` for the next page. `null` when the page came back short,
+    /// which is how a client knows to stop without spending a request to find out.
+    pub next_before_seq: Option<i64>,
+}
+
+/// What became of one file the run read.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchRunFile {
+    pub path: String,
+    /// The index's hash when the run first read it.
+    pub sha256: String,
+    /// The index's hash now; `null` when the file is no longer indexed.
+    pub current_sha256: Option<String>,
+    /// `fresh`, `changed` or `removed`. Three values rather than a boolean because a
+    /// file that was deleted and a file that was edited call for different reading.
+    pub state: &'static str,
+}
+
+/// One stored run in full, including the report.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchRunDetail {
+    #[serde(flatten)]
+    pub summary: ResearchRunSummary,
+    /// The report, as Markdown — the thing the whole table exists to keep.
+    pub report: String,
+    pub prompt_version: String,
+    /// Earlier runs that were fed to this one as context.
+    pub context_run_ids: Vec<String>,
+    /// The run's file scope as it was described to the model; `null` if unscoped.
+    pub scope: Option<String>,
+    /// Per-file freshness — the honest form of `stale`.
+    pub files: Vec<ResearchRunFile>,
+}
+
+/// `POST /projects/{guid}/research/{run_id}/pin` body.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchPinRequest {
+    /// `true` clears the expiry outright. `false` restores
+    /// `created_at + [research].retention_days` — so unpinning a run older than the
+    /// window makes it eligible at the very next sweep, which is what "let it age
+    /// normally" honestly means.
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Debug, ToSchema)]

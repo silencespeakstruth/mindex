@@ -15,7 +15,10 @@ use crate::backend::metrics::{
     ClassLabels, Metrics, ModelEffortLabels, ModelKindLabels, ModelLabels, ModelReasonLabels,
 };
 use crate::db::sqlite3::SQLite3Pool;
-use crate::research::{ResearchJournal, RunRecord};
+use crate::research::{RecordedRun, ResearchJournal, RunRecord};
+
+/// Shared with `worker::gc`, which prunes on the same unit.
+const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Everything about a run that the *request* decided rather than the loop.
 ///
@@ -30,17 +33,35 @@ pub struct RunContext {
     /// The run's file scope, rendered once by the caller. `None` for an unscoped run —
     /// stored as SQL NULL, so "no scope" and "an empty scope" stay apart.
     pub scope_json: Option<String>,
+    /// `[research].retention_days`, threaded rather than read from a global. Stamped
+    /// onto the row as an absolute `expires_at` at insert, so a run's deadline is a
+    /// property of the run and a later config change moves only future runs.
+    pub retention_days: u64,
 }
 
 /// Insert one finished run. Logs and swallows every failure — the caller is on
 /// the "report already delivered" side of the run.
+///
+/// Returns [`RecordedRun`] so the `done` event can name what was stored, or `None`
+/// if nothing was: the best-effort contract is unchanged, and a `None` simply means
+/// the client is not offered a run it cannot later fetch.
+///
+/// **Two tables, one transaction.** The v1.0.0 comment on this table says "one row,
+/// one INSERT", which stopped being literally true when `research_run_files` arrived;
+/// the property it was really claiming — a run has all its rows or none — is what the
+/// single transaction still guarantees. A half-written run would be worse than no run
+/// at all here, since a report stored without its baselines reads as permanently
+/// fresh.
 pub async fn insert_run(
     db_pool: &SQLite3Pool,
     ctx: RunContext,
     record: RunRecord,
     token: CancellationToken,
-) {
+) -> Option<RecordedRun> {
     let id = uuid::Uuid::new_v4().to_string();
+    let retention_secs = (ctx.retention_days as i64).saturating_mul(SECONDS_PER_DAY);
+    let context_run_ids =
+        serde_json::to_string(&record.context_run_ids).unwrap_or_else(|_| "[]".to_string());
     let cited_paths =
         serde_json::to_string(&record.citations.cited_paths).unwrap_or_else(|_| "[]".to_string());
     let unverified_paths = serde_json::to_string(&record.citations.unverified_paths)
@@ -50,9 +71,18 @@ pub async fn insert_run(
 
     let res = db_pool
         .transaction(token, move |tx| {
+            // The per-project ordinal, read inside the same transaction as the insert
+            // that consumes it. GC reaps the oldest rows, so MAX survives a sweep and
+            // the sequence keeps climbing; the UNIQUE index on (project_guid, seq) is
+            // the backstop if two runs ever race here.
+            let seq: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM research_runs WHERE project_guid = ?1",
+                rusqlite::params![ctx.project_guid],
+                |r| r.get(0),
+            )?;
             tx.execute(
                 "INSERT INTO research_runs (
-                     id, project_guid,
+                     id, project_guid, seq, expires_at, context_run_ids_json,
                      question, model, prompt_version, effort, seed, temperature,
                      granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
                      done_reason, steps, turns, elapsed_ms,
@@ -65,9 +95,9 @@ pub async fn insert_run(
                      out_of_scope_refusals, out_of_scope_rows,
                      scoped, scope_json,
                      forced_synthesis, report_window_ms, report_elapsed_ms,
-                     report
+                     title, report
                  ) VALUES (
-                     ?1, ?2,
+                     ?1, ?2, ?44, unixepoch() + ?45, ?46,
                      ?3, ?4, ?5, ?6, ?7, ?8,
                      ?9, ?10, ?11, ?12,
                      ?13, ?14, ?15, ?16,
@@ -80,7 +110,7 @@ pub async fn insert_run(
                      ?36, ?37,
                      ?38, ?39,
                      ?40, ?41, ?42,
-                     ?43
+                     ?47, ?43
                  )",
                 rusqlite::params![
                     id,
@@ -126,17 +156,38 @@ pub async fn insert_run(
                     record.tools.report_window_ms as i64,
                     record.tools.report_elapsed_ms as i64,
                     record.report,
+                    seq,
+                    retention_secs,
+                    context_run_ids,
+                    record.title,
                 ],
             )?;
-            Ok(())
+
+            // The baselines, in the same transaction. A prepared statement reused
+            // across the loop: a run that read fifty files would otherwise re-parse
+            // the same INSERT fifty times.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_files (run_id, path, sha256) VALUES (?1, ?2, ?3)",
+                )?;
+                for b in &record.file_baselines {
+                    stmt.execute(rusqlite::params![id, b.path, b.sha256])?;
+                }
+            }
+            Ok(RecordedRun { id, seq })
         })
         .await;
-    if let Err(e) = res {
-        warn!(
-            error = ?e,
-            "Could not journal a finished research run; the report was delivered but \
-             leaves no trace. Check the database is writable."
-        );
+    match res {
+        Ok(recorded) => Some(recorded),
+        Err(e) => {
+            warn!(
+                error = ?e,
+                "Could not journal a finished research run; the report was delivered but \
+                 leaves no trace, and the client cannot be offered it as context for a \
+                 later run. Check the database is writable."
+            );
+            None
+        }
     }
 }
 
@@ -176,12 +227,21 @@ impl MeteredJournal {
 
 #[async_trait]
 impl ResearchJournal for MeteredJournal {
-    async fn record(&self, record: RunRecord) {
+    async fn record(&self, record: RunRecord) -> Option<RecordedRun> {
         let r = &self.metrics.research;
         let model = record.model.clone();
         let labels = ModelLabels {
             model: model.clone(),
         };
+
+        // Was this run given earlier reports to read, and how many? Counted here
+        // rather than at the injection site for the decorator's usual reason: a seam
+        // cannot miss a caller, and `RunRecord` already carries the list.
+        if !record.context_run_ids.is_empty() {
+            r.runs_with_context.get_or_create(&labels).inc();
+            r.context_runs_used
+                .inc_by(record.context_run_ids.len() as u64);
+        }
 
         // Split from `runs_by_effort` rather than crossed with it: `model` is a
         // client-supplied string, so model x effort x reason is the one product
@@ -245,7 +305,7 @@ impl ResearchJournal for MeteredJournal {
             r.forced_syntheses.inc();
         }
 
-        self.inner.record(record).await;
+        self.inner.record(record).await
     }
 }
 
@@ -257,6 +317,8 @@ mod tests {
     fn record() -> RunRecord {
         RunRecord {
             tools: crate::research::RunTools::default(),
+            file_baselines: Vec::new(),
+            context_run_ids: Vec::new(),
             question: "how does GC work?".into(),
             model: "test-model".into(),
             prompt_version: "test.1",
@@ -290,6 +352,7 @@ mod tests {
                 removed_files: 0,
             },
             revalidation: None,
+            title: Some("Report".into()),
             report: "# Report\n\nIt sweeps.".into(),
         }
     }
@@ -301,8 +364,9 @@ mod tests {
         struct Inner(std::sync::atomic::AtomicUsize);
         #[async_trait]
         impl ResearchJournal for Inner {
-            async fn record(&self, _: RunRecord) {
+            async fn record(&self, _: RunRecord) -> Option<RecordedRun> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
             }
         }
 
@@ -355,6 +419,7 @@ mod tests {
     fn ctx() -> RunContext {
         RunContext {
             scope_json: None,
+            retention_days: 90,
             project_guid: "c2d7e2c1-3165-42f5-9366-0ff1492b4bab".into(),
             effort: "medium",
             seed: Some(7),
@@ -366,12 +431,19 @@ mod tests {
     // larger pool would read a different (empty) one back.
     async fn pool() -> SQLite3Pool {
         let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
-        pool.transaction(CancellationToken::new(), |tx| {
-            tx.execute_batch(include_str!("migrations/v1.0.0_schema.sql"))?;
+        // Every migration, through `migration_transaction`, exactly as startup applies
+        // them. Pinning this to v1.0.0 alone was a trap: the schema this module writes
+        // to is the migrated one, so a test against the base file would fail on any
+        // column a later migration added — and would have passed while production
+        // broke, had the columns gone the other way.
+        pool.migration_transaction(CancellationToken::new(), |tx| {
+            for (_, sql) in crate::MIGRATIONS {
+                tx.execute_batch(sql)?;
+            }
             Ok(())
         })
         .await
-        .expect("migration applies");
+        .expect("migrations apply");
         pool
     }
 
@@ -454,6 +526,30 @@ mod tests {
             .await
             .expect("one row");
         assert_eq!(got, (None, None));
+    }
+
+    /// The stored title is the record's own — nothing derives or defaults it at
+    /// write time, so None must land as NULL, not as an empty string a reader
+    /// would render.
+    #[tokio::test]
+    async fn the_title_is_stored_and_null_when_absent() {
+        let pool = pool().await;
+        insert_run(&pool, ctx(), record(), CancellationToken::new()).await;
+        let mut untitled = record();
+        untitled.title = None;
+        insert_run(&pool, ctx(), untitled, CancellationToken::new()).await;
+
+        let titles: Vec<Option<String>> = pool
+            .transaction(CancellationToken::new(), |tx| {
+                let mut stmt = tx.prepare("SELECT title FROM research_runs ORDER BY seq")?;
+                let rows = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("two rows");
+        assert_eq!(titles, vec![Some("Report".to_string()), None]);
     }
 
     /// The write is on the "report already delivered" side of the run, so a

@@ -48,12 +48,18 @@ use crate::models::ollama::OllamaModel;
 /// defines "permanently failed").
 ///
 /// A struct rather than five loose parameters, following `RetryTuning` — and it
-/// is what keeps `run` under clippy's argument limit.
-#[derive(Debug, Clone, Copy)]
+/// is what keeps `run` under clippy's argument limit, which is also why `model_id`
+/// belongs here rather than as a ninth parameter. `Clone` and not `Copy` because of
+/// that `String`.
+#[derive(Debug, Clone)]
 pub struct MetricsTuning {
     pub refresh_interval_seconds: u64,
     pub probe_dependencies: bool,
     pub max_retries: i64,
+    /// The embedding model whose rows this collector describes. `project_files` is
+    /// keyed `(project_guid, model_id, path)`, so the research staleness join would
+    /// otherwise match a run's baseline across every model the database has held.
+    pub model_id: String,
 }
 
 /// The dependencies the collector probes, when probing is on.
@@ -83,6 +89,9 @@ struct Snapshot {
     permanently_failed: Vec<(String, i64)>,
     projects: i64,
     status_log_rows: i64,
+    research_runs: Vec<(String, i64)>,
+    research_pinned: Vec<(String, i64)>,
+    research_stale: Vec<(String, i64)>,
     db_size_bytes: i64,
 }
 
@@ -114,7 +123,7 @@ pub async fn run(
             }
         }
 
-        collect_once(&db_pool, &metrics, tuning, &token).await;
+        collect_once(&db_pool, &metrics, &tuning, &token).await;
 
         // Derived, never incremented: a run finishes on the leaked research
         // runtime and a dropped SSE stream is its *normal* exit, so an inc/dec
@@ -140,15 +149,17 @@ pub async fn run(
 pub(crate) async fn collect_once(
     db_pool: &SQLite3Pool,
     metrics: &Metrics,
-    tuning: MetricsTuning,
+    tuning: &MetricsTuning,
     token: &CancellationToken,
 ) {
     // One transaction for all seven aggregates: holding one of the pool's
     // connections for a few milliseconds a minute is nothing, while seven
     // transactions would be seven `spawn_blocking` round-trips.
+    let model_id = tuning.model_id.clone();
+    let max_retries = tuning.max_retries;
     let snapshot = match db_pool
         .transaction(token.clone(), move |tx| {
-            read_snapshot(tx, tuning.max_retries)
+            read_snapshot(tx, max_retries, &model_id)
         })
         .with_cancellation_token(token)
         .await
@@ -171,6 +182,7 @@ pub(crate) async fn collect_once(
 fn read_snapshot(
     tx: &rusqlite::Transaction,
     max_retries: i64,
+    model_id: &str,
 ) -> Result<Snapshot, SQLite3PoolError> {
     let mut s = Snapshot::default();
 
@@ -246,6 +258,46 @@ fn read_snapshot(
     s.status_log_rows = tx.query_row("SELECT COUNT(*) FROM project_file_status_log", [], |r| {
         r.get(0)
     })?;
+
+    s.research_runs = tx
+        .prepare("SELECT project_guid, COUNT(*) FROM research_runs GROUP BY 1")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    s.research_pinned = tx
+        .prepare(
+            "SELECT project_guid, COUNT(*) FROM research_runs
+              WHERE expires_at IS NULL GROUP BY 1",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    // The one join in this collector, and the one worth watching. It probes every
+    // retained run's file list against `project_files` by primary key — order
+    // `runs x files_per_run` indexed lookups a tick, which at the default
+    // `[research].retention_days` is small, and which `retention_days` is the only
+    // thing bounding. Raise that by an order of magnitude and this is the first gauge
+    // to drop. It is still nothing like the `SUM(LENGTH(code))` scan the
+    // "deliberately not measured" rule refused: that one evicts the page cache the
+    // search candidate query depends on, this one touches an index.
+    //
+    // `model_id` is bound because project_files is keyed (project_guid, model_id,
+    // path); joining on the path alone would match a baseline against every embedding
+    // model the database has ever held.
+    s.research_stale = tx
+        .prepare(
+            "SELECT r.project_guid, COUNT(*) FROM research_runs r
+              WHERE EXISTS (
+                    SELECT 1 FROM research_run_files rf
+                    LEFT JOIN project_files pf
+                           ON pf.project_guid = r.project_guid
+                          AND pf.model_id     = ?1
+                          AND pf.path         = rf.path
+                          AND pf.status      != 'deleted'
+                     WHERE rf.run_id = r.id
+                       AND (pf.sha256 IS NULL OR pf.sha256 <> rf.sha256))
+              GROUP BY 1",
+        )?
+        .query_map([model_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
 
     let pages: i64 = tx.pragma_query_value(None, "page_count", |r| r.get(0))?;
     let page_size: i64 = tx.pragma_query_value(None, "page_size", |r| r.get(0))?;
@@ -332,6 +384,20 @@ fn apply(metrics: &Metrics, snapshot: &Snapshot) {
 
     s.projects.set(snapshot.projects);
     s.status_log_rows.set(snapshot.status_log_rows);
+    for (family, rows) in [
+        (&s.project_research_runs, &snapshot.research_runs),
+        (&s.project_research_pinned, &snapshot.research_pinned),
+        (&s.project_research_stale, &snapshot.research_stale),
+    ] {
+        family.clear();
+        for (project_guid, n) in rows {
+            family
+                .get_or_create(&ProjectLabels {
+                    project_guid: project_guid.clone(),
+                })
+                .set(*n);
+        }
+    }
     s.db_size_bytes.set(snapshot.db_size_bytes);
 }
 
@@ -380,6 +446,7 @@ mod tests {
             refresh_interval_seconds: 60,
             probe_dependencies: false,
             max_retries: 3,
+            model_id: MODEL.to_string(),
         }
     }
 
@@ -432,7 +499,7 @@ mod tests {
 
         let metrics = Metrics::new();
         let token = CancellationToken::new();
-        collect_once(&pool, &metrics, tuning(), &token).await;
+        collect_once(&pool, &metrics, &tuning(), &token).await;
 
         let text = metrics.render().expect("renders");
         assert!(text.contains(a), "project A missing: {text}");
@@ -454,7 +521,7 @@ mod tests {
         .await
         .expect("delete");
 
-        collect_once(&pool, &metrics, tuning(), &token).await;
+        collect_once(&pool, &metrics, &tuning(), &token).await;
 
         let text = metrics.render().expect("renders");
         assert!(text.contains(a), "project A should still report: {text}");
@@ -475,7 +542,7 @@ mod tests {
         seed_project(&pool, a).await;
 
         let metrics = Metrics::new();
-        collect_once(&pool, &metrics, tuning(), &CancellationToken::new()).await;
+        collect_once(&pool, &metrics, &tuning(), &CancellationToken::new()).await;
 
         let text = metrics.render().expect("renders");
         assert!(
@@ -495,7 +562,7 @@ mod tests {
         seed_project(&pool, a).await;
 
         let metrics = Metrics::new();
-        collect_once(&pool, &metrics, tuning(), &CancellationToken::new()).await;
+        collect_once(&pool, &metrics, &tuning(), &CancellationToken::new()).await;
         assert!(
             metrics
                 .render()
@@ -505,7 +572,7 @@ mod tests {
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        collect_once(&pool, &metrics, tuning(), &cancelled).await;
+        collect_once(&pool, &metrics, &tuning(), &cancelled).await;
 
         assert!(
             metrics

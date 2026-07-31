@@ -8,6 +8,7 @@ import { buildManifest, scanWorkspace } from "./scanner";
 import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
 import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
 import { StatusPanel } from "./statusPanel";
+import { ResearchRunsPanel } from "./researchRunsPanel";
 import { paintStatusBar } from "./statusBar";
 import { reindexPaths, showReindexSummary } from "./indexer";
 import { runSearch } from "./search";
@@ -275,6 +276,10 @@ export function activate(context: vscode.ExtensionContext): void {
                     budget: s.budget,
                     include: s.include,
                     exclude: s.exclude,
+                    context_run_ids:
+                        s.contextRunIds !== undefined && s.contextRunIds.length > 0
+                            ? s.contextRunIds
+                            : undefined,
                 },
                 {
                     onThinking: (text) => panel.thinking(text),
@@ -701,6 +706,22 @@ export function activate(context: vscode.ExtensionContext): void {
             // is in flight rather than a blank tab.
             StatusPanel.showOrReveal(context.extensionUri, statusProvider, statusActions);
             void statusProvider.refresh();
+        }),
+
+        vscode.commands.registerCommand("mindex.openResearchHistory", () => {
+            ResearchRunsPanel.showOrReveal(
+                context.extensionUri,
+                () => api,
+                () => project?.mindex.guid,
+                {
+                    useAsContext: (runs) => {
+                        askProvider.setContextRuns(runs);
+                        // Reveal the form and switch it to Research: a selection made
+                        // here is only useful to the mode that can spend it.
+                        askProvider.focus("research");
+                    },
+                }
+            );
         }),
 
         vscode.commands.registerCommand("mindex.openSettings", () => openSettings()),

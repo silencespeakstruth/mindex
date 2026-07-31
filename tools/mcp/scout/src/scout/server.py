@@ -59,10 +59,10 @@ _EFFORTS = {"low", "medium", "high"}
 _TRUTHY = {"1", "true", "yes", "on"}
 
 # Fields kept from a `step` event. Each action names its argument differently —
-# search/grep/symbols/outline/list_files/note/revise_plan →
-# query/pattern/name/path/glob/text/plan — and dropping an unknown key would
-# silently blank the trace for that action rather than error. A new tool on the
-# server means a new key here, in the same commit.
+# search/grep/symbols/outline/list_files/note/revise_plan/read_research →
+# query/pattern/name/path/glob/text/plan/seq (list_research reuses query) — and
+# dropping an unknown key would silently blank the trace for that action rather
+# than error. A new tool on the server means a new key here, in the same commit.
 _STEP_KEYS = (
     "n",
     "action",
@@ -73,6 +73,7 @@ _STEP_KEYS = (
     "glob",
     "text",
     "plan",
+    "seq",
     "hits",
 )
 
@@ -238,6 +239,14 @@ licence to investigate yourself; it is the signal to send ONE follow-up (or the
 same question at a higher effort). Checking a field is not spot-checking — it
 costs nothing and it is the only honest signal you get about coverage.
 
+WHEN YOU SEND A FOLLOW-UP, chain it: pass the previous result's `run_id` in
+`context_run_ids`. The local model is then handed that report before it plans, so it
+starts from the names and files already established instead of spending its first
+steps rediscovering them — which is measurably where a cold run's budget goes. It is
+given as background, not as evidence: the model is told it may not cite it, so a
+chained follow-up is no less grounded than a cold one. `run_id` is absent only when
+the server could not store the run.
+
 The result's `usage` says what the run spent against what it was granted, and
 `usage.binding` names the axis that came closest to running out. Read it when you
 are about to ask a *broader* follow-up: a "finalized" report whose binding axis
@@ -301,6 +310,7 @@ async def research(
     include: dict[str, Any] | None = None,
     exclude: dict[str, Any] | None = None,
     budget: dict[str, Any] | None = None,
+    context_run_ids: list[str] | None = None,
 ) -> dict:
     """Investigate the codebase and return a report — without spending your tokens.
 
@@ -316,7 +326,10 @@ async def research(
 
     IF IT ISN'T ENOUGH, CALL THIS TOOL AGAIN with a sharper follow-up question
     naming exactly what was missing. Follow-ups are the intended path. Never
-    substitute your own investigation loop.
+    substitute your own investigation loop. When you do, pass the previous call's
+    ``run_id`` in ``context_run_ids``: the local model then starts from what it
+    already established instead of rediscovering the same file names, which is where
+    a cold run spends its first steps.
 
     The raw `mindex` tools are only for pulling the byte-exact text of a location
     this report already cited, immediately before you edit that code.
@@ -343,6 +356,12 @@ async def research(
             The server owns the ceilings and rejects an over-large value with a 400;
             they are deliberately not duplicated here, because three separate copies
             of these numbers have drifted from the server before.
+        context_run_ids: Optional ``run_id`` values of earlier runs on this project
+            whose reports should be handed to this one as background — normally the
+            ``run_id`` a previous call returned. They save the new run the work of
+            rediscovering names, and they are NOT evidence: the local model is told it
+            may not cite them, and anything it copies from one is reported back as
+            ``unverified``. The server caps how many may be given.
 
     Returns ``{"report", "steps": [{n, action, query|name|path|glob, hits}],
     "elapsed_ms", "done_reason", "usage"}``. ``steps`` is just the trace of what
@@ -361,6 +380,10 @@ async def research(
     tokens, steps, turns) plus ``binding``: the axis that came closest to
     exhausted. On a "finalized" report a nearly-exhausted axis means the next,
     broader question needs a higher effort to finish at all.
+
+    ``run_id`` (with a short per-project ``seq``) names the stored report. Pass it as
+    ``context_run_ids`` on a follow-up so the next run reads this one first. Absent
+    when the server could not store the run, which only means it cannot be referenced.
     """
     question = question.strip()
     if not question:
@@ -377,6 +400,8 @@ async def research(
         body["exclude"] = exclude
     if budget:
         body["budget"] = budget
+    if context_run_ids:
+        body["context_run_ids"] = context_run_ids
     # `seed` is deliberately NOT exposed. An agent has no use for repeatability, and
     # a pinned seed would make the "ask again, sharper" path this tool's own
     # instructions sell return the same report for the same question. Do not add it
@@ -391,6 +416,8 @@ async def research(
     citations: dict[str, Any] = {}
     elapsed_ms = 0
     done_reason: str | None = None
+    run_id: str | None = None
+    run_seq: int | None = None
     failure: str | None = None
 
     try:
@@ -435,6 +462,15 @@ async def research(
                     # older than the reason taxonomy — treat that as unknown, not
                     # as complete.
                     done_reason = str(data.get("reason", "")) or None
+                    # The stored run this became. Read explicitly rather than through
+                    # `_USAGE_KEYS`: these are not cost, they are how to ask for the
+                    # report again — and how to hand it to a LATER question as context
+                    # instead of re-investigating from cold, which is the whole
+                    # token-economy argument this server exists for. Null when the
+                    # server's best-effort journal write failed, and absent on servers
+                    # older than the field; both mean "cannot be referenced".
+                    run_id = data.get("run_id") or None
+                    run_seq = data.get("seq")
                 elif event == "citations":
                     # The server's own verdict on the report's `path:start-end`
                     # references, checked against what its tools actually
@@ -495,6 +531,10 @@ async def research(
         "done_reason": done_reason,
         "usage": usage,
     }
+    if run_id is not None:
+        out["run_id"] = run_id
+        if run_seq is not None:
+            out["seq"] = run_seq
     # Echoed back so a report read later knows what it was allowed to see. A scoped
     # report and an unscoped one are otherwise the same document, and the scoped one
     # can only speak about its scope.

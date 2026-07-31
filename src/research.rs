@@ -40,10 +40,11 @@ use crate::models::ollama::{
 /// **Bump on any edit to** `system_prompt`, [`PLAN_REQUEST`],
 /// [`SUFFICIENCY_REQUEST`], the re-open nudge that follows it,
 /// [`REVALIDATION_SYSTEM_PROMPT`], [`format_citation_complaint`],
-/// [`format_ungrounded_complaint`], [`REPORT_SYSTEM_PROMPT`], either report turn's
+/// [`format_ungrounded_complaint`], [`format_markdown_complaint`],
+/// [`REPORT_SYSTEM_PROMPT`], either report turn's
 /// user message, the
-/// budget-exhausted nudges, or [`tool_specs`] — anything that changes what the
-/// model is asked or what it may call. The run-state note counts too, but only its
+/// budget-exhausted nudges, [`format_prior_reports`], or [`tool_specs`] — anything
+/// that changes what the model is asked or what it may call. The run-state note counts too, but only its
 /// wording ([`format_state_note`]'s labels): its *contents* are the run's own
 /// history and differ every run by design. Not a version of the *code*: refactors
 /// that leave the wording identical leave this alone.
@@ -53,7 +54,7 @@ use crate::models::ollama::{
 /// Nothing ever compares this one — it is pure provenance — so the split between
 /// the two numbers is the only thing that gives it meaning: MINOR for reworded
 /// instructions, MAJOR for a run that asks the model to do a different job.
-pub const PROMPT_VERSION: &str = "1.1";
+pub const PROMPT_VERSION: &str = "1.3";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -412,6 +413,11 @@ pub enum ResearchEvent {
         progress: RunProgress,
         context_fraction: f64,
         reason: DoneReason,
+        /// How the finished run can be named afterwards, or `None` if the journal
+        /// write failed. A client cannot offer to reuse a run it cannot fetch, and
+        /// the journal is best-effort by contract — so this is nullable on the wire
+        /// rather than fabricated.
+        recorded: Option<RecordedRun>,
     },
     /// A failure after the stream started (the HTTP status is already 200).
     Error { code: String, detail: String },
@@ -426,16 +432,45 @@ pub enum ResearchEvent {
 /// remembering both, with a silent `"query"` fallback if you didn't.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepCall {
-    Search { query: String },
-    Symbols { name: String },
-    Outline { path: String },
-    Callers { name: String },
-    ListFiles { glob: String },
-    ReadChunks { path: String },
-    Grep { pattern: String },
-    FileHistory { path: String },
-    Note { text: String },
-    RevisePlan { plan: String },
+    Search {
+        query: String,
+    },
+    Symbols {
+        name: String,
+    },
+    Outline {
+        path: String,
+    },
+    Callers {
+        name: String,
+    },
+    ListFiles {
+        glob: String,
+    },
+    ReadChunks {
+        path: String,
+    },
+    Grep {
+        pattern: String,
+    },
+    FileHistory {
+        path: String,
+    },
+    Note {
+        text: String,
+    },
+    RevisePlan {
+        plan: String,
+    },
+    ListResearch {
+        query: String,
+    },
+    /// The seq, formatted — `argument()` returns `&str`, and its consumers only
+    /// display the value, so a numeric wire type would buy a per-variant special
+    /// case in `data()` for nothing.
+    ReadResearch {
+        seq: String,
+    },
 }
 
 impl StepCall {
@@ -452,6 +487,8 @@ impl StepCall {
             StepCall::FileHistory { .. } => "file_history",
             StepCall::Note { .. } => "note",
             StepCall::RevisePlan { .. } => "revise_plan",
+            StepCall::ListResearch { .. } => "list_research",
+            StepCall::ReadResearch { .. } => "read_research",
         }
     }
 
@@ -468,6 +505,8 @@ impl StepCall {
             StepCall::FileHistory { path } => ("path", path),
             StepCall::Note { text } => ("text", text),
             StepCall::RevisePlan { plan } => ("plan", plan),
+            StepCall::ListResearch { query } => ("query", query),
+            StepCall::ReadResearch { seq } => ("seq", seq),
         }
     }
 }
@@ -531,6 +570,7 @@ impl ResearchEvent {
                 progress,
                 context_fraction,
                 reason,
+                recorded,
             } => {
                 // `steps`/`elapsed_ms` stay top-level: they were the original
                 // contract, and the cost fields are added around them.
@@ -543,6 +583,19 @@ impl ResearchEvent {
                     map.insert(
                         "prompt_version".into(),
                         Value::String(PROMPT_VERSION.into()),
+                    );
+                    // How to ask for this run again. Null when the journal write
+                    // failed — the run happened, but nothing can fetch it, and a
+                    // fabricated id would be worse than an honest absence.
+                    map.insert(
+                        "run_id".into(),
+                        recorded
+                            .as_ref()
+                            .map_or(Value::Null, |r| Value::String(r.id.clone())),
+                    );
+                    map.insert(
+                        "seq".into(),
+                        recorded.as_ref().map_or(Value::Null, |r| json!(r.seq)),
                     );
                 }
                 data
@@ -626,6 +679,25 @@ pub trait ResearchTools: Send + Sync {
         scope: &ToolScope,
         token: &CancellationToken,
     ) -> Result<ReadChunksResponse, ApiError>;
+
+    /// The stored, still-valid research runs of the same project — never invalid
+    /// ones. Takes no [`ToolScope`]: reports are not files, and a run scoped to a
+    /// corner of the tree may still orient itself from project-wide research (its
+    /// content cannot be cited anyway — see the hearsay rule in `execute`). The
+    /// loop, not the impl, filters out the runs already injected as context.
+    async fn list_research(
+        &self,
+        query: Option<String>,
+        token: &CancellationToken,
+    ) -> Result<Vec<ResearchListing>, ApiError>;
+
+    /// One stored run's report, by per-project seq. Unscoped, like
+    /// [`list_research`](ResearchTools::list_research).
+    async fn read_research(
+        &self,
+        seq: i64,
+        token: &CancellationToken,
+    ) -> Result<StoredReport, ApiError>;
 
     /// The index's current identity for a set of paths — the freshness probe.
     ///
@@ -783,6 +855,28 @@ impl ResearchTools for MeteredResearchTools {
         r
     }
 
+    async fn list_research(
+        &self,
+        query: Option<String>,
+        token: &CancellationToken,
+    ) -> Result<Vec<ResearchListing>, ApiError> {
+        let t = Instant::now();
+        let r = self.inner.list_research(query, token).await;
+        self.record("list_research", t, &r);
+        r
+    }
+
+    async fn read_research(
+        &self,
+        seq: i64,
+        token: &CancellationToken,
+    ) -> Result<StoredReport, ApiError> {
+        let t = Instant::now();
+        let r = self.inner.read_research(seq, token).await;
+        self.record("read_research", t, &r);
+        r
+    }
+
     async fn file_versions(
         &self,
         paths: Vec<String>,
@@ -908,6 +1002,16 @@ pub struct ResearchParams {
     /// `Option` so every test constructs a params value without a metric registry, as
     /// the `with_metrics` seams do.
     pub metrics: Option<Arc<crate::backend::metrics::Metrics>>,
+    /// Earlier runs' reports, injected into the transcript before the plan turn.
+    ///
+    /// Loaded by the handler, because the loop has no project identity and no database
+    /// access of its own — the same reason `scope` arrives already resolved. Empty for
+    /// a cold run, which is the overwhelmingly common case and byte-for-byte the
+    /// transcript this loop has always built.
+    pub prior_reports: Vec<PriorReport>,
+    /// Total characters the block above may occupy
+    /// (`[research].max_context_chars`). Ignored when `prior_reports` is empty.
+    pub max_context_chars: usize,
     /// Abandon a turn once its thinking channel has streamed this many characters;
     /// `0` disables the guard (`[research].max_turn_thinking_chars`).
     ///
@@ -917,6 +1021,59 @@ pub struct ResearchParams {
     /// the caller holds no information the server lacks — the number depends on the
     /// model, and the model is already the server's to look up.
     pub max_turn_thinking_chars: usize,
+}
+
+/// One earlier run's report, as handed to a new run.
+///
+/// Carries the run's own staleness alongside the prose, because that is the only
+/// thing that lets the model weigh two reports that disagree — and stating it is what
+/// keeps an obsolete report from reading as current. It is the same currency signal
+/// `probe_freshness` gives a live run about its own evidence, asked of a stored one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorReport {
+    /// The stable identifier, journalled onto the new run so reuse is measurable.
+    pub id: String,
+    /// The per-project ordinal, which is what the model and the reader both see.
+    pub seq: i64,
+    pub question: String,
+    pub report: String,
+    /// Files the run read whose indexed hash has since changed or gone, against how
+    /// many it read at all. `0` of anything means the report still describes what is
+    /// there.
+    pub files_moved: usize,
+    pub files_total: usize,
+}
+
+/// One row of `list_research`: enough for the model to decide whether to read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchListing {
+    /// The stable id — used only to exclude the runs already injected as context;
+    /// the model addresses reports by `seq`.
+    pub id: String,
+    pub seq: i64,
+    /// The report's own stored heading; `None` falls back to the question.
+    pub title: Option<String>,
+    pub question: String,
+    pub created_at: i64,
+}
+
+/// `read_research`'s three honest answers. `Invalid` is its own variant rather
+/// than an empty result for the `outline.indexed` reason: a refusal that reads as
+/// "no such report" sends the model hunting for a seq it was just shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredReport {
+    Found {
+        seq: i64,
+        question: String,
+        report: String,
+    },
+    /// Exists but is no longer valid — never handed to the model.
+    Invalid {
+        seq: i64,
+    },
+    Missing {
+        seq: i64,
+    },
 }
 
 /// The model's reply each turn must be exactly one of these, as a JSON object.
@@ -987,6 +1144,17 @@ enum Action {
     #[serde(rename = "revise_plan")]
     RevisePlan {
         plan: String,
+    },
+    /// Browse the stored, still-valid research reports of this project.
+    #[serde(rename = "list_research")]
+    ListResearch {
+        #[serde(default)]
+        query: Option<String>,
+    },
+    /// Read one stored report in full, by its per-project seq.
+    #[serde(rename = "read_research")]
+    ReadResearch {
+        seq: i64,
     },
     Finalize,
 }
@@ -1171,6 +1339,42 @@ fn tool_specs() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::function(
+            "list_research",
+            "Earlier research reports stored for this project: the seq, title and \
+             question of every run whose evidence still matches the index. Reports \
+             already handed to you as context are not repeated. They are HEARSAY — \
+             use them to learn names and what was already ruled out, never as \
+             citable evidence. Your file scope does not apply to them.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional: case-insensitive substring over titles \
+                                        and questions."
+                    }
+                },
+                "required": []
+            }),
+        ),
+        ToolSpec::function(
+            "read_research",
+            "The full Markdown report of one stored run, by its seq from \
+             list_research. HEARSAY: you may not cite anything in it — a \
+             `path:start-end` copied from it will be reported as invented. Open the \
+             code yourself before citing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "seq": {
+                        "type": "integer",
+                        "description": "The report's seq, as shown by list_research."
+                    }
+                },
+                "required": ["seq"]
+            }),
+        ),
+        ToolSpec::function(
             "note",
             "Write down a conclusion you want to still have later. YOUR REASONING IS \
              NOT KEPT: everything you think is discarded after each turn, and only tool \
@@ -1315,7 +1519,7 @@ fn looks_like_tool_call_attempt(content: &str) -> bool {
 /// are the server's problem. What remains is the part a model cannot infer — the
 /// retrieval strategy, measured on this corpus: identifiers find implementations,
 /// plain English finds the tests that describe them.
-fn system_prompt(budget: Budget, scope: &ToolScope) -> String {
+fn system_prompt(budget: Budget, scope: &ToolScope, has_prior_research: bool) -> String {
     format!(
         r#"You are a code-research agent working over "mindex", a semantic index of ONE project's source code. You cannot open files or browse: the tools are your only access to the code. Gather evidence with them, then answer.
 
@@ -1328,6 +1532,8 @@ That rule governs CODE. The index also contains this project's DOCUMENTATION —
 A third channel answers what neither code nor documentation can: the project's GIT HISTORY, through `file_history`. Code says what it does now; documentation says what the project means to do; the commit that made a change says WHY it was made — the alternative that was rejected, the bug that forced it, the measurement behind a number. That reasoning exists nowhere else, so when the question is "why is this like this", "what was tried before", "what changed here recently", or you are staring at code whose shape makes no sense, ask the file's history. Its place in the pipeline is after you know the filename: `outline`/`symbols` tells you WHICH file, then `file_history` tells you why it is that way, and `read_chunks` shows you what it now says. Commit messages are prose, so read them as prose, in plain English — the same inversion documentation gets.
 
 When you take a claim from a commit, cite the CODE it is about — a `path:start-end` you were shown — and name the short sha in your sentence ("added in a1b2c3d4 to ..."). A sha alone is not a citation and will not verify.
+
+This project also keeps STORED RESEARCH REPORTS — the reports earlier runs like this one produced. `list_research` shows the still-valid ones (seq, title, question) and `read_research(seq)` opens one. They are HEARSAY, exactly like any report injected below: the fastest way to learn the real names and what was already ruled out, and never citable — a `path:start-end` copied out of one will be reported as invented, so open the location yourself before citing it. Consulting them early can save most of a cold start. Your file scope does not cover them: they are reports, not files.
 
 `outline`, `list_files` and `callers` are metadata lookups — cheap, and they cost the same as any other step, so spending your first step or two on them pays for itself. When `symbols` or `outline` hands you a location, READ IT with `read_chunks` — do not search for its line numbers, that never works. If you know which directory the answer lives in, pass `path_prefix` to `search` rather than re-asking the same query and hoping.
 
@@ -1346,9 +1552,28 @@ Rules:
 - You may ask for several tools in one turn when they are genuinely independent.
 - Your budget is at most {max_steps} tool calls and {max_seconds} seconds, whichever runs out first. The clock is a HARD deadline: when it expires you are cut off mid-thought and whatever you have becomes the report. So do not save the important lookup for later, and call `finalize` — or simply answer in prose — as soon as the evidence suffices. A report you chose to write is worth more than one the clock ended.
 - Cite only what a tool actually showed you. Before the report ships, every `path:start-end` in it is checked against the locations your own calls returned, and you will be asked to fix the ones that were not.
-{scope_rule}"#,
+{scope_rule}{prior_research_rule}"#,
         max_steps = budget.max_steps,
         max_seconds = budget.max_seconds,
+        prior_research_rule = if has_prior_research {
+            "\nYOU HAVE BEEN GIVEN EARLIER REPORTS on this project, in a message below. They are \
+             HEARSAY: prose a model wrote about an earlier state of this tree, never checked \
+             against it by you. Read them the way you would read a colleague's note — they are \
+             the fastest way to learn the REAL NAMES, which files matter and what has already \
+             been ruled out, and that is precisely what a cold run spends its first steps \
+             discovering. (They are also excluded from `list_research`, so do not \
+             go looking for them there.)\n\
+             But you may NOT cite them. A `path:start-end` copied out of an earlier report has \
+             not been shown to *you*, and the provenance check that runs before your report \
+             ships will mark it unverified exactly as if you had invented it. To cite a \
+             location, open it yourself first — `read_chunks`, `outline` or `symbols` — and \
+             cite what you were shown.\n\
+             Each report says how many of the files it read have changed since. Where that \
+             number is not zero, treat its specific claims as most likely wrong and check those \
+             first; where it is zero, the report still describes what is there.\n"
+        } else {
+            ""
+        },
         scope_rule = if scope.is_scoped() {
             format!(
                 "\nYOUR SCOPE IS RESTRICTED: this run may only see {}. That restriction is \
@@ -1443,7 +1668,8 @@ const REPORT_SYSTEM_PROMPT: &str = "You are a technical writer. Below is a resea
     code excerpts, symbol locations and file outlines. Your only job now is to write \
     the report. You have NO tools: there is nothing left to call, and any JSON you \
     emit would be discarded. Write Markdown prose, grounded in the evidence, citing \
-    locations as `path:start-end`.";
+    locations as `path:start-end`. Begin with a single `# heading` that names the \
+    finding.";
 
 /// The report turn's user message: the standing instruction, plus a truncation
 /// preamble when the run did not finish on its own terms.
@@ -1604,6 +1830,9 @@ struct RunState {
     greps: Vec<String>,
     reads: Vec<String>,
     histories: Vec<String>,
+    /// Stored-report lookups (`list_research` queries and `read_research` seqs),
+    /// one list: both answer "which earlier research have I already consulted".
+    report_lookups: Vec<String>,
 }
 
 impl RunState {
@@ -1635,6 +1864,11 @@ impl RunState {
                 Some(g) => format!("{pattern} (in {g})"),
                 None => pattern.clone(),
             }),
+            Action::ListResearch { query } => self.report_lookups.push(match query {
+                Some(q) if !q.trim().is_empty() => format!("list ({})", q.trim()),
+                _ => "list (all)".to_string(),
+            }),
+            Action::ReadResearch { seq } => self.report_lookups.push(format!("#{seq}")),
             // Both are applied by `apply_local`, which owns the caps and the wording
             // of its own replies; there is nothing to record as "already asked".
             Action::Note { .. } | Action::RevisePlan { .. } => {}
@@ -1899,6 +2133,12 @@ fn format_state_note(
         &state.histories,
         STATE_NOTE_MAX_ITEMS,
     );
+    state_note_line(
+        &mut out,
+        "Stored reports already consulted",
+        &state.report_lookups,
+        STATE_NOTE_MAX_ITEMS,
+    );
 
     // Paths only. Which files the model has seen *anything* from is the cheap,
     // useful half; the spans are already in the transcript above.
@@ -2077,6 +2317,11 @@ struct ResearchOutcome {
     revalidation: Option<Revalidation>,
     /// What the run did with the scratchpad, `grep` and its scope.
     tools: RunTools,
+    /// Every file the run was shown, at the version it read. Lifted out of the
+    /// loop's private `Evidence` because the journal — which runs one level up, in
+    /// `run_research` — cannot reach it, and because "what the loop produced" is
+    /// exactly this struct's contract.
+    file_baselines: Vec<FileBaseline>,
     /// The finished report. Streamed already — carried back only so the run can
     /// be journalled; nothing re-sends it.
     report: String,
@@ -2135,7 +2380,39 @@ pub trait ResearchJournal: Send + Sync {
     /// Record a finished run. **Best-effort by contract**: the report has already
     /// reached the client, so an implementation must log its own failures and
     /// return — never propagate, never panic.
-    async fn record(&self, record: RunRecord);
+    ///
+    /// Returns how the run can be named afterwards, or `None` when nothing was
+    /// stored. `None` is the *normal* expression of a failed write, not an error
+    /// path: the `done` event then carries a null `run_id` and the client simply
+    /// cannot offer to reuse a run that was never persisted. A non-optional return
+    /// would force either a fabricated identifier or a lie about the contract above.
+    async fn record(&self, record: RunRecord) -> Option<RecordedRun>;
+}
+
+/// How a stored run is named once it exists.
+///
+/// Two identifiers on purpose, and they are not interchangeable. `id` is the stable
+/// one — a UUID, what every per-run endpoint keys on, safe in a URL or a bookmark.
+/// `seq` is a per-project ordinal: short enough to say out loud and to type into a
+/// picker, and monotonic enough to be the keyset cursor a paginated list resumes
+/// from — but it is renumbered if a project's runs are ever wiped entirely, so it
+/// must never be treated as identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRun {
+    pub id: String,
+    pub seq: i64,
+}
+
+/// A file the run read, and the index's hash for it at the moment the run first
+/// looked — the persistent half of [`Evidence`]'s `baseline_sha`.
+///
+/// This is what lets a *stored* report be told apart from a current one later: the
+/// same comparison `apply_versions` makes during a run, asked again days afterwards
+/// against whatever `project_files` now holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBaseline {
+    pub path: String,
+    pub sha256: String,
 }
 
 /// A journal that keeps nothing, for the loop's own tests — they are about the
@@ -2148,7 +2425,9 @@ pub struct NoJournal;
 #[cfg(test)]
 #[async_trait]
 impl ResearchJournal for NoJournal {
-    async fn record(&self, _record: RunRecord) {}
+    async fn record(&self, _record: RunRecord) -> Option<RecordedRun> {
+        None
+    }
 }
 
 /// One finished run, as handed to a [`ResearchJournal`].
@@ -2201,6 +2480,23 @@ pub struct RunRecord {
     pub revalidation: Option<Revalidation>,
     /// What the run did with the scratchpad, `grep` and its scope.
     pub tools: RunTools,
+    /// Every file the run was shown, with the index's hash for it when the run first
+    /// probed it. Paths never probed are absent, not zero-valued: a baseline nobody
+    /// established cannot be compared against later, and inventing one would make a
+    /// file read as changed the moment anything touched it.
+    ///
+    /// The sha is the one from the *first* probe — the version the report was
+    /// actually written against. A run whose file moved mid-flight is therefore
+    /// stored already-stale, which is correct and is what `stale_citations` on the
+    /// same row already said.
+    pub file_baselines: Vec<FileBaseline>,
+    /// Earlier runs whose reports were injected into this one's transcript, in the
+    /// order they were given. Empty for a cold run.
+    pub context_run_ids: Vec<String>,
+    /// The report's own first ATX heading (`extract_report_title`). None when the
+    /// report has no heading or the heading trivially repeats the question —
+    /// readers then fall back to a title derived from `question`.
+    pub title: Option<String>,
     pub report: String,
 }
 
@@ -2315,6 +2611,29 @@ impl Evidence {
                 e.in_flight = false;
             }
         }
+    }
+
+    /// What this run read, and the hash it read it at — the persistent form of the
+    /// baselines above, for the journal.
+    ///
+    /// Paths with no `baseline_sha` are **dropped, not defaulted**: the probe never
+    /// established a version for them, so there is nothing a later comparison could
+    /// be against, and inventing one (an empty string, a zero hash) would make the
+    /// file read as changed the first time anyone asked. Sorted, so a run's rows land
+    /// in a stable order and two journal writes of the same run are comparable.
+    fn baselines(&self) -> Vec<FileBaseline> {
+        let mut out: Vec<FileBaseline> = self
+            .by_path
+            .iter()
+            .filter_map(|(path, e)| {
+                e.baseline_sha.as_ref().map(|sha| FileBaseline {
+                    path: path.clone(),
+                    sha256: sha.clone(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
     }
 
     /// Whether a citation into this path describes code the index no longer holds.
@@ -2556,6 +2875,77 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
         }
     }
     r
+}
+
+/// The report's first ATX heading, as the stored display title.
+///
+/// None when the report has no heading, the heading is empty, or it trivially
+/// repeats the question (case- and whitespace-insensitive equality) — a heading
+/// that merely echoes the question adds nothing over the question column the
+/// readers already fall back to, so storing it would only make the two drift
+/// apart visually. Hand-rolled: the grammar is one line.
+pub fn extract_report_title(report: &str, question: &str) -> Option<String> {
+    let line = report.lines().find(|l| !l.trim().is_empty())?.trim();
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // A closing ATX sequence (`# Title #`) is part of the syntax, not the title.
+    let title = rest.trim().trim_end_matches('#').trim();
+    if title.is_empty() {
+        return None;
+    }
+    let collapse = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    if collapse(title) == collapse(question) {
+        return None;
+    }
+    Some(title.to_string())
+}
+
+/// Honest structural checks on a finished report — empty vec means valid.
+///
+/// tree-sitter-md accepts *anything* (an unclosed fence or stray HTML yields a
+/// block, never an error node), so parsing it would be a validator that cannot
+/// fail — worse than none, because it would read as coverage. What is honestly
+/// checkable is shape: the defects a broken report actually ships with are JSON
+/// where prose was asked for, a missing heading, and an unclosed code fence that
+/// swallows the rest of the document in every renderer. Each entry is one concrete
+/// problem, worded for the model — the list is sent back verbatim as a complaint.
+pub fn validate_report_markdown(report: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let trimmed = report.trim();
+    if trimmed.is_empty() {
+        problems.push("The report is empty.".to_string());
+        return problems;
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        problems.push(
+            "The report begins with JSON, not Markdown prose. Output a Markdown document."
+                .to_string(),
+        );
+    }
+    let first_line = trimmed.lines().next().unwrap_or_default().trim();
+    let hashes = first_line.chars().take_while(|&c| c == '#').count();
+    if !(1..=6).contains(&hashes) || !first_line[hashes..].starts_with(char::is_whitespace) {
+        problems.push("The report must begin with a `# heading` naming the finding.".to_string());
+    }
+    let fences = report
+        .lines()
+        .filter(|l| l.trim_start().starts_with("```"))
+        .count();
+    if fences % 2 != 0 {
+        problems.push("An unclosed ``` code fence: every fence opened must be closed.".to_string());
+    }
+    problems
 }
 
 /// Re-probe every path the run has been shown and fold the result into `evidence`.
@@ -3262,6 +3652,63 @@ async fn execute(
                 shown,
             })
         }
+        // The two stored-report tools. Both return `shown: Vec::new()`
+        // unconditionally — the hearsay invariant: a stored report is another
+        // run's prose, not this run's evidence, so nothing in it may seed
+        // `Evidence`. A `path:start-end` copied out of one therefore lands
+        // `unverified`, exactly as `format_prior_reports`' injected blocks do.
+        Action::ListResearch { query } => {
+            let mut listings = tools
+                .list_research(query.clone(), token)
+                .await
+                .map_err(ResearchAbort::from)?;
+            // The runs already injected as context are in the transcript in
+            // full; repeating their titles here would invite re-reading them.
+            listings.retain(|l| !params.prior_reports.iter().any(|p| p.id == l.id));
+            let hits = listings.len();
+            let text = format_research_listing(&listings);
+            Ok(Executed {
+                call: StepCall::ListResearch {
+                    query: query.clone().unwrap_or_default(),
+                },
+                hits,
+                text,
+                shown: Vec::new(),
+            })
+        }
+        Action::ReadResearch { seq } => {
+            let stored = tools
+                .read_research(*seq, token)
+                .await
+                .map_err(ResearchAbort::from)?;
+            let (hits, text) = match stored {
+                StoredReport::Found {
+                    seq,
+                    question,
+                    report,
+                } => (
+                    1,
+                    format_stored_report(seq, &question, &report, params.max_context_chars),
+                ),
+                StoredReport::Invalid { seq } => (
+                    0,
+                    format!(
+                        "Report #{seq} exists but is no longer valid: its evidence, or a \
+                         report it depended on, has changed or been deleted since it was \
+                         written. It cannot be used."
+                    ),
+                ),
+                StoredReport::Missing { seq } => (0, format!("No stored report #{seq}.")),
+            };
+            Ok(Executed {
+                call: StepCall::ReadResearch {
+                    seq: seq.to_string(),
+                },
+                hits,
+                text,
+                shown: Vec::new(),
+            })
+        }
     }
 }
 
@@ -3285,6 +3732,7 @@ pub async fn run_research(
         staleness,
         revalidation,
         tools: run_tools,
+        file_baselines,
         report,
     } = match research_inner(&*ollama, &*tools, &params, &tx, &token).await {
         Ok(outcome) => outcome,
@@ -3369,31 +3817,57 @@ pub async fn run_research(
     // Journalled after the events are queued, not before: the client's report must
     // never wait on a database write, and a write failure must not change what the
     // client saw.
-    journal
-        .record(RunRecord {
-            question: params.question.clone(),
-            model: params.model.clone(),
-            prompt_version: PROMPT_VERSION,
-            budget: params.budget,
-            reason,
-            steps,
-            turns: tally.turns,
-            elapsed_ms: progress.elapsed_ms,
-            prompt_tokens: tally.prompt_tokens,
-            eval_tokens: tally.eval_tokens,
-            peak_prompt_tokens: tally.peak_prompt_tokens,
-            num_ctx: tally.num_ctx,
-            citations,
-            staleness,
-            revalidation,
-            tools: run_tools,
-            report,
-        })
-        .await;
+    //
+    // A report that is still structurally broken Markdown after the repair pass is
+    // streamed (a broken report the client watched beats a silently vanished one)
+    // but never journalled: the corpus is what later runs are fed as context, and
+    // storing JSON-as-a-report there would inject it into a future transcript as
+    // prose. `done` then carries null run_id/seq — the same wire shape as a failed
+    // journal write, which is what this is. A forced synthesis is server-written
+    // and valid by construction, so the gate exempts it rather than re-parsing it.
+    let md_problems = validate_report_markdown(&report);
+    let recorded = if md_problems.is_empty() || run_tools.forced_synthesis {
+        journal
+            .record(RunRecord {
+                question: params.question.clone(),
+                model: params.model.clone(),
+                prompt_version: PROMPT_VERSION,
+                budget: params.budget,
+                reason,
+                steps,
+                turns: tally.turns,
+                elapsed_ms: progress.elapsed_ms,
+                prompt_tokens: tally.prompt_tokens,
+                eval_tokens: tally.eval_tokens,
+                peak_prompt_tokens: tally.peak_prompt_tokens,
+                num_ctx: tally.num_ctx,
+                citations,
+                staleness,
+                revalidation,
+                tools: run_tools,
+                // What this run read and at which version, so a reader days from
+                // now can be told whether the report still describes the tree.
+                file_baselines,
+                context_run_ids: params.prior_reports.iter().map(|p| p.id.clone()).collect(),
+                title: extract_report_title(&report, &params.question),
+                report,
+            })
+            .await
+    } else {
+        warn!(
+            model = %params.model,
+            problems = ?md_problems,
+            "The final research report is structurally broken Markdown even after \
+             the repair pass; it was streamed to the client but will not be \
+             journalled."
+        );
+        None
+    };
     let _ = tx.send(ResearchEvent::Done {
         progress,
         context_fraction: params.budget.context_fraction,
         reason,
+        recorded,
     });
 }
 
@@ -3530,9 +4004,24 @@ async fn research_inner(
     let budget_deadline = DeadlineToken::after(token, time_budget);
     let work = &budget_deadline.token;
     let mut messages = vec![
-        ChatMessage::system(system_prompt(params.budget, &params.scope)),
+        ChatMessage::system(system_prompt(
+            params.budget,
+            &params.scope,
+            !params.prior_reports.is_empty(),
+        )),
         ChatMessage::user(format!("Research question:\n{}", params.question)),
     ];
+    // Before the plan turn on purpose: the plan is the run's only sufficiency
+    // criterion, and prior work is exactly the input that should change which
+    // sub-questions are worth asking.
+    if !params.prior_reports.is_empty() {
+        let (block, truncated) =
+            format_prior_reports(&params.prior_reports, params.max_context_chars);
+        if truncated && let Some(m) = params.metrics.as_ref() {
+            m.research.context_truncations.inc();
+        }
+        messages.push(ChatMessage::user(block));
+    }
 
     let mut steps = 0usize;
     let mut parse_retries = 0usize;
@@ -3827,7 +4316,8 @@ async fn research_inner(
                         &mut messages,
                         format!(
                             "No such tool, or wrong arguments: \"{asked}\". Available: search, \
-                         grep, symbols, outline, callers, list_files, read_chunks, note, \
+                         grep, symbols, outline, callers, list_files, read_chunks, \
+                         file_history, list_research, read_research, note, \
                          revise_plan, finalize."
                         ),
                     );
@@ -3881,6 +4371,10 @@ async fn research_inner(
                         "read_chunks\u{0}{}\u{0}{start_line}\u{0}{end_line}",
                         path.trim()
                     ),
+                    Action::ListResearch { query } => {
+                        format!("list_research\u{0}{:?}", query.as_deref().map(str::trim))
+                    }
+                    Action::ReadResearch { seq } => format!("read_research\u{0}{seq}"),
                 };
                 // Exact repeats are the liveness hazard; *near* repeats are the common
                 // and expensive case. Measured: a run spent its whole budget asking for
@@ -4225,6 +4719,10 @@ async fn research_inner(
     // ── citation revalidation ────────────────────────────────────────────────
     let mut citations = check_citations(&summary, &evidence);
     let mut revalidation = None;
+    // Structural Markdown defects join the gate: a broken draft is never
+    // journalled (see `run_research`), so sending it back while the gate is
+    // already closed is the one chance to store the run at all.
+    let md_problems = validate_report_markdown(&summary);
     // A report that grounds *nothing* is the third defect, and it was the one the
     // gate could not see: `citations: {total: 0}` is emitted for an ungrounded report
     // and is byte-for-byte what a clean one emits, in exactly the place a caller is
@@ -4247,12 +4745,20 @@ async fn research_inner(
     // Staleness joins the two provenance defects in the gate: a claim cited to a
     // file the index has since rewritten is as unsupported as one cited nowhere,
     // and the remedy is the same — re-read it, then correct or drop the claim.
-    if !forced && (ungrounded || citations.unverified + citations.path_only + citations.stale > 0) {
+    let citation_defects =
+        ungrounded || citations.unverified + citations.path_only + citations.stale > 0;
+    if !forced && (citation_defects || !md_problems.is_empty()) {
         if ungrounded {
             info!(
                 report_chars = summary.chars().count(),
                 shown_paths = evidence.paths().len(),
                 "The draft report cites nothing checkable; sending it back to be grounded."
+            );
+        }
+        if !md_problems.is_empty() {
+            info!(
+                problems = ?md_problems,
+                "The draft report is structurally broken Markdown; sending it back."
             );
         }
         let mut rv = Revalidation {
@@ -4266,21 +4772,34 @@ async fn research_inner(
         // Tools re-open only for a run that chose to stop: one stopped by a budget
         // has nothing left to spend, and re-opening would buy an exhausted run a
         // second helping the budget axes exist to refuse. It can still correct or
-        // drop the claim, which is the honest half of the fix.
-        let tools_reopen = reason == DoneReason::Finalized;
+        // drop the claim, which is the honest half of the fix. A markdown-only
+        // defect re-opens nothing either way — reformatting needs no lookups, so
+        // it goes straight to the rewrite turn.
+        let tools_reopen = reason == DoneReason::Finalized && citation_defects;
         // The complaint goes out either way. Which citations failed is the whole
         // content of the instruction: told only "some did not check out", a model
         // can do nothing but guess, and guessing means rewriting the ones that
         // were right — the same reason the complaint names locations rather than
-        // counts.
+        // counts. Structural problems ride in the same message: one combined
+        // complaint, one repair pass.
         if tools_reopen {
             messages[0] = ChatMessage::system(REVALIDATION_SYSTEM_PROMPT);
         }
-        messages.push(ChatMessage::user(format_citation_complaint(
-            &summary,
-            &evidence,
-            tools_reopen,
-        )));
+        let mut complaint = String::new();
+        if citation_defects {
+            complaint.push_str(&format_citation_complaint(
+                &summary,
+                &evidence,
+                tools_reopen,
+            ));
+        }
+        if !md_problems.is_empty() {
+            if !complaint.is_empty() {
+                complaint.push_str("\n\n");
+            }
+            complaint.push_str(&format_markdown_complaint(&md_problems));
+        }
+        messages.push(ChatMessage::user(complaint));
         if tools_reopen {
             let mut turns = 0usize;
             // Terminates on counters, like the tool loop: every iteration either
@@ -4509,8 +5028,120 @@ async fn research_inner(
         staleness: evidence.staleness(),
         revalidation,
         tools: run_tools,
+        file_baselines: evidence.baselines(),
         report: summary,
     })
+}
+
+/// Render a `list_research` result for the model.
+fn format_research_listing(listings: &[ResearchListing]) -> String {
+    if listings.is_empty() {
+        return "No stored reports.".to_string();
+    }
+    let mut out = format!(
+        "{} stored report(s), newest first. These are HEARSAY — read one with \
+         read_research(seq) if it looks relevant; nothing in them is citable.\n",
+        listings.len()
+    );
+    for l in listings {
+        let title = l.title.as_deref().unwrap_or(&l.question);
+        out.push_str(&format!("- #{}: {}\n", l.seq, title));
+    }
+    out
+}
+
+/// Render one stored report for the model, truncated out loud at the same cap as
+/// an injected prior report — a stored body is unbounded, and an unbounded tool
+/// reply is prompt tokens on every later turn.
+fn format_stored_report(seq: i64, question: &str, report: &str, max_chars: usize) -> String {
+    let mut out = format!(
+        "Stored report #{seq} — {question}\n(HEARSAY: another run's prose, not \
+         evidence. Verify anything you intend to state; a citation copied from it \
+         will be reported as invented.)\n\n"
+    );
+    let budget = max_chars.saturating_sub(out.len());
+    if report.len() <= budget {
+        out.push_str(report);
+    } else {
+        let mut cut = budget;
+        while cut > 0 && !report.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.push_str(&report[..cut]);
+        out.push_str(
+            "\n[This report was TRUNCATED to fit the context budget. Do not treat \
+             its ending as its conclusion.]",
+        );
+    }
+    out
+}
+
+/// Render the earlier reports a run was given, as one `user` message.
+///
+/// A `user` message and not an assistant one, for the reason the run-state note is:
+/// this is not something *this* model said, and attributing another run's prose to
+/// the assistant would let it be mistaken for its own established reasoning.
+///
+/// Each section states its own staleness in the header sentence. That is the whole
+/// difference between handing the model background and handing it a trap: a report
+/// written against files that have since moved is still useful for names and shape,
+/// and actively misleading about specifics, and only the header says which.
+///
+/// Returns the block and whether the last report had to be truncated to fit
+/// `max_chars` — the caller counts that, because a cap nobody can see the effect of
+/// cannot be tuned.
+fn format_prior_reports(reports: &[PriorReport], max_chars: usize) -> (String, bool) {
+    let mut out = String::from(
+        "Earlier research on this project. These are REPORTS, not tool output: prose written \
+         by a model about an earlier state of this tree. Use them for orientation — the names, \
+         files and shape of the answer — and verify anything you intend to state.\n",
+    );
+    let mut truncated = false;
+    for r in reports {
+        let freshness = if r.files_moved == 0 {
+            format!("all {} files it read still match the index", r.files_total)
+        } else {
+            format!(
+                "{} of the {} files it read have CHANGED or been removed since — treat its \
+                 specifics as most likely wrong, and check those first",
+                r.files_moved, r.files_total
+            )
+        };
+        let header = format!(
+            "\n## Earlier report #{} — {}\n({})\n\n",
+            r.seq, r.question, freshness
+        );
+
+        // The budget is over the whole block, so what is left shrinks as sections are
+        // added. A section whose header alone would not fit is dropped entirely
+        // rather than half-written.
+        let remaining = max_chars.saturating_sub(out.len());
+        if remaining <= header.len() {
+            truncated = true;
+            break;
+        }
+        out.push_str(&header);
+        let room = remaining - header.len();
+        if r.report.len() <= room {
+            out.push_str(&r.report);
+        } else {
+            // Cut on a char boundary, and SAY SO. A silently clipped report lets the
+            // model reason from half a conclusion and present it whole — the same
+            // argument the `note` cap makes for announcing what it drops.
+            let mut cut = room.min(r.report.len());
+            while cut > 0 && !r.report.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&r.report[..cut]);
+            out.push_str(
+                "\n\n[This report was TRUNCATED to fit the context budget. Do not treat \
+                          its ending as its conclusion.]",
+            );
+            truncated = true;
+        }
+        out.push('\n');
+    }
+    (out, truncated)
 }
 
 /// The message that sends a draft back: which of its citations failed, and why.
@@ -4638,6 +5269,27 @@ fn format_ungrounded_complaint(evidence: &Evidence, tools_open: bool) -> String 
          each claim, and drop any claim you cannot ground that way rather than \
          inventing a location for it.\n"
     });
+    out
+}
+
+/// The message that sends back a draft whose Markdown is structurally broken.
+///
+/// The problems come from [`validate_report_markdown`] verbatim: each names one
+/// concrete defect, so the model fixes the form without touching claims that were
+/// right. Distinct from the citation complaints because the remedy is different —
+/// nothing needs to be looked up, only rewritten.
+fn format_markdown_complaint(problems: &[String]) -> String {
+    let mut out =
+        String::from("Your draft is not published yet — its Markdown is structurally broken:\n");
+    for p in problems {
+        out.push_str(" - ");
+        out.push_str(p);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nWhen you are asked to rewrite the report, produce a well-formed Markdown \
+         document — keep every claim and citation that was right as it was.\n",
+    );
     out
 }
 
@@ -4959,6 +5611,413 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokio::sync::mpsc;
+
+    fn prior(seq: i64, report: &str, files_moved: usize, files_total: usize) -> PriorReport {
+        PriorReport {
+            id: format!("run-{seq}"),
+            seq,
+            question: "How does GC work?".into(),
+            report: report.into(),
+            files_moved,
+            files_total,
+        }
+    }
+
+    /// Each section must state its own staleness, and the two cases must read
+    /// differently. Handing the model a report written against files that have since
+    /// moved, without saying so, is worse than not handing it one at all: it is
+    /// confident prose about code that no longer exists.
+    #[test]
+    fn a_prior_report_states_whether_the_tree_moved_under_it() {
+        let (fresh, truncated) = format_prior_reports(&[prior(3, "the body", 0, 12)], 10_000);
+        assert!(!truncated);
+        assert!(fresh.contains("#3"), "the ordinal is how a reader names it");
+        assert!(
+            fresh.contains("all 12 files it read still match"),
+            "{fresh}"
+        );
+        assert!(fresh.contains("the body"));
+
+        let (stale, _) = format_prior_reports(&[prior(4, "the body", 5, 12)], 10_000);
+        assert!(stale.contains("5 of the 12 files"), "{stale}");
+        assert!(
+            stale.contains("CHANGED"),
+            "a stale section must say so loudly: {stale}"
+        );
+    }
+
+    /// A report clipped to fit the budget must **say** it was clipped. A silently
+    /// truncated report lets the model read half a conclusion and present it whole —
+    /// the same argument the `note` cap makes for announcing what it drops.
+    #[test]
+    fn an_over_long_prior_report_is_truncated_out_loud() {
+        let body = "x".repeat(5_000);
+        let (block, truncated) = format_prior_reports(&[prior(1, &body, 0, 1)], 800);
+        assert!(truncated, "the caller must be able to count this");
+        assert!(block.contains("TRUNCATED"), "{block}");
+        assert!(
+            block.len() < 1_200,
+            "the cap should bound the block: {} chars",
+            block.len()
+        );
+    }
+
+    /// **The provenance invariant.** A `path:start-end` copied out of an earlier
+    /// report was never shown to *this* run, so it must be reported as `unverified`
+    /// exactly as an invented one would be. Seeding `Evidence` from the injected
+    /// block would quietly promote hearsay to verified provenance and destroy the one
+    /// guarantee scout's "trust the report" instruction rests on.
+    #[tokio::test]
+    async fn a_prior_report_never_seeds_the_evidence() {
+        let mut params = params(8);
+        params.prior_reports = vec![PriorReport {
+            id: "earlier".into(),
+            seq: 1,
+            question: "How does the slicer work?".into(),
+            // The earlier report cites a location this run will never open.
+            report: "The gap pass lives in src/slicing/traits.rs:100-140.".into(),
+            files_moved: 0,
+            files_total: 1,
+        }];
+
+        // No tool calls at all: the model goes straight to a report citing exactly
+        // what it was only *told*.
+        let events = run_native(
+            NativeOllama::new(
+                vec![],
+                vec!["The gap pass lives in src/slicing/traits.rs:100-140, as established."],
+            ),
+            params,
+        )
+        .await;
+
+        let citations = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Citations { report, .. } => Some(report.clone()),
+                _ => None,
+            })
+            .expect("the run must emit a citation verdict");
+        assert_eq!(
+            citations.verified, 0,
+            "a citation lifted from a prior report must never count as verified"
+        );
+        assert!(
+            citations
+                .unverified_paths
+                .iter()
+                .any(|p| p == "src/slicing/traits.rs"),
+            "the copied path must be named as unverified: {:?}",
+            citations.unverified_paths
+        );
+    }
+
+    /// The mirror of `a_prior_report_never_seeds_the_evidence` for the browse
+    /// tool: a report the model *opened itself* is still hearsay, and a citation
+    /// copied out of it must land unverified exactly like an invented one.
+    #[tokio::test]
+    async fn read_research_never_seeds_the_evidence() {
+        let events = run_native(
+            NativeOllama::new(
+                // FakeTools' stored report #2 cites src/slicing/traits.rs:100-140 —
+                // a path no other fake ever shows.
+                vec![
+                    vec![call("read_research", json!({"seq": 2}))],
+                    vec![call("finalize", json!({}))],
+                ],
+                vec!["# Pool return\n\nThe pool return lives in src/slicing/traits.rs:100-140."],
+            ),
+            params(8),
+        )
+        .await;
+
+        let citations = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Citations { report, .. } => Some(report.clone()),
+                _ => None,
+            })
+            .expect("the run must emit a citation verdict");
+        assert_eq!(
+            citations.verified, 0,
+            "a citation copied from a stored report must never count as verified"
+        );
+        assert!(
+            citations
+                .unverified_paths
+                .iter()
+                .any(|p| p == "src/slicing/traits.rs"),
+            "the copied path must be named as unverified: {:?}",
+            citations.unverified_paths
+        );
+    }
+
+    /// The reports already injected as context are in the transcript in full;
+    /// `list_research` repeating them would invite re-reading what is already
+    /// there.
+    #[tokio::test]
+    async fn list_research_excludes_the_reports_already_in_context() {
+        let mut params = params(8);
+        // `prior(1, …)` carries id `run-1` — the same id FakeTools lists as seq 1.
+        params.prior_reports = vec![prior(1, "# GC sweep ordering\n\nOld prose.", 0, 1)];
+        let ollama = Arc::new(NativeOllama::new(
+            vec![
+                vec![call("list_research", json!({}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec!["# Listing\n\nNothing further."],
+        ));
+        let events = run_native_shared(ollama.clone(), params).await;
+
+        let hits = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Step {
+                    call: StepCall::ListResearch { .. },
+                    hits,
+                    ..
+                } => Some(*hits),
+                _ => None,
+            })
+            .expect("the list_research step must execute");
+        assert_eq!(
+            hits, 1,
+            "the injected run-1 must be excluded from the listing"
+        );
+        // The tool reply the model saw must not offer the injected report again.
+        let replies = ollama.transcripts.lock().unwrap();
+        let listed = replies
+            .iter()
+            .flatten()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !listed.contains("GC sweep ordering"),
+            "an injected report must not be re-offered: {listed}"
+        );
+        assert!(
+            listed.contains("#2"),
+            "the other stored report must still be offered: {listed}"
+        );
+    }
+
+    /// A repeated `read_research` executes nothing and is bounded like every other
+    /// duplicate.
+    #[tokio::test]
+    async fn a_repeated_read_research_is_rejected_as_a_duplicate() {
+        let events = run_native(
+            NativeOllama::new(
+                vec![
+                    vec![call("read_research", json!({"seq": 2}))],
+                    vec![call("read_research", json!({"seq": 2}))],
+                    vec![call("finalize", json!({}))],
+                ],
+                vec!["# Done\n\nEnough."],
+            ),
+            params(8),
+        )
+        .await;
+        let read_steps = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ResearchEvent::Step { call, .. }
+                        if matches!(call, StepCall::ReadResearch { .. })
+                )
+            })
+            .count();
+        assert_eq!(read_steps, 1, "the repeat must execute nothing");
+        assert_eq!(done_reason(&events), Some(DoneReason::Finalized));
+    }
+
+    /// A structurally broken draft is sent back through the same gate as a
+    /// mis-cited one — with the gate closed, so nothing reaches the client — and
+    /// the rewrite ships instead. Markdown-only defects reopen no tools.
+    #[tokio::test]
+    async fn a_markdown_broken_draft_is_sent_back_and_rewritten() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                // Broken: JSON, no heading. Cites nothing, and is short enough to
+                // stay out of the ungrounded gate — the markdown gate alone fires.
+                r#"{"finding": "the sweep is safe"}"#,
+                "# Fixed\n\nSee src/worker/gc.rs:10-20.",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+
+        let summaries: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ResearchEvent::Summary { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            summaries.iter().all(|t| !t.contains("finding")),
+            "the broken draft must never reach the client: {summaries:?}"
+        );
+        assert!(
+            summaries.concat().contains("# Fixed"),
+            "the rewrite must ship: {summaries:?}"
+        );
+        // The complaint must name the concrete defects.
+        let asked = ollama.report_prompts.lock().unwrap().join("\n");
+        assert!(
+            asked.contains("structurally broken"),
+            "the model must be told the Markdown is broken: {asked}"
+        );
+        assert!(
+            asked.contains("begins with JSON"),
+            "the complaint must name the defect: {asked}"
+        );
+    }
+
+    /// The other half of the gate: a report that is STILL broken after the repair
+    /// pass is streamed (a watched broken report beats a vanished one) but never
+    /// journalled — the corpus is what later runs are fed as context.
+    #[tokio::test]
+    async fn a_run_whose_final_report_stays_broken_is_not_journalled() {
+        struct CountingJournal(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl ResearchJournal for CountingJournal {
+            async fn record(&self, _: RunRecord) -> Option<RecordedRun> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            }
+        }
+
+        let journal = Arc::new(CountingJournal(std::sync::atomic::AtomicUsize::new(0)));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_research(
+            Arc::new(NativeOllama::new(
+                vec![vec![call("finalize", json!({}))]],
+                // Both the draft and the rewrite are JSON.
+                vec![r#"{"a": 1}"#, r#"{"a": 2}"#],
+            )),
+            Arc::new(FakeTools::default()),
+            journal.clone(),
+            params(8),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        assert_eq!(
+            journal.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a structurally broken report must not be journalled"
+        );
+        match events.last() {
+            Some(ResearchEvent::Done { recorded, .. }) => {
+                assert!(recorded.is_none(), "done must carry null run_id/seq");
+            }
+            other => panic!("expected a done event, got {other:?}"),
+        }
+    }
+
+    /// The server's own fallback report must pass the gate it is exempt from —
+    /// the exemption is a shortcut, not a loophole.
+    #[test]
+    fn forced_synthesis_passes_the_markdown_gate() {
+        let p = params(8);
+        let text = forced_synthesis(
+            &p,
+            &RunState::default(),
+            &Evidence::default(),
+            DoneReason::TimeExhausted,
+            Duration::from_secs(30),
+        );
+        assert!(
+            validate_report_markdown(&text).is_empty(),
+            "forced synthesis must be valid Markdown"
+        );
+    }
+
+    // ── extract_report_title / validate_report_markdown ──────────────────────
+
+    #[test]
+    fn the_report_title_is_the_first_heading() {
+        assert_eq!(
+            extract_report_title("# GC sweep ordering\n\nProse.", "How does GC work?"),
+            Some("GC sweep ordering".to_string())
+        );
+        // A closing ATX sequence is syntax, not title.
+        assert_eq!(
+            extract_report_title("## Pool return ##\n\nProse.", "q"),
+            Some("Pool return".to_string())
+        );
+        // Leading blank lines are skipped, not a missing heading.
+        assert_eq!(
+            extract_report_title("\n\n# Title\n\nProse.", "q"),
+            Some("Title".to_string())
+        );
+    }
+
+    #[test]
+    fn a_heading_that_repeats_the_question_stores_no_title() {
+        assert_eq!(
+            extract_report_title("# How  does GC work?\n\nProse.", "how does gc work?"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_report_without_a_heading_stores_no_title() {
+        assert_eq!(extract_report_title("Plain prose.", "q"), None);
+        // `#hashtag` is not a heading (no space), and neither is an empty one.
+        assert_eq!(extract_report_title("#hashtag\n\nProse.", "q"), None);
+        assert_eq!(extract_report_title("#   \n\nProse.", "q"), None);
+        assert_eq!(extract_report_title("", "q"), None);
+        // Seven hashes is not ATX.
+        assert_eq!(extract_report_title("####### Deep\n\nProse.", "q"), None);
+    }
+
+    #[test]
+    fn a_clean_report_passes_the_markdown_check() {
+        assert!(
+            validate_report_markdown("# Title\n\nProse with `code`.\n\n```rust\nfn f() {}\n```\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_json_report_is_named_as_broken() {
+        let problems = validate_report_markdown(r#"{"action": "finalize"}"#);
+        assert!(
+            problems.iter().any(|p| p.contains("begins with JSON")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("# heading")),
+            "{problems:?}"
+        );
+        // Empty is its own (single) answer.
+        assert_eq!(
+            validate_report_markdown("  \n "),
+            vec!["The report is empty."]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_named() {
+        let problems = validate_report_markdown("# T\n\n```rust\nfn f() {}\n");
+        assert!(
+            problems.iter().any(|p| p.contains("code fence")),
+            "{problems:?}"
+        );
+        assert!(validate_report_markdown("# T\n\n```\nx\n```\n").is_empty());
+    }
 
     /// A model whose template cannot call tools writes the call as text. That is an
     /// operator problem — the wrong model — so it must surface as one instead of
@@ -5477,6 +6536,49 @@ mod tests {
             })
         }
 
+        /// One stored report, seq 1, whose id `run-1` matches the `prior()`
+        /// helper — so a test can assert the already-in-context exclusion.
+        async fn list_research(
+            &self,
+            _query: Option<String>,
+            _token: &CancellationToken,
+        ) -> Result<Vec<ResearchListing>, ApiError> {
+            Ok(vec![
+                ResearchListing {
+                    id: "run-1".into(),
+                    seq: 1,
+                    title: Some("GC sweep ordering".into()),
+                    question: "How does GC sweep?".into(),
+                    created_at: 1,
+                },
+                ResearchListing {
+                    id: "stored-2".into(),
+                    seq: 2,
+                    title: None,
+                    question: "Where is the connection pool returned?".into(),
+                    created_at: 2,
+                },
+            ])
+        }
+
+        /// Seq 2 cites a path no other fake ever shows, so the hearsay test can
+        /// assert a citation copied from it stays unverified.
+        async fn read_research(
+            &self,
+            seq: i64,
+            _token: &CancellationToken,
+        ) -> Result<StoredReport, ApiError> {
+            match seq {
+                2 => Ok(StoredReport::Found {
+                    seq,
+                    question: "Where is the connection pool returned?".into(),
+                    report: "# Pool return\n\nSee src/slicing/traits.rs:100-140.".into(),
+                }),
+                3 => Ok(StoredReport::Invalid { seq }),
+                _ => Ok(StoredReport::Missing { seq }),
+            }
+        }
+
         async fn file_versions(
             &self,
             paths: Vec<String>,
@@ -5534,6 +6636,8 @@ mod tests {
             // delta every turn, and a guard armed by default would be a tripwire on
             // every one of these runs rather than a thing under test.
             max_turn_thinking_chars: 0,
+            prior_reports: Vec::new(),
+            max_context_chars: 24_000,
             metrics: None,
         }
     }
@@ -5857,9 +6961,11 @@ mod tests {
                 "finalize",
                 "grep",
                 "list_files",
+                "list_research",
                 "note",
                 "outline",
                 "read_chunks",
+                "read_research",
                 "revise_plan",
                 "search",
                 "symbols"
@@ -5877,6 +6983,7 @@ mod tests {
                 "file_history" => json!({"path": "x"}),
                 "note" => json!({"text": "x"}),
                 "revise_plan" => json!({"plan": "x"}),
+                "read_research" => json!({"seq": 1}),
                 _ => json!({}),
             };
             assert!(
@@ -7645,6 +8752,8 @@ mod tests {
             (StepCall::Callers { name: "x".into() }, "name"),
             (StepCall::ListFiles { glob: "x".into() }, "glob"),
             (StepCall::ReadChunks { path: "x".into() }, "path"),
+            (StepCall::ListResearch { query: "x".into() }, "query"),
+            (StepCall::ReadResearch { seq: "x".into() }, "seq"),
         ] {
             let action = call.action();
             let d = ResearchEvent::Step {
@@ -7942,6 +9051,10 @@ mod tests {
             progress: progress_fixture(),
             context_fraction: 0.7,
             reason: DoneReason::BudgetExhausted,
+            recorded: Some(RecordedRun {
+                id: "run-uuid".into(),
+                seq: 12,
+            }),
         };
         let d = ev.data();
         assert_eq!(d["reason"], "budget_exhausted");
@@ -7959,6 +9072,32 @@ mod tests {
         // tell two prompt generations apart reads a prompt regression as model
         // variance, so this is part of the record, not decoration.
         assert_eq!(d["prompt_version"], PROMPT_VERSION);
+        // How to ask for this run again. Without it a client that just watched a run
+        // stream by cannot offer to reuse it, which is the whole point of storing it.
+        assert_eq!(d["run_id"], "run-uuid");
+        assert_eq!(d["seq"], 12);
+    }
+
+    /// The branch nobody exercises by hand: the journal is best-effort, so a failed
+    /// write must still produce a well-formed `done` — with the two identifiers
+    /// **present and null** rather than absent, since a consumer that whitelists
+    /// fields reads a missing key and a null one the same way only if it is looking
+    /// for the key at all.
+    #[test]
+    fn done_names_no_run_when_the_journal_write_failed() {
+        let ev = ResearchEvent::Done {
+            progress: progress_fixture(),
+            context_fraction: 0.7,
+            reason: DoneReason::Finalized,
+            recorded: None,
+        };
+        let d = ev.data();
+        assert!(d.get("run_id").is_some(), "the key must still be present");
+        assert!(d["run_id"].is_null());
+        assert!(d["seq"].is_null());
+        // The rest of the record is unaffected: the run happened.
+        assert_eq!(d["reason"], "finalized");
+        assert_eq!(d["steps"], 3);
     }
 
     #[test]

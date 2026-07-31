@@ -102,6 +102,44 @@ pub fn research_budget(
     Ok(())
 }
 
+/// The `context_run_ids` count, against `[research].max_context_runs`.
+///
+/// Count only — whether the ids exist and belong to this project needs the database
+/// and so happens in the handler.
+///
+/// Repeats are dropped rather than rejected, and the **de-duplicated** list is what
+/// the run is given and what it journals, so nothing downstream can disagree about
+/// what the run was shown. Injecting one report twice would cost its characters twice
+/// against `max_context_chars` for no information, and a 400 would fail a request
+/// whose intent is unambiguous. The cap is applied to what actually gets used.
+///
+/// A cap of `0` switches the feature off, so any id is then a rejection — which is
+/// why the empty case returns early rather than comparing against the cap.
+pub fn research_context(ids: &mut Vec<String>, max: usize) -> Result<(), ApiError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    ids.retain(|id| seen.insert(id.clone()));
+    if ids.len() > max {
+        return Err(ApiError::ResearchContextTooMany {
+            got: ids.len(),
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// The `limit` on the stored-research list, against `[research].list_page_limit`.
+/// Absent = the server's own page size, so only an explicit value is checked.
+pub fn research_list_limit(limit: Option<usize>, max: usize) -> Result<(), ApiError> {
+    let Some(got) = limit else { return Ok(()) };
+    if got < 1 || got > max {
+        return Err(ApiError::ResearchListLimitOutOfRange { got, max });
+    }
+    Ok(())
+}
+
 /// One `include`/`exclude` selector: its globs + languages combined must stay within
 /// the pattern cap. (Glob *syntax* is already validated when `GlobPattern` deserializes.)
 pub fn validate_selector(

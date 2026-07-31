@@ -1092,6 +1092,56 @@ P += [
 ]
 y += 7
 
+P += [
+    ts(
+        "Stored research",
+        gp(7, 12, 0, y),
+        targets(
+            ("sum(mindex_project_research_runs)", "stored"),
+            ("sum(mindex_project_research_stale)", "outdated"),
+            ("sum(mindex_project_research_pinned)", "pinned"),
+        ),
+        unit="short",
+        desc="The corpus a new run can be given as context. `outdated` counts runs "
+        "at least one of whose files has changed since — still useful for names, "
+        "unreliable on specifics. `pinned` runs have no expiry and GC never "
+        "reaps them, so a rising pinned count is the thing that stops retention "
+        "from bounding this table.",
+        overrides=by_name_overrides(
+            {"stored": "blue", "outdated": "yellow", "pinned": "green"}
+        ),
+    ),
+    ts(
+        "Context reuse",
+        gp(7, 12, 12, y),
+        targets(
+            (
+                "sum(" + ev("mindex_research_runs_with_context_total") + ")",
+                "runs given context",
+            ),
+            (ev("mindex_research_context_runs_used_total"), "reports injected"),
+            (ev("mindex_research_context_truncations_total"), "truncated to fit"),
+            (ev("mindex_gc_research_pruned_total"), "reaped by GC"),
+        ),
+        unit="short",
+        desc="Does prior research get reused, and does the character cap bite? "
+        "Counted with increase() and drawn as bars: these are a handful of "
+        "events a day, and a label set seeing one event in a process lifetime "
+        "is flat at 1 under rate() forever.",
+        overrides=by_name_overrides(
+            {
+                "runs given context": "blue",
+                "reports injected": "purple",
+                "truncated to fit": "orange",
+                "reaped by GC": "text",
+            }
+        ),
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
+    ),
+]
+y += 7
+
 # ─── Row 7 — GC & retry ─────────────────────────────────────────────────────
 P.append(row("GC & retry", y))
 y += 1

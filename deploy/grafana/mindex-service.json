@@ -4639,6 +4639,313 @@
     },
     {
       "id": 56,
+      "type": "timeseries",
+      "title": "Stored research",
+      "description": "The corpus a new run can be given as context. `outdated` counts runs at least one of whose files has changed since \u2014 still useful for names, unreliable on specifics. `pinned` runs have no expiry and GC never reaps them, so a rising pinned count is the thing that stops retention from bounding this table.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 136
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mindex_project_research_runs)",
+          "legendFormat": "stored",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mindex_project_research_stale)",
+          "legendFormat": "outdated",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mindex_project_research_pinned)",
+          "legendFormat": "pinned",
+          "range": true,
+          "instant": false,
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stored"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "outdated"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pinned"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Context reuse",
+      "description": "Does prior research get reused, and does the character cap bite? Counted with increase() and drawn as bars: these are a handful of events a day, and a label set seeing one event in a process lifetime is flat at 1 under rate() forever.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 136
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(mindex_research_runs_with_context_total[$__rate_interval]))",
+          "legendFormat": "runs given context",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_context_runs_used_total[$__rate_interval])",
+          "legendFormat": "reports injected",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_context_truncations_total[$__rate_interval])",
+          "legendFormat": "truncated to fit",
+          "range": true,
+          "instant": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_gc_research_pruned_total[$__rate_interval])",
+          "legendFormat": "reaped by GC",
+          "range": true,
+          "instant": false,
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "barAlignment": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "runs given context"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reports injected"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "truncated to fit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reaped by GC"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 58,
       "type": "row",
       "title": "GC & retry",
       "collapsed": false,
@@ -4646,12 +4953,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 136
+        "y": 143
       },
       "panels": []
     },
     {
-      "id": 57,
+      "id": 59,
       "type": "timeseries",
       "title": "GC rows removed",
       "description": "Only chunks whose Qdrant delete was confirmed are hard-deleted; the rest keep their rows for the next sweep.",
@@ -4663,7 +4970,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 137
+        "y": 144
       },
       "targets": [
         {
@@ -4789,7 +5096,7 @@
       }
     },
     {
-      "id": 58,
+      "id": 60,
       "type": "timeseries",
       "title": "GC backlog",
       "description": "Soft-deleted chunks whose vectors still sit in Qdrant. Indexing is append-only, so this rises on every reindex and falls on the hourly sweep. A monotonic rise means the sweep is failing.",
@@ -4801,7 +5108,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 137
+        "y": 144
       },
       "targets": [
         {
@@ -4873,7 +5180,7 @@
       }
     },
     {
-      "id": 59,
+      "id": 61,
       "type": "timeseries",
       "title": "GC passes",
       "description": "",
@@ -4885,7 +5192,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 137
+        "y": 144
       },
       "targets": [
         {
@@ -4972,7 +5279,7 @@
       }
     },
     {
-      "id": 60,
+      "id": 62,
       "type": "timeseries",
       "title": "Retry outcomes",
       "description": "`skipped_claim` dominating means the worker is racing live /index traffic, which is different from it failing.",
@@ -4984,7 +5291,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 144
+        "y": 151
       },
       "targets": [
         {
@@ -5168,7 +5475,7 @@
       }
     },
     {
-      "id": 61,
+      "id": 63,
       "type": "timeseries",
       "title": "Permanently failed files",
       "description": "Files that exhausted `[workers].max_retries`. The retry worker will never touch them again \u2014 they need a re-push. Until now this existed only as an hourly WARN.",
@@ -5180,7 +5487,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 144
+        "y": 151
       },
       "targets": [
         {
@@ -5236,7 +5543,7 @@
       }
     },
     {
-      "id": 62,
+      "id": 64,
       "type": "row",
       "title": "Per-project state",
       "collapsed": false,
@@ -5244,12 +5551,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 151
+        "y": 158
       },
       "panels": []
     },
     {
-      "id": 63,
+      "id": 65,
       "type": "table",
       "title": "Projects",
       "description": "Recomputed by the metrics collector every `[metrics].refresh_interval_seconds`, and cleared and repopulated each tick \u2014 so a deleted project disappears here rather than reporting its last known state forever.",
@@ -5261,7 +5568,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 152
+        "y": 159
       },
       "targets": [
         {
@@ -5498,7 +5805,7 @@
       }
     },
     {
-      "id": 64,
+      "id": 66,
       "type": "bargauge",
       "title": "Files by language",
       "description": "A bar rather than a pie: there are more than a handful of languages and their values are close, which is exactly where a pie stops being readable.",
@@ -5510,7 +5817,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 161
+        "y": 168
       },
       "targets": [
         {
@@ -5559,7 +5866,7 @@
       }
     },
     {
-      "id": 65,
+      "id": 67,
       "type": "timeseries",
       "title": "Files by status",
       "description": "",
@@ -5571,7 +5878,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 161
+        "y": 168
       },
       "targets": [
         {
@@ -5725,7 +6032,7 @@
       }
     },
     {
-      "id": 66,
+      "id": 68,
       "type": "timeseries",
       "title": "Drift reported per check",
       "description": "A counter, not a gauge: /drift compares against a manifest only the client can produce, so there is no server-side drift level. This is what the checks that ran reported.",
@@ -5737,7 +6044,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 161
+        "y": 168
       },
       "targets": [
         {

@@ -89,22 +89,27 @@ flag) — tuning them in a container means mounting a `config.toml`.
   kernel**, which returns NaN for padded rows in fp16 and still answers 200. That is
   `attention_backend()` in `__main__.py`; removing it silently corrupts every batch of
   more than one text.
-- Migrations live in `src/db/migrations/`. **Three**: `v1.0.0_schema.sql` (version 1)
+- Migrations live in `src/db/migrations/`. **Four**: `v1.0.0_schema.sql` (version 1)
   — the whole 1.0.0 schema, in the order SQLite needs (tables before the triggers
   and foreign keys that name them) — `v1.1.0_git_history.sql` (version 2),
   which adds `project_commits` + `project_commit_paths`, and
   `v1.1.0_toml_yaml_languages.sql` (version 3), which rebuilds `project_files` to
-  widen its `programming_language` CHECK. The applied set is the
+  widen its `programming_language` CHECK, and `v1.2.0_research_context.sql`
+  (version 4), which rebuilds `research_runs` to add `seq`/`expires_at`/
+  `context_run_ids_json` and adds `research_run_files`. The applied set is the
   `MIGRATIONS` slice in `main.rs`, keyed by the integer that lands in
   `PRAGMA user_version`; the filename's version is documentation. **v1.0.0 is now
   frozen** — editing it in place no longer reaches a database stamped at 1, since
   the filter is `version > user_version`, so the edit would be skipped in silence.
-  Eight tables: `projects`, `project_files`, `project_file_chunks`,
+  Nine tables: `projects`, `project_files`, `project_file_chunks`,
   `project_file_status_log`, `project_file_symbols`, `research_runs`,
-  `project_commits`, `project_commit_paths`. There are **no 1:1 side tables** — the three that existed were
+  `research_run_files`, `project_commits`, `project_commit_paths`. There are
+  **no 1:1 side tables** — the three that existed were
   artefacts of `ADD COLUMN` having no `IF NOT EXISTS` form, and folding them back
   into their parents removed a JOIN from the prepare-phase skip and two INSERTs
-  from every journalled run. Note `sqlfluff` skips files over its default 20 kB and
+  from every journalled run. `ADD COLUMN` is still blocked, so a new *field* is a
+  table rebuild rather than a side table (rule 8); `research_run_files` is a
+  genuine 1:N child, not a revival of that pattern. Note `sqlfluff` skips files over its default 20 kB and
   only *warns*, so `.sqlfluff` raises `large_file_skip_byte_limit` — without it the
   schema is silently unlinted.
 - `scripts/entrypoint.sh` generates a self-signed cert on first container start.
@@ -196,7 +201,8 @@ unreadable rather than merely recomputable. Every one of them is compared by pla
 equality and never ordered, so both halves trigger the identical rebuild: the split
 informs whoever reads the release notes, and claiming more for it would be a
 distinction the code does not make. The set is `CHUNKS_DERIVATION_VERSION`,
-`SYMBOLS_DERIVATION_VERSION` and `PROMPT_VERSION`, all `"1.0"` at this release. Two
+`SYMBOLS_DERIVATION_VERSION` and `PROMPT_VERSION` (the first two `"1.0"`; the
+prompt one moves with the instructions, currently `"1.3"`). Two
 neighbours deliberately stay outside it: `COLLECTION_SCHEMA_VERSION` (`"v1"`) is a
 Qdrant collection-*name* component, where a dot buys nothing, and the migration
 version is the `i32` SQLite stores in `PRAGMA user_version`.
@@ -281,6 +287,15 @@ Full behavior is in the handlers + OpenAPI; the non-obvious parts:
   excluded from `stale`/`missing` since its stored hash is the *incoming* value).
   Unknown project ≠ 404 — every posted file is simply `missing`. Backs
   `mindex-index --check`, the MCP `drift` tool, the watcher's periodic sweep.
+- **Stored research** (`GET /projects/{guid}/research[/{run_id}]`,
+  `POST …/{run_id}/pin`, `DELETE …/{run_id}`): the browse half of the corpus, on the
+  management plane because it reads server state the way `/files` does — the run that
+  *produces* a report stays at `POST /v0/{guid}/research`. The list is keyset by
+  `seq`, searches `question` **and** `report` with `like_escape` (FTS5 is the next
+  rung of the documented ladder and nothing has measured `LIKE` insufficient over a
+  corpus two orders of magnitude smaller than `project_file_chunks`), and never
+  selects the report body — that is what makes it a separate endpoint from the detail
+  one. `pin` is the one mutation on an otherwise append-only row.
 - The read-only set (`GET /projects[/{guid}][/files]`, `/status`, `/config`,
   `/health`, `/version`) + `POST /gc` are self-describing in OpenAPI. `GET /config`
   serves the canonical language list of what the server *supports* (read by the
@@ -325,9 +340,9 @@ Non-obvious invariants:
   turn) drives any sequence, and the `force_text_calls` knob makes it write a call
   as text so the `research.model_lacks_tools` path is covered. It finds its place in
   the script by counting `role: "tool"` messages.
-- **Model protocol = Ollama's native tool calling.** The ten tools
-  (search/grep/symbols/outline/callers/list_files/read_chunks/file_history/note/
-  revise_plan/finalize)
+- **Model protocol = Ollama's native tool calling.** The twelve tools
+  (search/grep/symbols/outline/callers/list_files/read_chunks/file_history/
+  list_research/read_research/note/revise_plan, plus `finalize`)
   are passed as `tools` JSON Schemas
   (`tool_specs`) and arrive back in `message.tool_calls` — a field distinct from
   `content` and `thinking`, which is the whole point: a model cannot put its
@@ -491,6 +506,101 @@ Non-obvious invariants:
   Unset sampling stores NULL, not 0. This is what makes a bake-off re-analysable
   later without the harness's CSVs. `NoJournal` is `#[cfg(test)]`-gated on
   purpose: production is never offered a trace-less journal.
+- **A stored run is reusable as context, and staleness is per-path — not a global
+  counter.** `context_run_ids` on a request names earlier runs of the *same
+  project*; their reports are injected as one `user` message before the plan turn
+  (`format_prior_reports`), so the plan can use them. A global monotonic
+  `project_version` was the obvious alternative and was **rejected**: with
+  `mindex-watch` running, one save of any file would mark every stored run stale at
+  once, and the feature would be correct and useless. Instead each run's own
+  baselines are persisted — `Evidence.baseline_sha` per shown path, into
+  `research_run_files` — and staleness is the same `changed || removed` comparison
+  `apply_versions` makes during a live run, asked later against `project_files`.
+  Three things about it are easy to break. The join needs **`model_id`**, which
+  `research_runs` does not store (bind it from `RouterState`, as `file_versions_core`
+  does): `project_files` is keyed `(project_guid, model_id, path)`, so joining on the
+  path alone matches across embedding models. `research_run_files.path` carries **no
+  FK** — `RESTRICT` would make `prune_deleted_files` refuse to drop any file a past
+  run ever read, silently turning research into a brake on the GC of the code
+  channel, and `CASCADE` would erase the baseline and make a run whose file is *gone*
+  read as fresh. And the freshness and validity filters on the list must be applied
+  **inside** the cursor-bounded subquery, before `LIMIT`, or a short page stops
+  meaning "there is no more".
+- **Validity is the transitive verdict, and it is derived — never stored.**
+  `context_run_ids_json` is the edge set of a knowledge graph (edge A → B = "B was
+  in A's context at launch"), and `research_validity_ctes` (`handlers.rs`) computes
+  `valid = own files unmoved AND every context parent exists AND is itself valid`
+  as one recursive CTE over `json_each` at read time. A stored flag was rejected:
+  staleness can *heal* (a file reindexed back to the same bytes), and its onset is
+  an ordinary indexing write with no research-side event to hook a cascade on.
+  Deletion needs no cascade either — hard `DELETE` (and the GC retention sweep,
+  which is the same event here) leaves a dangling id in every child's edge list,
+  and the CTE reads a dangling reference as invalid, transitively and immediately,
+  with no write anywhere. Cycles are impossible by construction (context ids are
+  validated at launch and the run's own row does not exist yet, so edges point
+  strictly backwards), and the recursive `UNION` deduplicates besides. `freshness`
+  keeps its self-staleness meaning; `valid=true|false` is the orthogonal filter,
+  and each summary carries `valid`/`invalid_reason`
+  (`stale`/`context_deleted`/`context_invalid`) plus `context` — the flat
+  transitive ancestry, each ancestor with its own state — so a human picks context
+  from what the graph still vouches for. A request naming an invalid run in
+  `context_run_ids` is refused up front (400 `validation.research_context_invalid`,
+  offenders and reasons in `meta.runs`): the client showed `valid` before the pick,
+  so the refusal only fires when the index moved in between.
+- **The model can browse the stored corpus itself** — `list_research` (seq, title,
+  question of *valid* runs only, minus the ones already injected as context, capped
+  at the `LIST_RESEARCH_LIMIT` const) and `read_research(seq)` (one valid report,
+  truncated out loud at `max_context_chars`). Both are deliberately **unscoped** —
+  reports are not files, and `ToolScope` does not apply (the tool descriptions and
+  the `system_prompt` paragraph say so) — and both return `shown: Vec::new()`
+  unconditionally: the hearsay invariant below covers them
+  (`read_research_never_seeds_the_evidence`). An invalid or missing seq is an
+  explicit refusal, not an empty answer — the `outline.indexed` lesson. Self-scan
+  needs no check: the live run has no `research_runs` row yet.
+- **Prior reports are hearsay, and nothing in them may be cited.** They are the
+  fastest way to learn the real names — the measured bottleneck a cold run spends its
+  first steps on — and they are not evidence. Their paths are **never** seeded into
+  `Evidence`, so a `path:start-end` copied out of one lands `unverified` and trips the
+  revalidation gate exactly as an invented one would; seeding it would promote hearsay
+  to verified provenance and destroy the one guarantee scout's "trust the report"
+  instruction rests on (`a_prior_report_never_seeds_the_evidence`). The
+  `system_prompt` paragraph that says so is conditional, like `scope_rule`, and ships
+  with the corpus half or not at all — the markdown lesson again. Each section states
+  its own staleness in words, because a report written against files that have since
+  moved is still useful for names and actively misleading about specifics, and only
+  the header says which. Over-cap reports are truncated **with a marker**
+  (`[research].max_context_chars`), never silently: an injected block is prompt tokens
+  on *every* turn, so that cap is a budget axis and not politeness.
+- **`title` is the report's own heading, `seq` is an ordinal, `id` is identity.**
+  `extract_report_title` stores the report's first ATX heading at journalling time —
+  NULL when there is none or it trivially repeats the question — and the wire `title`
+  falls back to the question-derived truncation (`research_title`, still derived at
+  read time for the reason it always was: a stored copy of a *truncation* goes stale
+  the day the rule changes; a stored copy of the model's own output cannot). The
+  list's `q` searches title, question **and** report. `seq` is
+  per-project, monotonic, and doubles as the keyset cursor — never `OFFSET`, over a
+  table GC prunes and every run appends to. It is **not** identity: a total wipe of a
+  project's runs restarts it at 1, so every mutating endpoint keys on the uuid `id`.
+- **A structurally broken report is sent back, and if it stays broken it is never
+  journalled.** `validate_report_markdown` is four honest shape checks (empty, JSON
+  start, no leading `# heading`, unclosed fence) — tree-sitter-md accepts anything,
+  so parsing would be a validator that cannot fail. A failing draft joins the
+  citation gate's complaint (`format_markdown_complaint`, appended to the citation
+  complaint when both fire); a markdown-only defect re-opens **no** tools — nothing
+  needs looking up, only rewriting. If the final text still fails, it is streamed
+  (a watched broken report beats a vanished one) but `journal.record` is skipped and
+  `done` carries null `run_id`/`seq` — the existing failed-journal wire shape, no new
+  field. `forced_synthesis` is exempt by flag and valid by construction
+  (`forced_synthesis_passes_the_markdown_gate`); the skipped run is also invisible
+  to `MeteredJournal`'s counters, accepted with a `warn!` as the trace.
+- **`expires_at IS NULL` means pinned**, and that is the whole retention mechanism.
+  The deadline is stamped at insert from `[research].retention_days`, so changing that
+  setting moves future runs only and `prune_expired_research` takes no retention
+  argument — comparing against the *current* config would make pinning inexpressible
+  and silently re-date the corpus on every edit. Unpinning restores
+  `created_at + retention`, which means unpinning a run older than the window makes it
+  eligible at the very next sweep; stamping `now + retention` instead would turn a
+  checkbox toggled twice into a silent renewal of everything it touched.
 - **`effort` selects a budget; the request may override it** (`[research.effort.
   {low,medium,high}]` → `EffortBudget` → `research::Budget` via `Budget::resolve`,
   which applies `ResearchRequest.budget` axis by axis — an absent axis keeps the
@@ -879,8 +989,13 @@ Non-obvious invariants:
   `data:` line) — keep it that way, or they lose every multi-line frame in
   silence. The wire
   shapes are pinned by `progress_wire_fields_are_stable`,
-  `done_event_carries_the_reason_and_the_run_cost_on_the_wire` and
-  `each_action_names_its_argument_on_the_wire`.
+  `done_event_carries_the_reason_and_the_run_cost_on_the_wire`,
+  `done_names_no_run_when_the_journal_write_failed` and
+  `each_action_names_its_argument_on_the_wire`. `done` carries `run_id`/`seq` — how a
+  client that just watched a run offers it back as context — and both are **null**
+  when the best-effort journal write failed, since a fabricated id would name a run
+  nothing can fetch. Nullable, not absent: scout reads them explicitly rather than
+  through `_USAGE_KEYS`, because they are not cost.
 - **The report turn passes no tools at all** — the field is *omitted*, not sent
   empty, so there is structurally nothing to call. That is the fix for a measured
   failure: on the old text protocol, ~1 run in 5 across *three* different models
@@ -1689,6 +1804,17 @@ is wrong.
   thinking + `marked`-rendered report). The SSE client is hand-rolled in `api.ts` (no
   reconnects — a drop is a cancel, by contract). Force reindex (this file / whole
   project, the latter modal-confirmed) lives in the Drift view's overflow menu.
+  **Research History** (`researchRunsPanel.ts` + `webview/runs.ts`) is an
+  editor-area panel, not a third sidebar view — the same argument `icons.test.ts`
+  already records for moving Server Status out, so that pinned view list is
+  unchanged. Two panes, a debounced search (`shared/debounce.ts`, vscode-free so
+  `node --test` can reach it; trailing, because the first keystroke of an identifier
+  is one letter and its results would be wrong on arrival), keyset paging by `seq`,
+  and a multi-select that posts to the host and arrives in the Ask form as removable
+  chips. **One `AbortController`, aborted on every keystroke**, and the caller must
+  swallow `AbortError` itself: `api.request` *rejects* on abort while `research()`
+  resolves, and "fixing" that asymmetry would break every other caller's ability to
+  tell a cancelled request from an empty answer.
   **The form offers only what the server confirmed exists**: the language pickers are
   the project's `chunks_active > 0` languages and the model field is a `<select>` over
   `research.models`, both arriving through `StatusMonitor.refresh()` — the one
@@ -1762,7 +1888,9 @@ is wrong.
   Ollama connection; what it owns is the *reader* (`_STEP_KEYS`, `_USAGE_KEYS`,
   `_CITATION_KEYS` — whitelists that silently drop unknown fields, so an SSE change
   that skips them fails by going quiet) and the `_INSTRUCTIONS` that tell the caller
-  to trust the report but check `citations.unverified_paths` and `done_reason`. The
+  to trust the report but check `citations.unverified_paths` and `done_reason`, and
+  to chain a follow-up by passing the previous `run_id` in `context_run_ids` rather
+  than re-investigating from cold. The
   **cheap-breadth half**; `mindex.search` is the paid-precision half. Fully removable
   layer.
 - `.mindex` (repo-root, committed — index scope is part of the project): **YAML**,
@@ -1879,16 +2007,14 @@ is wrong.
    pattern the status-machine and shape-validation triggers set, additive, no volume
    drop). New *columns* are equally
    blocked: `ADD COLUMN` has no `IF NOT EXISTS` form, so it fails the idempotency
-   test — a later migration must add the field as a 1:1 side table with
-   `CREATE TABLE IF NOT EXISTS` and `ON DELETE CASCADE`. **v1.0.0 is frozen** —
+   test. **v1.0.0 is frozen** —
    its schema is in use, so an in-place edit is skipped in silence on any database
    already stamped at 1 (`version > user_version`), and the first symptom is a 500
    with `no such table`/`no such column` on the request that needs it. New *tables*
-   are the easy case and need no side table: `v1.1.0_git_history.sql` adds two, and
-   the upgrade is verified non-destructive on a copy of a real database. A new
-   *field* still costs a 1:1 side table, which is why the schema has none today —
-   three were folded back into their parents before release.
-   **Widening an existing constraint is the one case none of that covers**, and
+   are the easy case: `v1.1.0_git_history.sql` adds two, and
+   the upgrade is verified non-destructive on a copy of a real database.
+   **Widening an existing constraint, and adding a column, are the cases none of
+   that covers**, and both are answered by the same table rebuild —
    `v1.1.0_toml_yaml_languages.sql` is the precedent: a trigger cannot loosen a
    CHECK that is already in the table text, so the table is rebuilt. Copy its
    shape rather than re-deriving it — create the replacement under a temporary
@@ -1902,6 +2028,19 @@ is wrong.
    `DROP TABLE IF EXISTS <tmp>`: a second run rebuilds again, which costs a copy
    and changes nothing. Rehearse it on a copy of a real database and compare row
    counts per table, not just that it ran.
+   **A 1:1 side table is not the answer for a new field**, though `ADD COLUMN`
+   being blocked makes it look like one: the three that existed were folded back
+   into their parents before release precisely because each cost a JOIN on a hot
+   path, and reintroducing one would undo that for the convenience of the
+   migration rather than of the reader. `v1.2.0_research_context.sql` is the
+   precedent — it rebuilds `research_runs` to add three columns.
+   One consequence of the rebuild is worth knowing before it surprises someone:
+   the FK suspension also suspends `ON DELETE CASCADE`, so dropping the old table
+   does **not** take a child table's rows with it, and `id` surviving the copy is
+   what makes them still resolve. That is load-bearing rather than lucky, and
+   `rebuilding_research_runs_keeps_the_baselines_that_reference_it` pins it —
+   applied through an ordinary transaction instead, the same migration silently
+   erases every child row.
 9. Changing how chunks or symbols are derived → bump the matching const under
    **Derivation versions**. That is what makes the change reach files already
    indexed; skipping it leaves them stale behind a matching hash, silently.

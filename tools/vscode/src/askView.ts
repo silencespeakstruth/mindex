@@ -34,6 +34,15 @@ export interface AskSubmission {
      * by the extension, which has the editor API this webview does not.
      */
     scopeCurrentFolder?: boolean;
+    /**
+     * Research only: stored runs whose reports the server hands the model as
+     * background before it plans. Picked in Research History.
+     *
+     * Read from the provider's own cache rather than from the webview message: these
+     * are ids the user never typed, and the form is an input surface for the question,
+     * not an authority on which runs exist.
+     */
+    contextRunIds?: string[];
 }
 
 /**
@@ -73,6 +82,19 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
      * [`pickerLanguages`].
      */
     private inventory?: string[];
+    /**
+     * Stored runs the user picked in Research History, to be handed to the next
+     * question as background. Cached here and replayed on resolve for the same reason
+     * the languages and the model list are: a reopened sidebar starts from the default
+     * HTML, and a selection that took several clicks to build must survive that.
+     */
+    private contextRuns: {
+        id: string;
+        seq: number;
+        title: string;
+        stale: boolean;
+        valid: boolean;
+    }[] = [];
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -124,6 +146,9 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
         if (this.serverConfig !== undefined) {
             this.postConfig(this.serverConfig);
         }
+        if (this.contextRuns.length > 0) {
+            this.postContextRuns();
+        }
 
         view.webview.onDidReceiveMessage((msg: Record<string, unknown>) => {
             switch (msg.type) {
@@ -139,6 +164,16 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
                 case "scopeDefaults":
                     this.postScopeDefaults();
                     break;
+                case "contextRuns": {
+                    // The form can only ever *remove* runs — they are chosen in the
+                    // Research History panel — so this filters the cache rather than
+                    // trusting the message to name them.
+                    const keep = new Set(
+                        Array.isArray(msg.ids) ? (msg.ids as unknown[]).map(String) : []
+                    );
+                    this.contextRuns = this.contextRuns.filter((r) => keep.has(r.id));
+                    break;
+                }
             }
         });
     }
@@ -169,6 +204,8 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
             budget: readBudget(msg),
             ...readScope(msg),
             scopeCurrentFolder: msg.scopeCurrentFolder === true,
+            contextRunIds:
+                this.contextRuns.length > 0 ? this.contextRuns.map((r) => r.id) : undefined,
         });
     }
 
@@ -267,6 +304,33 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
      * away the half-typed question, the restored form state and a running run's Stop
      * button — and this fires on every status refresh.
      */
+    /**
+     * Offer these stored runs as context for the next question.
+     *
+     * Replaces rather than appends: the panel sends its whole selection every time, so
+     * appending would make unchecking a run in the panel leave it silently attached
+     * here.
+     */
+    setContextRuns(
+        runs: { id: string; seq: number; title: string; stale: boolean; valid: boolean }[]
+    ): void {
+        this.contextRuns = runs.map((r) => ({
+            id: r.id,
+            seq: r.seq,
+            title: r.title,
+            stale: r.stale,
+            valid: r.valid,
+        }));
+        this.postContextRuns();
+    }
+
+    private postContextRuns(): void {
+        void this.view?.webview.postMessage({
+            type: "contextRuns",
+            runs: this.contextRuns,
+        });
+    }
+
     setLanguageInventory(languages: string[] | undefined): void {
         this.inventory = languages;
         void this.view?.webview.postMessage({

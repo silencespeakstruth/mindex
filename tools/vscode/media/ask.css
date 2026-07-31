@@ -243,3 +243,42 @@ body {
     background: none;
     opacity: 0.8;
 }
+
+/*
+ * Earlier reports handed to the next question as background, picked in Research
+ * History. Research only — /search takes no prior context, and a control that does
+ * nothing in the active mode is worse than an absent one.
+ */
+.context-runs {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.context-runs-head {
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.context-runs-head .linky {
+    margin-left: auto;
+}
+
+/*
+ * A chip for a report whose files have moved. Marked because staleness is the one
+ * thing that changes what a report is worth, and it can change after the user picked
+ * it. The colour is the theme's, so it reads in light and dark alike.
+ */
+.pill.pill-stale {
+    border-color: var(--vscode-inputValidation-warningBorder);
+}
+
+/*
+ * A chip for a report the server will refuse as context: it went invalid (its own
+ * files, or a report it built on, moved or was deleted) after the user picked it.
+ * Error palette, not warning — the submit will 400 while it is attached.
+ */
+.pill.pill-invalid {
+    border-color: var(--vscode-inputValidation-errorBorder);
+    color: var(--vscode-inputValidation-errorForeground, inherit);
+}

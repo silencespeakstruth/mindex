@@ -19,6 +19,7 @@ use crate::backend::v0::handlers;
 /// `tag = "…"` on the corresponding `#[utoipa::path]`.
 const INDEXING: &str = "Indexing";
 const SEARCH: &str = "Search";
+const RESEARCH: &str = "Research";
 const PROJECTS: &str = "Projects";
 const GC: &str = "Garbage Collection";
 const OBSERVABILITY: &str = "Observability";
@@ -67,7 +68,9 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.symbol_limit_out_of_range`, `validation.research_budget_out_of_range`, \
 `validation.too_many_commits`, `validation.commit_message_too_large`, \
 `validation.commit_invalid`, `validation.history_bound_missing`, `research.busy`, \
-`research.model_missing`.",
+`research.model_missing`, `validation.research_context_too_many`, \
+`validation.research_context_invalid`, \
+`validation.research_list_limit_out_of_range`, `research.run_not_found`.",
     ),
     paths(
         // Indexing
@@ -82,6 +85,10 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::post_search,
         handlers::post_symbols,
         handlers::post_research,
+        handlers::get_research_runs,
+        handlers::get_research_run,
+        handlers::post_research_pin,
+        handlers::delete_research_run,
         // Projects
         handlers::get_projects,
         handlers::get_project_stats,
@@ -131,6 +138,13 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::HistoryResponse,
         crate::backend::v0::models::HistoryPruneResponse,
         crate::backend::v0::models::GcResponse,
+        crate::backend::v0::models::ResearchFreshness,
+        crate::backend::v0::models::ResearchRunDependency,
+        crate::backend::v0::models::ResearchRunSummary,
+        crate::backend::v0::models::ResearchRunListResponse,
+        crate::backend::v0::models::ResearchRunFile,
+        crate::backend::v0::models::ResearchRunDetail,
+        crate::backend::v0::models::ResearchPinRequest,
         crate::backend::v0::models::VersionResponse,
         crate::backend::v0::models::HealthChecks,
         crate::backend::v0::models::HealthResponse,
@@ -149,6 +163,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
     tags(
         (name = INDEXING, description = "Index lifecycle: (re)index files, cancel in-flight work, requeue failures, soft-delete files, and detect working-tree drift."),
         (name = SEARCH, description = "Hybrid semantic + lexical code retrieval over a project's active chunks."),
+        (name = RESEARCH, description = "Stored research: browse, search and read past reports, pin the ones worth keeping, and drop the rest. The run that produces a report is POST /v0/{project_guid}/research."),
         (name = PROJECTS, description = "Project inventory, per-project stats, per-file listings, and whole-project hard delete."),
         (name = GC, description = "Reclaim soft-deleted chunks/files and prune the status log (globally serialized)."),
         (name = OBSERVABILITY, description = "Liveness, version, and a live runtime/concurrency snapshot for diagnostics."),
@@ -180,7 +195,7 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (16 routes; two carry two methods each).
+        // Every routed path is documented (19 routes; three carry two methods each).
         for p in [
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",
@@ -193,6 +208,9 @@ mod tests {
             "/projects/{project_guid}/cancel",
             "/projects/{project_guid}/retry",
             "/projects/{project_guid}/drift",
+            "/projects/{project_guid}/research",
+            "/projects/{project_guid}/research/{run_id}",
+            "/projects/{project_guid}/research/{run_id}/pin",
             "/gc",
             "/status",
             "/config",
@@ -201,7 +219,7 @@ mod tests {
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 16, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 19, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak

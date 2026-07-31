@@ -1,0 +1,261 @@
+/*
+ * Research History: list left, report right.
+ *
+ * Colours come from VS Code's own theme variables throughout — the panel must read
+ * correctly in every theme a user might have, and a hard-coded value is a bug in
+ * whichever half of light/dark it was not chosen for.
+ */
+
+.runs-page {
+    display: grid;
+    grid-template-columns: minmax(260px, 24rem) 1fr;
+    gap: 0;
+    height: 100vh;
+    box-sizing: border-box;
+}
+
+/* ── The list ─────────────────────────────────────────────────────────────── */
+
+.runs-list {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-right: 1px solid var(--vscode-panel-border);
+}
+
+.runs-head {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0.6rem;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.runs-search {
+    flex: 1;
+    min-width: 0;
+    padding: 0.3rem 0.4rem;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 2px;
+    font: inherit;
+}
+
+.runs-search:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.runs-select {
+    padding: 0.2rem 0.3rem;
+    color: var(--vscode-dropdown-foreground);
+    background: var(--vscode-dropdown-background);
+    border: 1px solid var(--vscode-dropdown-border, transparent);
+    font: inherit;
+}
+
+.runs-filters {
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.runs-spinner {
+    margin-left: auto;
+}
+
+.runs-error {
+    padding: 0.5rem 0.6rem;
+    color: var(--vscode-inputValidation-errorForeground, inherit);
+    background: var(--vscode-inputValidation-errorBackground);
+    border-bottom: 1px solid var(--vscode-inputValidation-errorBorder);
+}
+
+.runs-items {
+    flex: 1;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    list-style: none;
+}
+
+.runs-item {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 0.4rem;
+    align-items: start;
+    padding: 0.45rem 0.6rem;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    cursor: pointer;
+}
+
+.runs-item:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.runs-item.selected-row {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+.runs-item-body {
+    min-width: 0;
+}
+
+.runs-title {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.runs-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.15rem;
+    font-size: 0.9em;
+}
+
+.runs-seq {
+    font-family: var(--vscode-editor-font-family, monospace);
+    opacity: 0.75;
+}
+
+/*
+ * Staleness is the one thing in this list that changes what a report is worth, so it
+ * is a badge rather than another dim meta field.
+ */
+.runs-badge {
+    padding: 0 0.3rem;
+    border-radius: 3px;
+    font-size: 0.85em;
+}
+
+.runs-badge.stale {
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+    background: var(--vscode-inputValidation-warningBackground);
+    border: 1px solid var(--vscode-inputValidation-warningBorder);
+}
+
+.runs-badge.incomplete {
+    color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-panel-border);
+}
+
+/*
+ * Invalidity outranks staleness: a stale report is dubious, an invalid one is
+ * refused as context by the server — so it borrows the error palette.
+ */
+.runs-badge.invalid {
+    color: var(--vscode-inputValidation-errorForeground, inherit);
+    background: var(--vscode-inputValidation-errorBackground);
+    border: 1px solid var(--vscode-inputValidation-errorBorder);
+}
+
+/* The compact "built on N earlier reports" marker; the tooltip carries the list. */
+.runs-badge.deps {
+    color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-panel-border);
+}
+
+.runs-actions {
+    display: flex;
+    gap: 0.1rem;
+}
+
+.runs-foot {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    padding: 0.5rem 0.6rem;
+    border-top: 1px solid var(--vscode-panel-border);
+}
+
+.runs-foot .primary {
+    margin-left: auto;
+}
+
+.runs-empty {
+    padding: 1rem 0.6rem;
+}
+
+/* ── The report ───────────────────────────────────────────────────────────── */
+
+.runs-preview {
+    min-width: 0;
+    padding: 0.8rem 1.2rem;
+    overflow-y: auto;
+}
+
+.runs-placeholder {
+    margin-top: 3rem;
+    text-align: center;
+}
+
+.runs-detail-head {
+    padding-bottom: 0.6rem;
+    margin-bottom: 0.8rem;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.runs-files {
+    margin: 0.4rem 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.runs-file {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.1rem 0;
+}
+
+.runs-file button {
+    padding: 0;
+    color: var(--vscode-textLink-foreground);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+}
+
+.runs-file .state-changed,
+.runs-file .state-removed {
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+}
+
+/* ── The context ancestry in the detail head ─────────────────────────────── */
+
+.runs-deps {
+    margin: 0.4rem 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.runs-dep {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.1rem 0;
+}
+
+.runs-dep .dep-invalid,
+.runs-dep .dep-deleted {
+    color: var(--vscode-inputValidation-errorForeground, inherit);
+}
+
+/* Wide content must scroll inside itself; the page must never scroll sideways. */
+.runs-report pre {
+    overflow-x: auto;
+}
+
+.runs-report table {
+    display: block;
+    overflow-x: auto;
+}
+
+.runs-report img {
+    max-width: 100%;
+}

@@ -164,6 +164,24 @@ const DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS: u64 = 2000;
 /// minutes because the catalog changes only when a human runs `ollama pull`/`rm`,
 /// and one tick is a single GET bounded by [`DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS`].
 const DEFAULT_RESEARCH_MODELS_REFRESH_SECONDS: u64 = 300;
+/// Ninety days, against thirty for the status log: a stored report is the corpus a
+/// later run reads, not an audit trail, and a question worth asking once tends to be
+/// worth re-reading a season later. Pinning is the escape hatch for anything that
+/// should outlive it.
+const DEFAULT_RESEARCH_RETENTION_DAYS: u64 = 90;
+/// Three earlier reports. More is not obviously better: each is resent every turn, and
+/// the failure the feature addresses (not knowing the names) is usually cured by one.
+const DEFAULT_RESEARCH_MAX_CONTEXT_RUNS: usize = 3;
+/// ~6k tokens at four characters each — under a tenth of the smallest window the
+/// server asks Ollama for, so an injected block cannot on its own crowd out the
+/// investigation it is meant to accelerate.
+const DEFAULT_RESEARCH_MAX_CONTEXT_CHARS: usize = 24_000;
+/// A page of runs. Large enough that the common project never pages at all, small
+/// enough that a page is one screen and one cheap query.
+const DEFAULT_RESEARCH_LIST_PAGE_LIMIT: usize = 50;
+/// Below this a context block cannot hold one useful report, so a cap under it is a
+/// misconfiguration rather than a tight setting.
+const MIN_RESEARCH_MAX_CONTEXT_CHARS: usize = 1000;
 /// Thinking characters after which one turn is abandoned: twice
 /// [`MIN_RESEARCH_MAX_TURN_THINKING_CHARS`], which is the smallest value that is still
 /// clear of ordinary thinking.
@@ -436,6 +454,37 @@ pub struct ResearchConfig {
     /// question differ. A request's `seed` overrides this; that is the axis a
     /// measurement harness varies to get repetitions worth averaging.
     pub seed: Option<i64>,
+    /// How long a finished run is kept before `/gc` reaps it.
+    ///
+    /// Stamped onto the row as `expires_at` at insert, **not** compared against this
+    /// value at sweep time — so changing it affects future runs only, and a run's
+    /// deadline is a property of the run rather than of the config it outlived. A
+    /// **pinned** run has `expires_at IS NULL` and is never reaped, which is how a
+    /// report worth keeping outlives any retention an operator picks.
+    ///
+    /// Not the `[workers].status_log_retention_days` case despite the shape: that is
+    /// an audit log nobody reads twice, this is the corpus a later run is given as
+    /// context. Hence the far longer default.
+    pub retention_days: u64,
+    /// How many earlier runs a request may name in `context_run_ids`.
+    ///
+    /// A cap on hearsay. Each injected report is prompt tokens on *every* turn (the
+    /// whole transcript is resent), so this multiplies against `max_tokens` and
+    /// `context_fraction` rather than being paid once. `0` disables the feature and
+    /// makes any `context_run_ids` a 400.
+    pub max_context_runs: usize,
+    /// Total characters of prior reports injected into one run, across all of them.
+    ///
+    /// The last report included is truncated to fit, with a visible marker — a
+    /// silently clipped report would let the model reason from half a conclusion,
+    /// which is the `note`-cap argument. ~4 chars per token, so the default is of
+    /// order 6k tokens: under a tenth of the smallest window the server asks for.
+    pub max_context_chars: usize,
+    /// Ceiling on `limit` for `GET /projects/{guid}/research`.
+    ///
+    /// A request-shape limit, so TOML-only like `[limits]` — tuning it in a container
+    /// means mounting a `config.toml`.
+    pub list_page_limit: usize,
 }
 
 /// The budgets per effort level. A run stops at whichever is reached first, and
@@ -685,6 +734,10 @@ impl Default for ResearchConfig {
             temperature: None,
             top_p: None,
             seed: None,
+            retention_days: DEFAULT_RESEARCH_RETENTION_DAYS,
+            max_context_runs: DEFAULT_RESEARCH_MAX_CONTEXT_RUNS,
+            max_context_chars: DEFAULT_RESEARCH_MAX_CONTEXT_CHARS,
+            list_page_limit: DEFAULT_RESEARCH_LIST_PAGE_LIMIT,
         }
     }
 }
@@ -1307,6 +1360,50 @@ impl Config {
                 ));
             }
         }
+        if self.research.retention_days < 1 {
+            e.push(
+                "[research].retention_days = 0 would let the first GC pass reap every run as \
+                 soon as it is written, so no report could ever be reused as context. Fix: use \
+                 at least 1 (default 90), and pin the runs that must outlive it."
+                    .to_string(),
+            );
+        }
+        if self.research.list_page_limit < 1 {
+            e.push(
+                "[research].list_page_limit = 0 makes every page of the research list empty. \
+                 Fix: use at least 1 (default 50)."
+                    .to_string(),
+            );
+        }
+        // Zero runs is a legal way to switch the feature off; a zero *budget* for a
+        // feature that is on is not, since the first report would be truncated to
+        // nothing and the model would be handed an empty section it cannot use.
+        if self.research.max_context_runs > 0
+            && self.research.max_context_chars < MIN_RESEARCH_MAX_CONTEXT_CHARS
+        {
+            e.push(format!(
+                "[research].max_context_chars = {} is too small to carry one useful report, but \
+                 [research].max_context_runs = {} still offers the feature. Fix: raise it to at \
+                 least {MIN_RESEARCH_MAX_CONTEXT_CHARS} (default {DEFAULT_RESEARCH_MAX_CONTEXT_CHARS}), \
+                 or set max_context_runs = 0 to switch prior-research context off.",
+                self.research.max_context_chars, self.research.max_context_runs
+            ));
+        }
+        // The `search_top_k` trap again, one level up: an injected block is prompt
+        // tokens on EVERY turn, so a cap larger than the window makes every run that
+        // uses the feature die of context exhaustion before its first tool call — and
+        // the edge validator never sees these two keys together. ~4 chars per token.
+        let context_tokens = (self.research.max_context_chars as u64) / 4;
+        if self.research.max_context_runs > 0 && context_tokens >= self.research.max_num_ctx_tokens
+        {
+            e.push(format!(
+                "[research].max_context_chars = {} is about {context_tokens} tokens, which does not \
+                 fit [research].max_num_ctx_tokens = {}; a run given prior context would exhaust its \
+                 window before its first tool call. Fix: lower max_context_chars, or raise \
+                 max_num_ctx_tokens.",
+                self.research.max_context_chars, self.research.max_num_ctx_tokens
+            ));
+        }
         if let Some(t) = self.research.temperature
             && !(0.0..=2.0).contains(&t)
         {
@@ -1536,6 +1633,41 @@ mod tests {
         assert_eq!(cfg.research.temperature, None);
         assert_eq!(cfg.research.top_p, None);
         assert_eq!(cfg.research.seed, None);
+    }
+
+    /// Prior-research context is paid on every turn, so its cap and the context
+    /// window are two halves of one setting — and nothing at the request edge ever
+    /// sees them together. Startup is the only place that can catch the combination.
+    #[test]
+    fn a_context_block_that_cannot_fit_the_window_is_rejected() {
+        let cfg = parse(
+            "[research]\nmax_num_ctx_tokens = 4096\nmax_context_runs = 2\n\
+             max_context_chars = 65536\n",
+        )
+        .expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter().any(|m| m.contains("max_context_chars")),
+            "the error must name the key: {err:?}"
+        );
+
+        // Switching the feature off makes the same numbers harmless.
+        let off = parse(
+            "[research]\nmax_num_ctx_tokens = 4096\nmax_context_runs = 0\n\
+             max_context_chars = 65536\n",
+        )
+        .expect("parses");
+        off.validate()
+            .expect("an unused context cap must not fail startup");
+    }
+
+    /// Zero retention is not a tight setting, it is a corpus that cannot exist: the
+    /// next GC pass reaps every run before anything can reference it.
+    #[test]
+    fn zero_research_retention_is_rejected() {
+        let cfg = parse("[research]\nretention_days = 0\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(err.iter().any(|m| m.contains("retention_days")), "{err:?}");
     }
 
     /// The research loop builds its `SearchRequest` directly and so never passes

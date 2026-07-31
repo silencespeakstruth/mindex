@@ -38,6 +38,7 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
         3,
         include_str!("db/migrations/v1.1.0_toml_yaml_languages.sql"),
     ),
+    (4, include_str!("db/migrations/v1.2.0_research_context.sql")),
 ];
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
@@ -380,6 +381,7 @@ async fn main() -> Result<(), BoxError> {
                 refresh_interval_seconds: cfg.metrics.refresh_interval_seconds,
                 probe_dependencies: cfg.metrics.probe_dependencies,
                 max_retries: cfg.workers.max_retries,
+                model_id: cfg.model.name.clone(),
             },
             cfg.metrics.probe_dependencies.then(|| {
                 worker::metrics::ProbeTargets {
@@ -458,6 +460,10 @@ async fn main() -> Result<(), BoxError> {
                 research_max_request_steps: cfg.research.max_request_steps,
                 research_report_timeout_ms: cfg.research.report_timeout_ms,
                 research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
+                research_retention_days: cfg.research.retention_days,
+                research_max_context_runs: cfg.research.max_context_runs,
+                research_max_context_chars: cfg.research.max_context_chars,
+                research_list_page_limit: cfg.research.list_page_limit,
                 research_sampling: models::ollama::Sampling {
                     temperature: cfg.research.temperature,
                     top_p: cfg.research.top_p,
@@ -566,6 +572,9 @@ mod tests {
             "project_file_status_log",
             "project_file_symbols",
             "research_runs",
+            "research_run_files",
+            "project_commits",
+            "project_commit_paths",
         ] {
             assert!(
                 object_exists(&p, "table", table).await,
@@ -581,6 +590,12 @@ mod tests {
             ("research_runs", "changed_files"),
             ("research_runs", "notes_written"),
             ("research_runs", "scope_json"),
+            // Migration 4 rebuilt this table; a rebuild that lost a column would be
+            // silent until the first list request 500s with `no such column`.
+            ("research_runs", "seq"),
+            ("research_runs", "expires_at"),
+            ("research_runs", "context_run_ids_json"),
+            ("research_runs", "title"),
         ] {
             assert!(
                 column_exists(&p, table, column).await,
@@ -654,6 +669,89 @@ mod tests {
                     panic!("migration {v} is not idempotent (re-run failed): {e}")
                 });
             }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Migration 4 rebuilds `research_runs` while `research_run_files` already
+    /// references it, which the test above cannot exercise: it starts from an empty
+    /// database, where a rebuild that dropped every child row would still pass.
+    ///
+    /// The rebuild is safe only because migrations run with foreign keys suspended
+    /// (`SQLite3Pool::migration_transaction`) — which suspends the child's
+    /// `ON DELETE CASCADE` too, so the `DROP TABLE` does not take the baselines with
+    /// it, and `id` is preserved by the copy so they still point at their run. That
+    /// is a load-bearing accident of the FK suspension, and this is the test that
+    /// notices if it stops being true.
+    #[tokio::test]
+    async fn rebuilding_research_runs_keeps_the_baselines_that_reference_it() {
+        let p = pool();
+        // `migration_transaction`, not `transaction`: the FK suspension is the whole
+        // mechanism under test. Under an ordinary transaction the `DROP TABLE` fires
+        // the child's `ON DELETE CASCADE` and every baseline is silently erased —
+        // which is precisely the failure this pins, and why a migration must never be
+        // applied through the ordinary path.
+        p.migration_transaction(CancellationToken::new(), |tx| {
+            for (_, sql) in MIGRATIONS {
+                tx.execute_batch(sql)?;
+            }
+            tx.execute_batch(
+                "INSERT INTO research_runs (
+                     id, project_guid, seq, question, model, prompt_version, effort,
+                     granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
+                     done_reason, steps, turns, elapsed_ms,
+                     prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx,
+                     citations_total, citations_verified, citations_path_only,
+                     citations_unverified, cited_paths_json, unverified_paths_json,
+                     changed_files, removed_files, stale_citations, stale_paths_json,
+                     notes_written, notes_rejected, plan_revisions, grep_calls, grep_hits,
+                     out_of_scope_refusals, out_of_scope_rows, scoped,
+                     forced_synthesis, report_window_ms, report_elapsed_ms, report
+                 ) VALUES (
+                     'run-1', 'p1', 1, 'q', 'm', '1.2', 'medium',
+                     1, 1, 1, 1,
+                     'finalized', 1, 1, 1,
+                     1, 1, 1, 1,
+                     0, 0, 0,
+                     0, '[]', '[]',
+                     0, 0, 0, '[]',
+                     0, 0, 0, 0, 0,
+                     0, 0, 0,
+                     0, 0, 0, 'report'
+                 );
+                 INSERT INTO research_run_files (run_id, path, sha256) VALUES
+                     ('run-1', 'src/a.rs', '\
+                      0000000000000000000000000000000000000000000000000000000000000001');",
+            )?;
+
+            // The whole batch again, as a cold re-run would apply it.
+            for (v, sql) in MIGRATIONS {
+                tx.execute_batch(sql)
+                    .unwrap_or_else(|e| panic!("migration {v} failed on a populated DB: {e}"));
+            }
+
+            let runs: i64 = tx.query_row("SELECT COUNT(*) FROM research_runs", [], |r| r.get(0))?;
+            let files: i64 =
+                tx.query_row("SELECT COUNT(*) FROM research_run_files", [], |r| r.get(0))?;
+            assert_eq!(runs, 1, "the rebuild lost the run");
+            assert_eq!(files, 1, "the rebuild orphaned or dropped the baselines");
+
+            // And they still join: `id` survives the copy, so the child still resolves.
+            let joined: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM research_run_files f
+                   JOIN research_runs r ON r.id = f.run_id",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(joined, 1, "baselines no longer point at their run");
+
+            let violations: i64 =
+                tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(violations, 0, "the rebuild left dangling references");
             Ok(())
         })
         .await

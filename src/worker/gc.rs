@@ -37,11 +37,15 @@ impl Drop for GcGuard {
 }
 
 /// One full GC pass: hard-delete confirmed-removed chunks, then drop now-empty
-/// `deleted` file rows, then prune the old status log. The step order is the
-/// invariant (chunks before files, since the chunk→file FK is RESTRICT), so it
-/// lives in one place shared by the worker and `POST /gc`. Returns
-/// `(chunks_removed, files_removed, status_log_pruned)`. Callers serialize this
-/// behind [`GcGuard`].
+/// `deleted` file rows, prune the old status log, then reap expired research runs.
+/// The step order is the invariant (chunks before files, since the chunk→file FK is
+/// RESTRICT), so it lives in one place shared by the worker and `POST /gc`. Returns
+/// `(chunks_removed, files_removed, status_log_pruned, research_runs_pruned)`.
+/// Callers serialize this behind [`GcGuard`].
+///
+/// The research step is last only because it is newest — it shares no foreign key
+/// with the ordering above. It lives *inside* `collect` rather than in a worker of
+/// its own so it inherits `GcGuard` serialization and the `POST /gc` 409 for free.
 ///
 /// `trigger` is `"worker"` or `"manual"` — recorded here rather than at the two
 /// call sites so a pass can never be counted twice or not at all. Qdrant delete
@@ -54,19 +58,21 @@ pub(crate) async fn collect(
     metrics: &Metrics,
     trigger: &'static str,
     token: &CancellationToken,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     let started = std::time::Instant::now();
     metrics.gc.running.set(1);
 
     let chunks = sweep(db_pool, store, token).await;
     let files = prune_deleted_files(db_pool, token).await;
     let log = prune_status_log(db_pool, status_log_retention_days, token).await;
+    let research = prune_expired_research(db_pool, token).await;
 
     let g = &metrics.gc;
     g.duration.observe(started.elapsed().as_secs_f64());
     g.chunks_removed.inc_by(chunks as u64);
     g.files_pruned.inc_by(files as u64);
     g.status_log_pruned.inc_by(log as u64);
+    g.research_pruned.inc_by(research as u64);
     // A pass that ran to completion under a cancelled token did partial work; say
     // so rather than calling it a clean sweep.
     g.runs
@@ -81,7 +87,7 @@ pub(crate) async fn collect(
         .inc();
     g.running.set(0);
 
-    (chunks, files, log)
+    (chunks, files, log, research)
 }
 
 pub async fn run(
@@ -114,7 +120,7 @@ pub async fn run(
         };
 
         info!("GC worker: starting sweep.");
-        let (chunks, files, _log) = collect(
+        let (chunks, files, _log, research) = collect(
             &db_pool,
             &*store,
             status_log_retention_days,
@@ -126,6 +132,7 @@ pub async fn run(
         info!(
             chunks_removed = chunks,
             files_removed = files,
+            research_runs_pruned = research,
             "GC worker: sweep complete."
         );
     }
@@ -197,6 +204,48 @@ pub(crate) async fn prune_status_log(
         Err(SQLite3PoolError::Cancelled) => 0,
         Err(e) => {
             error!(error = ?e, "GC worker: failed to prune the status log.");
+            0
+        }
+    }
+}
+
+/// Deletes stored research runs whose `expires_at` has passed, and their baseline
+/// rows with them (`research_run_files` cascades).
+///
+/// **Takes no retention argument**, unlike [`prune_status_log`] beside it, and the
+/// difference is the point: a run's deadline is stamped onto its row at insert from
+/// `[research].retention_days`. So changing that setting moves future runs only, and
+/// a run can opt out of it entirely — `expires_at IS NULL` means **pinned**, and the
+/// predicate below can never reach one. Comparing against the *current* config here
+/// would make pinning impossible to express and would silently re-date every stored
+/// run the day an operator edited the config.
+///
+/// The partial index `idx_research_runs_expiry` covers exactly this predicate, so
+/// pinned runs cost the sweep nothing at all.
+pub(crate) async fn prune_expired_research(
+    db_pool: &SQLite3Pool,
+    token: &CancellationToken,
+) -> usize {
+    let pruned = db_pool
+        .transaction(token.clone(), move |tx| {
+            let n = tx.execute(
+                "DELETE FROM research_runs
+                  WHERE expires_at IS NOT NULL AND expires_at < unixepoch()",
+                [],
+            )?;
+            Ok(n)
+        })
+        .await;
+
+    match pruned {
+        Ok(0) => 0,
+        Ok(rows) => {
+            info!(rows, "GC worker: reaped expired research runs.");
+            rows
+        }
+        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(e) => {
+            error!(error = ?e, "GC worker: failed to reap expired research runs.");
             0
         }
     }
@@ -519,6 +568,113 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// Seeds one run with the given expiry and one baseline row for it.
+    async fn seed_run(pool: &SQLite3Pool, id: &str, expires_at: Option<i64>) {
+        let id = id.to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO research_runs (
+                     id, project_guid, seq, expires_at,
+                     question, model, prompt_version, effort,
+                     granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
+                     done_reason, steps, turns, elapsed_ms,
+                     prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx,
+                     citations_total, citations_verified, citations_path_only,
+                     citations_unverified, cited_paths_json, unverified_paths_json,
+                     changed_files, removed_files, stale_citations, stale_paths_json,
+                     notes_written, notes_rejected, plan_revisions, grep_calls, grep_hits,
+                     out_of_scope_refusals, out_of_scope_rows, scoped,
+                     forced_synthesis, report_window_ms, report_elapsed_ms, report
+                 ) VALUES (
+                     ?1, 'p', (SELECT COALESCE(MAX(seq), 0) + 1 FROM research_runs), ?2,
+                     'q', 'm', '1.2', 'medium',
+                     1, 1, 1, 1,
+                     'finalized', 1, 1, 1,
+                     1, 1, 1, 1,
+                     0, 0, 0,
+                     0, '[]', '[]',
+                     0, 0, 0, '[]',
+                     0, 0, 0, 0, 0,
+                     0, 0, 0,
+                     0, 0, 0, 'r'
+                 )",
+                rusqlite::params![id, expires_at],
+            )?;
+            tx.execute(
+                "INSERT INTO research_run_files (run_id, path, sha256) VALUES (?1, 'a.rs', ?2)",
+                rusqlite::params![id, "0".repeat(64)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn count(pool: &SQLite3Pool, sql: &'static str) -> i64 {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            Ok(tx.query_row(sql, [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The sweep must reap what has expired, leave what has not, and be structurally
+    /// incapable of touching a **pinned** run — `expires_at IS NULL` is the whole
+    /// mechanism by which a report worth keeping outlives the retention window, and a
+    /// NULL that compared as "long ago" would silently delete exactly the runs
+    /// somebody cared enough about to pin.
+    #[tokio::test]
+    async fn expired_research_is_reaped_but_pinned_research_is_never_touched() {
+        let pool = migrated_pool().await;
+        seed_run(&pool, "expired", Some(1)).await; // 1970 — long past
+        seed_run(&pool, "pinned", None).await;
+        seed_run(&pool, "future", Some(4_000_000_000)).await; // 2096
+
+        let pruned = prune_expired_research(&pool, &CancellationToken::new()).await;
+        assert_eq!(pruned, 1, "exactly the expired run should go");
+
+        let ids: i64 = count(
+            &pool,
+            "SELECT COUNT(*) FROM research_runs WHERE id IN ('pinned', 'future')",
+        )
+        .await;
+        assert_eq!(ids, 2, "a pinned or future run must survive the sweep");
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM research_runs WHERE id = 'expired'"
+            )
+            .await,
+            0
+        );
+        // The baselines go with the run: research_run_files cascades, so a reaped run
+        // cannot leave rows behind that no longer join to anything.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM research_run_files WHERE run_id = 'expired'"
+            )
+            .await,
+            0,
+            "the expired run's baselines should have cascaded away"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM research_run_files").await,
+            2,
+            "the surviving runs must keep theirs"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_expired_research_on_a_cancelled_token_does_nothing() {
+        let pool = migrated_pool().await;
+        seed_run(&pool, "expired", Some(1)).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        assert_eq!(prune_expired_research(&pool, &token).await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM research_runs").await, 1);
     }
 
     #[tokio::test]

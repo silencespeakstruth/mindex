@@ -203,6 +203,12 @@ export interface ResearchRequest {
     exclude?: SearchFilter;
     /** Pins sampling for a repeatable run; omit for the server's configured default. */
     seed?: number;
+    /**
+     * Earlier runs of this project whose reports are handed to the model as
+     * background before it plans. Not evidence: the model is told it may not cite
+     * them, and anything copied from one comes back `unverified`.
+     */
+    context_run_ids?: string[];
 }
 export interface ResearchStep {
     n: number;
@@ -267,7 +273,101 @@ export interface ResearchDone extends Partial<ResearchProgress> {
      * omits it.
      */
     prompt_version?: string;
+    /**
+     * The stored run this became — how to fetch the report later, and what to pass
+     * as `context_run_ids` on a follow-up question.
+     *
+     * `null` when the server's best-effort journal write failed, and absent on a
+     * server older than the field. Both mean the same thing to a client: the run
+     * cannot be referenced, so do not offer to reuse it.
+     */
+    run_id?: string | null;
+    /** Short per-project ordinal for display. Null/absent alongside `run_id`. */
+    seq?: number | null;
 }
+/** One stored research run, as the list returns it — without its report. */
+export interface ResearchRunSummary {
+    /** Stable identity: what every per-run call keys on, and what goes in a URL. */
+    id: string;
+    /**
+     * Per-project ordinal — short enough to show, and the keyset cursor. **Not**
+     * identity: it is renumbered if a project's runs are ever wiped entirely.
+     */
+    seq: number;
+    /**
+     * The report's own stored heading when the run journalled one, else derived
+     * server-side from the question. Never null.
+     */
+    title: string;
+    question: string;
+    created_at: number;
+    /** When GC may reap it; `null` = pinned, never reaped. */
+    expires_at: number | null;
+    pinned: boolean;
+    model: string;
+    effort: string;
+    done_reason: string;
+    citations_total: number;
+    citations_verified: number;
+    citations_unverified: number;
+    steps: number;
+    elapsed_ms: number;
+    /** Files the run read and recorded a baseline for. */
+    files_total: number;
+    /** How many of those have changed or left the index since. */
+    files_moved: number;
+    /** `files_moved > 0` — the report describes code that has since moved. */
+    stale: boolean;
+    /**
+     * Derived validity: the run itself is fresh AND every run in its transitive
+     * context still exists and is itself valid. The server refuses an invalid run
+     * as context, so an unchecked-able row should not offer the checkbox.
+     */
+    valid: boolean;
+    /** "stale" | "context_deleted" | "context_invalid"; null when valid. */
+    invalid_reason: string | null;
+    /** Flat transitive context ancestry — every report this one leaned on. */
+    context: ResearchRunDependency[];
+}
+
+/** One run in another run's context chain (direct or transitive). */
+export interface ResearchRunDependency {
+    /** The id as recorded at launch — present even when the run is gone. */
+    id: string;
+    /** `null` when the run no longer exists. */
+    seq: number | null;
+    /** `null` when the run no longer exists — render a "deleted report" marker. */
+    title: string | null;
+    state: "valid" | "invalid" | "deleted";
+}
+
+export interface ResearchRunListResponse {
+    runs: ResearchRunSummary[];
+    /**
+     * Pass as `beforeSeq` for the next page. `null` when the page came back short,
+     * which is how the client knows to hide "Load more" without another request.
+     */
+    next_before_seq: number | null;
+}
+
+/** What became of one file a run read. */
+export interface ResearchRunFile {
+    path: string;
+    sha256: string;
+    current_sha256: string | null;
+    /** "fresh" | "changed" | "removed" — an edit and a deletion read differently. */
+    state: string;
+}
+
+export interface ResearchRunDetail extends ResearchRunSummary {
+    /** The report, as Markdown. */
+    report: string;
+    prompt_version: string;
+    context_run_ids: string[];
+    scope: string | null;
+    files: ResearchRunFile[];
+}
+
 /**
  * The server's provenance check on the report's `path:start-end` references,
  * emitted once between the report and `done`. Not a spell-check: it says how much
@@ -509,6 +609,93 @@ export class MindexApi {
         return this.request("GET", `/projects/${guid}/files${qs}`) as Promise<{
             files: FileEntry[];
         }>;
+    }
+
+    /**
+     * One keyset page of stored research runs, newest first, without their reports.
+     *
+     * **Keyset, not offset**: pass the previous page's `next_before_seq` as
+     * `beforeSeq`. A run written or reaped between two pages then cannot make the
+     * reader skip or repeat a row, which is exactly what `OFFSET` would do over a
+     * table that GC prunes and every run appends to.
+     *
+     * Takes a `signal` — unlike `listFiles` — because this is typed into: every
+     * keystroke supersedes the request before it. Note `request` **rejects** on
+     * abort, so the caller must swallow `AbortError` itself.
+     */
+    listResearchRuns(
+        guid: string,
+        query?: {
+            q?: string;
+            beforeSeq?: number;
+            limit?: number;
+            freshness?: "all" | "fresh" | "stale";
+            pinned?: boolean;
+            /** Restrict to fully-valid (`true`) or invalid (`false`) runs. */
+            valid?: boolean;
+        },
+        signal?: AbortSignal
+    ): Promise<ResearchRunListResponse> {
+        const params = new URLSearchParams();
+        if (query?.q) {
+            params.set("q", query.q);
+        }
+        if (query?.beforeSeq !== undefined) {
+            params.set("before_seq", String(query.beforeSeq));
+        }
+        if (query?.limit !== undefined) {
+            params.set("limit", String(query.limit));
+        }
+        if (query?.freshness && query.freshness !== "all") {
+            params.set("freshness", query.freshness);
+        }
+        if (query?.pinned !== undefined) {
+            params.set("pinned", String(query.pinned));
+        }
+        if (query?.valid !== undefined) {
+            params.set("valid", String(query.valid));
+        }
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
+        return this.request(
+            "GET",
+            `/projects/${guid}/research${qs}`,
+            undefined,
+            signal
+        ) as Promise<ResearchRunListResponse>;
+    }
+
+    /** One stored run in full, including its Markdown report and per-file freshness. */
+    getResearchRun(
+        guid: string,
+        runId: string,
+        signal?: AbortSignal
+    ): Promise<ResearchRunDetail> {
+        return this.request(
+            "GET",
+            `/projects/${guid}/research/${encodeURIComponent(runId)}`,
+            undefined,
+            signal
+        ) as Promise<ResearchRunDetail>;
+    }
+
+    /**
+     * Exempt a run from the retention sweep, or return it to it. Returns the updated
+     * summary, so the caller renders the server's answer rather than its own guess.
+     */
+    pinResearchRun(guid: string, runId: string, pinned: boolean): Promise<ResearchRunSummary> {
+        return this.request(
+            "POST",
+            `/projects/${guid}/research/${encodeURIComponent(runId)}/pin`,
+            { pinned }
+        ) as Promise<ResearchRunSummary>;
+    }
+
+    /** Drop one stored run. Idempotent — deleting one that is already gone is a 204. */
+    async deleteResearchRun(guid: string, runId: string): Promise<void> {
+        await this.request(
+            "DELETE",
+            `/projects/${guid}/research/${encodeURIComponent(runId)}`
+        );
     }
 
     /**

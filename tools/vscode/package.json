@@ -181,6 +181,12 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "mindex.openResearchHistory",
+        "title": "Show Research History",
+        "category": "MINDex",
+        "icon": "$(history)"
+      },
+      {
         "command": "mindex.openSettings",
         "title": "Open Settings",
         "category": "MINDex",
@@ -195,9 +201,14 @@
           "group": "navigation@1"
         },
         {
-          "command": "mindex.openSettings",
+          "command": "mindex.openResearchHistory",
           "when": "view == mindexAsk",
           "group": "navigation@2"
+        },
+        {
+          "command": "mindex.openSettings",
+          "when": "view == mindexAsk",
+          "group": "navigation@3"
         },
         {
           "command": "mindex.createProjectFile",
