@@ -13,6 +13,30 @@ changes of its own is still released, so "which version am I running" has one an
 
 ### Added
 
+- **`POST /v0/{guid}/index?stream=yes` streams indexing progress as SSE.** The
+  default (`stream=no` or absent) keeps the one-shot JSON summary byte-for-byte, and
+  both modes run the identical pipeline — the query parameter only decides how the
+  result travels. The stream reports `started`, per-file `prepared`/`skipped`
+  (`unchanged`/`in_flight`/`cancelled`), one `embedded` per GPU embed batch with
+  cumulative `chunks_done`/`chunks_total` and the server's own `elapsed_ms`, per-file
+  `indexed`, then exactly one terminal `done` (whose `files` is the JSON mode's
+  response body) or `error` (the stable `ApiError` code, since the HTTP status is
+  already 200 by then). Closing the connection cancels the request and recovers the
+  batch exactly as a dropped JSON request would. A mistyped `?stream=` value or key
+  is a 400, never a silent fall-through to the mode the caller did not ask for.
+- **`mindex-index` progress is now a measurement, not an estimate.** The bar consumes
+  the SSE events: the file counter advances as the server settles each file instead
+  of once per 100-file batch, the status line names the file being worked on, and
+  chunks-per-second is computed over a 20-second sliding window fed by the per-batch
+  `embedded` events — the old figure was a cumulative average over a counter that
+  jumped once per batch response. Against an older server the client detects the
+  plain-JSON answer and degrades to exactly the previous behaviour.
+- **VS Code — live reindex progress.** The reindex notification and the Drift view's
+  progress row now show `settled/total files · N chunks/s · <path>` from the same
+  stream, updating per file and per embed batch (throttled) instead of once per
+  batch. The Drift row's tooltip no longer has to disclaim that a posted batch may
+  still be on the GPU — a file now counts only once it is settled.
+
 - **TOML and YAML are indexed** (`tree-sitter-toml-ng`, `tree-sitter-yaml`), sliced by
   the ordinary AST walk like JSON. Neither grammar ships a tags query, so they
   contribute no symbols. `Cargo.toml`, `config.example.toml`, `docker-compose*.yml`

@@ -109,6 +109,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::Code,
         crate::backend::v0::models::IndexRequest,
         crate::backend::v0::models::IndexResponse,
+        crate::backend::v0::models::StreamChoice,
         crate::backend::v0::models::SearchFilter,
         crate::backend::v0::models::SearchRequest,
         crate::backend::v0::models::SearchResult,

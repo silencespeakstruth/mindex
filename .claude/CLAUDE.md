@@ -1472,6 +1472,31 @@ re-embeds later. `tree_sitter::Parser` is `Send` — slicer built inside the
 256 MiB) via `DefaultBodyLimit` (axum's 2 MB default is far too small); over-cap =
 problem+json 413 (`request.body_too_large`), not axum's plain-text.
 
+**`?stream=yes` reports the same pipeline as SSE**, and the pipeline itself is one
+function either way: `run_index_job` is shared verbatim, the query only picks who
+builds the terminal (`Json` body vs a `done`/`error` event), so the two modes
+cannot drift. The cancellation shapes differ on purpose and mirror research's: the
+JSON mode keeps its `CancellationGuard` (handler-future drop = cancel), the SSE
+mode spawns the job detached and the *stream's* Drop cancels the token — a guard in
+the handler would fire the instant the response is constructed. Recovery therefore
+runs inside the job, so a disconnected streaming client still lands its batch in
+`cancelled`. The event vocabulary (`started`/`prepared`/`skipped`/`embedded`/
+`indexed`/`done`/`error`, `IndexEvent` in `models.rs`) is a wire contract like the
+research one, in four places that move together: `post_index`'s doc comment, its
+OpenAPI 200 description, the `mindex-index` reader (`tools/indexer/src/client.rs`)
+and the VS Code client (`api.ts`); both consumers drop unknown events silently, and
+the shapes are pinned by `index_event_names_are_stable` +
+`index_event_data_names_its_fields_on_the_wire`. `embedded` (one per embed batch,
+via `embed_and_upsert`'s optional progress callback — its one deliberate
+side-channel) carries cumulative `chunks_done`/`chunks_total` plus the server's own
+`elapsed_ms`, which is what makes a client's chunks-per-second a measurement
+instead of the old batch-granular estimate; both clients compute it over a sliding
+window and fall back to plain JSON transparently when an older server ignores the
+query (`StreamOutcome.streamed` / content-type sniff). `done.files` is
+byte-for-byte the JSON response body, so both modes tally identically. A typo'd
+`?stream=` value or key is a 400 (`IndexQuery` is `deny_unknown_fields`), never a
+silent fall-through to the mode the caller did not ask for.
+
 ## Mockable interfaces
 
 Three traits; production type is the sole real impl, fakes live in `#[cfg(test)]`:

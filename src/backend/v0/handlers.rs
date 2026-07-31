@@ -33,6 +33,8 @@ use crate::backend::v0::models::GcResponse;
 use crate::backend::v0::models::HealthChecks;
 use crate::backend::v0::models::HealthResponse;
 use crate::backend::v0::models::HistoryResponse;
+use crate::backend::v0::models::IndexEvent;
+use crate::backend::v0::models::IndexQuery;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::LanguageStats;
 use crate::backend::v0::models::ListFilesResponse;
@@ -58,7 +60,9 @@ use crate::backend::v0::models::SearchFilter;
 use crate::backend::v0::models::SearchRequest;
 use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
+use crate::backend::v0::models::SkipReason;
 use crate::backend::v0::models::StatusResponse;
+use crate::backend::v0::models::StreamChoice;
 use crate::backend::v0::models::SymbolInfo;
 use crate::backend::v0::models::SymbolRoleFilter;
 use crate::backend::v0::models::SymbolsRequest;
@@ -77,6 +81,7 @@ use crate::db::qdrant::VectorStore;
 use crate::db::qdrant::collection_for;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::db::sqlite3::SQLite3PoolError;
+use crate::embed::EmbedProgress;
 use crate::embed::EmbedUpsertError;
 use crate::embed::embed_and_upsert;
 use crate::models::bge_m3::BGEm3EmbedRequest;
@@ -850,8 +855,13 @@ impl FileIndexer<'_> {
     }
 
     /// Phase 2: embed + upsert every chunk across all prepared files in one batched
-    /// pass (`embed_batch` chunks per `/encode`).
-    async fn embed_all(&self, chunks: &[(UUIDv4, String)]) -> Result<(), EmbedUpsertError> {
+    /// pass (`embed_batch` chunks per `/encode`). `progress` is invoked per completed
+    /// batch — `None` outside a streaming (`?stream=yes`) request.
+    async fn embed_all(
+        &self,
+        chunks: &[(UUIDv4, String)],
+        progress: Option<&(dyn Fn(EmbedProgress) + Send + Sync)>,
+    ) -> Result<(), EmbedUpsertError> {
         embed_and_upsert(
             self.embedder,
             self.store,
@@ -859,6 +869,7 @@ impl FileIndexer<'_> {
             chunks,
             self.token,
             self.embed_tuning,
+            progress,
         )
         .await
     }
@@ -1157,6 +1168,38 @@ impl FileIndexer<'_> {
 ///   (its chunks are stale too, and symbols must parallel the chunk set); the response
 ///   count is the number of symbol rows written instead of chunks.
 ///
+/// **Streaming** (`?stream=yes`): the same pipeline reported live as SSE
+/// (`text/event-stream`, named events with JSON `data`), for clients that want a
+/// real progress display instead of one summary at the end. The wire shape lives
+/// in four places that must move together: this doc comment, the OpenAPI 200
+/// description, the `mindex-index` reader and the VS Code extension. Events:
+///
+/// - `started` `{files, symbols_only}` — the request was accepted; `files` is
+///   what was posted (unchanged files are discovered per file, later), and
+///   `symbols_only` says what unit every later `count` is in;
+/// - `prepared` `{path, language, chunks, symbols}` — one file hash-checked,
+///   sliced and its chunks inserted, awaiting the shared embed pass;
+/// - `skipped` `{path, language, reason}` — a posted file that produced no work,
+///   `reason` one of `unchanged` / `in_flight` / `cancelled` (a concurrent
+///   `POST /cancel`); it is absent from `done.files` exactly as it would be
+///   absent from the JSON response;
+/// - `embedded` `{batch_chunks, chunks_done, chunks_total, elapsed_ms}` — one
+///   embed batch encoded **and** upserted. `chunks_done` is cumulative and
+///   `elapsed_ms` is the server's own clock since request start — the pair a
+///   client needs for an honest chunks-per-second;
+/// - `indexed` `{path, language, count}` — one file confirmed `indexed`;
+///   `count` is chunks (or symbol rows under `symbols_only`);
+/// - `done` `{files, files_indexed, chunks, elapsed_ms}` — terminal; `files` is
+///   byte-for-byte the JSON mode's response body, so both modes tally
+///   identically;
+/// - `error` `{code, detail}` — terminal failure after the stream started (the
+///   HTTP status is already 200); `code` is the stable `ApiError` code the JSON
+///   mode would have carried in problem+json.
+///
+/// SSE comments are sent as keep-alive every 15 s. **Closing the connection
+/// cancels the request** — the job notices at its next cancellation point and
+/// recovers the batch exactly as a dropped JSON request would (499 semantics).
+///
 /// **Concurrency:** safe. Each `(project, model, path)` is serialized by an in-process
 /// claim — a second in-flight request for the *same* file is **skipped** (it is absent
 /// from the response, like an unchanged file); different files proceed in parallel.
@@ -1166,10 +1209,21 @@ impl FileIndexer<'_> {
     post,
     path = "/v0/{project_guid}/index",
     tag = "Indexing",
-    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        IndexQuery,
+    ),
     request_body = IndexRequest,
     responses(
-        (status = 200, description = "Per-file chunk counts for the files actually (re)indexed.", body = IndexResponse),
+        (status = 200, description = "Without `?stream=yes`: per-file chunk counts for the files \
+actually (re)indexed (JSON). With `?stream=yes`: an SSE stream of indexing events — \
+`started` `{files, symbols_only}`, `prepared` `{path, language, chunks, symbols}`, `skipped` \
+`{path, language, reason: unchanged|in_flight|cancelled}`, `embedded` `{batch_chunks, \
+chunks_done, chunks_total, elapsed_ms}` (one per embed batch, cumulative — the basis for a \
+live chunks-per-second), `indexed` `{path, language, count}`, then exactly one terminal \
+event: `done` `{files, files_indexed, chunks, elapsed_ms}` (where `files` is the JSON mode's \
+response body) or `error` `{code, detail}` (a failure after the stream started; `code` is \
+the stable `ApiError` code). Closing the connection cancels the request.", body = IndexResponse),
         (status = 400, description = "Validation failed (bad path, oversized file, too many files).", body = ProblemDetails),
         (status = 413, description = "The request body exceeded [server].max_body_mib.", body = ProblemDetails),
         (status = 499, description = "Client closed the connection; indexing was cancelled (nginx convention).", body = ProblemDetails),
@@ -1180,15 +1234,94 @@ impl FileIndexer<'_> {
 #[debug_handler]
 pub async fn post_index(
     ApiPath(project_guid): ApiPath<UUIDv4>,
+    ApiQuery(q): ApiQuery<IndexQuery>,
     State(s): State<RouterState>,
     ApiJson(payload): ApiJson<IndexRequest>,
-) -> Result<Json<IndexResponse>, ApiError> {
+) -> Result<Response, ApiError> {
+    validate::validate_index_request(&payload, s.max_files_per_request, s.max_code_bytes)?;
+
+    if q.stream != Some(StreamChoice::Yes) {
+        // JSON mode — the original behaviour: the guard's Drop (fired when a
+        // disconnected client's handler future is dropped) cancels the work, and
+        // every failure is an HTTP status.
+        let guard = http3::CancellationGuard(CancellationToken::new());
+        let started = std::time::Instant::now();
+        let res = run_index_job(s, project_guid, payload, None, guard.0.clone(), started).await?;
+        return Ok(Json(res).into_response());
+    }
+
+    // SSE mode. The handler future returns as soon as the stream is constructed,
+    // so a CancellationGuard here would cancel the job at that very instant.
+    // Instead the job is spawned detached (the research shape) and the *stream's*
+    // Drop cancels the token: a client disconnect makes axum drop the SSE body,
+    // which cancels the job, whose own recovery paths then mark the batch
+    // `cancelled` — the same end state a dropped JSON request reaches.
+    let token = CancellationToken::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let job_token = token.clone();
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        let terminal = match run_index_job(
+            s,
+            project_guid,
+            payload,
+            Some(tx.clone()),
+            job_token,
+            started,
+        )
+        .await
+        {
+            Ok(res) => {
+                let files_indexed = res.files.values().map(HashMap::len).sum();
+                let chunks = res.files.values().flat_map(HashMap::values).sum();
+                IndexEvent::Done {
+                    response: res,
+                    files_indexed,
+                    chunks,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+            Err(e) => IndexEvent::Error {
+                code: e.code().to_string(),
+                detail: e.detail(),
+            },
+        };
+        // A send failure means the client is gone; the job has already recovered.
+        let _ = tx.send(terminal);
+    });
+
+    Ok(axum::response::sse::Sse::new(SseEventStream { rx, token })
+        .keep_alive(
+            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+        )
+        .into_response())
+}
+
+/// The whole indexing pipeline for one `/index` request, shared verbatim by both
+/// response modes. `events` present = streaming: progress events are sent as the
+/// work happens (a send to a disconnected receiver is silently dropped — the job
+/// still runs to its next cancellation point). The terminal `done`/`error` event
+/// is the *caller's* job, built from this function's return value.
+async fn run_index_job(
+    s: RouterState,
+    project_guid: UUIDv4,
+    payload: IndexRequest,
+    events: Option<tokio::sync::mpsc::UnboundedSender<IndexEvent>>,
+    token: CancellationToken,
+    started: std::time::Instant,
+) -> Result<IndexResponse, ApiError> {
     let span = info_span!("indexing", project_guid = %project_guid.0);
 
     async move {
-        validate::validate_index_request(&payload, s.max_files_per_request, s.max_code_bytes)?;
-
-        let guard = http3::CancellationGuard(CancellationToken::new());
+        let emit = |e: IndexEvent| {
+            if let Some(tx) = &events {
+                let _ = tx.send(e);
+            }
+        };
+        emit(IndexEvent::Started {
+            files: payload.files.values().map(HashMap::len).sum(),
+            symbols_only: payload.symbols_only,
+        });
 
         let db_pool = s.db_pool;
         let qdrant = s.qdrant;
@@ -1202,7 +1335,7 @@ pub async fn post_index(
         {
             let model_id = model_id.clone();
             db_pool
-                .transaction(guard.0.child_token(), move |tx| {
+                .transaction(token.child_token(), move |tx| {
                     // Idempotent and concurrency-safe: two parallel first-time /index
                     // calls for the same new project both reach here. A SELECT-then-
                     // INSERT would let both pass the check and the second trip the
@@ -1221,7 +1354,7 @@ pub async fn post_index(
                     }
                     Ok(())
                 })
-                .with_cancellation_token(&guard.0)
+                .with_cancellation_token(&token)
                 .await
                 .from_cancelled()
                 .map_err(|err| {
@@ -1263,7 +1396,7 @@ pub async fn post_index(
             fill_gaps: s.fill_gaps,
             max_doc_chunk_tokens: s.max_doc_chunk_tokens,
             doc_semantic_weight: s.doc_semantic_weight,
-            token: &guard.0,
+            token: &token,
             indexing_locks: &indexing_locks,
             force: payload.force,
         };
@@ -1281,18 +1414,31 @@ pub async fn post_index(
                         .await
                     {
                         Ok(Some(n)) => {
+                            emit(IndexEvent::Indexed {
+                                path: path.clone(),
+                                language: pl,
+                                count: n,
+                            });
                             res.files.entry(pl).or_default().insert(path.clone(), n);
                         }
                         // Up to date, or stale/not-indexed (needs a full pass instead).
-                        Ok(None) => {}
+                        Ok(None) => emit(IndexEvent::Skipped {
+                            path: path.clone(),
+                            language: pl,
+                            reason: SkipReason::Unchanged,
+                        }),
                         // Another in-flight request holds the claim; skip it so the rest
                         // of the batch proceeds, exactly as the full path does.
-                        Err(ApiError::FileInFlight) => {}
+                        Err(ApiError::FileInFlight) => emit(IndexEvent::Skipped {
+                            path: path.clone(),
+                            language: pl,
+                            reason: SkipReason::InFlight,
+                        }),
                         Err(e) => return Err(e),
                     }
                 }
             }
-            return Ok(Json(res));
+            return Ok(res);
         }
 
         // ── Phase 1: prepare every file (hash-check, mark indexing, slice + insert).
@@ -1351,9 +1497,22 @@ pub async fn post_index(
                                 language: pl.name(),
                             })
                             .observe(p.chunks.len() as f64);
+                        emit(IndexEvent::Prepared {
+                            path: path.clone(),
+                            language: pl,
+                            chunks: p.chunks.len(),
+                            symbols: p.symbols,
+                        });
                         prepared.push(p);
                     }
-                    Ok(None) => file_outcome(pl, "skipped_unchanged"),
+                    Ok(None) => {
+                        emit(IndexEvent::Skipped {
+                            path: path.clone(),
+                            language: pl,
+                            reason: SkipReason::Unchanged,
+                        });
+                        file_outcome(pl, "skipped_unchanged");
+                    }
                     // Another in-flight request holds the claim for this file; skip it
                     // so the rest of the batch proceeds. Innocent co-batched files must
                     // not pay a retry_count penalty for an unrelated file's contention.
@@ -1362,6 +1521,11 @@ pub async fn post_index(
                         // is swallowed and the request still 200s, so the HTTP
                         // middleware can never see this.
                         m.index.claim_conflicts.inc();
+                        emit(IndexEvent::Skipped {
+                            path: path.clone(),
+                            language: pl,
+                            reason: SkipReason::InFlight,
+                        });
                         file_outcome(pl, "in_flight");
                     }
                     Err(e) => {
@@ -1384,7 +1548,26 @@ pub async fn post_index(
 
         // ── Reconcile against concurrent cancellation before the expensive embed pass:
         //    drop any file a `POST /cancel` flipped to 'cancelled' since it was prepared.
+        //    Streaming reports the dropped files by set difference — computed only when
+        //    someone is listening, so the JSON path pays nothing for it.
+        let before: Vec<(ProgrammingLanguage, String)> = if events.is_some() {
+            prepared.iter().map(|p| (p.pl, p.path.clone())).collect()
+        } else {
+            Vec::new()
+        };
         let mut prepared = indexer.drop_cancelled(prepared).await;
+        if events.is_some() {
+            let kept: HashSet<&str> = prepared.iter().map(|p| p.path.as_str()).collect();
+            for (pl, path) in before {
+                if !kept.contains(path.as_str()) {
+                    emit(IndexEvent::Skipped {
+                        path,
+                        language: pl,
+                        reason: SkipReason::Cancelled,
+                    });
+                }
+            }
+        }
 
         // ── Phase 2: embed + upsert every chunk across all files in one batched pass.
         let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
@@ -1400,7 +1583,21 @@ pub async fn post_index(
         );
 
         let embed_started = std::time::Instant::now();
-        let embed_result = indexer.embed_all(&all_chunks).await;
+        // The per-batch progress closure: `elapsed_ms` is measured from *request*
+        // start, not embed start, so a client's rate and ETA line up with what it
+        // has watched since `started`.
+        let embed_events = events.clone();
+        let embed_progress = move |p: EmbedProgress| {
+            if let Some(tx) = &embed_events {
+                let _ = tx.send(IndexEvent::Embedded {
+                    batch_chunks: p.batch_chunks,
+                    chunks_done: p.chunks_done,
+                    chunks_total: p.chunks_total,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        };
+        let embed_result = indexer.embed_all(&all_chunks, Some(&embed_progress)).await;
         m.index
             .phase_duration
             .get_or_create(&crate::backend::metrics::PhaseLabels { phase: "embed" })
@@ -1457,6 +1654,11 @@ pub async fn post_index(
         for (p, count) in prepared.iter().zip(counts) {
             indexer.mark_indexed(&p.path, &p.sha256).await?;
             file_outcome(p.pl, "indexed");
+            emit(IndexEvent::Indexed {
+                path: p.path.clone(),
+                language: p.pl,
+                count,
+            });
             *res.files
                 .entry(p.pl)
                 .or_default()
@@ -1469,7 +1671,7 @@ pub async fn post_index(
             .observe(mark_started.elapsed().as_secs_f64());
 
         info!("All files processed.");
-        Ok(Json(res))
+        Ok(res)
     }
     .instrument(span)
     .await
@@ -4082,28 +4284,56 @@ impl crate::research::ResearchTools for StateResearchTools {
     }
 }
 
-/// The SSE body of one research job. Owns the event receiver and the job's
-/// cancellation token; **dropping the stream cancels the job** — that is the
-/// whole cancellation contract (a client disconnect makes axum drop the body).
+/// A named SSE event that knows its own wire shape. `data()` must serialize to
+/// one line (`serde_json::to_string` escapes newlines), because both SSE
+/// consumers read the stream per `data:` line.
+trait SseWireEvent {
+    fn name(&self) -> &'static str;
+    fn data(&self) -> serde_json::Value;
+}
+
+impl SseWireEvent for crate::research::ResearchEvent {
+    fn name(&self) -> &'static str {
+        self.name()
+    }
+    fn data(&self) -> serde_json::Value {
+        self.data()
+    }
+}
+
+impl SseWireEvent for IndexEvent {
+    fn name(&self) -> &'static str {
+        self.name()
+    }
+    fn data(&self) -> serde_json::Value {
+        self.data()
+    }
+}
+
+/// The SSE body of one detached job (research, or a streaming `/index`). Owns
+/// the event receiver and the job's cancellation token; **dropping the stream
+/// cancels the job** — that is the whole cancellation contract (a client
+/// disconnect makes axum drop the body).
 ///
-/// The semaphore permit deliberately does **not** ride here. The job is spawned
-/// detached, so a permit held by the stream would be released the instant a client
-/// disconnected while the job kept running to its next cancellation point — briefly
-/// over-admitting past `max_concurrent`, which matters now that a run may be granted
-/// an hour. The permit lives in the spawned future instead, so a slot frees when the
-/// work stops rather than when the reader leaves.
-struct ResearchEventStream {
-    rx: tokio::sync::mpsc::UnboundedReceiver<crate::research::ResearchEvent>,
+/// A research job's semaphore permit deliberately does **not** ride here. The job
+/// is spawned detached, so a permit held by the stream would be released the
+/// instant a client disconnected while the job kept running to its next
+/// cancellation point — briefly over-admitting past `max_concurrent`, which
+/// matters now that a run may be granted an hour. The permit lives in the spawned
+/// future instead, so a slot frees when the work stops rather than when the
+/// reader leaves.
+struct SseEventStream<E> {
+    rx: tokio::sync::mpsc::UnboundedReceiver<E>,
     token: CancellationToken,
 }
 
-impl Drop for ResearchEventStream {
+impl<E> Drop for SseEventStream<E> {
     fn drop(&mut self) {
         self.token.cancel();
     }
 }
 
-impl futures_core::Stream for ResearchEventStream {
+impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
     type Item = Result<axum::response::sse::Event, std::convert::Infallible>;
 
     fn poll_next(
@@ -4379,7 +4609,7 @@ pub async fn post_research(
         crate::research::run_research(ollama, tools, journal, params, tx, job_token).await;
     });
 
-    let stream = ResearchEventStream { rx, token };
+    let stream = SseEventStream { rx, token };
     Ok(axum::response::sse::Sse::new(stream)
         .keep_alive(
             axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),

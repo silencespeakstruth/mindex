@@ -263,7 +263,10 @@ impl ApiError {
     }
 
     /// The default English `detail` (one human-readable sentence).
-    fn detail(&self) -> String {
+    /// `pub` for one consumer: the streaming `/index` mode, whose failures happen
+    /// after the HTTP status is already 200 and so travel as an SSE `error` event
+    /// carrying this same text instead of a problem+json body.
+    pub fn detail(&self) -> String {
         match self {
             ApiError::Cancelled => {
                 "The client closed the connection before the request completed.".into()

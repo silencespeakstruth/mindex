@@ -1,9 +1,10 @@
 import * as vscode from "vscode";
-import { IndexFiles, MindexApi } from "./api";
+import { IndexFiles, IndexStreamCallbacks, MindexApi } from "./api";
 import { detectLanguage } from "./languages";
 import { readUtf8 } from "./scanner";
 import { isCancellation, reportError } from "./errors";
 import { say } from "./brand";
+import { RateWindow } from "./shared/rateWindow";
 
 export interface ReindexSummary {
     /** Files the server actually (re)indexed (present in the /index response). */
@@ -95,20 +96,64 @@ async function doReindex(
     const abort = new AbortController();
     const sub = token.onCancellationRequested(() => abort.abort());
     const summary: ReindexSummary = { indexed: 0, unchanged: 0, skipped: [] };
+
+    // Live progress across all batches, fed by the server's SSE events: files
+    // settle one by one (`skipped`/`indexed`), and each embed batch advances the
+    // chunk counter, from which a sliding window computes an honest live
+    // chunks-per-second (a cumulative average flattens a long run). Against an
+    // older JSON-only server the callbacks never fire and the per-batch
+    // catch-up below keeps the old batch-granular behaviour.
+    const total = relPaths.length;
+    let settled = 0;
+    let lastPct = 0;
+    let chunks = 0;
+    const rate = new RateWindow(20_000);
+    let lastReport = 0;
+    const report = (label: string, forceReport = false): void => {
+        const now = Date.now();
+        // The Drift view redraws its whole tree per update; per-file events can
+        // arrive in bursts, so cap the redraw rate.
+        if (!forceReport && now - lastReport < 200) {
+            return;
+        }
+        lastReport = now;
+        const perSecond = rate.perSecond();
+        const rateLabel = perSecond === undefined ? "" : `${Math.round(perSecond)} chunks/s`;
+        const detail = [rateLabel, label].filter((s) => s !== "").join(" · ");
+        const pct = total > 0 ? (settled / total) * 100 : 100;
+        progress.report({
+            message: `${settled}/${total} files${detail === "" ? "" : ` · ${detail}`}`,
+            increment: pct - lastPct,
+        });
+        lastPct = pct;
+        onProgress?.(settled, total, detail);
+    };
+    const callbacks: IndexStreamCallbacks = {
+        onPrepared: (e) => report(e.path),
+        onSkipped: (e) => {
+            settled += 1;
+            report(e.path);
+        },
+        onEmbedded: (e) => {
+            chunks += e.batch_chunks;
+            rate.push(Date.now(), chunks);
+            report("embedding");
+        },
+        onIndexed: (e) => {
+            settled += 1;
+            report(e.path);
+        },
+    };
+
     try {
         for (let i = 0; i < relPaths.length; i += batchSize) {
             const batchPaths = relPaths.slice(i, i + batchSize);
-            progress.report({
-                message: `${Math.min(i + batchSize, relPaths.length)}/${relPaths.length} files`,
-                increment: (batchPaths.length / relPaths.length) * 100,
-            });
             // Reported *before* the batch, naming what is about to be read and sent:
             // the long wait is the request, so a counter that only moved afterwards
             // would sit still for exactly the stretch it exists to explain.
-            onProgress?.(
-                i,
-                relPaths.length,
-                batchPaths.length === 1 ? batchPaths[0] : `${batchPaths.length} files`
+            report(
+                batchPaths.length === 1 ? batchPaths[0] : `${batchPaths.length} files`,
+                true
             );
 
             const files: IndexFiles = {};
@@ -128,16 +173,22 @@ async function doReindex(
                 posted += 1;
             }
             if (posted === 0) {
+                settled = Math.min(i + batchPaths.length, total);
+                report("skipped", true);
                 continue;
             }
-            const resp = await api.index(guid, files, abort.signal, force);
+            const resp = await api.indexStream(guid, files, callbacks, abort.signal, force);
             let indexed = 0;
             for (const byPath of Object.values(resp.files)) {
                 indexed += Object.keys(byPath).length;
             }
             summary.indexed += indexed;
             summary.unchanged += posted - indexed;
-            onProgress?.(Math.min(i + batchSize, relPaths.length), relPaths.length, "posted");
+            // Idempotent catch-up: with SSE the events already settled every
+            // posted file and this only accounts the client-side skips; on the
+            // JSON fallback it advances the whole batch at once.
+            settled = Math.min(i + batchPaths.length, total);
+            report("posted", true);
         }
     } finally {
         sub.dispose();

@@ -83,3 +83,6 @@ utoipa-swagger-ui = { version = "9.0", default-features = false, features = ["ax
 prometheus-client = "0.25.0"
 
 [dev-dependencies]
+# Exercises the `?stream=` query grammar in unit tests exactly as axum's Query
+# extractor parses it (axum uses serde_urlencoded internally).
+serde_urlencoded = "0.7"

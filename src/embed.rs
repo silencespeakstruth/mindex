@@ -24,6 +24,21 @@ pub struct EmbedTuning {
     pub sparse_min_weight: f32,
 }
 
+/// One embed batch's worth of progress, reported after the batch has been both
+/// encoded **and** upserted — `chunks_done` never counts a chunk whose vectors
+/// are not in Qdrant yet. `chunks_done`/`chunks_total` are cumulative over one
+/// `embed_and_upsert` call, which is what a client needs to compute an honest
+/// chunks-per-second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedProgress {
+    /// Chunks in the batch that just completed.
+    pub batch_chunks: usize,
+    /// Chunks completed so far, this batch included.
+    pub chunks_done: usize,
+    /// Chunks this whole call was given.
+    pub chunks_total: usize,
+}
+
 /// Failure modes of [`embed_and_upsert`], kept distinct so callers can map each
 /// to their own control flow (HTTP status + file-status recovery in the handler;
 /// a success flag in the retry worker).
@@ -44,8 +59,11 @@ pub enum EmbedUpsertError {
 /// sent per `/encode` call — the lever for GPU batch size (the model server further
 /// sub-batches by its own `--batch`); `tuning.upsert_batch` and
 /// `tuning.sparse_min_weight` govern Qdrant upsert sizing and sparse pruning.
-/// Side-effect-free apart from the embed/upsert I/O, so behaviour is identical for
-/// every caller.
+/// Side-effect-free apart from the embed/upsert I/O — and the optional `progress`
+/// callback, the one deliberate departure from that sentence: it exists so a
+/// streaming `/index` (`?stream=yes`) can report per-batch progress, is invoked
+/// only after a batch is fully upserted, and a `None` caller (the retry worker,
+/// every test that doesn't pin it) gets byte-for-byte the old behaviour.
 pub async fn embed_and_upsert(
     embedder: &dyn BGEm3Model,
     store: &dyn VectorStore,
@@ -53,7 +71,10 @@ pub async fn embed_and_upsert(
     chunks: &[(UUIDv4, String)],
     token: &CancellationToken,
     tuning: EmbedTuning,
+    progress: Option<&(dyn Fn(EmbedProgress) + Send + Sync)>,
 ) -> Result<(), EmbedUpsertError> {
+    let chunks_total = chunks.len();
+    let mut chunks_done = 0usize;
     for batch in chunks.chunks(tuning.embed_batch.max(1)) {
         let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
         let guids: Vec<UUIDv4> = batch.iter().map(|(g, _)| *g).collect();
@@ -106,6 +127,15 @@ pub async fn embed_and_upsert(
                 .insert_batch(collection, points_batch.to_vec())
                 .await
                 .map_err(EmbedUpsertError::Store)?;
+        }
+
+        chunks_done += batch.len();
+        if let Some(report) = progress {
+            report(EmbedProgress {
+                batch_chunks: batch.len(),
+                chunks_done,
+                chunks_total,
+            });
         }
     }
 
@@ -232,6 +262,7 @@ mod tests {
             &input,
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await
         .expect("should succeed");
@@ -256,11 +287,62 @@ mod tests {
             &[],
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await
         .expect("empty is a no-op success");
 
         assert!(store.upserted.lock().unwrap().is_empty());
+    }
+
+    /// The progress callback fires once per embed batch, after the batch is
+    /// upserted, with cumulative counts — the contract the streaming `/index`
+    /// mode's `embedded` events (and every client rate display) are built on.
+    #[tokio::test]
+    async fn progress_reports_each_batch_with_cumulative_counts() {
+        let embedder = StubEmbedder { cancel: false };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
+        // 150 chunks at embed_batch 64 → batches of 64, 64, 22.
+        let input = chunks(150);
+        let seen: Mutex<Vec<EmbedProgress>> = Mutex::new(vec![]);
+        let record = |p: EmbedProgress| seen.lock().unwrap().push(p);
+
+        embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &input,
+            &CancellationToken::new(),
+            TEST_TUNING,
+            Some(&record),
+        )
+        .await
+        .expect("should succeed");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![
+                EmbedProgress {
+                    batch_chunks: 64,
+                    chunks_done: 64,
+                    chunks_total: 150,
+                },
+                EmbedProgress {
+                    batch_chunks: 64,
+                    chunks_done: 128,
+                    chunks_total: 150,
+                },
+                EmbedProgress {
+                    batch_chunks: 22,
+                    chunks_done: 150,
+                    chunks_total: 150,
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -278,6 +360,7 @@ mod tests {
             &chunks(1),
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await;
         assert!(matches!(res, Err(EmbedUpsertError::Store(_))));
@@ -298,6 +381,7 @@ mod tests {
             &chunks(1),
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await;
         assert!(matches!(res, Err(EmbedUpsertError::Cancelled)));

@@ -4,6 +4,7 @@ use rusqlite::{
     types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -228,10 +229,197 @@ pub struct IndexRequest {
 /// Under `symbols_only` the count is the number of **symbol rows** written instead,
 /// and the same omission rule applies (a file that was already at the current
 /// `SYMBOLS_DERIVATION_VERSION`, or whose hash no longer matches, is absent).
-#[derive(Deserialize, Serialize, Debug, ToSchema)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, ToSchema)]
 pub struct IndexResponse {
     /// `language → (path → chunk_count)`, covering only files actually (re)indexed.
     pub files: HashMap<ProgrammingLanguage, HashMap<UnixPath, u64>>,
+}
+
+/// `POST /v0/{project_guid}/index` query.
+#[derive(Deserialize, Debug, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct IndexQuery {
+    /// `yes` switches the response to an SSE stream of per-file / per-batch
+    /// indexing events (see the endpoint description); `no` or absent keeps the
+    /// original one-shot JSON summary. An enum rather than a bool so the wire
+    /// spelling is exactly `stream=yes|no` and anything else is a 400, not a
+    /// silently-ignored truthy string.
+    pub stream: Option<StreamChoice>,
+}
+
+/// The two spellings of `?stream=`. A typo is a 400 (`request.malformed_body`),
+/// never a silent fallback to the JSON mode the caller did not ask for.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamChoice {
+    Yes,
+    No,
+}
+
+/// Why a posted file produced no work and is absent from the final counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Stored hash and derivation versions match — nothing to do. Under
+    /// `symbols_only` this also covers a file whose hash no longer matches (its
+    /// chunks are stale too, so symbols alone must not be rebuilt) — the server
+    /// does not distinguish the two there.
+    Unchanged,
+    /// Another in-flight request holds this file's indexing claim.
+    InFlight,
+    /// A concurrent `POST /cancel` flipped the file after it was prepared.
+    Cancelled,
+}
+
+impl SkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::Unchanged => "unchanged",
+            SkipReason::InFlight => "in_flight",
+            SkipReason::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One SSE event of a streaming `/index` request (`?stream=yes`). `name()`/`data()`
+/// define the wire shape, which is mirrored in four places that must move
+/// together: `post_index`'s doc comment, its OpenAPI 200 description, the
+/// `mindex-index` CLI reader (`tools/indexer/src/client.rs`) and the VS Code
+/// extension (`tools/vscode/src/api.ts`) — both consumers ignore what they don't
+/// recognise, so a field added here and nowhere else is simply never seen.
+///
+/// The counts are chosen so a client can compute an honest chunks-per-second:
+/// `embedded` fires once per GPU batch with a monotonic `chunks_done` /
+/// `chunks_total` and the server's own `elapsed_ms`, which is exactly the pair a
+/// windowed rate needs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexEvent {
+    /// The request was accepted; counts name what was posted, not what will be
+    /// (re)indexed — unchanged files are discovered per file, later.
+    /// `symbols_only` says what unit every later `count` is in (symbol rows
+    /// instead of chunks), so a live display never has to guess.
+    Started { files: usize, symbols_only: bool },
+    /// Phase 1, one file hash-checked, sliced and its chunks inserted — now
+    /// awaiting the shared embed pass. `chunks` is this file's chunk count.
+    Prepared {
+        path: String,
+        language: ProgrammingLanguage,
+        chunks: usize,
+        symbols: usize,
+    },
+    /// A posted file that produced no work (absent from the final counts, exactly
+    /// as it is absent from the JSON response).
+    Skipped {
+        path: String,
+        language: ProgrammingLanguage,
+        reason: SkipReason,
+    },
+    /// Phase 2, one embed batch encoded **and** upserted. `chunks_done` is
+    /// cumulative across the whole request; `elapsed_ms` is measured from request
+    /// start on the server's clock, so rates survive client-side buffering.
+    Embedded {
+        batch_chunks: usize,
+        chunks_done: usize,
+        chunks_total: usize,
+        elapsed_ms: u64,
+    },
+    /// Phase 3, one file confirmed `indexed`. `count` is what the JSON response
+    /// would report for it: chunks, or symbol rows under `symbols_only`.
+    Indexed {
+        path: String,
+        language: ProgrammingLanguage,
+        count: u64,
+    },
+    /// Terminal success (closes the stream). `files` is byte-for-byte the JSON
+    /// mode's `IndexResponse.files`, so both modes tally identically; the totals
+    /// beside it are a convenience for one-line summaries.
+    Done {
+        response: IndexResponse,
+        files_indexed: usize,
+        chunks: u64,
+        elapsed_ms: u64,
+    },
+    /// Terminal failure after the stream started (the HTTP status is already
+    /// 200). `code` is the same stable `ApiError` code the JSON mode would have
+    /// carried in its problem+json body.
+    Error { code: String, detail: String },
+}
+
+impl IndexEvent {
+    pub fn name(&self) -> &'static str {
+        match self {
+            IndexEvent::Started { .. } => "started",
+            IndexEvent::Prepared { .. } => "prepared",
+            IndexEvent::Skipped { .. } => "skipped",
+            IndexEvent::Embedded { .. } => "embedded",
+            IndexEvent::Indexed { .. } => "indexed",
+            IndexEvent::Done { .. } => "done",
+            IndexEvent::Error { .. } => "error",
+        }
+    }
+
+    pub fn data(&self) -> Value {
+        match self {
+            IndexEvent::Started {
+                files,
+                symbols_only,
+            } => json!({ "files": files, "symbols_only": symbols_only }),
+            IndexEvent::Prepared {
+                path,
+                language,
+                chunks,
+                symbols,
+            } => json!({
+                "path": path,
+                "language": language.name(),
+                "chunks": chunks,
+                "symbols": symbols,
+            }),
+            IndexEvent::Skipped {
+                path,
+                language,
+                reason,
+            } => json!({
+                "path": path,
+                "language": language.name(),
+                "reason": reason.as_str(),
+            }),
+            IndexEvent::Embedded {
+                batch_chunks,
+                chunks_done,
+                chunks_total,
+                elapsed_ms,
+            } => json!({
+                "batch_chunks": batch_chunks,
+                "chunks_done": chunks_done,
+                "chunks_total": chunks_total,
+                "elapsed_ms": elapsed_ms,
+            }),
+            IndexEvent::Indexed {
+                path,
+                language,
+                count,
+            } => json!({
+                "path": path,
+                "language": language.name(),
+                "count": count,
+            }),
+            IndexEvent::Done {
+                response,
+                files_indexed,
+                chunks,
+                elapsed_ms,
+            } => json!({
+                // Serializing our own wire type cannot fail; Null would only ever
+                // signal a bug in `IndexResponse`'s Serialize impl.
+                "files": serde_json::to_value(&response.files).unwrap_or(Value::Null),
+                "files_indexed": files_indexed,
+                "chunks": chunks,
+                "elapsed_ms": elapsed_ms,
+            }),
+            IndexEvent::Error { code, detail } => json!({ "code": code, "detail": detail }),
+        }
+    }
 }
 
 /// A shell-style glob (e.g. `src/**`, `*.rs`) evaluated by SQLite `GLOB`. Serialized
@@ -1360,5 +1548,220 @@ impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
             context_fraction: b.context_fraction,
             search_top_k: b.search_top_k,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lang() -> ProgrammingLanguage {
+        ProgrammingLanguage::Rust
+    }
+
+    /// The `/index` SSE event names are a wire contract, exactly like `ApiError`
+    /// codes: the `mindex-index` CLI and the VS Code extension dispatch on them,
+    /// and both silently drop what they don't recognise — so a renamed event
+    /// fails by going quiet, not by erroring. Changing one is deliberate: update
+    /// `post_index`'s doc comment, its OpenAPI 200 description and both readers.
+    #[test]
+    fn index_event_names_are_stable() {
+        let events = [
+            (
+                IndexEvent::Started {
+                    files: 1,
+                    symbols_only: false,
+                },
+                "started",
+            ),
+            (
+                IndexEvent::Prepared {
+                    path: "a.rs".into(),
+                    language: lang(),
+                    chunks: 2,
+                    symbols: 3,
+                },
+                "prepared",
+            ),
+            (
+                IndexEvent::Skipped {
+                    path: "a.rs".into(),
+                    language: lang(),
+                    reason: SkipReason::Unchanged,
+                },
+                "skipped",
+            ),
+            (
+                IndexEvent::Embedded {
+                    batch_chunks: 4,
+                    chunks_done: 8,
+                    chunks_total: 16,
+                    elapsed_ms: 100,
+                },
+                "embedded",
+            ),
+            (
+                IndexEvent::Indexed {
+                    path: "a.rs".into(),
+                    language: lang(),
+                    count: 5,
+                },
+                "indexed",
+            ),
+            (
+                IndexEvent::Done {
+                    response: IndexResponse {
+                        files: HashMap::new(),
+                    },
+                    files_indexed: 1,
+                    chunks: 2,
+                    elapsed_ms: 3,
+                },
+                "done",
+            ),
+            (
+                IndexEvent::Error {
+                    code: "internal".into(),
+                    detail: "boom".into(),
+                },
+                "error",
+            ),
+        ];
+        for (event, name) in events {
+            assert_eq!(event.name(), name);
+        }
+    }
+
+    /// Every event's `data` keys, pinned. Both consumers read these by name and
+    /// ignore unknown keys, so a renamed field disappears without an error.
+    #[test]
+    fn index_event_data_names_its_fields_on_the_wire() {
+        let keys = |v: Value| -> Vec<String> {
+            let Value::Object(map) = v else {
+                panic!("event data must be a JSON object");
+            };
+            map.keys().cloned().collect()
+        };
+
+        assert_eq!(
+            keys(
+                IndexEvent::Started {
+                    files: 1,
+                    symbols_only: true,
+                }
+                .data()
+            ),
+            ["files", "symbols_only"]
+        );
+        let prepared = IndexEvent::Prepared {
+            path: "a.rs".into(),
+            language: lang(),
+            chunks: 2,
+            symbols: 3,
+        }
+        .data();
+        assert_eq!(prepared["language"], "rust");
+        assert_eq!(keys(prepared), ["chunks", "language", "path", "symbols"]);
+        assert_eq!(
+            keys(
+                IndexEvent::Skipped {
+                    path: "a.rs".into(),
+                    language: lang(),
+                    reason: SkipReason::InFlight,
+                }
+                .data()
+            ),
+            ["language", "path", "reason"]
+        );
+        assert_eq!(
+            keys(
+                IndexEvent::Embedded {
+                    batch_chunks: 4,
+                    chunks_done: 8,
+                    chunks_total: 16,
+                    elapsed_ms: 100,
+                }
+                .data()
+            ),
+            ["batch_chunks", "chunks_done", "chunks_total", "elapsed_ms"]
+        );
+        assert_eq!(
+            keys(
+                IndexEvent::Indexed {
+                    path: "a.rs".into(),
+                    language: lang(),
+                    count: 5,
+                }
+                .data()
+            ),
+            ["count", "language", "path"]
+        );
+        assert_eq!(
+            keys(
+                IndexEvent::Done {
+                    response: IndexResponse {
+                        files: HashMap::new(),
+                    },
+                    files_indexed: 1,
+                    chunks: 2,
+                    elapsed_ms: 3,
+                }
+                .data()
+            ),
+            ["chunks", "elapsed_ms", "files", "files_indexed"]
+        );
+        assert_eq!(
+            keys(
+                IndexEvent::Error {
+                    code: "internal".into(),
+                    detail: "boom".into(),
+                }
+                .data()
+            ),
+            ["code", "detail"]
+        );
+    }
+
+    /// `done.files` must be byte-for-byte the JSON mode's `IndexResponse.files`,
+    /// so a streaming client tallies exactly what a JSON client parses.
+    #[test]
+    fn done_files_matches_the_json_response_shape() {
+        let mut files = HashMap::new();
+        files.insert(lang(), HashMap::from([("src/a.rs".to_string(), 7u64)]));
+        let response = IndexResponse {
+            files: files.clone(),
+        };
+        let done = IndexEvent::Done {
+            response: response.clone(),
+            files_indexed: 1,
+            chunks: 7,
+            elapsed_ms: 1,
+        }
+        .data();
+        let via_json_mode =
+            serde_json::to_value(&response).expect("IndexResponse always serializes");
+        assert_eq!(done["files"], via_json_mode["files"]);
+    }
+
+    /// The skip reasons ride the wire as these exact strings.
+    #[test]
+    fn skip_reason_wire_values_are_stable() {
+        assert_eq!(SkipReason::Unchanged.as_str(), "unchanged");
+        assert_eq!(SkipReason::InFlight.as_str(), "in_flight");
+        assert_eq!(SkipReason::Cancelled.as_str(), "cancelled");
+    }
+
+    /// `?stream=` accepts exactly `yes`/`no`; anything else must be a 400 at the
+    /// extractor, never a silent fall-through to the JSON mode.
+    #[test]
+    fn stream_choice_parses_yes_and_no_only() {
+        let q: IndexQuery = serde_urlencoded::from_str("stream=yes").expect("yes parses");
+        assert_eq!(q.stream, Some(StreamChoice::Yes));
+        let q: IndexQuery = serde_urlencoded::from_str("stream=no").expect("no parses");
+        assert_eq!(q.stream, Some(StreamChoice::No));
+        let q: IndexQuery = serde_urlencoded::from_str("").expect("absent parses");
+        assert_eq!(q.stream, None);
+        assert!(serde_urlencoded::from_str::<IndexQuery>("stream=true").is_err());
+        assert!(serde_urlencoded::from_str::<IndexQuery>("streem=yes").is_err());
     }
 }

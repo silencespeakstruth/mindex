@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use sha2::{Digest, Sha256};
 
 use client::{
-    Code, DriftRequest, HistoryRequest, IndexRequest, IndexResponse, check_drift, post_history,
-    upload_batch,
+    Code, DriftRequest, HistoryRequest, IndexRequest, IndexResponse, IndexStreamEvent, check_drift,
+    post_history, upload_batch, upload_batch_streaming,
 };
 use scanner::{FileEntry, Language, ScanResult, scan};
 
@@ -286,6 +286,10 @@ struct Shared {
     chunks: AtomicU64,
     errors: AtomicU64,
     active: AtomicUsize,
+    /// The most recently touched file (prepared or indexed), for the bar's status
+    /// line. With several workers it is simply the last event to arrive — a live
+    /// "what is it doing right now", not an ordered log.
+    current: std::sync::Mutex<String>,
 }
 
 #[derive(Default)]
@@ -512,11 +516,14 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // ── Drive the bar from the shared counters. Position updates every tick;
-    // the speed line is the cumulative average (total chunks / elapsed) rather
-    // than a windowed rate, so it stays stable instead of collapsing to zero
-    // during the prepare-heavy gaps between embed bursts. ETA uses the same
-    // cumulative file rate. ────────────────────────────────────────────────────
+    // ── Drive the bar from the shared counters. Position updates every tick.
+    // The chunk counter advances per embed batch (SSE `embedded` events), so the
+    // speed line can be an honest **windowed** rate — what the GPU is doing right
+    // now — instead of the old cumulative average that a long run flattened into
+    // meaninglessness. Until the window fills (and against an old JSON-only
+    // server, whose counter still jumps per batch) the oldest retained sample is
+    // t=0, which makes the very same formula the cumulative average — the stable
+    // fallback, not a special case. ETA keeps the cumulative file rate. ────────
     let total_files = total as u64;
     let tick_stop = CancellationToken::new();
     let ticker = {
@@ -524,17 +531,29 @@ async fn main() -> Result<()> {
         let shared = shared.clone();
         let stop = tick_stop.clone();
         tokio::spawn(async move {
+            const RATE_WINDOW_SECS: f64 = 20.0;
+            let mut samples: std::collections::VecDeque<(f64, u64)> =
+                std::collections::VecDeque::from([(0.0, 0u64)]);
             loop {
                 let done = shared.files_done.load(Ordering::Relaxed);
                 let chunks = shared.chunks.load(Ordering::Relaxed);
                 let active = shared.active.load(Ordering::Relaxed);
                 let errs = shared.errors.load(Ordering::Relaxed);
+                let current = shared.current.lock().unwrap().clone();
 
                 bar.set_position(done);
 
                 let elapsed = t0.elapsed().as_secs_f64();
-                let chunks_per_s = if elapsed > 0.0 {
-                    chunks as f64 / elapsed
+                samples.push_back((elapsed, chunks));
+                while samples.len() > 2
+                    && elapsed - samples.front().map(|s| s.0).unwrap_or(0.0) > RATE_WINDOW_SECS
+                {
+                    samples.pop_front();
+                }
+                let (t_old, chunks_old) = *samples.front().unwrap_or(&(0.0, 0));
+                let dt = elapsed - t_old;
+                let chunks_per_s = if dt > 0.0 {
+                    chunks.saturating_sub(chunks_old) as f64 / dt
                 } else {
                     0.0
                 };
@@ -550,12 +569,17 @@ async fn main() -> Result<()> {
                     f64::INFINITY
                 };
                 bar.set_message(format!(
-                    "{chunks_per_s:.0} chunks/s · ETA {} · {chunks} chunks · {active} active{}",
+                    "{chunks_per_s:.0} chunks/s · ETA {} · {chunks} chunks · {active} active{}{}",
                     fmt_eta(eta),
                     if errs > 0 {
                         format!(" · {errs} err")
                     } else {
                         String::new()
+                    },
+                    if current.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", path_tail(&current, 42))
                     },
                 ));
 
@@ -768,7 +792,49 @@ async fn run_worker(
             continue;
         }
 
-        match upload_batch(
+        // Per-event progress: files advance the bar as the server settles them,
+        // embed batches advance the chunk counter (the honest chunks-per-second
+        // source), and `counted` remembers how many files the events already
+        // moved so the post-request catch-up below never double-counts.
+        let mut counted: u64 = 0;
+        let mut on_event = |ev: IndexStreamEvent| match ev {
+            IndexStreamEvent::Started { .. } => {}
+            IndexStreamEvent::Prepared { path, .. } => {
+                *shared.current.lock().unwrap() = path;
+            }
+            IndexStreamEvent::Skipped { path, reason } => {
+                counted += 1;
+                shared.files_done.fetch_add(1, Ordering::Relaxed);
+                // Unchanged files are the silent common case (they are absent
+                // from the JSON response too); the rarer reasons are worth a line.
+                if verbose && reason != "unchanged" {
+                    bar.println(format!(
+                        "  {} {}  {}",
+                        style("!").yellow(),
+                        path,
+                        style(reason).yellow().dim(),
+                    ));
+                }
+            }
+            IndexStreamEvent::Embedded { batch_chunks, .. } => {
+                shared.chunks.fetch_add(batch_chunks, Ordering::Relaxed);
+            }
+            IndexStreamEvent::Indexed { path, count } => {
+                counted += 1;
+                shared.files_done.fetch_add(1, Ordering::Relaxed);
+                // The embed pass never runs under --symbols-only, so the live
+                // counter advances on the per-file symbol counts instead.
+                if symbols_only {
+                    shared.chunks.fetch_add(count, Ordering::Relaxed);
+                }
+                if verbose {
+                    print_verbose_line(&bar, &path, count);
+                }
+                *shared.current.lock().unwrap() = path;
+            }
+        };
+
+        match upload_batch_streaming(
             &http,
             &server,
             &protocol,
@@ -779,16 +845,22 @@ async fn run_worker(
                 symbols_only,
             },
             &cancel,
+            &mut on_event,
         )
         .await
         {
-            Ok(resp) => {
-                let (chunks, too_short) = tally_response(&resp);
+            Ok(outcome) => {
+                let (chunks, too_short) = tally_response(&outcome.response);
                 stats.new_chunks += chunks;
                 stats.too_short += too_short;
-                shared.chunks.fetch_add(chunks, Ordering::Relaxed);
-                if verbose {
-                    print_verbose(&bar, &resp);
+                if !outcome.streamed {
+                    // Plain-JSON fallback (an older server): the callback saw
+                    // nothing, so the counters and verbose lines come from the
+                    // response, batch-granular — exactly the old behaviour.
+                    shared.chunks.fetch_add(chunks, Ordering::Relaxed);
+                    if verbose {
+                        print_verbose(&bar, &outcome.response);
+                    }
                 }
             }
             Err(e) => {
@@ -805,7 +877,11 @@ async fn run_worker(
             }
         }
 
-        shared.files_done.fetch_add(readable, Ordering::Relaxed);
+        // Catch up the bar for whatever the events did not report per file:
+        // everything in the JSON fallback, and the tail of a failed stream.
+        shared
+            .files_done
+            .fetch_add(readable.saturating_sub(counted), Ordering::Relaxed);
     }
 
     shared.active.fetch_sub(1, Ordering::Relaxed);
@@ -962,6 +1038,20 @@ fn fmt_eta(secs: f64) -> String {
     }
 }
 
+/// The trailing `max_chars` of a path for the bar's one-line status, `…`-prefixed
+/// when truncated — the file name end is the informative half.
+fn path_tail(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    let tail: String = path
+        .chars()
+        .skip(count.saturating_sub(max_chars.saturating_sub(1)))
+        .collect();
+    format!("…{tail}")
+}
+
 /// The one HTTP client every request goes through.
 ///
 /// TLS trusts the OS store (reqwest's `rustls-tls-native-roots`), plus `ca_cert`
@@ -1049,25 +1139,31 @@ fn print_verbose(pb: &ProgressBar, resp: &IndexResponse) {
     lines.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (path, count) in lines {
-        if count == 0 {
-            pb.println(format!(
-                "  {} {}  {}",
-                style("⊘").dim(),
-                style(&path).dim(),
-                style("0 chunks (too short)").dim(),
-            ));
-        } else {
-            pb.println(format!(
-                "  {} {}  {}",
-                style("✓").green(),
-                path,
-                style(format!(
-                    "{count} chunk{}",
-                    if count == 1 { "" } else { "s" }
-                ))
-                .green(),
-            ));
-        }
+        print_verbose_line(pb, &path, count);
+    }
+}
+
+/// One file's verbose line — shared by the batch printer above (JSON fallback)
+/// and the per-`indexed`-event streaming path, so both modes read identically.
+fn print_verbose_line(pb: &ProgressBar, path: &str, count: u64) {
+    if count == 0 {
+        pb.println(format!(
+            "  {} {}  {}",
+            style("⊘").dim(),
+            style(path).dim(),
+            style("0 chunks (too short)").dim(),
+        ));
+    } else {
+        pb.println(format!(
+            "  {} {}  {}",
+            style("✓").green(),
+            path,
+            style(format!(
+                "{count} chunk{}",
+                if count == 1 { "" } else { "s" }
+            ))
+            .green(),
+        ));
     }
 }
 

@@ -9,6 +9,57 @@ export interface IndexResponse {
     files: Record<string, Record<string, number>>;
 }
 
+// ---- streaming /index (`?stream=yes`) wire events ----
+// Mirrors the server's `IndexEvent` (src/backend/v0/models.rs); this reader
+// ignores events and fields it does not know, so a newer server degrades to less
+// detail rather than an error.
+
+export interface IndexStartedEvent {
+    files: number;
+    /** True when every later `count` is symbol rows, not chunks. */
+    symbols_only: boolean;
+}
+export interface IndexPreparedEvent {
+    path: string;
+    language: string;
+    chunks: number;
+    symbols: number;
+}
+export interface IndexSkippedEvent {
+    path: string;
+    language: string;
+    /** `unchanged`, `in_flight` or `cancelled` today; opaque so a new reason displays. */
+    reason: string;
+}
+export interface IndexEmbeddedEvent {
+    /** One embed batch, encoded and upserted; `chunks_done` is cumulative — the
+     *  honest chunks-per-second source. `elapsed_ms` is the server's own clock. */
+    batch_chunks: number;
+    chunks_done: number;
+    chunks_total: number;
+    elapsed_ms: number;
+}
+export interface IndexIndexedEvent {
+    path: string;
+    language: string;
+    count: number;
+}
+export interface IndexDoneEvent {
+    /** Byte-for-byte the JSON mode's `IndexResponse.files`. */
+    files: IndexResponse["files"];
+    files_indexed: number;
+    chunks: number;
+    elapsed_ms: number;
+}
+/** Non-terminal events of a streaming /index; terminals fold into the promise. */
+export interface IndexStreamCallbacks {
+    onStarted?(e: IndexStartedEvent): void;
+    onPrepared?(e: IndexPreparedEvent): void;
+    onSkipped?(e: IndexSkippedEvent): void;
+    onEmbedded?(e: IndexEmbeddedEvent): void;
+    onIndexed?(e: IndexIndexedEvent): void;
+}
+
 export interface SearchFilter {
     paths?: string[];
     programming_languages?: string[];
@@ -438,8 +489,12 @@ function asString(v: unknown, fallback = ""): string {
     return typeof v === "string" ? v : fallback;
 }
 
-/** Parse one SSE frame (`event:` + `data:` lines) and route it to the callbacks. */
-function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
+/**
+ * Parse one SSE frame (`event:` + `data:` lines) into its event name and decoded
+ * JSON payload. Returns undefined for keep-alive comments, empty frames and
+ * malformed JSON — skipping one frame beats killing a live stream.
+ */
+export function parseSseFrame(frame: string): { event: string; data: unknown } | undefined {
     let event = "message";
     const dataLines: string[] = [];
     for (const line of frame.split("\n")) {
@@ -451,14 +506,22 @@ function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
         // `:keep-alive` comments and unknown fields are ignored per the SSE spec.
     }
     if (dataLines.length === 0) {
+        return undefined;
+    }
+    try {
+        return { event, data: JSON.parse(dataLines.join("\n")) };
+    } catch {
+        return undefined; // malformed frame — skip rather than kill the stream
+    }
+}
+
+/** Parse one SSE frame (`event:` + `data:` lines) and route it to the callbacks. */
+function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
+    const parsed = parseSseFrame(frame);
+    if (parsed === undefined) {
         return;
     }
-    let data: unknown;
-    try {
-        data = JSON.parse(dataLines.join("\n"));
-    } catch {
-        return; // malformed frame — skip rather than kill the stream
-    }
+    const { event, data } = parsed;
     const d = data as Record<string, unknown>;
     switch (event) {
         case "thinking":
@@ -485,6 +548,48 @@ function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
         default:
             break;
     }
+}
+
+/**
+ * Route one streaming-/index SSE frame: progress events go to the callbacks,
+ * terminals (`done`/`error`) are returned so the caller can settle its promise.
+ * Unknown events and malformed frames yield undefined. Exported for tests.
+ */
+export function routeIndexFrame(
+    frame: string,
+    cb: IndexStreamCallbacks
+): { done?: IndexDoneEvent; error?: { code: string; detail: string } } | undefined {
+    const parsed = parseSseFrame(frame);
+    if (parsed === undefined) {
+        return undefined;
+    }
+    const d = parsed.data as Record<string, unknown>;
+    switch (parsed.event) {
+        case "started":
+            cb.onStarted?.(d as unknown as IndexStartedEvent);
+            break;
+        case "prepared":
+            cb.onPrepared?.(d as unknown as IndexPreparedEvent);
+            break;
+        case "skipped":
+            cb.onSkipped?.(d as unknown as IndexSkippedEvent);
+            break;
+        case "embedded":
+            cb.onEmbedded?.(d as unknown as IndexEmbeddedEvent);
+            break;
+        case "indexed":
+            cb.onIndexed?.(d as unknown as IndexIndexedEvent);
+            break;
+        case "done":
+            return { done: d as unknown as IndexDoneEvent };
+        case "error":
+            return {
+                error: { code: asString(d.code, "unknown"), detail: asString(d.detail) },
+            };
+        default:
+            break;
+    }
+    return undefined;
 }
 
 export class MindexApi {
@@ -725,8 +830,95 @@ export class MindexApi {
         cb: ResearchCallbacks,
         signal: AbortSignal
     ): Promise<void> {
-        const url = new URL(`${this.base}/${this.protocol}/${guid}/research`);
-        const payload = Buffer.from(JSON.stringify(req), "utf8");
+        return this.streamRequest(`/${this.protocol}/${guid}/research`, req, signal, {
+            onFrame: (frame) => dispatchSseFrame(frame, cb),
+            // An abort is the user's cancel, not a failure.
+            abortResolves: true,
+        });
+    }
+
+    /**
+     * `POST /index?stream=yes` — the same upload as [`index`], reported live:
+     * per-file `prepared`/`skipped`/`indexed` and per-embed-batch `embedded`
+     * events reach `cb` as the server works, and the resolved value is the same
+     * `IndexResponse` the JSON mode returns (`done.files`). An older server that
+     * does not know the query answers plain JSON; that degrades transparently —
+     * `cb` sees nothing and the body is parsed as the response. Aborting `signal`
+     * rejects (like [`index`], unlike [`research`]) so a caller can tell the
+     * user's cancel from an empty result; the disconnect is what cancels the
+     * server-side work.
+     */
+    async indexStream(
+        guid: string,
+        files: IndexFiles,
+        cb: IndexStreamCallbacks,
+        signal: AbortSignal,
+        force = false
+    ): Promise<IndexResponse> {
+        let done: IndexDoneEvent | undefined;
+        let streamError: { code: string; detail: string } | undefined;
+        let jsonBody: IndexResponse | undefined;
+        await this.streamRequest(
+            `/${this.protocol}/${guid}/index?stream=yes`,
+            { files, force },
+            signal,
+            {
+                onFrame: (frame) => {
+                    const out = routeIndexFrame(frame, cb);
+                    if (out?.done !== undefined) {
+                        done = out.done;
+                    }
+                    if (out?.error !== undefined) {
+                        streamError = out.error;
+                    }
+                },
+                onJson: (text) => {
+                    try {
+                        jsonBody = JSON.parse(text) as IndexResponse;
+                    } catch {
+                        // fall through to the "ended without done" error below
+                    }
+                },
+                abortResolves: false,
+            }
+        );
+        if (streamError !== undefined) {
+            // The HTTP status was already 200 when the failure happened.
+            throw new ProblemError(200, streamError.code, streamError.detail);
+        }
+        if (done !== undefined) {
+            return { files: done.files };
+        }
+        if (jsonBody !== undefined) {
+            return jsonBody;
+        }
+        throw new UnreachableError(
+            new Error("index stream ended without a terminal done/error event")
+        );
+    }
+
+    /**
+     * Shared SSE plumbing for the two streaming endpoints. Resolves when the
+     * server closes the stream, rejects on transport failure or a non-2xx
+     * response. When the server answers with a non-SSE content type the whole
+     * body is buffered into `onJson` instead (how an older server that ignores
+     * `?stream=yes` degrades). `abortResolves` picks the abort contract: research
+     * resolves (a cancel is not a failure), index rejects (its caller tells a
+     * cancel apart from an empty result) — both callers depend on their side, so
+     * this cannot be unified further.
+     */
+    private streamRequest(
+        path: string,
+        body: unknown,
+        signal: AbortSignal,
+        handlers: {
+            onFrame: (frame: string) => void;
+            onJson?: (text: string) => void;
+            abortResolves: boolean;
+        }
+    ): Promise<void> {
+        const url = new URL(this.base + path);
+        const payload = Buffer.from(JSON.stringify(body), "utf8");
 
         return new Promise((resolve, reject) => {
             const request = https.request(
@@ -767,6 +959,21 @@ export class MindexApi {
                         return;
                     }
 
+                    const contentType = res.headers["content-type"] ?? "";
+                    if (
+                        handlers.onJson !== undefined &&
+                        !contentType.startsWith("text/event-stream")
+                    ) {
+                        const chunks: Buffer[] = [];
+                        res.on("data", (c: Buffer) => chunks.push(c));
+                        res.on("end", () => {
+                            handlers.onJson?.(Buffer.concat(chunks).toString("utf8"));
+                            resolve();
+                        });
+                        res.on("error", (e) => reject(new UnreachableError(e)));
+                        return;
+                    }
+
                     res.setEncoding("utf8");
                     let buf = "";
                     res.on("data", (chunk: string) => {
@@ -776,7 +983,7 @@ export class MindexApi {
                         while ((sep = buf.indexOf("\n\n")) !== -1) {
                             const frame = buf.slice(0, sep);
                             buf = buf.slice(sep + 2);
-                            dispatchSseFrame(frame, cb);
+                            handlers.onFrame(frame);
                         }
                     });
                     res.on("end", () => resolve());
@@ -784,8 +991,10 @@ export class MindexApi {
                 }
             );
             request.on("error", (e) => {
-                if (e.name === "AbortError") {
-                    resolve(); // an abort is the user's cancel, not a failure
+                if (e.name === "AbortError" && handlers.abortResolves) {
+                    resolve();
+                } else if (e.name === "AbortError") {
+                    reject(e);
                 } else {
                     reject(new UnreachableError(e));
                 }

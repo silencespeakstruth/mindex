@@ -440,7 +440,7 @@ async fn retry_file(
     }
 
     let success =
-        match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed).await {
+        match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed, None).await {
             Ok(()) => true,
             Err(EmbedUpsertError::Cancelled) => false,
             Err(EmbedUpsertError::Embed(e)) => {

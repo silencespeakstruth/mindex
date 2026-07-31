@@ -261,8 +261,9 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
                       "another client, mindex-index or the retry worker.\n\n" +
                       "Reindexing them now would be refused as in-flight and would look " +
                       "like it did nothing, so wait for this to drain."
-                    : "Uploading. The count is files handed to the server, not chunks " +
-                      "embedded — a posted batch may still be on the GPU.\n" +
+                    : "Uploading. The count and the chunks-per-second come from the " +
+                      "server's live progress stream, so a file counts once it is " +
+                      "settled — embedded and confirmed, skipped, or unchanged.\n" +
                       "Cancel from the progress notification.";
             item.contextValue = "progress";
             return item;
