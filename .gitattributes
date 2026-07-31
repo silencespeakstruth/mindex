@@ -1,6 +1,48 @@
-# Files executed by a shebang must keep LF in the working tree on every platform.
-# A Windows clone with the default core.autocrlf=true rewrites them to CRLF, and the
-# Docker image then fails with a bare "exec /entrypoint.sh failed: No such file or
-# directory" — the kernel is looking for the interpreter "/bin/sh\r".
+# Line endings: LF everywhere, on every platform, forever.
+#
+# This project is developed and run on Linux, but is cloned on Windows too, where
+# git's default core.autocrlf=true rewrites the working tree to CRLF on checkout.
+# That flips the bytes of every text file, and mindex hashes `code.as_bytes()` —
+# so every client (mindex-index, mindex-watch, the VS Code extension, the MCP
+# index_files tool) reports permanent drift and reindexes the whole tree on every
+# check, forever, with nothing erroring. See "Four clients, one working-tree view"
+# in .claude/CLAUDE.md: what a client hashes must be exactly what /index posted.
+#
+# The rule below is repo-wide and unconditional: it covers every subdirectory,
+# every tool, and every file type added in the future — including ones nobody has
+# thought of yet. Do not add per-extension exceptions; if a new file type needs
+# different handling, it is binary and belongs in the section at the bottom.
+#
+# `text=auto` lets git decide text vs binary by content; `eol=lf` then pins the
+# working-tree ending for everything it called text. It overrides core.autocrlf
+# and core.eol on the developer's machine, which is the point — the setting must
+# not be something each contributor has to get right.
+*           text=auto eol=lf
+
+# A Windows clone that predates this file still has CRLF in its working tree, and
+# .gitattributes only applies at checkout. Normalize once, per clone:
+#
+#     git add --renormalize .
+#     git status          # expect no changes on a clone that was already LF
+#
+# Files executed by a shebang are the case where CRLF is not merely churn: the
+# Docker image fails with a bare "exec /entrypoint.sh failed: No such file or
+# directory", because the kernel is looking for the interpreter "/bin/sh\r".
+# Covered by the rule above; kept explicit so the reason survives.
 *.sh        text eol=lf
 tools/hooks/* text eol=lf
+
+# Binary: never touched, never diffed as text. `text=auto` already detects these,
+# but declaring them removes the guess for content that can look textual.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+*.onnx      binary
+*.safetensors binary
+*.vsix      binary

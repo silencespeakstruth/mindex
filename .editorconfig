@@ -1,0 +1,15 @@
+# Companion to .gitattributes, which is the enforcement: that file pins LF in the
+# working tree at checkout, this one stops an editor from putting CRLF back into a
+# file it creates or saves on Windows (VS Code, the JetBrains IDEs, Vim and Emacs
+# all read this natively or via a bundled plugin).
+#
+# Deliberately minimal — only the line-ending, encoding and final-newline rules.
+# Indentation belongs to the per-language formatters this repo already runs
+# (rustfmt, prettier, black/ruff, shfmt -i 4 -ci, sqlfluff), and duplicating their
+# settings here would give two sources of truth that drift apart in silence.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
