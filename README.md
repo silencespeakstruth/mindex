@@ -27,7 +27,7 @@ or CPU-only.
 [VS Code extension](tools/vscode/README.md) drive the same API for humans — the
 extension ships as a `.vsix` on the
 [releases page](https://github.com/silencespeakstruth/mindex/releases), so
-`code --install-extension mindex-vscode-1.0.0.vsix` is the whole of installing it.
+`code --install-extension mindex-vscode-1.0.1.vsix` is the whole of installing it.
 
 ```mermaid
 flowchart LR
@@ -132,6 +132,7 @@ exclude_paths:                               # applied before include_paths
   - "**/node_modules/**"
 include_paths: []                            # empty = no filter, not "nothing"
 languages: []                                # lowercase mindex ids; empty = all
+git_refs: [master]                           # which refs the history channel walks
 ```
 
 An unknown key is an error rather than a silent no-op — a mistyped `exclude_path:`
@@ -143,6 +144,28 @@ subset by a shared fixture table in `tools/mindexfile/src/lib.rs` and
 
 The MCP servers do **not** parse `.mindex`: the agent reads it and passes the GUID
 and filters as call arguments.
+
+### Git history
+
+The working tree says what the code *is*; the commits say why it became that way.
+`mindex-index --history` walks the refs named above and stores **commit metadata** —
+subject, body, author, date, and which paths each commit touched — so a research run
+can ask what changed in a file and why, and quote the sha.
+
+It is opt-in and stays off until the flag is passed. Metadata only: no embeddings, no
+vectors, no GPU time, because the questions worth asking of history ("what touched
+this and why") are SQL questions rather than similarity ones. `--history-only` runs
+that phase alone, which is what the post-commit hook uses.
+
+```bash
+mindex-index --root . --history          # index the tree and reconcile commits
+mindex-index --root . --history-only     # commits only, no slicing or embedding
+```
+
+Reconciliation is a **set replace**, not an append: a sha is the hash of its own
+content, so a force-push or a rebase is one ordinary sync rather than a special case.
+Retention is separate — `DELETE /v0/{guid}/history` with `keep_last` and `older_than`,
+intersected — because a sync only drops what your refs no longer reach.
 
 ## What else you should know
 

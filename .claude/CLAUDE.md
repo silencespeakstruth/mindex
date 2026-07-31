@@ -1697,6 +1697,22 @@ is wrong.
   leaves the index better off. Its explanatory prose lives in `viewsWelcome` and not in
   `TreeView.message`, which VS Code renders *instead of* the welcome view when the tree
   is empty — the message is therefore set only once a check has produced rows.
+  **A reindex must show the server's claims, not just its own upload, and that is a
+  correctness matter rather than a nicety.** `post_index` swallows the indexing-claim
+  conflict (`Err(ApiError::FileInFlight) => {}`, see **Management endpoints**) and still
+  answers 200 with the claimed file *absent from the response* — which is byte-for-byte
+  how a hash-skipped file comes back. A client cannot tell the two apart from `/index`
+  alone, so the extension reported a refused reindex as `unchanged`, finished in
+  milliseconds, and looked like it had done nothing. It is now read from two places
+  neither of which is that response: `/status`'s `indexing_claims` drives a live row in
+  the Drift view and *refuses* to start an upload that would be swallowed, and the
+  follow-up `/drift`'s `indexing` bucket is what the summary subtracts to say "still
+  indexing" instead of "unchanged" — so the drift check must run **before** the summary,
+  not after. The status poll drops to 3 s while claims are outstanding, since a count
+  that only moves every 30 s reads as wedged; the configured interval stays the ceiling.
+  Every entry point funnels through the one `reindex()` helper, which is also what makes
+  its re-entry guard total — two concurrent runs over the same paths raced their own
+  drift checks and could settle showing just-indexed files as stale.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, and one tool — `research`,
   a thin SSE client over `POST /v0/{guid}/research`. The whole investigation runs on
   the server's local model, so scout itself holds no prompt, no chunk budget and no
