@@ -1977,6 +1977,24 @@ is wrong.
   Every entry point funnels through the one `reindex()` helper, which is also what makes
   its re-entry guard total — two concurrent runs over the same paths raced their own
   drift checks and could settle showing just-indexed files as stale.
+  **The run reports itself as a feed, not as a percentage, because indexing is
+  batched.** The server prepares a whole batch, embeds it in one GPU pass and settles
+  it, so a file-granular bar moves in two bursts with the long stretch it exists to
+  explain sitting frozen between them — which is why the Drift view's `▰▱` row is
+  gone and `increment` is no longer reported to the notification either. What is
+  live is `IndexFeed` (`shared/indexFeed.ts`, vscode-free so `node --test` reaches
+  it): the last five paths, the counters, and a `RateWindow` over the server's
+  **cumulative** `chunks_done` rather than a local sum of `batch_chunks`, so a
+  retry or a batch boundary cannot make the two disagree. One snapshot feeds two
+  surfaces, and the split is forced: a `withProgress` message is structurally
+  **single-line** (VS Code's `.notification-list-item-message` is `white-space:
+  normal`, so `\n` collapses to a space and there is no multi-line API), so the
+  paths live in a `StatusBarItem`'s `MarkdownString` tooltip and the toast keeps
+  only the one line and the Cancel button it alone can hold. Two things the Drift
+  view keeps: the **claims** row, which is other clients' work and not this
+  window's, and nothing else — the re-entry guard moved to a `reindexRunning` flag
+  in `activate()`, since `isBusy` used to be derived from the deleted progress
+  state.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, and one tool — `research`,
   a thin SSE client over `POST /v0/{guid}/research`. The whole investigation runs on
   the server's local model, so scout itself holds no prompt, no chunk budget and no

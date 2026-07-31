@@ -51,34 +51,12 @@ const BUCKETS: { id: Bucket; label: string; icon: string; tooltip: string }[] = 
 export const DRIFT_MESSAGE =
     "Tick files and reindex, or press Sync all to clear every difference at once.";
 
-/** A reindex in flight, as the view reports it. */
-export interface DriftProgress {
-    done: number;
-    total: number;
-    /** What is being worked on right now — a path, or a phase name. */
-    label: string;
-}
-
-/**
- * A progress bar drawn in a tree row.
- *
- * A `TreeView` has no way to draw a real one, and the notification VS Code *does* draw
- * appears in the bottom-right corner of the window — far from the view the user is
- * looking at and easy to miss entirely, which is what made a running reindex read as
- * "I pressed the button and nothing happened". Blocks are not decoration here; they
- * are the only bar this surface can have.
- */
-function meter(done: number, total: number, width = 12): string {
-    const filled = total <= 0 ? 0 : Math.round((done / total) * width);
-    return "▰".repeat(filled) + "▱".repeat(width - filled);
-}
-
 /** A bucket whose files can be checkbox-selected (indexing is read-only). */
 const SELECTABLE: ReadonlySet<Bucket> = new Set(["stale", "missing", "orphaned"]);
 
 export class DriftNode {
     constructor(
-        public readonly kind: "action" | "progress" | "bucket" | "dir" | "file",
+        public readonly kind: "action" | "claims" | "bucket" | "dir" | "file",
         public readonly bucket: Bucket,
         /** dir: the rel prefix; file: the full rel path; bucket: "". */
         public readonly relPath: string,
@@ -104,8 +82,6 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
     private selected: Record<Bucket, Set<string>> = emptySelection();
     /** When the last drift check ran, for the view description. */
     private checkedAt: Date | undefined;
-    /** This extension's own upload loop. While set, the first row is its progress bar. */
-    private progress: DriftProgress | undefined;
     /**
      * Files the *server* currently holds a claim on — `/status`'s `indexing_claims`.
      *
@@ -128,18 +104,6 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
         this.changed.fire(undefined);
     }
 
-    /**
-     * Report (or clear, with `undefined`) a running reindex.
-     *
-     * Fires a full refresh each time, which is cheap: the tree is a few hundred nodes
-     * held in memory and `getChildren` does no I/O. Throttling is the caller's job —
-     * this is called once per batch, not once per file.
-     */
-    setProgress(progress: DriftProgress | undefined): void {
-        this.progress = progress;
-        this.changed.fire(undefined);
-    }
-
     /** How many files the server is working on right now; 0 when it is idle. */
     setServerClaims(claims: number): void {
         if (claims === this.serverClaims) {
@@ -147,11 +111,6 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
         }
         this.serverClaims = claims;
         this.changed.fire(undefined);
-    }
-
-    /** Whether *this* extension is mid-upload, so a second one can be refused. */
-    get isBusy(): boolean {
-        return this.progress !== undefined;
     }
 
     /** Whether the server is busy, whoever asked it to be. */
@@ -218,16 +177,17 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
         if (element !== undefined) {
             return element.children;
         }
-        // While a reindex runs its progress takes that first row: the buckets below are
-        // the *previous* check's answer and are about to be wrong, so offering the
-        // button that starts it again there would be offering a second concurrent run.
+        // While the server holds claims that row takes the first place: the buckets
+        // below are the *previous* check's answer and are about to be wrong, so
+        // offering the button that starts a reindex there would be offering one the
+        // server is about to refuse as in-flight.
         //
         // Otherwise the action row exists only while there is something for it to do,
         // so "the list is empty" and "there is nothing to press" are the same statement
         // — a permanently present Sync all that does nothing on most days is a button
         // people learn to ignore.
-        if (this.progress !== undefined || this.serverClaims > 0) {
-            return [new DriftNode("progress", "stale", "", "Indexing", []), ...this.roots];
+        if (this.serverClaims > 0) {
+            return [new DriftNode("claims", "stale", "", "Indexing", []), ...this.roots];
         }
         return this.hasActionableDrift
             ? [new DriftNode("action", "stale", "", "Sync all", []), ...this.roots]
@@ -235,37 +195,26 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
     }
 
     getTreeItem(node: DriftNode): vscode.TreeItem {
-        if (node.kind === "progress") {
-            const p = this.progress;
-            // Two things can be running, and only one of them has a denominator. Our own
-            // upload knows how many files it is sending; the server's claim count only
-            // ever goes down, and there is no total to divide it by — so it gets a
-            // countdown rather than a bar that would have to invent one.
+        if (node.kind === "claims") {
+            // The server's claim count only ever goes down and there is no total to
+            // divide it by, so this is a countdown and not a bar. This window's own
+            // upload is not drawn here at all: it reports itself in the status bar,
+            // where a live feed of paths and chunks-per-second fits and a tree row
+            // does not.
             const item = new vscode.TreeItem(
-                p === undefined
-                    ? "Server is indexing"
-                    : `${meter(p.done, p.total)}  ${p.done}/${p.total}`,
+                "Server is indexing",
                 vscode.TreeItemCollapsibleState.None
             );
-            item.description =
-                p === undefined
-                    ? `${this.serverClaims} file(s) in flight`
-                    : p.label +
-                      (this.serverClaims > 0 ? ` · ${this.serverClaims} in flight` : "");
+            item.description = `${this.serverClaims} file(s) in flight`;
             // `~spin` animates the codicon, which is what says "still working" during
             // the long silent stretch while a batch is on the GPU.
             item.iconPath = new vscode.ThemeIcon(`${ICON.sync}~spin`);
             item.tooltip =
-                p === undefined
-                    ? "The server holds an indexing claim on these files — this window, " +
-                      "another client, mindex-index or the retry worker.\n\n" +
-                      "Reindexing them now would be refused as in-flight and would look " +
-                      "like it did nothing, so wait for this to drain."
-                    : "Uploading. The count and the chunks-per-second come from the " +
-                      "server's live progress stream, so a file counts once it is " +
-                      "settled — embedded and confirmed, skipped, or unchanged.\n" +
-                      "Cancel from the progress notification.";
-            item.contextValue = "progress";
+                "The server holds an indexing claim on these files — this window, " +
+                "another client, mindex-index or the retry worker.\n\n" +
+                "Reindexing them now would be refused as in-flight and would look " +
+                "like it did nothing, so wait for this to drain.";
+            item.contextValue = "claims";
             return item;
         }
 

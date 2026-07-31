@@ -78,6 +78,10 @@ export const ICON = {
     sync: "sync",
     /** Upload files to the index. */
     reindex: "cloud-upload",
+    /** In the live indexing feed: a file the server has finished indexing. */
+    feedIndexed: "check",
+    /** In the live indexing feed: a file the run passed over rather than indexed. */
+    feedSkipped: "arrow-right",
     /** An indexed file. */
     file: "symbol-file",
     /** The project's language inventory. */

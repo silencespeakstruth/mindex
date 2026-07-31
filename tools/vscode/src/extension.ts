@@ -12,6 +12,7 @@ import { ResearchRunsPanel } from "./researchRunsPanel";
 import { browseResearchRuns, pickContextRuns } from "./researchContextPick";
 import { openResearchReport, RESEARCH_SCHEME, ResearchDocumentProvider } from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
+import { IndexStatusBar } from "./indexStatusBar";
 import { reindexPaths, showReindexSummary } from "./indexer";
 import { runSearch } from "./search";
 import { ResearchPanel, ResearchSubmission } from "./researchView";
@@ -44,6 +45,16 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar.command = "mindex.openStatus";
     context.subscriptions.push(statusBar);
     paintStatusBar(statusBar);
+
+    // The live indexing feed, shown only while a reindex runs. A priority above the
+    // health indicator's puts it immediately to its left, so the two read as one
+    // group; it is a separate item because it is transient and the other is not.
+    const indexStatusItem = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Right,
+        91
+    );
+    context.subscriptions.push(indexStatusItem);
+    const indexStatusBar = new IndexStatusBar(indexStatusItem);
 
     // ── Project marker: one .mindex at a workspace root, cached and watched ──────
     // The file is the extension's whole reason to be active, so it is read once and
@@ -500,6 +511,9 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     };
 
+    /** Whether *this* window is mid-upload, so a second run can be refused. */
+    let reindexRunning = false;
+
     const reindex = async (
         paths: string[],
         noneMessage: string,
@@ -512,9 +526,9 @@ export function activate(context: vscode.ExtensionContext): void {
         // uploads — so the view can settle showing files as still stale that were in
         // fact just indexed. Pressing again looked like the only recourse, which
         // started a third.
-        if (driftProvider.isBusy) {
+        if (reindexRunning) {
             void vscode.window.showInformationMessage(
-                say("a reindex is already running — watch the Drift view for progress.")
+                say("a reindex is already running — watch the status bar for progress.")
             );
             return;
         }
@@ -544,7 +558,7 @@ export function activate(context: vscode.ExtensionContext): void {
             return;
         }
         const batch = config().get<number>("batchSize", 100);
-        driftProvider.setProgress({ done: 0, total: paths.length, label: "starting" });
+        reindexRunning = true;
         let summary;
         try {
             summary = await reindexPaths(
@@ -553,13 +567,14 @@ export function activate(context: vscode.ExtensionContext): void {
                 proj.root,
                 paths,
                 batch,
-                force,
-                (done, total, label) => driftProvider.setProgress({ done, total, label })
+                indexStatusBar,
+                force
             );
         } finally {
             // Cleared before the drift check below, which draws its own progress in
-            // the view title — two bars for one operation reads as two operations.
-            driftProvider.setProgress(undefined);
+            // the view title — two indicators for one operation reads as two
+            // operations.
+            reindexRunning = false;
         }
         if (summary !== undefined) {
             // The drift check runs *before* the summary, not after: it is the only

@@ -4,7 +4,8 @@ import { detectLanguage } from "./languages";
 import { readUtf8 } from "./scanner";
 import { isCancellation, reportError } from "./errors";
 import { say } from "./brand";
-import { RateWindow } from "./shared/rateWindow";
+import { IndexStatusBar } from "./indexStatusBar";
+import { IndexFeed } from "./shared/indexFeed";
 
 export interface ReindexSummary {
     /** Files the server actually (re)indexed (present in the /index response). */
@@ -15,13 +16,16 @@ export interface ReindexSummary {
     skipped: string[];
 }
 
-/** Where a run reports itself besides the notification — see [`reindexPaths`]. */
-export type ReindexProgress = (done: number, total: number, label: string) => void;
-
 /**
  * Reads the given repo-relative paths and POSTs them to /index in sequential batches
  * (the server's pool is small; parallel batches just contend). Shows progress and
  * honours the user's cancel. Returns undefined if it failed and the user declined retry.
+ *
+ * Two surfaces, rendered from the one snapshot: the status bar holds the live feed
+ * — the paths going through, the rate, the counters — and the notification holds
+ * the Cancel button, which is the only thing it can hold that the status bar
+ * cannot. Its message is the feed's one line, because a notification message is
+ * structurally single-line (see [`IndexStatusBar`]).
  */
 export async function reindexPaths(
     api: MindexApi,
@@ -29,16 +33,8 @@ export async function reindexPaths(
     root: string,
     relPaths: string[],
     batchSize: number,
-    force = false,
-    /**
-     * Mirrors the notification's progress into the Drift view.
-     *
-     * Both, not one: the notification is the only one of the two that can carry a
-     * Cancel button, and it appears in the corner of the window rather than in the
-     * view the user just pressed a button in — which is how a running reindex came to
-     * read as nothing happening at all.
-     */
-    onProgress?: ReindexProgress
+    statusBar: IndexStatusBar,
+    force = false
 ): Promise<ReindexSummary | undefined> {
     const run = () =>
         vscode.window.withProgress(
@@ -57,7 +53,7 @@ export async function reindexPaths(
                     progress,
                     token,
                     force,
-                    onProgress
+                    statusBar
                 )
         );
     try {
@@ -74,8 +70,8 @@ export async function reindexPaths(
                 root,
                 relPaths,
                 batchSize,
-                force,
-                onProgress
+                statusBar,
+                force
             );
         });
         return retried;
@@ -91,70 +87,59 @@ async function doReindex(
     progress: vscode.Progress<{ message?: string; increment?: number }>,
     token: vscode.CancellationToken,
     force: boolean,
-    onProgress?: ReindexProgress
+    statusBar: IndexStatusBar
 ): Promise<ReindexSummary> {
     const abort = new AbortController();
     const sub = token.onCancellationRequested(() => abort.abort());
     const summary: ReindexSummary = { indexed: 0, unchanged: 0, skipped: [] };
 
-    // Live progress across all batches, fed by the server's SSE events: files
-    // settle one by one (`skipped`/`indexed`), and each embed batch advances the
-    // chunk counter, from which a sliding window computes an honest live
-    // chunks-per-second (a cumulative average flattens a long run). Against an
-    // older JSON-only server the callbacks never fire and the per-batch
-    // catch-up below keeps the old batch-granular behaviour.
+    // One feed across every batch, folded from the server's SSE events. Against an
+    // older JSON-only server no callback ever fires and the per-batch catch-up
+    // below keeps the counters moving, batch by batch.
     const total = relPaths.length;
-    let settled = 0;
-    let lastPct = 0;
-    let chunks = 0;
-    const rate = new RateWindow(20_000);
-    let lastReport = 0;
-    const report = (label: string, forceReport = false): void => {
+    const feed = new IndexFeed(total);
+    let lastRender = 0;
+    const render = (forceRender = false): void => {
         const now = Date.now();
-        // The Drift view redraws its whole tree per update; per-file events can
-        // arrive in bursts, so cap the redraw rate.
-        if (!forceReport && now - lastReport < 200) {
+        // Events arrive in bursts — a whole batch prepares at once — and each
+        // render rebuilds a Markdown tooltip. Cap the rate.
+        if (!forceRender && now - lastRender < 200) {
             return;
         }
-        lastReport = now;
-        const perSecond = rate.perSecond();
-        const rateLabel = perSecond === undefined ? "" : `${Math.round(perSecond)} chunks/s`;
-        const detail = [rateLabel, label].filter((s) => s !== "").join(" · ");
-        const pct = total > 0 ? (settled / total) * 100 : 100;
-        progress.report({
-            message: `${settled}/${total} files${detail === "" ? "" : ` · ${detail}`}`,
-            increment: pct - lastPct,
-        });
-        lastPct = pct;
-        onProgress?.(settled, total, detail);
+        lastRender = now;
+        const snapshot = feed.snapshot();
+        // No `increment`: the toast's own bar was a file-granular percentage, which
+        // is exactly the thing batched indexing makes meaningless — it jumps in two
+        // bursts and stands still through the embed pass it exists to explain.
+        progress.report({ message: snapshot.line });
+        statusBar.render(snapshot);
     };
     const callbacks: IndexStreamCallbacks = {
-        onPrepared: (e) => report(e.path),
+        onPrepared: (e) => {
+            feed.prepared(e.path);
+            render();
+        },
         onSkipped: (e) => {
-            settled += 1;
-            report(e.path);
+            feed.skipped(e.path, e.reason);
+            render();
         },
         onEmbedded: (e) => {
-            chunks += e.batch_chunks;
-            rate.push(Date.now(), chunks);
-            report("embedding");
+            feed.embedded(e.chunks_done, e.chunks_total, Date.now());
+            render();
         },
         onIndexed: (e) => {
-            settled += 1;
-            report(e.path);
+            feed.indexed(e.path, e.count);
+            render();
         },
     };
 
     try {
         for (let i = 0; i < relPaths.length; i += batchSize) {
             const batchPaths = relPaths.slice(i, i + batchSize);
-            // Reported *before* the batch, naming what is about to be read and sent:
-            // the long wait is the request, so a counter that only moved afterwards
-            // would sit still for exactly the stretch it exists to explain.
-            report(
-                batchPaths.length === 1 ? batchPaths[0] : `${batchPaths.length} files`,
-                true
-            );
+            // Shown *before* the batch is read and sent: the long wait is the
+            // request, so a surface that only appeared afterwards would be absent
+            // for exactly the stretch it exists to explain.
+            render(true);
 
             const files: IndexFiles = {};
             let posted = 0;
@@ -162,19 +147,20 @@ async function doReindex(
                 const language = detectLanguage(rel);
                 if (language === undefined) {
                     summary.skipped.push(rel);
+                    feed.droppedLocally(rel);
                     continue;
                 }
                 const code = await readUtf8(`${root}/${rel}`);
                 if (code === undefined) {
                     summary.skipped.push(rel);
+                    feed.droppedLocally(rel);
                     continue;
                 }
                 (files[language] ??= {})[rel] = { code };
                 posted += 1;
             }
             if (posted === 0) {
-                settled = Math.min(i + batchPaths.length, total);
-                report("skipped", true);
+                render(true);
                 continue;
             }
             const resp = await api.indexStream(guid, files, callbacks, abort.signal, force);
@@ -184,14 +170,15 @@ async function doReindex(
             }
             summary.indexed += indexed;
             summary.unchanged += posted - indexed;
-            // Idempotent catch-up: with SSE the events already settled every
-            // posted file and this only accounts the client-side skips; on the
-            // JSON fallback it advances the whole batch at once.
-            settled = Math.min(i + batchPaths.length, total);
-            report("posted", true);
+            // Idempotent catch-up: with SSE the events have already counted every
+            // posted file and this changes nothing; on the JSON fallback it is the
+            // only thing that moves the counters at all.
+            feed.settledAtLeast(summary.indexed, summary.unchanged + summary.skipped.length);
+            render(true);
         }
     } finally {
         sub.dispose();
+        statusBar.clear();
     }
     return summary;
 }
