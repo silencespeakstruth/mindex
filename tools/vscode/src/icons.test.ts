@@ -41,7 +41,7 @@ describe("icons", () => {
         // Icons that belong to VS Code's own vocabulary for an action this extension
         // did not invent. Listed rather than added to ICON, which is for glyphs the
         // extension's *own* surfaces share.
-        const borrowed = new Set(["new-file", "save", "trash", "stop-circle", "debug-rerun"]);
+        const borrowed = new Set(["new-file", "save", "stop-circle", "debug-rerun"]);
         for (const cmd of pkg.contributes.commands) {
             if (cmd.icon === undefined) {
                 continue;

@@ -28,10 +28,11 @@ use crate::backend::metrics::{
 };
 use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
-    delete_files, delete_history, delete_project, delete_research_run, get_config, get_files,
-    get_health, get_metrics, get_project_stats, get_projects, get_research_run, get_research_runs,
-    get_status, get_version, post_cancel, post_drift, post_gc, post_history, post_index,
-    post_research, post_research_pin, post_retry, post_search, post_symbols,
+    delete_files, delete_history, delete_project, delete_research_run, delete_research_runs,
+    get_config, get_files, get_health, get_metrics, get_project_stats, get_projects,
+    get_research_run, get_research_runs, get_status, get_version, post_cancel, post_drift, post_gc,
+    post_history, post_index, post_research, post_research_pin, post_retry, post_search,
+    post_symbols,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -92,6 +93,8 @@ pub struct RouterState {
     pub max_history_commits: usize,
     /// Byte cap for one commit's subject + body (`[limits]` config).
     pub max_commit_message_bytes: usize,
+    /// Run-id cap for one batch research delete (`[limits]` config).
+    pub max_research_delete_ids: usize,
     /// Paths per batch on soft-delete / cancel (`[indexing]` config).
     pub path_batch_size: usize,
     /// Status-log retention for the synchronous `POST /gc` pass (`[workers]` config).
@@ -449,7 +452,10 @@ fn build_router(
         // Browsing stored research is management, not the versioned data plane: it
         // reads server state the same way `/projects/{guid}/files` does. The run that
         // *produces* a report stays at `POST /v0/{guid}/research`.
-        .route("/projects/{project_guid}/research", get(get_research_runs))
+        .route(
+            "/projects/{project_guid}/research",
+            get(get_research_runs).delete(delete_research_runs),
+        )
         .route(
             "/projects/{project_guid}/research/{run_id}",
             get(get_research_run).delete(delete_research_run),

@@ -9,6 +9,8 @@ import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
 import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
 import { StatusPanel } from "./statusPanel";
 import { ResearchRunsPanel } from "./researchRunsPanel";
+import { browseResearchRuns, pickContextRuns } from "./researchContextPick";
+import { openResearchReport, RESEARCH_SCHEME, ResearchDocumentProvider } from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
 import { reindexPaths, showReindexSummary } from "./indexer";
 import { runSearch } from "./search";
@@ -258,7 +260,13 @@ export function activate(context: vscode.ExtensionContext): void {
                     cancelResearch();
                 }
             },
-            { include: s.include, exclude: s.exclude }
+            { include: s.include, exclude: s.exclude },
+            // Titles come from the form's own cache — `contextRunIds` on the
+            // submission is ids only, and a header reading "#7, #9" would name the
+            // provenance without saying what it is.
+            askProvider.currentContextRuns.filter((r) =>
+                (s.contextRunIds ?? []).includes(r.id)
+            )
         );
         researchPanel = panel;
 
@@ -367,14 +375,21 @@ export function activate(context: vscode.ExtensionContext): void {
             return;
         }
         if (s.mode === "research") {
-            await startResearch({
-                question: s.text,
-                effort: s.effort,
-                model: s.model,
-                budget: s.budget,
-                include: s.include,
-                exclude: s.exclude,
-            });
+            // Spread the whole submission minus the fields a research run has no
+            // use for, rather than naming the ones it does: `ResearchSubmission` is
+            // `AskSubmission` less exactly these four, so a field the form grows
+            // arrives here by construction. Copied field by field, `contextRunIds`
+            // was simply never listed — the picked reports reached the panel header
+            // and the request went out without them, so every run the user gave
+            // context to ran with none and said so in its report.
+            const {
+                mode: _mode,
+                text,
+                topK: _topK,
+                scopeCurrentFolder: _folder,
+                ...research
+            } = s;
+            await startResearch({ question: text, ...research });
             return;
         }
         try {
@@ -407,10 +422,17 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
         (s: AskSubmission) => void onAsk(s),
         cancelResearch,
-        () => void vscode.commands.executeCommand("mindex.openStatus")
+        () => void vscode.commands.executeCommand("mindex.openStatus"),
+        () => void vscode.commands.executeCommand("mindex.pickResearchContext")
     );
+    // Stored reports are served as read-only Markdown documents, so a report can be
+    // opened in a tab from anywhere that knows its id — the picker, the History
+    // rows, a dependency chip in a live run's header.
+    const researchDocs = new ResearchDocumentProvider(() => api);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(AskViewProvider.viewId, askProvider),
+        vscode.workspace.registerTextDocumentContentProvider(RESEARCH_SCHEME, researchDocs),
+        researchDocs,
         new vscode.Disposable(cancelResearch)
     );
 
@@ -720,8 +742,85 @@ export function activate(context: vscode.ExtensionContext): void {
                         // here is only useful to the mode that can spend it.
                         askProvider.focus("research");
                     },
+                    openReport: (run) => {
+                        const guid = project?.mindex.guid;
+                        if (guid !== undefined) {
+                            void openResearchReport(guid, run);
+                        }
+                    },
+                    reAsk: (run) => {
+                        const effort =
+                            run.effort === "low" || run.effort === "high"
+                                ? run.effort
+                                : "medium";
+                        askProvider.prefill(run.question, effort, run.model);
+                        // Attach the report being followed up, which is the point of
+                        // re-asking: the next run starts from what this one found
+                        // instead of rediscovering it.
+                        askProvider.setContextRuns(run.valid ? [run] : []);
+                        askProvider.focus("research");
+                        if (run.scope !== null) {
+                            // See `AskViewProvider.prefill`: the stored scope is prose,
+                            // not a selector, so it cannot be restored — say so rather
+                            // than silently widening the question.
+                            void vscode.window.showInformationMessage(
+                                say(
+                                    `report #${run.seq} was scoped to ${run.scope}. ` +
+                                        "Set the scope again if it mattered."
+                                )
+                            );
+                        }
+                    },
                 }
             );
+        }),
+
+        vscode.commands.registerCommand("mindex.pickResearchContext", async () => {
+            const guid = project?.mindex.guid;
+            if (guid === undefined) {
+                await vscode.window.showInformationMessage(
+                    say("no project here yet — create a .mindex file first.")
+                );
+                return;
+            }
+            const picked = await pickContextRuns(
+                api,
+                guid,
+                askProvider.currentContextRuns,
+                () => void vscode.commands.executeCommand("mindex.openResearchHistory")
+            );
+            // `undefined` is a dismissed picker and must leave the form alone; an
+            // empty array is a deliberate "no context" and must clear it.
+            if (picked !== undefined) {
+                askProvider.setContextRuns(picked);
+                askProvider.focus("research");
+            }
+        }),
+
+        vscode.commands.registerCommand("mindex.browseResearch", async () => {
+            const guid = project?.mindex.guid;
+            if (guid === undefined) {
+                await vscode.window.showInformationMessage(
+                    say("no project here yet — create a .mindex file first.")
+                );
+                return;
+            }
+            await browseResearchRuns(api, guid, () => {
+                void vscode.commands.executeCommand("mindex.openResearchHistory");
+            });
+        }),
+
+        vscode.commands.registerCommand("mindex.openResearchReport", async (arg: unknown) => {
+            const guid = project?.mindex.guid;
+            const run = arg as { id?: unknown; seq?: unknown; title?: unknown } | undefined;
+            if (guid === undefined || typeof run?.id !== "string") {
+                return;
+            }
+            await openResearchReport(guid, {
+                id: run.id,
+                seq: typeof run.seq === "number" ? run.seq : 0,
+                title: typeof run.title === "string" ? run.title : "report",
+            });
         }),
 
         vscode.commands.registerCommand("mindex.openSettings", () => openSettings()),

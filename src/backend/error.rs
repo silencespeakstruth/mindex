@@ -62,8 +62,14 @@ pub enum ApiError {
     BodyTooLarge,
 
     // ── Selector ──────────────────────────────────────────────────────────────
-    /// A management selector (`include`/`exclude`) was empty where non-empty is required. 400.
-    SelectorEmpty,
+    /// A destructive endpoint's selector was empty where non-empty is required. 400.
+    ///
+    /// `field` names what that endpoint's selector is spelled as — `include`/`exclude`
+    /// for the file endpoints, `ids` for the research batch delete. One code, because
+    /// the rule is one rule (a wipe is asked for, never reached by omission) and a
+    /// client maps codes; but the *pointer* has to name a field the request actually
+    /// has, or it sends the caller looking for one that does not exist.
+    SelectorEmpty { field: &'static str },
 
     // ── Validation (each carries the data its detail/meta interpolate) ──────────
     /// A repo-relative path violated the path rules (absolute / `..` / backslash / empty). 400.
@@ -123,6 +129,9 @@ pub enum ApiError {
     /// each offender with its reason (`stale` / `context_deleted` /
     /// `context_invalid`), so the client can drop exactly those picks.
     ResearchContextInvalid { runs: Vec<(String, &'static str)> },
+    /// A batch delete named more runs than `[limits].max_research_delete_ids`
+    /// allows. 400.
+    ResearchDeleteTooMany { got: usize, max: usize },
     /// A stored run was named that this project does not have. 404.
     ///
     /// One code for "no such run" and "a run of another project", deliberately: the
@@ -149,7 +158,7 @@ impl ApiError {
             ApiError::MalformedBody(_) => "request.malformed_body",
             ApiError::MalformedPath(_) => "request.malformed_path",
             ApiError::BodyTooLarge => "request.body_too_large",
-            ApiError::SelectorEmpty => "selector.empty",
+            ApiError::SelectorEmpty { .. } => "selector.empty",
             ApiError::PathInvalid { .. } => "validation.path_invalid",
             ApiError::Sha256Invalid { .. } => "validation.sha256_invalid",
             ApiError::TopKOutOfRange { .. } => "validation.top_k_out_of_range",
@@ -170,6 +179,7 @@ impl ApiError {
             ApiError::ResearchBudgetOutOfRange { .. } => "validation.research_budget_out_of_range",
             ApiError::ResearchContextTooMany { .. } => "validation.research_context_too_many",
             ApiError::ResearchContextInvalid { .. } => "validation.research_context_invalid",
+            ApiError::ResearchDeleteTooMany { .. } => "validation.research_delete_too_many",
             ApiError::ResearchRunNotFound { .. } => "research.run_not_found",
             ApiError::ResearchListLimitOutOfRange { .. } => {
                 "validation.research_list_limit_out_of_range"
@@ -210,7 +220,7 @@ impl ApiError {
             ApiError::MalformedBody(_) => "Malformed request body",
             ApiError::MalformedPath(_) => "Malformed path parameter",
             ApiError::BodyTooLarge => "Request body too large",
-            ApiError::SelectorEmpty => "Empty selector",
+            ApiError::SelectorEmpty { .. } => "Empty selector",
             ApiError::PathInvalid { .. } => "Invalid file path",
             ApiError::Sha256Invalid { .. } => "Invalid sha256",
             ApiError::TopKOutOfRange { .. } => "Invalid top_k",
@@ -231,6 +241,7 @@ impl ApiError {
             ApiError::ResearchBudgetOutOfRange { .. } => "Invalid research budget",
             ApiError::ResearchContextTooMany { .. } => "Too much prior research",
             ApiError::ResearchContextInvalid { .. } => "Research context run is invalid",
+            ApiError::ResearchDeleteTooMany { .. } => "Too many runs in one delete",
             ApiError::ResearchRunNotFound { .. } => "No such research run",
             ApiError::ResearchListLimitOutOfRange { .. } => "Invalid page size",
         }
@@ -245,7 +256,8 @@ impl ApiError {
             | ApiError::TooManyFiles { .. } => Some("files"),
             ApiError::TopKOutOfRange { .. } => Some("top_k"),
             ApiError::QueryEmpty | ApiError::QueryTooLong { .. } => Some("query"),
-            ApiError::SelectorEmpty | ApiError::SelectorTooLarge { .. } => Some("include/exclude"),
+            ApiError::SelectorEmpty { field } => Some(field),
+            ApiError::SelectorTooLarge { .. } => Some("include/exclude"),
             ApiError::SymbolNameEmpty | ApiError::SymbolNameTooLong { .. } => Some("name"),
             ApiError::SymbolLimitOutOfRange { .. } => Some("limit"),
             ApiError::TooManyCommits { .. }
@@ -258,6 +270,7 @@ impl ApiError {
                 Some("context_run_ids")
             }
             ApiError::ResearchListLimitOutOfRange { .. } => Some("limit"),
+            ApiError::ResearchDeleteTooMany { .. } => Some("ids"),
             _ => None,
         }
     }
@@ -294,9 +307,10 @@ impl ApiError {
             ApiError::BodyTooLarge => {
                 "The request body exceeds the configured size limit ([server].max_body_mib).".into()
             }
-            ApiError::SelectorEmpty => {
-                "At least one non-empty `include` or `exclude` selector is required.".into()
-            }
+            ApiError::SelectorEmpty { field } => format!(
+                "This endpoint refuses an empty selector, so that a destructive request \
+                 cannot match everything by omission. Name what it applies to in `{field}`."
+            ),
             ApiError::PathInvalid { path } => format!(
                 "Path {path:?} is invalid: paths must be non-empty, repo-relative (no leading '/'), \
                  free of '..' traversal, and use '/' (no backslash)."
@@ -360,6 +374,10 @@ impl ApiError {
                  ([research].max_context_runs). Each one is resent on every turn, so the cap is \
                  a token budget rather than a formality."
             ),
+            ApiError::ResearchDeleteTooMany { got, max } => format!(
+                "The request names {got} runs to delete, but at most {max} may be given in one \
+                 call ([limits].max_research_delete_ids). Delete them in batches."
+            ),
             ApiError::ResearchContextInvalid { runs } => format!(
                 "{} of the named context runs are no longer valid — stale, or resting on a \
                  deleted or stale run; injecting them would feed the new run obsolete prose. \
@@ -405,7 +423,8 @@ impl ApiError {
             ApiError::ResearchBudgetOutOfRange { field, got, max } => {
                 Some(json!({ "field": field, "got": got, "min": 1, "max": max }))
             }
-            ApiError::ResearchContextTooMany { got, max } => {
+            ApiError::ResearchContextTooMany { got, max }
+            | ApiError::ResearchDeleteTooMany { got, max } => {
                 Some(json!({ "got": got, "max": max }))
             }
             ApiError::ResearchContextInvalid { runs } => Some(json!({
@@ -527,7 +546,7 @@ mod tests {
             ApiError::MalformedBody(String::new()),
             ApiError::MalformedPath(String::new()),
             ApiError::BodyTooLarge,
-            ApiError::SelectorEmpty,
+            ApiError::SelectorEmpty { field: "" },
             ApiError::PathInvalid {
                 path: String::new(),
             },
@@ -567,6 +586,7 @@ mod tests {
             },
             ApiError::ResearchContextTooMany { got: 0, max: 0 },
             ApiError::ResearchContextInvalid { runs: Vec::new() },
+            ApiError::ResearchDeleteTooMany { got: 0, max: 0 },
             ApiError::ResearchRunNotFound {
                 run_id: String::new(),
             },
@@ -601,6 +621,7 @@ mod tests {
             "validation.research_budget_out_of_range",
             "validation.research_context_invalid",
             "validation.research_context_too_many",
+            "validation.research_delete_too_many",
             "validation.research_list_limit_out_of_range",
             "validation.selector_too_large",
             "validation.sha256_invalid",

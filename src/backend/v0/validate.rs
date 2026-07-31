@@ -140,6 +140,29 @@ pub fn research_list_limit(limit: Option<usize>, max: usize) -> Result<(), ApiEr
     Ok(())
 }
 
+/// A batch research delete: a non-empty id list within `[limits].max_research_delete_ids`.
+///
+/// The empty case is the `require_nonempty_selector` rule for a resource whose
+/// selector is a list — clearing a project's whole corpus must be *asked* for by
+/// naming the ids, never reached by posting `{}`. Duplicates are dropped rather
+/// than rejected (the ids become one `IN (…)` set, where a repeat means nothing),
+/// and the cap is applied to what is left, so a caller cannot exceed it with
+/// repetition alone.
+pub fn research_delete_ids(ids: &mut Vec<String>, max: usize) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    ids.retain(|id| seen.insert(id.clone()));
+    if ids.is_empty() {
+        return Err(ApiError::SelectorEmpty { field: "ids" });
+    }
+    if ids.len() > max {
+        return Err(ApiError::ResearchDeleteTooMany {
+            got: ids.len(),
+            max,
+        });
+    }
+    Ok(())
+}
+
 /// One `include`/`exclude` selector: its globs + languages combined must stay within
 /// the pattern cap. (Glob *syntax* is already validated when `GlobPattern` deserializes.)
 pub fn validate_selector(
@@ -205,7 +228,9 @@ pub fn require_nonempty_selector(
     if nonempty(include) || nonempty(exclude) {
         Ok(())
     } else {
-        Err(ApiError::SelectorEmpty)
+        Err(ApiError::SelectorEmpty {
+            field: "include/exclude",
+        })
     }
 }
 
@@ -519,6 +544,30 @@ mod tests {
             programming_languages: Some(vec![ProgrammingLanguage::Rust]),
         };
         assert!(require_nonempty_selector(&Some(lang), &None).is_ok());
+    }
+
+    /// The batch delete's selector is a list, so it needs the `selector.empty`
+    /// rule in its own shape: `{"ids": []}` must be a refusal, not a whole-corpus
+    /// wipe. Duplicates collapse first, so repetition cannot be used to clear the
+    /// cap either — and a list that is *only* duplicates of one id is one delete,
+    /// not an empty request.
+    #[test]
+    fn a_batch_delete_needs_ids_and_stays_within_the_cap() {
+        let mut none: Vec<String> = Vec::new();
+        assert_eq!(
+            err_code(research_delete_ids(&mut none, 10).unwrap_err()),
+            "selector.empty"
+        );
+
+        let mut dupes = vec!["a".to_string(), "a".to_string(), "a".to_string()];
+        assert!(research_delete_ids(&mut dupes, 2).is_ok());
+        assert_eq!(dupes, vec!["a".to_string()], "duplicates collapse");
+
+        let mut many = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            err_code(research_delete_ids(&mut many, 2).unwrap_err()),
+            "validation.research_delete_too_many"
+        );
     }
 
     #[test]

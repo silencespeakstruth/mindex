@@ -16,6 +16,8 @@ import { el, icon, pageData, vscodeApi } from "./host.js";
 interface PageData {
     question: string;
     scope: string;
+    /** The stored reports handed to this run as background. */
+    context: { id: string; seq: number; title: string }[];
 }
 
 interface Progress {
@@ -36,6 +38,14 @@ interface Progress {
 interface Done extends Progress {
     reason?: string;
     prompt_version?: string;
+    /**
+     * How the finished run can be named afterwards — **null when the journal write
+     * failed**, which is also how a report rejected by the markdown gate arrives.
+     * Nullable rather than absent: a fabricated id would name a run nothing can
+     * fetch.
+     */
+    run_id?: string | null;
+    seq?: number | null;
 }
 
 interface Step {
@@ -97,7 +107,7 @@ const CUT_SHORT: Record<string, string> = {
 };
 
 const api = vscodeApi<never>();
-const data = pageData<PageData>() ?? { question: "", scope: "" };
+const data = pageData<PageData>() ?? { question: "", scope: "", context: [] };
 
 const stepsBox = el("steps");
 const status = el("status");
@@ -111,6 +121,27 @@ if (data.scope !== "") {
     const node = el("scope");
     node.textContent = `Scope: ${data.scope}`;
     node.hidden = false;
+}
+// The provenance line. Rendered once from page data rather than on `done`: it is
+// true from the moment the run starts, and a reader watching the steps go by is
+// exactly who wants to know what it was told beforehand.
+if (data.context.length > 0) {
+    const node = el("deps");
+    node.hidden = false;
+    node.appendChild(document.createTextNode("Built on: "));
+    data.context.forEach((run, i) => {
+        if (i > 0) {
+            node.appendChild(document.createTextNode(", "));
+        }
+        const link = document.createElement("button");
+        link.className = "deplink";
+        link.textContent = `#${run.seq} ${run.title}`;
+        link.title = "Open this report in its own tab";
+        link.addEventListener("click", () =>
+            api.postMessage({ type: "openRun", id: run.id, seq: run.seq, title: run.title })
+        );
+        node.appendChild(link);
+    });
 }
 
 let currentThinking: HTMLDetailsElement | null = null;
@@ -355,6 +386,19 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
                     `The first draft cited ${
                         citations.draft_unverified + (citations.draft_path_only ?? 0)
                     } locations it had not looked at; it was sent back and rewritten.`
+                );
+            }
+            // The journal is best-effort by contract, so `run_id` is null when the
+            // write failed or the markdown gate rejected the draft. That is the
+            // whole wire signal, and it used to be rendered nowhere: the report was
+            // on screen, the History panel had no row for it, and nothing connected
+            // the two. Say it here, where the reader still has the text to copy.
+            if (msg.info.run_id === null || msg.info.run_id === undefined) {
+                prependNote(
+                    "warning",
+                    "This report was NOT saved to Research History — it cannot be " +
+                        "reopened or reused as context later. Copy it now if you want to " +
+                        "keep it."
                 );
             }
             toolbar.hidden = false;

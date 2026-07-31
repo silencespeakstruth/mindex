@@ -111,6 +111,7 @@ const DEFAULT_MAX_SYMBOL_NAME_BYTES: usize = 512;
 const DEFAULT_MAX_SYMBOL_RESULTS: usize = 50;
 const DEFAULT_MAX_HISTORY_COMMITS: usize = 20_000;
 const DEFAULT_MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_RESEARCH_DELETE_IDS: usize = 500;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_RESEARCH_WORKER_THREADS: usize = 2;
@@ -361,6 +362,11 @@ pub struct LimitsConfig {
     /// message is unbounded in git, so this is the `max_code_bytes` analogue for
     /// the history channel.
     pub max_commit_message_bytes: usize,
+    /// Maximum number of run ids in one `DELETE /projects/{guid}/research` body.
+    /// The ids become one `IN (…)` list, so this is what keeps a batch clear of
+    /// SQLite's bind-variable limit — the `max_history_commits` argument, at the
+    /// scale a research corpus actually reaches.
+    pub max_research_delete_ids: usize,
 }
 
 /// `/research` — the Ollama-driven iterative research endpoint. All TOML-only:
@@ -705,6 +711,7 @@ impl Default for LimitsConfig {
             max_symbol_results: DEFAULT_MAX_SYMBOL_RESULTS,
             max_history_commits: DEFAULT_MAX_HISTORY_COMMITS,
             max_commit_message_bytes: DEFAULT_MAX_COMMIT_MESSAGE_BYTES,
+            max_research_delete_ids: DEFAULT_MAX_RESEARCH_DELETE_IDS,
         }
     }
 }
@@ -1291,6 +1298,9 @@ impl Config {
         }
         if self.limits.max_symbol_results < 1 {
             e.push("[limits].max_symbol_results = 0 rejects every symbol lookup. Fix: use at least 1 (default 50).".to_string());
+        }
+        if self.limits.max_research_delete_ids < 1 {
+            e.push("[limits].max_research_delete_ids = 0 rejects every batch delete. Fix: use at least 1 (default 500).".to_string());
         }
         if self.limits.max_history_commits < 1 {
             e.push("[limits].max_history_commits = 0 rejects every history reconciliation. Fix: use at least 1 (default 20000).".to_string());

@@ -13,6 +13,41 @@ changes of its own is still released, so "which version am I running" has one an
 
 ### Added
 
+- **Stored research is a validity-tracked knowledge graph.** Every finished run is
+  browsable (`GET /projects/{guid}/research[/{run_id}]`), keeps or drops its place in
+  the retention sweep (`POST …/{run_id}/pin`), and can be fed to a later question as
+  prior context (`context_run_ids`). Validity is **derived at read time**, never
+  stored: a run is valid when its own files are unmoved *and* every run in its
+  transitive context chain still exists and is itself valid. Staleness can heal, and
+  a deleted parent leaves a dangling id that the recursive CTE reads as invalid
+  immediately — so there is no cascade to write and nothing to keep in step.
+  Migration 4 (`v1.2.0_research_context.sql`) rebuilds `research_runs` for `seq`,
+  `expires_at` and `context_run_ids_json`, and adds `research_run_files`.
+- **Batch delete for stored research** — `DELETE /projects/{guid}/research` with
+  `{"ids": […]}`. A corpus is pruned in handfuls, and one request per pick is one
+  chance per pick to fail halfway; this is a single transaction. Unknown ids are
+  ignored, so it is idempotent like the single-run delete. An **empty** list is a 400
+  (`selector.empty`) rather than a whole-corpus wipe, and the batch is capped by the
+  new `[limits].max_research_delete_ids` (TOML-only, default 500) — over it,
+  `validation.research_delete_too_many`.
+- **Two significance counters on every run summary**: `references_count` (how many
+  reports this one was built on) and `referenced_by_count` (how many were built on
+  it, counted across the whole corpus rather than the page). The first is
+  deliberately *not* `context.length`, which is the transitive ancestry — a run built
+  on one report that itself rests on three reads `1` and lists four. The second is
+  what makes a delete confirmation honest: removing a run invalidates every
+  descendant, and the caller is owed that number before agreeing.
+- **VS Code — research is a popup-first surface.** An `Add…` button beside the
+  context chips opens a QuickPick over the stored corpus, and it is visible in
+  Research mode whether or not anything is picked; while the block was hidden until
+  it had contents, the feature could only be found by already knowing about the
+  History panel. `Browse Stored Research` is the single-select twin for reading.
+  Stored reports open as read-only Markdown documents in their own tab (scheme
+  `mindex-research`, rendered by VS Code's own preview) with a provenance header, so
+  a report can sit beside the code it describes. A live run's header lists the
+  reports it was built on as clickable chips. Research History gained batch delete,
+  an `Ask again` action, visible retention (`pinned` / `3d left`), and both counters.
+
 - **`POST /v0/{guid}/index?stream=yes` streams indexing progress as SSE.** The
   default (`stream=no` or absent) keeps the one-shot JSON summary byte-for-byte, and
   both modes run the identical pipeline — the query parameter only decides how the
@@ -57,6 +92,38 @@ changes of its own is still released, so "which version am I running" has one an
 
 ### Fixed
 
+- **A research run whose report contained a non-ASCII character next to a citation
+  was lost outright.** `parse_citations` walks backwards from `:<digits>-<digits>` to
+  collect the path and did it by slicing the report at a **byte** index, which panics
+  when that byte falls inside a multi-byte character. `gpt-oss:20b` writes
+  OpenAI-style `【…】` citation brackets; one landing before a line range killed the
+  job thread, so no `done` event reached the client, `journal.record` was never
+  called, and the run left no row and no error — the report streamed to the screen and
+  then simply did not exist. Russian or any other non-ASCII prose in the report does
+  the same. The walk is over bytes now, which is exactly equivalent because the path
+  character class is ASCII-only. As a side effect the bracketed form parses correctly
+  instead of crashing.
+- **An SSE stream that ended without a terminal event looked like success.** Both
+  `/research` and `/index?stream=yes` spawn their job detached, so a panic aborts the
+  task, drops the sender and closes the channel — which is byte-for-byte what a
+  completed stream looks like to every consumer. The stream now tracks whether a
+  `done`/`error` went through and synthesises one `error` (`internal.error`) when the
+  channel closes without one. No new event name and no new code, so the SSE contract
+  and its consumers are unchanged.
+- **A run the server did not save now says so.** `done.run_id` has always been null
+  when the best-effort journal write failed or the report failed the Markdown gate,
+  and no surface rendered it — so a report that would never appear in Research
+  History was indistinguishable from one that would. The VS Code panel now warns
+  above the report, while the text is still there to copy.
+- **VS Code: deleting the open report left it rendered.** The Research History
+  preview kept showing a run that no longer existed, with the selection pointing at a
+  dead id. The pane resets, and it now remembers which report was open across a
+  reload the way the query and the selection already did.
+- **`selector.empty` named a field the request did not have.** The batch research
+  delete reuses the rule, but its selector is `ids`, not `include`/`exclude` — so the
+  error pointed a client at a field that does not exist in that body. The code is
+  unchanged (the rule is one rule); the `field` pointer and the detail now name
+  whichever selector the endpoint actually takes.
 - **The Grafana dashboard's whole Research row read as empty while the runs were
   there.** A labelled metric family is created by the first event carrying its label
   set, so its first scraped sample is already `1` — there is no preceding zero for

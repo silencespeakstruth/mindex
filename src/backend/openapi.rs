@@ -69,7 +69,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.too_many_commits`, `validation.commit_message_too_large`, \
 `validation.commit_invalid`, `validation.history_bound_missing`, `research.busy`, \
 `research.model_missing`, `validation.research_context_too_many`, \
-`validation.research_context_invalid`, \
+`validation.research_context_invalid`, `validation.research_delete_too_many`, \
 `validation.research_list_limit_out_of_range`, `research.run_not_found`.",
     ),
     paths(
@@ -89,6 +89,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::get_research_run,
         handlers::post_research_pin,
         handlers::delete_research_run,
+        handlers::delete_research_runs,
         // Projects
         handlers::get_projects,
         handlers::get_project_stats,
@@ -146,6 +147,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ResearchRunFile,
         crate::backend::v0::models::ResearchRunDetail,
         crate::backend::v0::models::ResearchPinRequest,
+        crate::backend::v0::models::DeleteResearchRunsRequest,
+        crate::backend::v0::models::DeleteResearchRunsResponse,
         crate::backend::v0::models::VersionResponse,
         crate::backend::v0::models::HealthChecks,
         crate::backend::v0::models::HealthResponse,

@@ -69,6 +69,7 @@ use crate::backend::v0::models::SymbolsRequest;
 use crate::backend::v0::models::SymbolsResponse;
 use crate::backend::v0::models::UUIDv4;
 use crate::backend::v0::models::VersionResponse;
+use crate::backend::v0::models::{DeleteResearchRunsRequest, DeleteResearchRunsResponse};
 use crate::backend::v0::models::{GrepMatch, GrepResponse};
 use crate::backend::v0::models::{HistoryPruneQuery, HistoryPruneResponse, HistoryRequest};
 use crate::backend::v0::models::{
@@ -1290,11 +1291,13 @@ pub async fn post_index(
         let _ = tx.send(terminal);
     });
 
-    Ok(axum::response::sse::Sse::new(SseEventStream { rx, token })
-        .keep_alive(
-            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-        )
-        .into_response())
+    Ok(
+        axum::response::sse::Sse::new(SseEventStream::new(rx, token))
+            .keep_alive(
+                axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+            )
+            .into_response(),
+    )
 }
 
 /// The whole indexing pipeline for one `/index` request, shared verbatim by both
@@ -3893,6 +3896,12 @@ fn research_validity_ctes(guid_bind: &str, model_bind: &str) -> String {
                FROM research_runs r, json_each(r.context_run_ids_json) je
               WHERE r.project_guid = {guid_bind}
          ),
+         refs AS (
+             SELECT child_id AS run_id, COUNT(*) AS n FROM edges GROUP BY child_id
+         ),
+         refd AS (
+             SELECT parent_id AS run_id, COUNT(*) AS n FROM edges GROUP BY parent_id
+         ),
          invalid (run_id) AS (
              SELECT run_id FROM moved WHERE files_moved > 0
              UNION
@@ -4290,6 +4299,18 @@ impl crate::research::ResearchTools for StateResearchTools {
 trait SseWireEvent {
     fn name(&self) -> &'static str;
     fn data(&self) -> serde_json::Value;
+    /// Whether this event closes the stream. Both vocabularies end the same
+    /// way — `done` or `error` — and `SseEventStream` uses this to notice a job
+    /// that stopped without saying so.
+    fn is_terminal(&self) -> bool;
+    /// The terminal `error` to synthesise when the job's channel closed with no
+    /// terminal event of its own. Deliberately an existing event name and an
+    /// existing `ApiError` code, so the four-place SSE contract and
+    /// `codes_are_stable` are both untouched — a consumer that already handles
+    /// `error` handles this with no change.
+    fn abnormal_end() -> Self
+    where
+        Self: Sized;
 }
 
 impl SseWireEvent for crate::research::ResearchEvent {
@@ -4299,6 +4320,21 @@ impl SseWireEvent for crate::research::ResearchEvent {
     fn data(&self) -> serde_json::Value {
         self.data()
     }
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            crate::research::ResearchEvent::Done { .. }
+                | crate::research::ResearchEvent::Error { .. }
+        )
+    }
+    fn abnormal_end() -> Self {
+        crate::research::ResearchEvent::Error {
+            code: ApiError::Internal.code().to_string(),
+            detail: "The research job stopped without producing a report. \
+                     Nothing was saved; the run can be re-asked."
+                .to_string(),
+        }
+    }
 }
 
 impl SseWireEvent for IndexEvent {
@@ -4307,6 +4343,18 @@ impl SseWireEvent for IndexEvent {
     }
     fn data(&self) -> serde_json::Value {
         self.data()
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(self, IndexEvent::Done { .. } | IndexEvent::Error { .. })
+    }
+    fn abnormal_end() -> Self {
+        IndexEvent::Error {
+            code: ApiError::Internal.code().to_string(),
+            detail: "The indexing job stopped without reporting a result. \
+                     Re-run the request; files left mid-flight are recovered by \
+                     the retry worker."
+                .to_string(),
+        }
     }
 }
 
@@ -4322,9 +4370,36 @@ impl SseWireEvent for IndexEvent {
 /// matters now that a run may be granted an hour. The permit lives in the spawned
 /// future instead, so a slot frees when the work stops rather than when the
 /// reader leaves.
+///
+/// A job that stops *without* sending a terminal event is the one case this
+/// stream has to invent something for, and it is not hypothetical: a panic in
+/// the detached job aborts the task, drops the sender, and the channel simply
+/// closes. To every consumer that is byte-for-byte a completed stream — which
+/// is how a research run that panicked in `parse_citations` read as a success
+/// that had merely produced no report, while nothing was journalled and no
+/// error was logged anywhere the client could see. So the closing of the
+/// channel is only a clean end if a terminal event went through first;
+/// otherwise one `error` is synthesised (`SseWireEvent::abnormal_end`).
 struct SseEventStream<E> {
     rx: tokio::sync::mpsc::UnboundedReceiver<E>,
     token: CancellationToken,
+    /// Whether a `done`/`error` has already gone out, so the synthetic terminal
+    /// is not appended to a stream that ended properly.
+    saw_terminal: bool,
+    /// Whether the synthetic terminal has been emitted, so the stream ends on
+    /// the poll after it rather than repeating it forever.
+    ended: bool,
+}
+
+impl<E> SseEventStream<E> {
+    fn new(rx: tokio::sync::mpsc::UnboundedReceiver<E>, token: CancellationToken) -> Self {
+        Self {
+            rx,
+            token,
+            saw_terminal: false,
+            ended: false,
+        }
+    }
 }
 
 impl<E> Drop for SseEventStream<E> {
@@ -4340,12 +4415,31 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.get_mut().rx.poll_recv(cx).map(|opt| {
-            opt.map(|e| {
-                Ok(axum::response::sse::Event::default()
+        let this = self.get_mut();
+        this.rx.poll_recv(cx).map(|opt| match opt {
+            Some(e) => {
+                this.saw_terminal |= e.is_terminal();
+                Some(Ok(axum::response::sse::Event::default()
                     .event(e.name())
-                    .data(e.data().to_string()))
-            })
+                    .data(e.data().to_string())))
+            }
+            // The channel closed. Ending here is correct only if the job said
+            // how it ended; otherwise it died without a word.
+            None if this.saw_terminal || this.ended => None,
+            None => {
+                this.ended = true;
+                let e = E::abnormal_end();
+                warn!(
+                    event = e.name(),
+                    "A streaming job ended without a terminal event; \
+                     synthesising one so the client does not read the stream as \
+                     successful. This means the job task died — check for a panic \
+                     above this line."
+                );
+                Some(Ok(axum::response::sse::Event::default()
+                    .event(e.name())
+                    .data(e.data().to_string())))
+            }
         })
     }
 }
@@ -4609,7 +4703,7 @@ pub async fn post_research(
         crate::research::run_research(ollama, tools, journal, params, tx, job_token).await;
     });
 
-    let stream = SseEventStream { rx, token };
+    let stream = SseEventStream::new(rx, token);
     Ok(axum::response::sse::Sse::new(stream)
         .keep_alive(
             axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
@@ -5528,12 +5622,24 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
 /// can never describe the same run differently. `?2` is the embedding model id.
 /// Any query selecting these must prepend [`research_validity_ctes`] — `invalid` is
 /// one of its CTEs, not a table.
+/// How many columns [`research_summary_columns`] selects, i.e. the index the
+/// *next* column a caller appends will land on.
+///
+/// The detail query selects the summary and then four columns of its own, and
+/// read them back at hardcoded indices — so adding one summary column silently
+/// shifted `report` into `invalid_flag`'s place and the run's own report became
+/// whatever the next column held. Naming the boundary is what stops the two from
+/// drifting; `research_summary_columns_are_counted_correctly` pins it.
+const RESEARCH_SUMMARY_COLUMNS: usize = 19;
+
 fn research_summary_columns() -> String {
     format!(
         "r.id, r.seq, r.question, r.created_at, r.expires_at, r.model, r.effort,
          r.done_reason, r.citations_total, r.citations_verified, r.citations_unverified,
          r.steps, r.elapsed_ms, {}, r.title,
-         EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS invalid_flag",
+         EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS invalid_flag,
+         COALESCE((SELECT n FROM refs WHERE refs.run_id = r.id), 0) AS references_count,
+         COALESCE((SELECT n FROM refd WHERE refd.run_id = r.id), 0) AS referenced_by_count",
         research_staleness_columns("?2")
     )
 }
@@ -5573,6 +5679,8 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
         stale: files_moved > 0,
         valid: !invalid_flag,
         invalid_reason: None,
+        references_count: row.get(17)?,
+        referenced_by_count: row.get(18)?,
         context: Vec::new(),
     })
 }
@@ -5794,13 +5902,17 @@ pub async fn get_research_run(
             let row = tx
                 .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
                     let summary = research_summary_from_row(row)?;
-                    let context_json: String = row.get(19)?;
+                    // The four detail-only columns, appended after the summary's —
+                    // indexed from the boundary rather than from a literal, so a
+                    // new summary column cannot quietly redirect them.
+                    let n = RESEARCH_SUMMARY_COLUMNS;
+                    let context_json: String = row.get(n + 2)?;
                     Ok((
                         summary,
-                        row.get::<_, String>(17)?,
-                        row.get::<_, String>(18)?,
+                        row.get::<_, String>(n)?,
+                        row.get::<_, String>(n + 1)?,
                         context_json,
-                        row.get::<_, Option<String>>(20)?,
+                        row.get::<_, Option<String>>(n + 3)?,
                     ))
                 })
                 .optional()?;
@@ -6011,6 +6123,96 @@ pub async fn delete_research_run(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /projects/{project_guid}/research` — drop a batch of stored runs.
+///
+/// The plural of [`delete_research_run`], and it exists because pruning a corpus is
+/// a *set* operation: the runs worth removing are the ones a human just picked out
+/// of a list, and one request per pick makes "clear these twenty" twenty chances to
+/// fail halfway. One transaction, one `IN (…)`, so the batch either lands or does
+/// not.
+///
+/// Unknown ids are ignored rather than 404 — the same idempotence the single-run
+/// delete has, and the only sane answer for a batch where one id was already gone.
+/// `deleted_runs` is what actually went, so a caller can tell the difference. An
+/// **empty** list is a 400 (`selector.empty`), the `require_nonempty_selector` rule:
+/// emptying a project's corpus is asked for by naming its runs, never reached by
+/// posting `{}`.
+///
+/// Like the single delete, this invalidates every descendant at read time and
+/// writes nothing to reach them — see [`research_validity_ctes`].
+///
+/// **Concurrency:** safe — rows only, no locks, no Qdrant contact.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_guid}/research",
+    tag = "Research",
+    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    request_body = DeleteResearchRunsRequest,
+    responses(
+        (status = 200, description = "Runs matched and deleted.", body = DeleteResearchRunsResponse),
+        (status = 204, description = "None of the named runs existed — nothing changed."),
+        (status = 400, description = "Empty or oversized id list.", body = ProblemDetails),
+        (status = 500, description = "SQLite write failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn delete_research_runs(
+    ApiPath(project_guid): ApiPath<UUIDv4>,
+    State(s): State<RouterState>,
+    ApiJson(mut req): ApiJson<DeleteResearchRunsRequest>,
+) -> Result<Response, ApiError> {
+    validate::research_delete_ids(&mut req.ids, s.max_research_delete_ids)?;
+
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let pg = project_guid;
+    let ids = req.ids;
+
+    let deleted = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            // `?1` is the project; the ids follow it, so the first is `?2`.
+            let placeholders = (0..ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+            binds.push(&pg);
+            for id in &ids {
+                binds.push(id);
+            }
+            let n = tx.execute(
+                &format!(
+                    "DELETE FROM research_runs \
+                      WHERE project_guid = ?1 AND id IN ({placeholders})"
+                ),
+                binds.as_slice(),
+            )?;
+            Ok(n as u64)
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to delete a batch of stored research runs. Check the database is writable."
+            );
+            ApiError::from(e)
+        })?;
+
+    if deleted == 0 {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    info!(
+        project_guid = %project_guid.0,
+        deleted_runs = deleted,
+        "Deleted stored research runs."
+    );
+    Ok(Json(DeleteResearchRunsResponse {
+        deleted_runs: deleted,
+    })
+    .into_response())
 }
 
 /// `POST /gc` — runs a full GC pass synchronously and returns what it removed:
@@ -6228,6 +6430,92 @@ mod tests {
     };
     use glob::Pattern;
     use uuid::Uuid;
+
+    /// Count the frames an `SseEventStream` yields once its sender is gone.
+    /// Every `poll_recv` here is immediately ready, so a no-op waker is enough
+    /// and the test needs no runtime.
+    fn drain_frames<E: SseWireEvent>(stream: &mut SseEventStream<E>) -> usize {
+        use futures_core::Stream;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut n = 0;
+        loop {
+            match std::pin::Pin::new(&mut *stream).poll_next(&mut cx) {
+                std::task::Poll::Ready(Some(Ok(_))) => n += 1,
+                std::task::Poll::Ready(None) => return n,
+                std::task::Poll::Pending => panic!("a closed channel must not park"),
+            }
+        }
+    }
+
+    /// A detached job that dies without a terminal event — the shape a panic
+    /// takes — must not read as a completed stream. Before this, a research job
+    /// that panicked in `parse_citations` closed its channel silently and every
+    /// consumer treated the run as finished-with-no-report.
+    #[test]
+    fn a_stream_whose_job_dies_without_a_terminal_event_still_ends_in_error() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<IndexEvent>();
+        let mut stream = SseEventStream::new(rx, CancellationToken::new());
+        tx.send(IndexEvent::Started {
+            files: 1,
+            symbols_only: false,
+        })
+        .unwrap();
+        drop(tx); // the job died here: no `done`, no `error`.
+
+        assert_eq!(
+            drain_frames(&mut stream),
+            2,
+            "the synthetic terminal must be appended"
+        );
+        assert!(stream.ended, "the stream must have synthesised a terminal");
+        assert!(!stream.saw_terminal, "the job never sent one itself");
+    }
+
+    /// The mirror: a job that ended properly gets nothing appended, or every
+    /// clean run would ship a spurious error after its `done`.
+    #[test]
+    fn a_stream_that_ended_properly_gets_no_synthetic_terminal() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<IndexEvent>();
+        let mut stream = SseEventStream::new(rx, CancellationToken::new());
+        tx.send(IndexEvent::Error {
+            code: ApiError::Internal.code().to_string(),
+            detail: "boom".into(),
+        })
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(drain_frames(&mut stream), 1);
+        assert!(stream.saw_terminal);
+        assert!(!stream.ended, "nothing should have been synthesised");
+    }
+
+    /// `RESEARCH_SUMMARY_COLUMNS` is the boundary the detail query indexes its own
+    /// four columns from, so a summary column added without moving it silently
+    /// hands the caller the wrong values — `report` would come back holding
+    /// `invalid_flag`. Counted from the SQL itself rather than trusted.
+    #[test]
+    fn research_summary_columns_are_counted_correctly() {
+        let cols = research_summary_columns();
+        // One column per top-level comma. The subselects inside contain none, and
+        // that is worth asserting rather than assuming.
+        let mut depth = 0i32;
+        let mut n = 1usize;
+        for c in cols.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => n += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced parentheses in the column list");
+        assert_eq!(
+            n, RESEARCH_SUMMARY_COLUMNS,
+            "the summary selects {n} columns but RESEARCH_SUMMARY_COLUMNS says \
+             {RESEARCH_SUMMARY_COLUMNS}; the detail query indexes its own columns \
+             from that constant, so update it in the same commit"
+        );
+    }
 
     /// A title is cut from the question at a **word** boundary, because a list of
     /// titles is scanned rather than read: a cut through an identifier

@@ -55,7 +55,17 @@ export class ResearchPanel {
          * report that could only see `docs/**` saying "this is not in the project" is
          * misleading unless the reader can see why.
          */
-        scope?: Scope
+        scope?: Scope,
+        /**
+         * The stored reports handed to this run as background, rendered as
+         * clickable chips in the header.
+         *
+         * A report built on other reports inherits their claims, and afterwards the
+         * document says nothing about whose. Showing the chain — and letting each
+         * link open — is what makes a chained run auditable instead of a fact with
+         * no visible provenance.
+         */
+        context: readonly { id: string; seq: number; title: string }[] = []
     ) {
         this.panel = vscode.window.createWebviewPanel(
             "mindexResearch",
@@ -78,9 +88,21 @@ export class ResearchPanel {
             // and no `node_modules` root to authorise.
             modules: ["js/research.js"],
             codicons: true,
-            data: { question, scope: describeScope(scope) },
+            data: {
+                question,
+                scope: describeScope(scope),
+                context: context.map((r) => ({ id: r.id, seq: r.seq, title: r.title })),
+            },
         });
         this.panel.webview.onDidReceiveMessage((msg: Record<string, unknown>) => {
+            if (msg.type === "openRun") {
+                void vscode.commands.executeCommand("mindex.openResearchReport", {
+                    id: asString(msg.id),
+                    seq: Number(msg.seq),
+                    title: asString(msg.title),
+                });
+                return;
+            }
             if (msg.type === "copy") {
                 void vscode.env.clipboard
                     .writeText(asString(msg.text))

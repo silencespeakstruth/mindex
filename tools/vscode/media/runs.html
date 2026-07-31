@@ -45,6 +45,10 @@
 
         <footer class="runs-foot">
             <button id="runs-more" class="ghost" hidden>Load more</button>
+            <button id="runs-delete" class="secondary" disabled>
+                <span class="codicon codicon-trash"></span>
+                <span id="runs-delete-label">Delete</span>
+            </button>
             <button id="runs-use" class="primary" disabled>
                 <span class="codicon codicon-references"></span>
                 <span id="runs-use-label">Use as context</span>
@@ -53,6 +57,8 @@
     </aside>
 
     <section class="runs-preview" id="runs-preview">
+        <!-- Kept in step with PREVIEW_PLACEHOLDER in webview/runs.ts, which restores
+             this pane after the open report is deleted. -->
         <p class="runs-placeholder dim">Select a run to read its report.</p>
     </section>
 </main>

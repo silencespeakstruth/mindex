@@ -2806,8 +2806,19 @@ fn parse_citations(report: &str) -> Vec<Citation> {
             }
         };
         // ── backward: the longest run of path characters before the colon
+        //
+        // Walked over **bytes**, and that is load-bearing rather than a
+        // micro-optimisation: `report[k - 1..k]` panics outright when byte
+        // `k - 1` is inside a multi-byte character, which is any report
+        // whose prose is not ASCII. It is exactly equivalent here because
+        // `is_path_char` accepts only ASCII, so a non-ASCII byte ends the
+        // path either way — and a byte below 0x80 is always a char boundary.
+        // Measured in production: `gpt-oss:20b` writes OpenAI-style `【…】`
+        // citation brackets, and one of them landing before a `:N-M` killed
+        // the whole research job, so the run was never journalled and the
+        // client saw a stream that simply stopped. Russian prose does it too.
         let mut k = i;
-        while k > 0 && is_path_char(report[k - 1..k].chars().next().unwrap_or(' ')) {
+        while k > 0 && b[k - 1].is_ascii() && is_path_char(b[k - 1] as char) {
             k -= 1;
         }
         let path = &report[k..i];
@@ -8923,6 +8934,56 @@ mod tests {
         }
         // A single-line citation is legal and common.
         assert_eq!(parse_citations("src/x.rs:12-12").len(), 1);
+    }
+
+    /// A report is arbitrary model prose, so it is arbitrary UTF-8 — and the
+    /// backward path walk used to index it by byte. Every case here panicked
+    /// ("byte index is not a char boundary") before the walk moved to bytes,
+    /// and a panic in `parse_citations` kills the research job: no `done`
+    /// event, no journal row, a silently vanished run. This is the regression
+    /// guard for that, not a parsing nicety.
+    #[test]
+    fn a_report_is_arbitrary_utf8_and_must_never_panic_the_parser() {
+        // The shape that actually did it in production: `gpt-oss:20b` writes
+        // OpenAI-style citation brackets, and `【` abuts the path. The bracket
+        // is simply not a path character, so the citation inside it parses —
+        // which is the right answer, and was unreachable while it panicked.
+        assert_eq!(
+            parse_citations("see 【F:src/x.rs:10-20】")
+                .iter()
+                .map(|c| (c.path.as_str(), c.start, c.end))
+                .collect::<Vec<_>>(),
+            vec![("src/x.rs", 10, 20)]
+        );
+        // Cyrillic prose directly before a real citation: the citation still
+        // parses, and the multi-byte character is simply where the path ends.
+        assert_eq!(
+            parse_citations("см. src/research.rs:518-539")
+                .iter()
+                .map(|c| (c.path.as_str(), c.start, c.end))
+                .collect::<Vec<_>>(),
+            vec![("src/research.rs", 518, 539)]
+        );
+        // A multi-byte character abutting a bare range is not a citation, and
+        // deciding that must not require slicing into the character.
+        for text in [
+            "версия 123-456",
+            "…:12-30",
+            "→:1-2",
+            "префикс—src/x.rs:12-30",
+            "【4:0-1】",
+        ] {
+            let _ = parse_citations(text);
+        }
+        // The last one still finds the path that follows the dash, because a
+        // dash is a path character: what matters is that it did not panic.
+        assert_eq!(
+            parse_citations("префикс—src/x.rs:12-30")
+                .iter()
+                .map(|c| c.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/x.rs"]
+        );
     }
 
     #[test]

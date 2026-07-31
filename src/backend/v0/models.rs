@@ -1248,6 +1248,22 @@ pub struct ResearchRunSummary {
     /// run in its context chain was deleted or reaped), or `context_invalid` (an
     /// ancestor is itself stale or broken). `null` when valid.
     pub invalid_reason: Option<&'static str>,
+    /// How many runs this one was launched **on** — the length of its own
+    /// `context_run_ids`, so *direct* dependencies only.
+    ///
+    /// Deliberately not the same number as `context.len()`, which is the
+    /// *transitive* ancestry: a run built on one report that was itself built on
+    /// three has `references_count = 1` and four entries in `context`. The direct
+    /// count is what a human chose; the transitive list is what they inherited,
+    /// and conflating them makes a shallow run look deep.
+    pub references_count: i64,
+    /// How many other runs of this project name this one in their context —
+    /// direct edges in, counted across the whole corpus rather than the page.
+    ///
+    /// The other half of "is this report load-bearing", and the number that makes
+    /// a delete confirmation honest: removing a run invalidates every descendant,
+    /// so a caller is owed the count before they agree to it.
+    pub referenced_by_count: i64,
     /// The run's transitive context ancestry, flattened and deduplicated —
     /// ascending `seq`, deleted entries last. What lets a human pick context with
     /// confidence: every report this one leaned on, each with its own state.
@@ -1303,6 +1319,29 @@ pub struct ResearchRunDetail {
     pub scope: Option<String>,
     /// Per-file freshness — the honest form of `stale`.
     pub files: Vec<ResearchRunFile>,
+}
+
+/// `DELETE /projects/{guid}/research` body — the ids to drop.
+///
+/// A list rather than the `include`/`exclude` selector the file endpoints take:
+/// a run is not a path, and the only thing a caller ever wants to remove is the
+/// set it just picked out of a list it was looking at. The `require_nonempty_selector`
+/// rule still applies (an empty list is a **400**, not a whole-project wipe) —
+/// clearing the corpus is asked for by naming every id, never arrived at by
+/// forgetting a field.
+#[derive(Deserialize, Serialize, Debug, Default, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteResearchRunsRequest {
+    /// Run ids, as returned by the list endpoint. Unknown ids are ignored, so the
+    /// call is idempotent the way the single-run delete is.
+    pub ids: Vec<String>,
+}
+
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DeleteResearchRunsResponse {
+    /// How many rows were actually removed — never more than `ids.len()`, and
+    /// less when some were already gone.
+    pub deleted_runs: u64,
 }
 
 /// `POST /projects/{guid}/research/{run_id}/pin` body.

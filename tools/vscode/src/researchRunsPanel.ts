@@ -17,6 +17,14 @@ export interface ResearchRunsActions {
      * way `StatusActions` keeps `StatusPanel` from reaching into the retry logic.
      */
     useAsContext(runs: ResearchRunSummary[]): void;
+    /** Open one stored report as its own Markdown tab. */
+    openReport(run: ResearchRunSummary): void;
+    /**
+     * Put a stored run's question back in the Ask form — same scope, model and
+     * effort — with the run itself attached as context. Following a report up is
+     * the common next move, and retyping the question is how it gets skipped.
+     */
+    reAsk(run: ResearchRunDetail): void;
 }
 
 /** How long the box waits after the last keystroke before it asks the server. */
@@ -127,7 +135,20 @@ export class ResearchRunsPanel {
                         void this.pin(asString(msg.id), msg.pinned === true);
                         break;
                     case "delete":
-                        void this.remove(asString(msg.id));
+                        void this.remove([asString(msg.id)]);
+                        break;
+                    case "deleteSelected":
+                        void this.remove([...this.selected]);
+                        break;
+                    case "openRun": {
+                        const run = this.rows.get(asString(msg.id));
+                        if (run !== undefined) {
+                            actions.openReport(run);
+                        }
+                        break;
+                    }
+                    case "reAsk":
+                        void this.reAsk(asString(msg.id), actions);
                         break;
                     case "useAsContext":
                         actions.useAsContext(
@@ -281,15 +302,41 @@ export class ResearchRunsPanel {
         }
     }
 
-    private async remove(id: string): Promise<void> {
+    /**
+     * Delete one run or a batch, through the one path.
+     *
+     * Batched server-side rather than looped here: a corpus is pruned in handfuls,
+     * and N requests is N chances to fail halfway and leave the user guessing which
+     * half went. The confirmation names the **dependants**, because deleting a run
+     * silently invalidates every later report built on it — the caller is owed that
+     * number before they agree, and `referenced_by_count` is why it is on the wire.
+     */
+    private async remove(ids: string[]): Promise<void> {
         const guid = this.guid();
-        if (guid === undefined) {
+        if (guid === undefined || ids.length === 0) {
             return;
         }
-        const row = this.rows.get(id);
-        const label = row === undefined ? "this run" : `#${row.seq} — ${row.title}`;
+        const picked = ids
+            .map((id) => this.rows.get(id))
+            .filter((r): r is ResearchRunSummary => r !== undefined);
+        const label =
+            ids.length === 1
+                ? picked[0] === undefined
+                    ? "this run"
+                    : `#${picked[0].seq} — ${picked[0].title}`
+                : `${ids.length} reports`;
+        // The count is stated, not netted against the selection: a summary carries
+        // its *ancestors* (`context`), never its dependants, so which of them are
+        // also being deleted is not knowable here — and quietly reporting a smaller
+        // number than the truth is the wrong way to be wrong in a delete dialog.
+        const dependants = picked.reduce((n, r) => n + r.referenced_by_count, 0);
+        const warning =
+            dependants > 0
+                ? `\n\n${dependants} later report(s) were built on ` +
+                  `${ids.length === 1 ? "it" : "these"} and will become invalid.`
+                : "";
         const yes = await vscode.window.showWarningMessage(
-            `Delete ${label}? The report cannot be recovered.`,
+            `Delete ${label}? The report${ids.length === 1 ? "" : "s"} cannot be recovered.${warning}`,
             { modal: true },
             "Delete"
         );
@@ -297,14 +344,33 @@ export class ResearchRunsPanel {
             return;
         }
         try {
-            await this.api().deleteResearchRun(guid, id);
+            if (ids.length === 1) {
+                await this.api().deleteResearchRun(guid, ids[0]);
+            } else {
+                await this.api().deleteResearchRuns(guid, ids);
+            }
         } catch (e) {
             this.post({ type: "error", message: messageOf(e) });
             return;
         }
-        this.rows.delete(id);
-        this.selected.delete(id);
-        this.post({ type: "removed", id, selected: [...this.selected] });
+        for (const id of ids) {
+            this.rows.delete(id);
+            this.selected.delete(id);
+        }
+        this.post({ type: "removed", ids, selected: [...this.selected] });
+    }
+
+    /** Send a stored run's question and settings back to the Ask form. */
+    private async reAsk(id: string, actions: ResearchRunsActions): Promise<void> {
+        const guid = this.guid();
+        if (guid === undefined) {
+            return;
+        }
+        try {
+            actions.reAsk(await this.api().getResearchRun(guid, id));
+        } catch (e) {
+            this.post({ type: "error", message: messageOf(e) });
+        }
     }
 
     private post(message: unknown): void {

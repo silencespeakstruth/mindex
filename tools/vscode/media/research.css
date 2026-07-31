@@ -163,3 +163,30 @@ details.thinking pre {
 #toolbar {
     margin-top: 16px;
 }
+
+/*
+ * The provenance line: which stored reports this run was given as background.
+ *
+ * Sits in the header with the scope for the same reason the scope does — both
+ * bound what the report is entitled to claim, and neither is recoverable from the
+ * document afterwards. The links are buttons, not anchors: the host opens the
+ * report, and a webview cannot navigate anywhere by itself.
+ */
+.deps {
+    margin-top: 0.2rem;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+.deplink {
+    padding: 0;
+    color: var(--vscode-textLink-foreground);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+}
+
+.deplink:hover {
+    text-decoration: underline;
+}

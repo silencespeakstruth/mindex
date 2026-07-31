@@ -187,6 +187,24 @@
         "icon": "$(history)"
       },
       {
+        "command": "mindex.browseResearch",
+        "title": "Browse Stored Research",
+        "category": "MINDex",
+        "icon": "$(book)"
+      },
+      {
+        "command": "mindex.pickResearchContext",
+        "title": "Pick Research Context",
+        "category": "MINDex",
+        "icon": "$(references)"
+      },
+      {
+        "command": "mindex.openResearchReport",
+        "title": "Open Research Report",
+        "category": "MINDex",
+        "icon": "$(go-to-file)"
+      },
+      {
         "command": "mindex.openSettings",
         "title": "Open Settings",
         "category": "MINDex",
@@ -201,14 +219,19 @@
           "group": "navigation@1"
         },
         {
-          "command": "mindex.openResearchHistory",
+          "command": "mindex.browseResearch",
           "when": "view == mindexAsk",
           "group": "navigation@2"
         },
         {
-          "command": "mindex.openSettings",
+          "command": "mindex.openResearchHistory",
           "when": "view == mindexAsk",
           "group": "navigation@3"
+        },
+        {
+          "command": "mindex.openSettings",
+          "when": "view == mindexAsk",
+          "group": "navigation@4"
         },
         {
           "command": "mindex.createProjectFile",
@@ -270,6 +293,10 @@
         {
           "command": "mindex.retryFile",
           "when": "false"
+        },
+        {
+          "command": "mindex.openResearchReport",
+          "when": "false"
         }
       ]
     },
@@ -277,6 +304,14 @@
       {
         "command": "mindex.search",
         "key": "ctrl+alt+/"
+      },
+      {
+        "command": "mindex.research",
+        "key": "ctrl+alt+."
+      },
+      {
+        "command": "mindex.browseResearch",
+        "key": "ctrl+alt+,"
       }
     ],
     "configuration": {

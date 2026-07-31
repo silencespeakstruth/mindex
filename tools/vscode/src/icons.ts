@@ -34,6 +34,24 @@ export const ICON = {
     status: "pulse",
     /** The Research History panel and the command that opens it. */
     researchHistory: "history",
+    /** Pick stored reports to feed the next question as context. */
+    context: "references",
+    /** Open one stored report in its own tab. */
+    openReport: "go-to-file",
+    /** Browse the stored corpus and read one. */
+    browseResearch: "book",
+    /** Ask this question again, with the same scope and settings. */
+    reAsk: "debug-restart",
+    /** Exempt a run from the retention sweep. */
+    pin: "pin",
+    /** A run already exempt from the retention sweep. */
+    pinned: "pinned",
+    /** Delete stored reports. */
+    trash: "trash",
+    /** A report whose own evidence has moved, or whose context has. */
+    outOfDate: "warning",
+    /** A report that can no longer be used as context. */
+    invalid: "error",
     /** Jump to the extension's own settings. */
     settings: "gear",
     /** Refresh whatever the surface is showing. */

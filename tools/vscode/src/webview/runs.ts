@@ -31,6 +31,8 @@ interface RunSummary {
     stale: boolean;
     valid: boolean;
     invalid_reason: string | null;
+    references_count: number;
+    referenced_by_count: number;
     context: RunDependency[];
 }
 
@@ -63,6 +65,13 @@ interface State {
     freshness: string;
     validity: string;
     selected: string[];
+    /**
+     * The report currently in the right pane. Persisted with the rest: the query
+     * and the selection already survived a reload while the pane came back blank,
+     * which reads as "the panel forgot what I was reading" rather than as a
+     * deliberate reset.
+     */
+    activeId?: string;
 }
 
 const api = vscodeApi<State>();
@@ -77,26 +86,42 @@ const loading = el("runs-loading");
 const moreBtn = el<HTMLButtonElement>("runs-more");
 const useBtn = el<HTMLButtonElement>("runs-use");
 const useLabel = el("runs-use-label");
+const deleteBtn = el<HTMLButtonElement>("runs-delete");
+const deleteLabel = el("runs-delete-label");
 const preview = el("runs-preview");
+
+/** What the right pane shows when nothing is open. */
+const PREVIEW_PLACEHOLDER = "Select a run to read its report.";
 
 let selected = new Set<string>();
 let activeId: string | undefined;
+/**
+ * The rows currently rendered, by id. The host keeps the authoritative copy; this
+ * one exists so the footer can say *why* a selection cannot be used as context
+ * without asking for the summaries again on every checkbox click.
+ */
+const rows = new Map<string, RunSummary>();
 
 const restored = api.getState();
-if (restored?.v === "2") {
+if (restored?.v === "3") {
     searchBox.value = restored.query;
     freshnessBox.value = restored.freshness;
     validityBox.value = restored.validity;
     selected = new Set(restored.selected);
+    activeId = restored.activeId;
+    if (activeId !== undefined) {
+        api.postMessage({ type: "select", id: activeId });
+    }
 }
 
 function save(): void {
     api.setState({
-        v: "2",
+        v: "3",
         query: searchBox.value,
         freshness: freshnessBox.value,
         validity: validityBox.value,
         selected: [...selected],
+        activeId,
     });
 }
 
@@ -117,6 +142,7 @@ freshnessBox.addEventListener("change", sendSearch);
 validityBox.addEventListener("change", sendSearch);
 moreBtn.addEventListener("click", () => api.postMessage({ type: "more" }));
 useBtn.addEventListener("click", () => api.postMessage({ type: "useAsContext" }));
+deleteBtn.addEventListener("click", () => api.postMessage({ type: "deleteSelected" }));
 
 function relative(unixSeconds: number): string {
     const secs = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
@@ -157,6 +183,7 @@ function ghostButton(glyph: string, title: string, onClick: () => void): HTMLBut
 }
 
 function renderRow(run: RunSummary): HTMLLIElement {
+    rows.set(run.id, run);
     const li = document.createElement("li");
     li.className = "runs-item";
     li.dataset.id = run.id;
@@ -166,13 +193,14 @@ function renderRow(run: RunSummary): HTMLLIElement {
 
     const check = document.createElement("input");
     check.type = "checkbox";
-    check.checked = selected.has(run.id) && run.valid;
-    // The server refuses an invalid run as context (400), so offering the
-    // checkbox would only defer the same refusal to submit time.
-    check.disabled = !run.valid;
+    check.checked = selected.has(run.id);
+    // Selection means "these rows", not "these context runs" — an out-of-date
+    // report is exactly the kind worth deleting in a batch, so disabling its
+    // checkbox would put the pruning workflow out of reach to protect a submit
+    // that has its own guard. `Use as context` is what refuses instead.
     check.title = run.valid
-        ? "Use this report as context for the next question"
-        : "This report is no longer valid and cannot be used as context.";
+        ? "Select — for context, or to delete"
+        : "Select — this report cannot be used as context, but it can be deleted.";
     check.addEventListener("click", (e) => e.stopPropagation());
     check.addEventListener("change", () => {
         if (check.checked) {
@@ -181,6 +209,7 @@ function renderRow(run: RunSummary): HTMLLIElement {
             selected.delete(run.id);
         }
         save();
+        refreshFooter();
         api.postMessage({ type: "toggle", id: run.id, checked: check.checked });
     });
 
@@ -201,6 +230,23 @@ function renderRow(run: RunSummary): HTMLLIElement {
     const when = document.createElement("span");
     when.textContent = relative(run.created_at);
     meta.appendChild(when);
+    // Retention is otherwise invisible: `expires_at` has always been on the wire and
+    // rendered nowhere, so a report simply vanished one day. Pinned is the loud
+    // state; a countdown appears only once it is close enough to act on.
+    if (run.pinned) {
+        meta.appendChild(badge("pinned", "pinned", "Kept indefinitely — never reaped."));
+    } else if (run.expires_at !== null) {
+        const days = Math.floor((run.expires_at - Date.now() / 1000) / 86400);
+        if (days <= 7) {
+            meta.appendChild(
+                badge(
+                    days <= 0 ? "expiring" : `${days}d left`,
+                    "expiring",
+                    "The retention sweep will delete this report. Pin it to keep it."
+                )
+            );
+        }
+    }
     if (run.stale) {
         meta.appendChild(
             badge(
@@ -221,9 +267,13 @@ function renderRow(run: RunSummary): HTMLLIElement {
         );
     }
     if (!run.valid) {
+        // The word on the badge is the *reason*, not the verdict. "invalid" states
+        // that something is wrong and leaves the user to hover for what — and the
+        // three causes call for three different actions: reindex, accept the loss,
+        // or fix the ancestor.
         meta.appendChild(
             badge(
-                "invalid",
+                invalidLabel(run),
                 "invalid",
                 run.invalid_reason === "stale"
                     ? "The files this report read have moved; it no longer describes the tree."
@@ -233,12 +283,13 @@ function renderRow(run: RunSummary): HTMLLIElement {
             )
         );
     }
-    if (run.context.length > 0) {
+    if (run.references_count > 0) {
         meta.appendChild(
             badge(
-                `⤷${run.context.length}`,
+                `⤷${run.references_count}`,
                 "deps",
-                "Built on earlier reports:\n" +
+                `Built directly on ${run.references_count} earlier report(s).\n` +
+                    `Whole chain (${run.context.length}):\n` +
                     run.context
                         .map((d) =>
                             d.state === "deleted"
@@ -246,6 +297,16 @@ function renderRow(run: RunSummary): HTMLLIElement {
                                 : `#${d.seq} ${d.title} (${d.state})`
                         )
                         .join("\n")
+            )
+        );
+    }
+    if (run.referenced_by_count > 0) {
+        meta.appendChild(
+            badge(
+                `↩${run.referenced_by_count}`,
+                "refd",
+                `${run.referenced_by_count} later report(s) were built on this one. ` +
+                    "Deleting it invalidates every one of them."
             )
         );
     }
@@ -260,6 +321,11 @@ function renderRow(run: RunSummary): HTMLLIElement {
                 ? "Pinned — never reaped. Click to let it age normally."
                 : "Pin: keep this report past the retention window.",
             () => api.postMessage({ type: "pin", id: run.id, pinned: !run.pinned })
+        )
+    );
+    actions.appendChild(
+        ghostButton("go-to-file", "Open this report in its own tab", () =>
+            api.postMessage({ type: "openRun", id: run.id })
         )
     );
     actions.appendChild(
@@ -282,10 +348,47 @@ function renderRow(run: RunSummary): HTMLLIElement {
     return li;
 }
 
-function refreshUseButton(): void {
-    useBtn.disabled = selected.size === 0;
+/** The badge word for an invalid run: why, not that. */
+function invalidLabel(run: RunSummary): string {
+    switch (run.invalid_reason) {
+        case "stale":
+            return `${run.files_moved}/${run.files_total} files changed`;
+        case "context_deleted":
+            return "context deleted";
+        default:
+            return "context out of date";
+    }
+}
+
+/**
+ * The two footer actions. They read the same selection and disable for different
+ * reasons: context refuses an invalid pick (the server would 400), while deleting
+ * one is the point.
+ */
+function refreshFooter(): void {
+    const picked = [...selected].map((id) => rows.get(id));
+    const invalid = picked.filter((r) => r !== undefined && !r.valid).length;
+
+    useBtn.disabled = selected.size === 0 || invalid > 0;
     useLabel.textContent =
         selected.size === 0 ? "Use as context" : `Use ${selected.size} as context`;
+    useBtn.title =
+        invalid > 0
+            ? `${invalid} of the selected reports are out of date; the server refuses ` +
+              "them as context. Unselect them, or delete them."
+            : "Hand the selected reports to the next question as background.";
+
+    deleteBtn.disabled = selected.size === 0;
+    deleteLabel.textContent = selected.size === 0 ? "Delete" : `Delete ${selected.size}`;
+}
+
+/** Return the right pane to its placeholder. */
+function clearPreview(): void {
+    preview.replaceChildren();
+    const p = document.createElement("p");
+    p.className = "runs-placeholder dim";
+    p.textContent = PREVIEW_PLACEHOLDER;
+    preview.appendChild(p);
 }
 
 function renderDetail(run: RunDetail): void {
@@ -296,6 +399,25 @@ function renderDetail(run: RunDetail): void {
     const h = document.createElement("h3");
     h.textContent = `#${run.seq} — ${run.question}`;
     head.appendChild(h);
+
+    const openTab = document.createElement("button");
+    openTab.className = "secondary";
+    openTab.append(icon("go-to-file", true), document.createTextNode(" Open in a tab"));
+    openTab.title =
+        "Open this report as a Markdown document, so it can sit beside the code it " +
+        "describes.";
+    openTab.addEventListener("click", () => api.postMessage({ type: "openRun", id: run.id }));
+    const reAsk = document.createElement("button");
+    reAsk.className = "secondary";
+    reAsk.append(icon("debug-restart", true), document.createTextNode(" Ask again"));
+    reAsk.title =
+        "Put this question back in the form with its scope and settings, and this " +
+        "report as context — the usual way to follow one up.";
+    reAsk.addEventListener("click", () => api.postMessage({ type: "reAsk", id: run.id }));
+    const headActions = document.createElement("div");
+    headActions.className = "row";
+    headActions.append(openTab, reAsk);
+    head.appendChild(headActions);
 
     const meta = document.createElement("div");
     meta.className = "dim";
@@ -325,7 +447,11 @@ function renderDetail(run: RunDetail): void {
     // whose claims it inherited — and which of those have since gone bad.
     if (run.context.length > 0) {
         const p = document.createElement("p");
-        p.textContent = `Built on ${run.context.length} earlier report(s):`;
+        p.textContent =
+            run.references_count === run.context.length
+                ? `Built on ${run.context.length} earlier report(s):`
+                : `Built on ${run.references_count} earlier report(s), ` +
+                  `${run.context.length} in the whole chain:`;
         head.appendChild(p);
         const ul = document.createElement("ul");
         ul.className = "runs-deps";
@@ -335,13 +461,33 @@ function renderDetail(run: RunDetail): void {
             const state = document.createElement("span");
             state.className = `dim dep-${d.state}`;
             state.textContent = d.state;
-            const label = document.createElement("span");
-            label.textContent =
-                d.state === "deleted" ? "deleted report" : `#${d.seq} ${d.title}`;
-            li.append(state, label);
+            if (d.state === "deleted") {
+                const label = document.createElement("span");
+                label.textContent = "deleted report";
+                li.append(state, label);
+            } else {
+                // A dependency is a report, so it opens like one. Reading what a
+                // claim was inherited from is the whole reason the chain is shown.
+                const link = document.createElement("button");
+                link.textContent = `#${d.seq} ${d.title ?? ""}`.trim();
+                link.title = "Open this report in its own tab";
+                link.addEventListener("click", () =>
+                    api.postMessage({ type: "openRun", id: d.id })
+                );
+                li.append(state, link);
+            }
             ul.appendChild(li);
         }
         head.appendChild(ul);
+    }
+
+    if (run.referenced_by_count > 0) {
+        const p = document.createElement("p");
+        p.className = "dim";
+        p.textContent =
+            `${run.referenced_by_count} later report(s) were built on this one; ` +
+            "deleting it would invalidate them.";
+        head.appendChild(p);
     }
 
     // The per-file freshness, which is the honest form of the list's badge: an edited
@@ -395,7 +541,7 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             const total = list.childElementCount;
             empty.hidden = total > 0;
             moreBtn.hidden = msg.nextBeforeSeq === null || msg.nextBeforeSeq === undefined;
-            refreshUseButton();
+            refreshFooter();
             save();
             break;
         }
@@ -411,17 +557,31 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             break;
         }
         case "removed": {
-            const id = String(msg.id);
-            list.querySelector(`[data-id="${CSS.escape(id)}"]`)?.remove();
-            selected.delete(id);
+            // One or many: the batch delete posts the same message with a list, so
+            // there is one removal path rather than two that can disagree.
+            const ids = Array.isArray(msg.ids)
+                ? (msg.ids as unknown[]).map(String)
+                : [String(msg.id)];
+            for (const id of ids) {
+                list.querySelector(`[data-id="${CSS.escape(id)}"]`)?.remove();
+                selected.delete(id);
+                rows.delete(id);
+                // The report on the right outlives its row otherwise: a deleted run
+                // stayed fully rendered, with `activeId` pointing at an id nothing
+                // could resolve, and the next render highlighted no row at all.
+                if (activeId === id) {
+                    activeId = undefined;
+                    clearPreview();
+                }
+            }
             empty.hidden = list.childElementCount > 0;
-            refreshUseButton();
+            refreshFooter();
             save();
             break;
         }
         case "selected":
             selected = new Set((msg.selected ?? []) as string[]);
-            refreshUseButton();
+            refreshFooter();
             save();
             break;
         case "loading":
@@ -434,5 +594,5 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
     }
 });
 
-refreshUseButton();
+refreshFooter();
 api.postMessage({ type: "ready" });

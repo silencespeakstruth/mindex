@@ -377,6 +377,19 @@ export interface ResearchRunSummary {
     valid: boolean;
     /** "stale" | "context_deleted" | "context_invalid"; null when valid. */
     invalid_reason: string | null;
+    /**
+     * How many runs this one was launched **on** — direct edges out. Not
+     * `context.length`, which is the transitive ancestry: a run built on one
+     * report that was itself built on three has `references_count = 1` and four
+     * entries in `context`.
+     */
+    references_count: number;
+    /**
+     * How many other runs name this one in their context — direct edges in,
+     * across the whole corpus rather than the loaded page. What makes a delete
+     * confirmation honest: every one of them is invalidated by the delete.
+     */
+    referenced_by_count: number;
     /** Flat transitive context ancestry — every report this one leaned on. */
     context: ResearchRunDependency[];
 }
@@ -801,6 +814,21 @@ export class MindexApi {
             "DELETE",
             `/projects/${guid}/research/${encodeURIComponent(runId)}`
         );
+    }
+
+    /**
+     * Drop a batch of stored runs in one transaction. Returns how many rows
+     * actually went — never more than `ids.length`, and fewer when some were
+     * already gone (unknown ids are ignored, like the single-run delete).
+     *
+     * An **empty** `ids` is a 400 server-side, not a whole-corpus wipe, so the
+     * caller must not "helpfully" send one for "delete everything".
+     */
+    async deleteResearchRuns(guid: string, ids: string[]): Promise<number> {
+        const body = (await this.request("DELETE", `/projects/${guid}/research`, {
+            ids,
+        })) as { deleted_runs: number } | null;
+        return body?.deleted_runs ?? 0;
     }
 
     /**

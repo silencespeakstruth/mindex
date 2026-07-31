@@ -295,7 +295,22 @@ Full behavior is in the handlers + OpenAPI; the non-obvious parts:
   rung of the documented ladder and nothing has measured `LIKE` insufficient over a
   corpus two orders of magnitude smaller than `project_file_chunks`), and never
   selects the report body — that is what makes it a separate endpoint from the detail
-  one. `pin` is the one mutation on an otherwise append-only row.
+  one. `pin` is the one mutation on an otherwise append-only row. `DELETE
+  …/research` (no `run_id`) is the **batch** form, body `{"ids": […]}`: a corpus is
+  pruned in handfuls, and N requests is N chances to fail halfway. Empty list =
+  400 `selector.empty`, capped by `[limits].max_research_delete_ids` — the
+  `require_nonempty_selector` rule for a resource whose selector is a list.
+  Unknown ids are ignored, so it is idempotent like the single delete.
+  Each summary also carries the two **significance counters**,
+  `references_count` (direct edges out) and `referenced_by_count` (direct edges in,
+  over the whole corpus). Both come from the `edges` CTE that validity already
+  builds. `references_count` is deliberately **not** `context.len()`: that is the
+  *transitive* ancestry, so a run built on one report that rests on three reads 1
+  and 4. The inbound count is what makes a delete confirmation honest — removing a
+  run invalidates every descendant, and the caller is owed the number first.
+  The summary's columns are counted by `RESEARCH_SUMMARY_COLUMNS`, and the detail
+  query indexes its own four columns *from* that constant: adding a summary column
+  without moving it used to hand the caller `invalid_flag` where `report` belonged.
 - The read-only set (`GET /projects[/{guid}][/files]`, `/status`, `/config`,
   `/health`, `/version`) + `POST /gc` are self-describing in OpenAPI. `GET /config`
   serves the canonical language list of what the server *supports* (read by the
@@ -995,7 +1010,33 @@ Non-obvious invariants:
   client that just watched a run offers it back as context — and both are **null**
   when the best-effort journal write failed, since a fabricated id would name a run
   nothing can fetch. Nullable, not absent: scout reads them explicitly rather than
-  through `_USAGE_KEYS`, because they are not cost.
+  through `_USAGE_KEYS`, because they are not cost. A null `run_id` is now
+  *rendered* — the VS Code panel says the report was not saved — because the wire
+  said so from the start and no surface did, so a run that failed the markdown gate
+  looked identical to one in the History list.
+- **A stream that ends without a terminal event is a failure, and `SseEventStream`
+  says so.** The job is spawned detached, so a panic aborts the task, drops the
+  sender and closes the channel — byte-for-byte a completed stream to every
+  consumer. That is exactly how a research run that panicked in `parse_citations`
+  read as "finished, no report" while nothing was journalled and no error reached
+  the client. The stream now tracks whether a `done`/`error` went through and
+  synthesises one `error` (`internal.error`) when the channel closes without one.
+  Deliberately an existing event name and an existing `ApiError` code, so the
+  four-place contract and `codes_are_stable` are both untouched. `SseWireEvent` is
+  generic, so the streaming `/index` path gets the same guarantee for free — and
+  `a_stream_that_ended_properly_gets_no_synthetic_terminal` is what keeps it from
+  appending an error to every healthy run.
+- **A report is arbitrary UTF-8, so nothing may index it by byte.**
+  `parse_citations` walked backwards from `:<digits>-<digits>` over
+  `report[k - 1..k]` — a byte slice into a `&str`, which *panics* when byte `k - 1`
+  sits inside a multi-byte character. Measured in production: `gpt-oss:20b` writes
+  OpenAI-style `【…】` citation brackets, one landed before a range, and the run was
+  lost outright (no `done`, no journal row, no error). Russian prose does it too.
+  The walk is over bytes now, which is exactly equivalent because `is_path_char`
+  accepts only ASCII and a byte below 0x80 is always a char boundary.
+  `a_report_is_arbitrary_utf8_and_must_never_panic_the_parser` is the guard. The
+  general rule: the report is model output and the *only* safe indexes into it are
+  `char_indices` or positions the tokenizer/scanner produced from ASCII.
 - **The report turn passes no tools at all** — the field is *omitted*, not sent
   empty, so there is structurally nothing to call. That is the fix for a measured
   failure: on the old text protocol, ~1 run in 5 across *three* different models
@@ -1840,6 +1881,35 @@ is wrong.
   swallow `AbortError` itself: `api.request` *rejects* on abort while `research()`
   resolves, and "fixing" that asymmetry would break every other caller's ability to
   tell a cancelled request from an empty answer.
+  **Research is a popup-first surface, and the panel is the deep end.** Picking
+  context is on the path to *asking*, so it is a `QuickPick`
+  (`researchContextPick.ts`) opened from an `Add…` button that is visible in
+  Research mode **whether or not anything is picked** — while the block was hidden
+  until it had contents, the only way to discover context was to already know about
+  the History panel. `browseResearchRuns` is the single-select twin for reading.
+  The picker offers **valid runs only** (the server 400s on an invalid context id,
+  so listing one defers the same refusal to submit time), tracks its selection in
+  `onDidChangeSelection` rather than reading `onDidAccept`'s *visible* selection —
+  a pick made under an earlier query is not in `items` — and keeps picked rows in
+  `items` for exactly that reason. Cancelling returns `undefined`, which is **not**
+  an empty array: one leaves the form alone, the other clears it.
+  A stored report opens as a **read-only Markdown document**
+  (`researchDocs.ts`, scheme `mindex-research`, `markdown.showPreview`), not a
+  fourth webview: outline, find and the user's own theme come free, and the
+  provider serves from the URI alone so a tab survives a window reload. It
+  prepends a provenance block, because the stored Markdown says what the run
+  concluded and nothing about what it was entitled to claim.
+  In the panel: selection means *rows*, not *context* — an out-of-date report is
+  exactly what a batch delete is for, so the checkbox stays enabled and
+  `Use as context` is what refuses instead. The delete confirmation names
+  `referenced_by_count`, and states it rather than netting it against the
+  selection: a summary carries its *ancestors*, never its dependants, so which of
+  them are also being deleted is not knowable client-side, and under-reporting in a
+  delete dialog is the wrong way to be wrong. The invalid badge shows the
+  **reason**, not the verdict — the three causes call for three different actions.
+  `removed` carries an id *list* so one path serves both deletes, and it must clear
+  the preview when the open report is the one going: it used to leave the report
+  fully rendered with `activeId` pointing at a dead id.
   **The form offers only what the server confirmed exists**: the language pickers are
   the project's `chunks_active > 0` languages and the model field is a `<select>` over
   `research.models`, both arriving through `StatusMonitor.refresh()` — the one

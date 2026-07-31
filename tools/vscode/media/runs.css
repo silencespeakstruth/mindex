@@ -138,11 +138,6 @@
     border: 1px solid var(--vscode-inputValidation-warningBorder);
 }
 
-.runs-badge.incomplete {
-    color: var(--vscode-descriptionForeground);
-    border: 1px solid var(--vscode-panel-border);
-}
-
 /*
  * Invalidity outranks staleness: a stale report is dubious, an invalid one is
  * refused as context by the server — so it borrows the error palette.
@@ -153,10 +148,40 @@
     border: 1px solid var(--vscode-inputValidation-errorBorder);
 }
 
-/* The compact "built on N earlier reports" marker; the tooltip carries the list. */
-.runs-badge.deps {
+/*
+ * The two significance markers: `⤷N` reports this one was built on, `↩N` reports
+ * built on it. Deliberately the quietest badges on the row — they are context for
+ * a decision, not a warning, and colouring them would compete with the two badges
+ * that are.
+ */
+.runs-badge.deps,
+.runs-badge.refd {
     color: var(--vscode-descriptionForeground);
     border: 1px solid var(--vscode-panel-border);
+}
+
+/* The "partial" badge on a run stopped by a budget rather than finished. */
+.runs-badge.incomplete {
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+    background: var(--vscode-inputValidation-warningBackground);
+    border: 1px solid var(--vscode-inputValidation-warningBorder);
+}
+
+/*
+ * Retention, made visible. `expires_at` was on the wire from the start and drawn
+ * nowhere, so a report aged out silently and the pin button read as decoration.
+ * Only the last week is counted down — earlier than that it is noise, and the
+ * pinned state is the one worth showing always.
+ */
+.runs-badge.pinned {
+    color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-panel-border);
+}
+
+.runs-badge.expiring {
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+    background: var(--vscode-inputValidation-warningBackground);
+    border: 1px solid var(--vscode-inputValidation-warningBorder);
 }
 
 .runs-actions {

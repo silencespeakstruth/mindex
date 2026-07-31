@@ -1,5 +1,11 @@
 import * as vscode from "vscode";
-import { ConfigResponse, ResearchBudget, ResearchEffort, SearchFilter } from "./api";
+import {
+    ConfigResponse,
+    ResearchBudget,
+    ResearchEffort,
+    ResearchRunSummary,
+    SearchFilter,
+} from "./api";
 import { say } from "./brand";
 import { ALL_LANGUAGES } from "./languages";
 import { AskMode } from "./shared/askFields";
@@ -88,13 +94,7 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
      * the languages and the model list are: a reopened sidebar starts from the default
      * HTML, and a selection that took several clicks to build must survive that.
      */
-    private contextRuns: {
-        id: string;
-        seq: number;
-        title: string;
-        stale: boolean;
-        valid: boolean;
-    }[] = [];
+    private contextRuns: ResearchRunSummary[] = [];
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -112,7 +112,13 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
         },
         private readonly onSubmit: (s: AskSubmission) => void,
         private readonly onCancel: () => void,
-        private readonly onOpenStatus: () => void
+        private readonly onOpenStatus: () => void,
+        /**
+         * Open the context picker. Lives in the extension because it needs the API
+         * client and the project guid, neither of which a view provider owns — and
+         * because the same picker is reachable from a command.
+         */
+        private readonly onPickContext: () => void
     ) {}
 
     resolveWebviewView(view: vscode.WebviewView): void {
@@ -163,6 +169,9 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case "scopeDefaults":
                     this.postScopeDefaults();
+                    break;
+                case "pickContext":
+                    this.onPickContext();
                     break;
                 case "contextRuns": {
                     // The form can only ever *remove* runs — they are chosen in the
@@ -222,6 +231,24 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
             include: (include?.paths ?? []).join(", "),
             exclude: (exclude?.paths ?? []).join(", "),
             languages: (include?.programming_languages ?? []).join(","),
+        });
+    }
+
+    /**
+     * Put a question back in the form, with the settings it was asked under.
+     *
+     * Scope is **not** restored, and that is a limitation rather than an oversight:
+     * a stored run carries its scope only as the sentence it was described to the
+     * model with (`ResearchRunDetail.scope`), not as the selector that produced it,
+     * so re-applying it would mean guessing globs from prose. The caller states the
+     * original scope instead, and the user re-enters it if it mattered.
+     */
+    prefill(question: string, effort: ResearchEffort, model: string): void {
+        void this.view?.webview.postMessage({
+            type: "prefill",
+            question,
+            effort,
+            model,
         });
     }
 
@@ -311,23 +338,32 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
      * appending would make unchecking a run in the panel leave it silently attached
      * here.
      */
-    setContextRuns(
-        runs: { id: string; seq: number; title: string; stale: boolean; valid: boolean }[]
-    ): void {
-        this.contextRuns = runs.map((r) => ({
-            id: r.id,
-            seq: r.seq,
-            title: r.title,
-            stale: r.stale,
-            valid: r.valid,
-        }));
+    setContextRuns(runs: readonly ResearchRunSummary[]): void {
+        this.contextRuns = [...runs];
         this.postContextRuns();
     }
 
+    /** What is currently attached — the picker seeds its selection from this. */
+    get currentContextRuns(): readonly ResearchRunSummary[] {
+        return this.contextRuns;
+    }
+
+    /**
+     * Only the fields the chips need. The webview is sent a projection rather than
+     * the summaries: it renders a label and two state marks, and shipping the whole
+     * record (report-less but still ~20 fields each) through `postMessage` on every
+     * status refresh buys nothing.
+     */
     private postContextRuns(): void {
         void this.view?.webview.postMessage({
             type: "contextRuns",
-            runs: this.contextRuns,
+            runs: this.contextRuns.map((r) => ({
+                id: r.id,
+                seq: r.seq,
+                title: r.title,
+                stale: r.stale,
+                valid: r.valid,
+            })),
         });
     }
 

@@ -439,6 +439,7 @@ async fn main() -> Result<(), BoxError> {
                 max_drift_files: cfg.limits.max_drift_files,
                 max_history_commits: cfg.limits.max_history_commits,
                 max_commit_message_bytes: cfg.limits.max_commit_message_bytes,
+                max_research_delete_ids: cfg.limits.max_research_delete_ids,
                 max_selector_patterns: cfg.limits.max_selector_patterns,
                 max_symbol_name_bytes: cfg.limits.max_symbol_name_bytes,
                 max_symbol_results: cfg.limits.max_symbol_results,

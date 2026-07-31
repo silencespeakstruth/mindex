@@ -336,16 +336,28 @@ function applyModels(models: string[] | undefined, defaultModel: string): void {
  * chip because it is the one thing that changes what a report is worth, and the user
  * chose these before they could see whether the tree had moved under them.
  */
+/** A message field that must be a string; anything else is the fallback. */
+function text(value: unknown, fallback = ""): string {
+    return typeof value === "string" ? value : fallback;
+}
+
 function renderContextRuns(): void {
     const box = el("context-runs");
-    box.hidden = mode !== "research" || contextRuns.length === 0;
+    // Shown in Research **whether or not anything is picked**. Chaining a question
+    // onto an earlier report is the common path, not an advanced one, and while the
+    // was hidden until it had contents the only way to discover it was to find the
+    // History panel first — a feature reachable only by already knowing about it.
+    box.hidden = mode !== "research";
     if (box.hidden) {
         return;
     }
     el("context-runs-label").textContent =
-        contextRuns.length === 1
-            ? "1 earlier report as context"
-            : `${contextRuns.length} earlier reports as context`;
+        contextRuns.length === 0
+            ? "No earlier reports as context"
+            : contextRuns.length === 1
+              ? "1 earlier report as context"
+              : `${contextRuns.length} earlier reports as context`;
+    el("context-runs-clear").hidden = contextRuns.length === 0;
     const pills = el("context-runs-pills");
     pills.replaceChildren();
     for (const run of contextRuns) {
@@ -600,6 +612,13 @@ el("context-runs-clear").addEventListener("click", () => {
     renderContextRuns();
 });
 
+// The host opens a QuickPick and pushes the result back as `contextRuns`, so
+// nothing is rendered optimistically here: the picker is cancellable, and a chip
+// that appeared before the user confirmed would have to be taken away again.
+el("context-runs-pick").addEventListener("click", () => {
+    api.postMessage({ type: "pickContext" });
+});
+
 // Enter submits; Shift+Enter keeps the newline (the question box is multiline).
 el("text").addEventListener("keydown", (key) => {
     if (key.key === "Enter" && !key.shiftKey) {
@@ -652,6 +671,19 @@ window.addEventListener("message", (e: MessageEvent<Record<string, unknown>>) =>
         case "contextRuns":
             contextRuns = (msg.runs ?? []) as typeof contextRuns;
             renderContextRuns();
+            break;
+        case "prefill":
+            // Never over a live run: the form is disabled then, and replacing the
+            // question under a running stream would leave the two disagreeing about
+            // what is being answered.
+            if (!running) {
+                controls.get("text")?.write(text(msg.question));
+                controls.get("effort")?.write(text(msg.effort, "medium"));
+                controls.get("model")?.write(text(msg.model));
+                persist();
+                applyPresets();
+                render();
+            }
             break;
         case "mode":
             if (!running) {
