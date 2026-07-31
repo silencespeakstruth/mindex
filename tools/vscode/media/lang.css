@@ -1,7 +1,7 @@
 /* MINDex — the language marks' colours.
  *
  * One rule per language, and each declares *two* colours rather than one. That is not
- * over-engineering: of the 21 official brand colours devicon publishes, 13 fail a 3:1
+ * over-engineering: of the 24 languages' official brand colours, 17 fail a 3:1
  * contrast check against one of VS Code's two default backgrounds. Rust and Markdown
  * are black, C is near-white, C# and C++ are dark enough to vanish on a dark theme.
  * A single hex per language is therefore not a thing that exists — it is only ever
@@ -13,10 +13,11 @@
  * colour that already passes is left exactly as the brand publishes it, which is why
  * TypeScript, Java, PHP, HTML, CSS, Ruby and Scala carry the same value twice.
  *
- * Four base colours are not devicon's, because devicon's is black or grey and says
+ * Five base colours are not devicon's, because devicon's is black or grey and says
  * nothing: rust `#dea584`, bash `#89e051` (both the widely-used linguist colours),
- * markdown `#755838` and sql `#6a9fb5` — sql has no mark at all and paints a codicon.
- * The test knows this list; adding to it is a decision, not a typo.
+ * markdown `#755838`, sql `#6a9fb5` and toml `#9c4221` — the last two have no mark at
+ * all and paint a codicon. The test knows this list; adding to it is a decision, not
+ * a typo.
  */
 
 /* The mark itself. Sized to sit on a text baseline in a list row. */
@@ -124,6 +125,10 @@ body.vscode-high-contrast .lang-glyph {
     --lang-light: #6597ac;
     --lang-dark: #6a9fb5;
 }
+.lang-toml {
+    --lang-light: #9c4221;
+    --lang-dark: #a65537;
+}
 .lang-tsx {
     --lang-light: #4499b0;
     --lang-dark: #61dafb;
@@ -131,6 +136,10 @@ body.vscode-high-contrast .lang-glyph {
 .lang-typescript {
     --lang-light: #007acc;
     --lang-dark: #007acc;
+}
+.lang-yaml {
+    --lang-light: #cb171e;
+    --lang-dark: #ce2329;
 }
 .lang-zig {
     --lang-light: #c68317;

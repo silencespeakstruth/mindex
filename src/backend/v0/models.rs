@@ -63,6 +63,10 @@ pub enum ProgrammingLanguage {
     Zig,
     #[serde(rename = "sql")]
     Sql,
+    #[serde(rename = "toml")]
+    Toml,
+    #[serde(rename = "yaml")]
+    Yaml,
     /// Documentation. The only variant whose chunking is not the AST walk in
     /// [`Slicer`](crate::slicing::traits::Slicer) — see
     /// [`MarkdownSlicer`](crate::slicing::markdown::MarkdownSlicer).
@@ -102,6 +106,8 @@ impl ProgrammingLanguage {
         ProgrammingLanguage::Ocaml,
         ProgrammingLanguage::Zig,
         ProgrammingLanguage::Sql,
+        ProgrammingLanguage::Toml,
+        ProgrammingLanguage::Yaml,
         ProgrammingLanguage::Markdown,
     ];
 
@@ -129,6 +135,8 @@ impl ProgrammingLanguage {
             ProgrammingLanguage::Ocaml => "ocaml",
             ProgrammingLanguage::Zig => "zig",
             ProgrammingLanguage::Sql => "sql",
+            ProgrammingLanguage::Toml => "toml",
+            ProgrammingLanguage::Yaml => "yaml",
             ProgrammingLanguage::Markdown => "markdown",
         }
     }
@@ -158,6 +166,8 @@ impl FromSql for ProgrammingLanguage {
             "ocaml" => Ok(ProgrammingLanguage::Ocaml),
             "zig" => Ok(ProgrammingLanguage::Zig),
             "sql" => Ok(ProgrammingLanguage::Sql),
+            "toml" => Ok(ProgrammingLanguage::Toml),
+            "yaml" => Ok(ProgrammingLanguage::Yaml),
             "markdown" => Ok(ProgrammingLanguage::Markdown),
             _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }

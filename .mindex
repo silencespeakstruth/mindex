@@ -66,6 +66,14 @@ exclude_paths:
   # Benchmark output: one CSV per run, plus generated plots.
   - perf/results/**
   - perf/plots/**
+  # CI and deployment YAML. Now that mindex indexes .yml/.yaml these would be
+  # retrieved as project content, and they are neither: a workflow describes how
+  # the repository is built elsewhere, and a scrape config describes a host this
+  # repository does not contain. The authored TOML and the compose files stay in —
+  # Cargo.toml, config.example.toml and docker-compose*.yml all answer questions
+  # about this project.
+  - .github/**
+  - deploy/**/*.yml
   # Secrets and generated certificates.
   - "**/*.pem"
   - certs/**

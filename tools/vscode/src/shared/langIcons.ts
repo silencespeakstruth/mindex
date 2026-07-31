@@ -19,12 +19,15 @@ import { LANG_GLYPH_SVG } from "./langGlyphs";
 /**
  * Languages devicon draws no mark for, and the codicon that stands in.
  *
- * `sql` is the whole list: devicon has marks for a dozen *products* (postgresql,
- * sqlite, mysql) and none for the language, and picking one of the products would
- * label every `.sql` file in the project with a database this project may not use.
+ * Two entries, for the same reason in two shapes. devicon has marks for a dozen
+ * database *products* (postgresql, sqlite, mysql) and none for SQL itself, and
+ * picking one of the products would label every `.sql` file in the project with a
+ * database this project may not use. For TOML it publishes nothing at all — not the
+ * language, not a stand-in — where its sibling formats json and yaml both have one.
  */
 export const LANG_FALLBACK_CODICON: Record<string, string> = {
     sql: "database",
+    toml: "settings",
 };
 
 /** A language this build has never heard of — a server newer than the extension. */

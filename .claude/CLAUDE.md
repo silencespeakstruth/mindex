@@ -89,10 +89,12 @@ flag) — tuning them in a container means mounting a `config.toml`.
   kernel**, which returns NaN for padded rows in fp16 and still answers 200. That is
   `attention_backend()` in `__main__.py`; removing it silently corrupts every batch of
   more than one text.
-- Migrations live in `src/db/migrations/`. **Two**: `v1.0.0_schema.sql` (version 1)
+- Migrations live in `src/db/migrations/`. **Three**: `v1.0.0_schema.sql` (version 1)
   — the whole 1.0.0 schema, in the order SQLite needs (tables before the triggers
-  and foreign keys that name them) — and `v1.1.0_git_history.sql` (version 2),
-  which adds `project_commits` + `project_commit_paths`. The applied set is the
+  and foreign keys that name them) — `v1.1.0_git_history.sql` (version 2),
+  which adds `project_commits` + `project_commit_paths`, and
+  `v1.1.0_toml_yaml_languages.sql` (version 3), which rebuilds `project_files` to
+  widen its `programming_language` CHECK. The applied set is the
   `MIGRATIONS` slice in `main.rs`, keyed by the integer that lands in
   `PRAGMA user_version`; the filename's version is documentation. **v1.0.0 is now
   frozen** — editing it in place no longer reaches a database stamped at 1, since
@@ -1520,7 +1522,8 @@ ones cause a native `links` conflict; verify with `cargo info` + registry source
 before adding. **Adding a language touches all of these** (each omission fails
 differently — 400 → SQLite CHECK 500 → silently skipped file):
 
-1. `ProgrammingLanguage` enum + `ToSql`/`FromSql` + `ALL`/`name()` (`models.rs`),
+1. `ProgrammingLanguage` enum + `ToSql`/`FromSql` + `ALL`/`name()`
+   (`backend/v0/models.rs` — the crate-root `src/models.rs` is a two-line module list),
    lowercase serde name. The sub-items fail differently: a missing `name()` arm is a
    compile error; a missing `FromSql` arm fails on **read** (rows insert fine, then
    500 on any query selecting the column); a missing serde rename means the wire
@@ -1529,8 +1532,17 @@ differently — 400 → SQLite CHECK 500 → silently skipped file):
    **silent** one, and it costs two things: absence from `GET /config`, *and* silent
    exclusion from `every_language_constructs_or_declines` (`slicing/symbols.rs`),
    which iterates `ALL` — so a broken tags query for that language ships untested.
-2. `CHECK` constraint on `project_files.programming_language` in
-   `src/db/migrations/v1.0.0_schema.sql`.
+2. `CHECK` constraint on `project_files.programming_language` — in **two** places, and
+   editing only the first is silent. `src/db/migrations/v1.0.0_schema.sql` is what a
+   *fresh* database is built from and is never re-read afterwards (the filter is
+   `version > user_version`), so a database already in use needs a new migration that
+   rebuilds `project_files` with the widened list. `v1.1.0_toml_yaml_languages.sql` is
+   the pattern to copy: SQLite cannot alter a CHECK, and the rebuild must be
+   create-copy-**drop**-rename in that order, running under
+   `SQLite3Pool::migration_transaction` — renaming the old table out of the way first
+   makes the two child tables' `REFERENCES` clauses follow the corpse, and the `DROP`
+   is refused by their `ON DELETE RESTRICT` unless foreign keys are suspended. Both
+   files must end up with the same list.
 3. `tree-sitter-<lang>` in `Cargo.toml` (verify ≥ 0.23).
 4. Arm in `tree_sitter_language(pl)` (`handlers.rs`) — total match, missing arm =
    compile error. A grammar here does **not** commit the language to the AST-walk
@@ -1544,7 +1556,7 @@ differently — 400 → SQLite CHECK 500 → silently skipped file):
    fixture test in `symbols.rs` when a query exists. **Bump
    `SYMBOLS_DERIVATION_VERSION`** — without it, files already indexed keep their
    matching hash and never gain the new language's symbols. Today the bash, html,
-   css, json, haskell, zig and sql crates ship no tags query, so those files
+   css, json, toml, yaml, haskell, zig and sql crates ship no tags query, so those files
    contribute **no symbols** (chunking and search are unaffected) — revisit per
    language when upstream adds one. `markdown` is `None` *permanently*, not pending
    upstream: headings are a table of contents, and making `outline` mean "the
@@ -1557,8 +1569,19 @@ differently — 400 → SQLite CHECK 500 → silently skipped file):
    language otherwise), and `tools/vscode/src/languages.ts` (`EXT_TO_LANGUAGE`).
 7. `ext_to_lexer()` in `mindex-search.sh` (pygments map); its `VALID_LANGS` is only
    the offline fallback (canonical list comes from `GET /config`).
-8. Rebuild the image and, since the `CHECK` changed, drop the DB volume
-   (`CREATE TABLE IF NOT EXISTS` won't alter an existing table).
+8. The VS Code **language mark**, in four places — this one fails as a red test rather
+   than at runtime, because `langIcons.test.ts` is exhaustive over `ALL_LANGUAGES`.
+   `DEVICON_MARKS` (`esbuild.mjs`) if devicon draws the language, else
+   `LANG_FALLBACK_CODICON` (`shared/langIcons.ts`) — sql and toml are the two it does
+   not; a rule in `media/lang.css`; and the base colour in the test's own `BRAND`
+   table, which every language needs whether it paints a mark or a codicon. The two
+   hex values in the CSS are **derived, not chosen** — the test recomputes them with
+   its `adapt()` (mix toward white on dark, black on light, in 5% steps until 3:1),
+   so run that function and paste its output. `shared/langGlyphs.ts` is generated;
+   rebuild, never hand-edit.
+9. Rebuild the image. A container whose volume predates the `CHECK` change picks the
+   widened list up from the migration added in step 2 — that is what makes dropping
+   the volume unnecessary, and why step 2 is not optional.
 
 ## Four clients, one working-tree view (sync rule)
 
@@ -1845,6 +1868,20 @@ is wrong.
    the upgrade is verified non-destructive on a copy of a real database. A new
    *field* still costs a 1:1 side table, which is why the schema has none today —
    three were folded back into their parents before release.
+   **Widening an existing constraint is the one case none of that covers**, and
+   `v1.1.0_toml_yaml_languages.sql` is the precedent: a trigger cannot loosen a
+   CHECK that is already in the table text, so the table is rebuilt. Copy its
+   shape rather than re-deriving it — create the replacement under a temporary
+   name, copy the rows with the columns **named** (`SELECT *` binds by position),
+   `DROP` the original, then rename; recreate its triggers, which the `DROP` took
+   with it. It runs under `SQLite3Pool::migration_transaction` because both halves
+   need foreign keys suspended (a rename-first ordering makes the children follow
+   the discarded table, and `ON DELETE RESTRICT` refuses the `DROP`), and
+   `apply_pending_migrations` pays that back with one `PRAGMA foreign_key_check`
+   before it stamps `user_version`. Idempotency comes from the leading
+   `DROP TABLE IF EXISTS <tmp>`: a second run rebuilds again, which costs a copy
+   and changes nothing. Rehearse it on a copy of a real database and compare row
+   counts per table, not just that it ran.
 9. Changing how chunks or symbols are derived → bump the matching const under
    **Derivation versions**. That is what makes the change reach files already
    indexed; skipping it leaves them stale behind a matching hash, silently.

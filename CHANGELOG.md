@@ -11,6 +11,26 @@ changes of its own is still released, so "which version am I running" has one an
 
 ## [Unreleased]
 
+### Added
+
+- **TOML and YAML are indexed** (`tree-sitter-toml-ng`, `tree-sitter-yaml`), sliced by
+  the ordinary AST walk like JSON. Neither grammar ships a tags query, so they
+  contribute no symbols. `Cargo.toml`, `config.example.toml`, `docker-compose*.yml`
+  and every `pyproject.toml` were previously dropped in silence: the three extension
+  maps carried no entry for them, which is the "silently skipped file" failure the
+  Languages checklist exists to catch.
+  - **Migration 3** (`v1.1.0_toml_yaml_languages.sql`) widens the
+    `programming_language` CHECK on `project_files`. It is the first migration that is
+    not purely additive — SQLite cannot alter a CHECK, so the table is rebuilt — and
+    the first to need `SQLite3Pool::migration_transaction`, which suspends foreign-key
+    enforcement for the rebuild and verifies the result with `PRAGMA foreign_key_check`
+    before stamping `user_version`. No manual step: an existing database upgrades on
+    the next start, and the `.toml`/`.yml` files appear on the next indexing run.
+  - The VS Code extension labels both: YAML gets devicon's mark, TOML a codicon —
+    devicon draws none, the second language after `sql` for which that is true.
+  - CI and deployment YAML (`.github/**`, `deploy/**/*.yml`) are excluded from this
+    repository's own `.mindex`.
+
 ## [1.0.1] — 2026-07-31
 
 Adds a second channel for research — **git history** — and reworks the VS Code

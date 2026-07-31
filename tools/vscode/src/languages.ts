@@ -41,6 +41,9 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
     mli: "ocaml",
     zig: "zig",
     sql: "sql",
+    toml: "toml",
+    yaml: "yaml",
+    yml: "yaml",
     md: "markdown",
     markdown: "markdown",
 };

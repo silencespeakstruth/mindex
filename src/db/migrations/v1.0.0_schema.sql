@@ -45,10 +45,13 @@ CREATE TABLE IF NOT EXISTS project_files (
     ),
 
     sha256               TEXT    NOT NULL COLLATE NOCASE CHECK (length(sha256) = 64),
+    -- Kept in step with migration 3, which widens this same list on databases
+    -- that were created before it: this file is only ever read by a cold start.
     programming_language TEXT    NOT NULL CHECK (programming_language IN (
         'rust', 'python', 'javascript', 'typescript', 'tsx',
         'go', 'c', 'cpp', 'java', 'csharp', 'ruby', 'php', 'bash',
         'html', 'css', 'json', 'scala', 'haskell', 'ocaml', 'zig', 'sql',
+        'toml', 'yaml',
         'markdown'
     )),
 

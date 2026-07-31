@@ -283,6 +283,8 @@ pub(crate) fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
         ProgrammingLanguage::Ocaml => Language::new(tree_sitter_ocaml::LANGUAGE_OCAML),
         ProgrammingLanguage::Zig => Language::new(tree_sitter_zig::LANGUAGE),
         ProgrammingLanguage::Sql => Language::new(tree_sitter_sequel::LANGUAGE),
+        ProgrammingLanguage::Toml => Language::new(tree_sitter_toml_ng::LANGUAGE),
+        ProgrammingLanguage::Yaml => Language::new(tree_sitter_yaml::LANGUAGE),
         // The *block* grammar. The inline grammar (emphasis, links) would only
         // subdivide text this slicer never cuts below the block, so it is not used.
         ProgrammingLanguage::Markdown => Language::new(tree_sitter_md::LANGUAGE),

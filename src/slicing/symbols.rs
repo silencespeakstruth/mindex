@@ -74,11 +74,16 @@ fn queries_for(pl: ProgrammingLanguage) -> Option<(String, String)> {
         // definitions, and `outline` would have to mean something different for
         // them than it means everywhere else.
         ProgrammingLanguage::Markdown => None,
-        // No upstream tags.scm in these grammar crates: no symbols for now.
+        // No upstream tags.scm in these grammar crates: no symbols for now. The
+        // three data formats (json, toml, yaml) ship only a highlights query, and
+        // whether a key is a "definition" at all is a separate decision from
+        // vendoring one — `outline` and `callers` mean something specific.
         ProgrammingLanguage::Bash
         | ProgrammingLanguage::Html
         | ProgrammingLanguage::Css
         | ProgrammingLanguage::Json
+        | ProgrammingLanguage::Toml
+        | ProgrammingLanguage::Yaml
         | ProgrammingLanguage::Haskell
         | ProgrammingLanguage::Zig
         | ProgrammingLanguage::Sql => None,

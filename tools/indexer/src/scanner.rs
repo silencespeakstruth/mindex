@@ -26,6 +26,8 @@ pub enum Language {
     Ocaml,
     Zig,
     Sql,
+    Toml,
+    Yaml,
     Markdown,
 }
 
@@ -53,6 +55,8 @@ impl Language {
             Language::Ocaml => "ocaml",
             Language::Zig => "zig",
             Language::Sql => "sql",
+            Language::Toml => "toml",
+            Language::Yaml => "yaml",
             Language::Markdown => "markdown",
         }
     }
@@ -81,6 +85,8 @@ fn detect_language(path: &Path) -> Option<Language> {
         "ml" | "mli" => Some(Language::Ocaml),
         "zig" => Some(Language::Zig),
         "sql" => Some(Language::Sql),
+        "toml" => Some(Language::Toml),
+        "yaml" | "yml" => Some(Language::Yaml),
         "md" | "markdown" => Some(Language::Markdown),
         _ => None,
     }

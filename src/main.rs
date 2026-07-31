@@ -34,6 +34,10 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("db/migrations/v1.0.0_schema.sql")),
     (2, include_str!("db/migrations/v1.1.0_git_history.sql")),
+    (
+        3,
+        include_str!("db/migrations/v1.1.0_toml_yaml_languages.sql"),
+    ),
 ];
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
@@ -49,6 +53,31 @@ pub(crate) fn apply_pending_migrations(
         tx.execute_batch(sql)?;
     }
     if let Some((max_v, _)) = pending.last() {
+        // Migrations run with foreign-key enforcement off (see
+        // `SQLite3Pool::migration_transaction`), so this is the check that would
+        // otherwise have run statement by statement. Failing here rolls the whole
+        // batch back — a migration that orphaned a chunk or a symbol row must not
+        // reach a running server, where the damage is silent.
+        let violations: i64 =
+            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if violations > 0 {
+            error!(
+                violations,
+                schema_version = *max_v,
+                "Schema migration left dangling foreign-key references; rolling back."
+            );
+            return Err(db::sqlite3::SQLite3PoolError::Sql(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                    Some(format!(
+                        "migration to schema version {max_v} left {violations} \
+                         dangling foreign-key reference(s)"
+                    )),
+                ),
+            ));
+        }
         tx.pragma_update(None, "user_version", max_v)?;
     }
     let applied = !pending.is_empty();
@@ -135,7 +164,10 @@ async fn main() -> Result<(), BoxError> {
         .with_metrics(&metrics),
     );
 
-    let db_schema_version = match db_pool.transaction(token, apply_pending_migrations).await {
+    let db_schema_version = match db_pool
+        .migration_transaction(token, apply_pending_migrations)
+        .await
+    {
         Ok((v, true)) => {
             info!(db_path = ?cfg.database.path, schema_version = v, "Schema migration completed.");
             v

@@ -31,6 +31,17 @@ impl From<StatusCode> for SQLite3PoolError {
     }
 }
 
+/// Whether a transaction runs under SQLite's foreign-key enforcement.
+///
+/// Private: `Off` is reachable only through
+/// [`migration_transaction`](SQLite3Pool::migration_transaction), which documents
+/// the one situation that needs it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForeignKeys {
+    On,
+    Off,
+}
+
 pub struct SQLite3Pool {
     conns: Arc<Mutex<Vec<Connection>>>,
     /// Total connections the pool was created with (the high-water mark). Stored so
@@ -120,6 +131,47 @@ impl SQLite3Pool {
         F: FnOnce(&Transaction) -> Result<T, SQLite3PoolError> + Send + 'static,
         T: Send + 'static,
     {
+        self.run(token, f, ForeignKeys::On).await
+    }
+
+    /// [`transaction`](Self::transaction) with foreign-key enforcement **off** for
+    /// the duration, restored before the connection goes back to the pool.
+    ///
+    /// One caller, by design: the startup migration. A migration that rebuilds a
+    /// table has to rename the old one out of the way, and SQLite rewrites every
+    /// `REFERENCES` clause naming a renamed table whenever `foreign_keys` is ON —
+    /// so the child tables would follow the corpse instead of adopting the
+    /// replacement. `PRAGMA legacy_alter_table` does not cover that (it spares
+    /// trigger and view bodies, never foreign keys), and the pragma is a silent
+    /// no-op inside a transaction, so it cannot be flipped by the migration SQL
+    /// itself. Turning it off around the whole transaction is what SQLite's own
+    /// table-rebuild procedure prescribes.
+    ///
+    /// Atomicity is unchanged — the transaction still commits or rolls back as one
+    /// — and the migration verifies its own result with `PRAGMA foreign_key_check`
+    /// before returning, which is the check this pragma suspends.
+    pub async fn migration_transaction<F, T>(
+        &self,
+        token: CancellationToken,
+        f: F,
+    ) -> Result<T, SQLite3PoolError>
+    where
+        F: FnOnce(&Transaction) -> Result<T, SQLite3PoolError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run(token, f, ForeignKeys::Off).await
+    }
+
+    async fn run<F, T>(
+        &self,
+        token: CancellationToken,
+        f: F,
+        foreign_keys: ForeignKeys,
+    ) -> Result<T, SQLite3PoolError>
+    where
+        F: FnOnce(&Transaction) -> Result<T, SQLite3PoolError> + Send + 'static,
+        T: Send + 'static,
+    {
         if token.is_cancelled() {
             return Err(SQLite3PoolError::Cancelled);
         }
@@ -155,6 +207,10 @@ impl SQLite3Pool {
             let res: Result<T, SQLite3PoolError> = (|| {
                 let _guard = span.enter();
 
+                if foreign_keys == ForeignKeys::Off {
+                    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+                }
+
                 let tx = conn.transaction()?;
                 let val = f(&tx)?;
                 tx.commit()?;
@@ -163,6 +219,21 @@ impl SQLite3Pool {
 
                 Ok(val)
             })();
+
+            // Unconditional, and outside the closure above: a connection handed back
+            // to the pool with enforcement still off would disable foreign keys for
+            // every unrelated caller that later borrowed it, silently and for the
+            // life of the process. It must be restored on the error path too.
+            if foreign_keys == ForeignKeys::Off
+                && let Err(err) = conn.execute_batch("PRAGMA foreign_keys = ON;")
+            {
+                error!(
+                    error = ?err,
+                    "Failed to restore PRAGMA foreign_keys on a migration connection; \
+                     dropping it rather than returning an unenforced one to the pool."
+                );
+                return Err(SQLite3PoolError::Sql(err));
+            }
 
             // `blocking_lock` is safe here: we are on a dedicated spawn_blocking thread,
             // not inside the async runtime. The lock is held only for the push.

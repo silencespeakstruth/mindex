@@ -18,7 +18,7 @@ three things, all of them local and all of them cheap:
   wall-clock time on your own hardware, and nothing else.
 
 Your code never leaves the machine: vectors in a local Qdrant, metadata in a local
-SQLite file. 21 programming languages plus Markdown. BGE-M3 is light — ~4–6 GB VRAM,
+SQLite file. 21 programming languages, TOML/YAML and Markdown. BGE-M3 is light — ~4–6 GB VRAM,
 or CPU-only.
 
 **The intended way to run it is as an agent's tool over [MCP](https://modelcontextprotocol.io)**

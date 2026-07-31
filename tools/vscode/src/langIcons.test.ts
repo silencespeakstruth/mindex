@@ -38,8 +38,10 @@ const BRAND: Record<string, string> = {
     rust: "#dea584", // devicon: #000
     scala: "#de3423",
     sql: "#6a9fb5", // no devicon mark at all
+    toml: "#9c4221", // no devicon mark at all; the widely-used TOML colour
     tsx: "#61dafb",
     typescript: "#007acc",
+    yaml: "#cb171e",
     zig: "#f7a41d",
 };
 

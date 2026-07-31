@@ -27,6 +27,8 @@ pub enum Language {
     Ocaml,
     Zig,
     Sql,
+    Toml,
+    Yaml,
     Markdown,
 }
 
@@ -54,6 +56,8 @@ impl Language {
             Language::Ocaml => "ocaml",
             Language::Zig => "zig",
             Language::Sql => "sql",
+            Language::Toml => "toml",
+            Language::Yaml => "yaml",
             Language::Markdown => "markdown",
         }
     }
@@ -82,6 +86,8 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "ml" | "mli" => Some(Language::Ocaml),
         "zig" => Some(Language::Zig),
         "sql" => Some(Language::Sql),
+        "toml" => Some(Language::Toml),
+        "yaml" | "yml" => Some(Language::Yaml),
         "md" | "markdown" => Some(Language::Markdown),
         _ => None,
     }
@@ -103,6 +109,9 @@ mod tests {
             ("a.lhs", Language::Haskell),
             ("a.mli", Language::Ocaml),
             ("a.sql", Language::Sql),
+            ("a.toml", Language::Toml),
+            // The second spelling, which is the one a compose file uses.
+            ("a.yml", Language::Yaml),
         ];
         for (path, want) in cases {
             assert_eq!(detect_language(Path::new(path)), Some(want), "{path}");

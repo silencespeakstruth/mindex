@@ -72,6 +72,7 @@ const DEVICON_MARKS = {
     haskell: "haskell/haskell-plain",
     ocaml: "ocaml/ocaml-plain",
     zig: "zig/zig-original",
+    yaml: "yaml/yaml-plain",
     markdown: "markdown/markdown-original",
 };
 
