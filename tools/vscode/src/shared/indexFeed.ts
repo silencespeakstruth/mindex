@@ -36,8 +36,11 @@ export interface IndexFeedSnapshot {
     /** Skips by reason: the server's `unchanged`/`in_flight`/`cancelled`, plus
      *  `unsupported` for the files this client never posted. */
     skipReasons: Record<string, number>;
+    /** The server's own per-request pair: how far *this* batch has embedded. */
     chunks: number;
     chunksTotal: number;
+    /** Chunks embedded across every batch so far — monotonic, unlike `chunks`. */
+    runChunks: number;
     /** How many files the run set out to send. */
     files: number;
 }
@@ -53,6 +56,7 @@ export class IndexFeed {
     private readonly reasons = new Map<string, number>();
     private chunks = 0;
     private chunksTotal = 0;
+    private runChunks = 0;
 
     constructor(
         private readonly files: number,
@@ -83,6 +87,23 @@ export class IndexFeed {
     }
 
     /**
+     * A new `/index` request begins.
+     *
+     * `chunks_done` is cumulative *per request*, so at every batch boundary it
+     * falls back toward zero. Fed straight to the `RateWindow` — which assumes a
+     * counter that only grows — that made `perSecond()` **negative** for the whole
+     * window, so any run longer than one batch reported a rate like `-340
+     * chunks/s` partway through. The per-batch numbers are still the server's own
+     * (see `embedded`); what the rate reads is this separate run-level total,
+     * which only ever grows.
+     */
+    beginBatch(): void {
+        this.runChunks += this.chunks;
+        this.chunks = 0;
+        this.chunksTotal = 0;
+    }
+
+    /**
      * One embed batch landed. `chunksDone`/`chunksTotal` are the server's own
      * cumulative counts — taken rather than re-accumulated locally, so a retry or
      * a batch boundary cannot make the client's total disagree with the server's.
@@ -90,7 +111,12 @@ export class IndexFeed {
     embedded(chunksDone: number, chunksTotal: number, now: number): void {
         this.chunks = chunksDone;
         this.chunksTotal = chunksTotal;
-        this.rate.push(now, chunksDone);
+        this.rate.push(now, this.runChunks + chunksDone);
+    }
+
+    /** The live rate, for a caller sampling it without building a whole snapshot. */
+    perSecond(): number | undefined {
+        return this.rate.perSecond();
     }
 
     /**
@@ -115,6 +141,7 @@ export class IndexFeed {
             skipReasons: Object.fromEntries(this.reasons),
             chunks: this.chunks,
             chunksTotal: this.chunksTotal,
+            runChunks: this.runChunks + this.chunks,
             files: this.files,
         };
     }

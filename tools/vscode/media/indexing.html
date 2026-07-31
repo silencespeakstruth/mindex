@@ -1,0 +1,105 @@
+<main class="page">
+    <header class="head">
+        <div class="title-row">
+            <h3 class="title">
+                <span class="state-dot codicon codicon-sync" id="state-icon"></span>
+                <span id="title-text">Indexing</span>
+            </h3>
+            <div class="row">
+                <span class="badge" id="badge-force" hidden>force</span>
+                <span class="badge" id="badge-symbols" hidden>symbols only</span>
+                <span class="clock dim" id="clock">0s</span>
+                <button id="cancel" class="secondary" hidden>
+                    <span class="codicon codicon-stop-circle codicon-sm"></span>Cancel
+                </button>
+            </div>
+        </div>
+        <div class="subtitle dim" id="subtitle">Waiting for the first batch…</div>
+        <progress id="progress-bar" value="0" max="1"></progress>
+    </header>
+
+    <div class="notice info" id="idle-notice" hidden>
+        <span class="codicon codicon-info"></span>
+        <div>
+            No reindex has run in this window yet. Start one from the Drift view, or run
+            <code>MINDex: Reindex Current File</code>.
+        </div>
+    </div>
+
+    <div class="notice" id="fallback-notice" hidden>
+        <span class="codicon codicon-warning"></span>
+        <div>
+            <div>This server answered without a live stream.</div>
+            <div class="dim">
+                The counts below come from each batch's response body only — there are no
+                per-file events, no rate and no language breakdown for those batches.
+            </div>
+        </div>
+    </div>
+
+    <div class="notice bad" id="error-notice" hidden>
+        <span class="codicon codicon-error"></span>
+        <div>
+            <div id="error-detail"></div>
+            <div class="dim" id="error-code"></div>
+        </div>
+    </div>
+
+    <section class="card files-card" id="files-card">
+        <h4 class="card-title">
+            <span class="codicon codicon-list-unordered codicon-sm"></span>Files
+            <span class="dim" id="files-detail"></span>
+        </h4>
+        <ul class="files" id="files"></ul>
+        <div class="dim files-empty" id="files-empty">
+            Nothing posted yet — the first batch is still being read.
+        </div>
+    </section>
+
+    <section class="card" id="summary-card" hidden>
+        <h4 class="card-title">
+            <span class="codicon codicon-check-all codicon-sm" id="summary-icon"></span>
+            <span id="summary-title">Finished</span>
+            <button id="copy" class="ghost" title="Copy this summary">
+                <span class="codicon codicon-copy"></span>
+            </button>
+        </h4>
+
+        <div class="stats" id="stats"></div>
+
+        <div class="rate-row">
+            <div class="rate-aux dim">
+                <div>
+                    <span id="rate-avg">—</span> <span id="rate-unit">chunks/s</span> average
+                </div>
+                <div><span id="rate-peak">—</span> peak</div>
+            </div>
+            <svg
+                class="spark"
+                id="spark"
+                viewBox="0 0 240 44"
+                preserveAspectRatio="none"
+                aria-hidden="true"
+            >
+                <path class="spark-area" id="spark-area" d=""></path>
+                <polyline class="spark-line" id="spark-line" points=""></polyline>
+                <line class="spark-avg" id="spark-avg" x1="0" x2="240" y1="44" y2="44"></line>
+            </svg>
+        </div>
+
+        <div id="summary-body"></div>
+
+        <table class="lang-table" id="lang-table" hidden>
+            <thead>
+                <tr>
+                    <th>language</th>
+                    <th class="num">files</th>
+                    <th class="num" id="lang-unit-head">chunks</th>
+                    <th class="num">symbols</th>
+                    <th class="num">skipped</th>
+                </tr>
+            </thead>
+            <tbody id="lang-rows"></tbody>
+        </table>
+    </section>
+</main>

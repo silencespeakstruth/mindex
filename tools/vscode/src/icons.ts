@@ -82,6 +82,8 @@ export const ICON = {
     feedIndexed: "check",
     /** In the live indexing feed: a file the run passed over rather than indexed. */
     feedSkipped: "arrow-right",
+    /** The live Indexing panel and the command that opens it. */
+    indexing: "pulse",
     /** An indexed file. */
     file: "symbol-file",
     /** The project's language inventory. */

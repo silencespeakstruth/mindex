@@ -68,3 +68,70 @@ export function debounce<A extends unknown[]>(
 
     return debounced;
 }
+
+/**
+ * Leading **and trailing** throttle — at most one call per `ms`, and the last call
+ * of a burst always lands.
+ *
+ * The trailing half is the whole reason this exists next to [`debounce`]. The
+ * indexing feed's own rate cap was leading-only, and indexing arrives in bursts: a
+ * whole batch prepares in a few milliseconds, then the run goes quiet for the
+ * length of a GPU pass. Dropping the burst's *last* event froze every surface on
+ * the second-to-last file's numbers for exactly the stretch they exist to explain,
+ * which is what "nothing is moving" looked like from outside.
+ *
+ * The opposite of the search box, hence the opposite edge policy: here the first
+ * event of a burst is the one worth showing immediately, and the human is reading
+ * rather than typing.
+ */
+export function throttle<A extends unknown[]>(
+    ms: number,
+    fn: (...args: A) => void
+): Debounced<A> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pending: A | undefined;
+    let lastRun = Number.NEGATIVE_INFINITY;
+
+    const invoke = (args: A): void => {
+        lastRun = Date.now();
+        fn(...args);
+    };
+
+    const run = (): void => {
+        timer = undefined;
+        const args = pending;
+        pending = undefined;
+        if (args !== undefined) {
+            invoke(args);
+        }
+    };
+
+    const throttled = (...args: A): void => {
+        const wait = ms - (Date.now() - lastRun);
+        if (wait <= 0 && timer === undefined) {
+            invoke(args);
+            return;
+        }
+        // Inside the window: remember the newest arguments and let the timer
+        // already running deliver them.
+        pending = args;
+        timer ??= setTimeout(run, Math.max(wait, 0));
+    };
+
+    throttled.cancel = (): void => {
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            timer = undefined;
+        }
+        pending = undefined;
+    };
+
+    throttled.flush = (): void => {
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            run();
+        }
+    };
+
+    return throttled;
+}

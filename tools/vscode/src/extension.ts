@@ -13,6 +13,7 @@ import { browseResearchRuns, pickContextRuns } from "./researchContextPick";
 import { openResearchReport, RESEARCH_SCHEME, ResearchDocumentProvider } from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
 import { IndexStatusBar } from "./indexStatusBar";
+import { IndexingPanel, IndexingPanelPlacement } from "./indexingPanel";
 import { reindexPaths, showReindexSummary } from "./indexer";
 import { runSearch } from "./search";
 import { ResearchPanel, ResearchSubmission } from "./researchView";
@@ -561,15 +562,14 @@ export function activate(context: vscode.ExtensionContext): void {
         reindexRunning = true;
         let summary;
         try {
-            summary = await reindexPaths(
-                api,
-                proj.mindex.guid,
-                proj.root,
-                paths,
-                batch,
-                indexStatusBar,
-                force
-            );
+            summary = await reindexPaths(api, proj.mindex.guid, proj.root, paths, {
+                statusBar: indexStatusBar,
+                extensionUri: context.extensionUri,
+                placement: config().get<IndexingPanelPlacement>("indexingPanel", "beside"),
+                openFile: statusActions.openFile,
+                batchSize: batch,
+                force,
+            });
         } finally {
             // Cleared before the drift check below, which draws its own progress in
             // the view title — two indicators for one operation reads as two
@@ -581,7 +581,11 @@ export function activate(context: vscode.ExtensionContext): void {
             // thing that can tell a hash-skipped file from one the server refused as
             // in-flight, and the summary is a claim about which of the two happened.
             await checkDrift();
-            showReindexSummary(summary, driftProvider.allPaths("indexing").length);
+            const inFlight = driftProvider.allPaths("indexing").length;
+            showReindexSummary(summary, inFlight);
+            // The same number, from the same source, so the panel's summary and the
+            // toast cannot disagree about what the server actually refused.
+            IndexingPanel.current?.finishedWithInFlight(inFlight);
             // The inventory just changed: a language may have gained its first
             // searchable chunk, which is what the Ask view's pickers offer.
             await statusProvider.refresh();
@@ -744,6 +748,13 @@ export function activate(context: vscode.ExtensionContext): void {
             StatusPanel.showOrReveal(context.extensionUri, statusProvider, statusActions);
             void statusProvider.refresh();
         }),
+
+        // How a panel closed mid-run is brought back, and the only way in at all
+        // when `mindex.indexingPanel` is set to `manual`. It renders whatever the
+        // last run left, which is the summary until the next one starts.
+        vscode.commands.registerCommand("mindex.openIndexing", () =>
+            IndexingPanel.showOrReveal(context.extensionUri, statusActions.openFile)
+        ),
 
         vscode.commands.registerCommand("mindex.openResearchHistory", () => {
             ResearchRunsPanel.showOrReveal(

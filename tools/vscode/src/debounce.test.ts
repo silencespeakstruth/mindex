@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
 
-import { debounce } from "./shared/debounce";
+import { debounce, throttle } from "./shared/debounce";
 
 /** `setTimeout` resolution is not exact; give each wait room without slowing the suite. */
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -62,5 +62,61 @@ describe("debounce", () => {
         const d = debounce(20, (n: number) => calls.push(n));
         d.flush();
         deepStrictEqual(calls, []);
+    });
+});
+
+describe("throttle", () => {
+    it("fires the first call of a burst at once", () => {
+        const calls: number[] = [];
+        const t = throttle(50, (n: number) => calls.push(n));
+        t(1);
+        deepStrictEqual(calls, [1], "leading edge — the opposite of debounce");
+    });
+
+    it("delivers the LAST call of a burst", async () => {
+        // The regression this exists for. Indexing arrives in bursts: a whole batch
+        // prepares in milliseconds and the run then goes quiet for a GPU pass.
+        // Leading-only, the burst's final numbers never reach the screen and every
+        // surface freezes one event short — for exactly the stretch it explains.
+        const calls: number[] = [];
+        const t = throttle(50, (n: number) => calls.push(n));
+        for (let i = 1; i <= 20; i += 1) {
+            t(i);
+        }
+        deepStrictEqual(calls, [1], "the rest are still inside the window");
+        await wait(120);
+        deepStrictEqual(calls, [1, 20], "the newest value lands when the window opens");
+    });
+
+    it("caps the rate without starving a steady stream", async () => {
+        const calls: number[] = [];
+        const t = throttle(30, (n: number) => calls.push(n));
+        for (let i = 0; i < 6; i += 1) {
+            t(i);
+            await wait(20);
+        }
+        await wait(60);
+        strictEqual(calls.length >= 2, true, "some calls got through");
+        strictEqual(calls.length < 6, true, "and the rate was capped");
+        strictEqual(calls[calls.length - 1], 5, "the newest value is never lost");
+    });
+
+    it("cancel drops the pending trailing call", async () => {
+        const calls: number[] = [];
+        const t = throttle(30, (n: number) => calls.push(n));
+        t(1);
+        t(2);
+        t.cancel();
+        await wait(80);
+        deepStrictEqual(calls, [1], "the leading call happened, the trailing one did not");
+    });
+
+    it("flush runs the pending call immediately", () => {
+        const calls: number[] = [];
+        const t = throttle(50, (n: number) => calls.push(n));
+        t(1);
+        t(2);
+        t.flush();
+        deepStrictEqual(calls, [1, 2]);
     });
 });

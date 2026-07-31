@@ -182,6 +182,7 @@ const webviews = {
         status: "src/webview/status.ts",
         research: "src/webview/research.ts",
         runs: "src/webview/runs.ts",
+        indexing: "src/webview/indexing.ts",
     },
     outdir: "media/js",
     platform: "browser",

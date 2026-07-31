@@ -181,6 +181,12 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "mindex.openIndexing",
+        "title": "Show Indexing",
+        "category": "MINDex",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "mindex.openResearchHistory",
         "title": "Show Research History",
         "category": "MINDex",
@@ -345,6 +351,21 @@
           "maximum": 3600,
           "description": "How often to re-check server health in the background, in seconds (0 disables it). This is what lets the Ask view stop offering Research when the server's Ollama goes away, and disable itself entirely when a required dependency does. Each poll is a handful of small local requests."
         },
+        "mindex.indexingPanel": {
+          "type": "string",
+          "enum": [
+            "beside",
+            "active",
+            "manual"
+          ],
+          "default": "beside",
+          "enumDescriptions": [
+            "Open it in a column beside the editor, without taking focus.",
+            "Open it in the active editor group, without taking focus.",
+            "Never open it on its own — use “MINDex: Show Indexing”."
+          ],
+          "description": "Where the live Indexing panel opens when a reindex starts. It shows what the server streams while it works: the files going through, the embed rate, per-language chunk and symbol counts, and a summary when the run ends."
+        },
         "mindex.topK": {
           "type": "number",
           "default": 10,
@@ -354,10 +375,10 @@
         },
         "mindex.batchSize": {
           "type": "number",
-          "default": 100,
+          "default": 10,
           "minimum": 1,
           "maximum": 10000,
-          "description": "Files per /index request when reindexing."
+          "markdownDescription": "Files per `/index` request when reindexing. Smaller batches report progress more often: the server emits one `embedded` event per completed embed batch, so a whole reindex sent as one request reports its GPU pass exactly once, on completion. Measured on this stack (14 files, 173 chunks): 14 files/request took 18.7 s and produced 1 progress event; 5 took 17.8 s and 3 events; 2 took 17.1 s and 7 events — so splitting cost no throughput at all here. Raise it for bulk runs on a fast GPU, where larger `/encode` batches do pay."
         },
         "mindex.researchModel": {
           "type": "string",
@@ -372,7 +393,7 @@
     "build": "node esbuild.mjs",
     "compile": "npm run typecheck && npm run build",
     "watch": "node esbuild.mjs --watch",
-    "test": "tsc -p . && node --test out/*.test.js",
+    "test": "tsc -p . && node --test \"out/**/*.test.js\"",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

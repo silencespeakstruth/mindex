@@ -72,9 +72,46 @@ describe("IndexFeed", () => {
         feed.embedded(50, 50, 0);
         // The next batch is a second request, so its totals restart — the feed
         // shows what the server last said rather than a sum of its own.
+        feed.beginBatch();
         feed.embedded(80, 200, 1000);
         assert.strictEqual(feed.snapshot().chunks, 80);
         assert.strictEqual(feed.snapshot().chunksTotal, 200);
+        // …while the run-level count is the sum, which is what the rate reads.
+        assert.strictEqual(feed.snapshot().runChunks, 130);
+    });
+
+    it("keeps the rate positive across a batch boundary", () => {
+        // The regression: `chunks_done` restarts per request, so feeding it
+        // straight to the RateWindow made `perSecond()` negative for a whole
+        // window on any run longer than one batch.
+        const feed = new IndexFeed(200);
+        feed.embedded(50, 400, 0);
+        feed.embedded(200, 400, 1000);
+        feed.beginBatch();
+        feed.embedded(40, 300, 2000);
+        const s = feed.snapshot();
+        assert.strictEqual(s.chunks, 40, "the batch pair stays the server's");
+        assert.strictEqual(s.runChunks, 240);
+        // (240 - 50) chunks over 2000 ms, the window's oldest sample being 50.
+        assert.strictEqual(s.chunksPerSecond, 95);
+    });
+
+    it("never reports a negative rate, however many batches a run takes", () => {
+        const feed = new IndexFeed(500);
+        let t = 0;
+        for (let batch = 0; batch < 4; batch += 1) {
+            feed.beginBatch();
+            for (const done of [30, 90, 150]) {
+                t += 500;
+                feed.embedded(done, 150, t);
+                const rate = feed.snapshot().chunksPerSecond;
+                assert.ok(
+                    rate === undefined || rate >= 0,
+                    `batch ${batch}: rate ${String(rate)} went backwards`
+                );
+            }
+        }
+        assert.strictEqual(feed.snapshot().runChunks, 600);
     });
 
     it("never lets the JSON-fallback catch-up double-count a streamed run", () => {

@@ -10,55 +10,29 @@ export interface IndexResponse {
 }
 
 // ---- streaming /index (`?stream=yes`) wire events ----
-// Mirrors the server's `IndexEvent` (src/backend/v0/models.rs); this reader
-// ignores events and fields it does not know, so a newer server degrades to less
-// detail rather than an error.
+// They live in `shared/indexEvents.ts` so the run aggregate and the webview page
+// can be typed against them without importing this module's `node:https`; every
+// name is re-exported here so no call site has to know that.
 
-export interface IndexStartedEvent {
-    files: number;
-    /** True when every later `count` is symbol rows, not chunks. */
-    symbols_only: boolean;
-}
-export interface IndexPreparedEvent {
-    path: string;
-    language: string;
-    chunks: number;
-    symbols: number;
-}
-export interface IndexSkippedEvent {
-    path: string;
-    language: string;
-    /** `unchanged`, `in_flight` or `cancelled` today; opaque so a new reason displays. */
-    reason: string;
-}
-export interface IndexEmbeddedEvent {
-    /** One embed batch, encoded and upserted; `chunks_done` is cumulative — the
-     *  honest chunks-per-second source. `elapsed_ms` is the server's own clock. */
-    batch_chunks: number;
-    chunks_done: number;
-    chunks_total: number;
-    elapsed_ms: number;
-}
-export interface IndexIndexedEvent {
-    path: string;
-    language: string;
-    count: number;
-}
-export interface IndexDoneEvent {
-    /** Byte-for-byte the JSON mode's `IndexResponse.files`. */
-    files: IndexResponse["files"];
-    files_indexed: number;
-    chunks: number;
-    elapsed_ms: number;
-}
-/** Non-terminal events of a streaming /index; terminals fold into the promise. */
-export interface IndexStreamCallbacks {
-    onStarted?(e: IndexStartedEvent): void;
-    onPrepared?(e: IndexPreparedEvent): void;
-    onSkipped?(e: IndexSkippedEvent): void;
-    onEmbedded?(e: IndexEmbeddedEvent): void;
-    onIndexed?(e: IndexIndexedEvent): void;
-}
+import type {
+    IndexStartedEvent,
+    IndexPreparedEvent,
+    IndexSkippedEvent,
+    IndexEmbeddedEvent,
+    IndexIndexedEvent,
+    IndexDoneEvent,
+    IndexStreamCallbacks,
+} from "./shared/indexEvents";
+
+export type {
+    IndexStartedEvent,
+    IndexPreparedEvent,
+    IndexSkippedEvent,
+    IndexEmbeddedEvent,
+    IndexIndexedEvent,
+    IndexDoneEvent,
+    IndexStreamCallbacks,
+};
 
 export interface SearchFilter {
     paths?: string[];
@@ -641,25 +615,6 @@ export class MindexApi {
 
     // ---- data plane ----
 
-    /**
-     * `force` bypasses the server's unchanged-skip (content hash *and* derivation
-     * versions), so every posted file is re-sliced and re-embedded. Routine reindexing
-     * leaves it off — an ordinary pass already picks up slicer/tags-query changes.
-     */
-    index(
-        guid: string,
-        files: IndexFiles,
-        signal?: AbortSignal,
-        force = false
-    ): Promise<IndexResponse> {
-        return this.request(
-            "POST",
-            `/${this.protocol}/${guid}/index`,
-            { files, force },
-            signal
-        ) as Promise<IndexResponse>;
-    }
-
     search(guid: string, req: SearchRequest, signal?: AbortSignal): Promise<SearchResponse> {
         return this.request(
             "POST",
@@ -866,13 +821,18 @@ export class MindexApi {
     }
 
     /**
-     * `POST /index?stream=yes` — the same upload as [`index`], reported live:
-     * per-file `prepared`/`skipped`/`indexed` and per-embed-batch `embedded`
-     * events reach `cb` as the server works, and the resolved value is the same
-     * `IndexResponse` the JSON mode returns (`done.files`). An older server that
-     * does not know the query answers plain JSON; that degrades transparently —
-     * `cb` sees nothing and the body is parsed as the response. Aborting `signal`
-     * rejects (like [`index`], unlike [`research`]) so a caller can tell the
+     * `POST /index?stream=yes` — an upload reported live: per-file
+     * `prepared`/`skipped`/`indexed` and per-embed-batch `embedded` events reach
+     * `cb` as the server works, and the resolved value is the `IndexResponse` the
+     * JSON mode would have returned (`done.files`). `force` bypasses the server's
+     * unchanged-skip (content hash *and* derivation versions), so every posted
+     * file is re-sliced and re-embedded; routine reindexing leaves it off.
+     *
+     * An older server that does not know the query answers plain JSON. That
+     * degrades transparently — the body is parsed as the response — but not
+     * silently: `cb.onJsonFallback` fires, because a run whose numbers came from
+     * two batch responses instead of a live stream is a different thing to read.
+     * Aborting `signal` rejects (unlike [`research`]) so a caller can tell the
      * user's cancel from an empty result; the disconnect is what cancels the
      * server-side work.
      */
@@ -901,6 +861,10 @@ export class MindexApi {
                     }
                 },
                 onJson: (text) => {
+                    // Fired before the parse: a body this client cannot read is
+                    // still a request that produced no events, and the caller has
+                    // to know that before it decides what its counters mean.
+                    cb.onJsonFallback?.();
                     try {
                         jsonBody = JSON.parse(text) as IndexResponse;
                     } catch {
@@ -915,6 +879,10 @@ export class MindexApi {
             throw new ProblemError(200, streamError.code, streamError.detail);
         }
         if (done !== undefined) {
+            // The three fields the response body does not carry — `files_indexed`,
+            // `chunks` and the server's own `elapsed_ms` — reach the caller only
+            // here. The promise still settles on the same terminal.
+            cb.onDone?.(done);
             return { files: done.files };
         }
         if (jsonBody !== undefined) {

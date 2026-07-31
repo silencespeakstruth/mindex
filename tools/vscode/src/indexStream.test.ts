@@ -37,6 +37,17 @@ describe("routeIndexFrame", () => {
         assert.deepStrictEqual(seen, ["b.rs:unchanged"]);
     });
 
+    it("routes started, which is what says the counts are symbol rows", () => {
+        let symbolsOnly: boolean | undefined;
+        const out = routeIndexFrame('event: started\ndata: {"files":4,"symbols_only":true}', {
+            onStarted: (e) => {
+                symbolsOnly = e.symbols_only;
+            },
+        });
+        assert.strictEqual(out, undefined);
+        assert.strictEqual(symbolsOnly, true);
+    });
+
     it("returns done as a terminal with the JSON-mode files shape", () => {
         const out = routeIndexFrame(
             'event: done\ndata: {"files":{"rust":{"a.rs":7}},"files_indexed":1,"chunks":7,"elapsed_ms":10}',
