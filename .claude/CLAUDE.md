@@ -1488,6 +1488,26 @@ fabricated label; and the HTTP/3 body-limit short-circuit answers before the
 router, so it records itself. A second such short-circuit needs the same three
 lines or it goes uncounted in silence.
 
+**A rare labelled counter must be charted with `increase()`, never `rate()`** —
+this is a dashboard rule that follows from how the metric layer works, and it is
+the one that made the whole research row read as empty while `research_runs` held
+the runs. A `Family` series does not exist until the first event carrying that
+label set, so its first scraped sample is already **1**: there is no preceding 0
+to subtract from, and a label set seeing exactly one event in a process lifetime —
+the normal case for `research_runs{model,done_reason}`, and for every per-run
+histogram — stays flat at 1 until restart. `rate()` over that is 0 for the entire
+life of the series. `increase()` counts the first sample of a newly-appeared
+counter (VictoriaMetrics does; upstream Prometheus does not, which is what
+seeding the label sets at zero would buy — impossible here, since `model` is
+client-supplied), so the same data is visible under one and invisible under the
+other. High-traffic families (`http_requests_total`, `index_files_total`) hide the
+defect because their second event arrives seconds after their first. The paired
+rendering rule: a handful of events a day is drawn as **bars** with a `sum`
+legend, and a quantile over a rare histogram as **points with gaps kept**, since
+there is nothing to join into a line. And a share-of-total stat needs
+`or vector(0)`: the healthy case is that the `unverified` series does not exist,
+and "No data" is indistinguishable from a broken query.
+
 **What is deliberately not measured.** Per-project code bytes as a *gauge*:
 `SUM(LENGTH(code))` is a full scan of the biggest column in the schema every tick
 and would evict the page cache the search candidate query depends on — the

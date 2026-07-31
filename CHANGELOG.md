@@ -31,6 +31,23 @@ changes of its own is still released, so "which version am I running" has one an
   - CI and deployment YAML (`.github/**`, `deploy/**/*.yml`) are excluded from this
     repository's own `.mindex`.
 
+### Fixed
+
+- **The Grafana dashboard's whole Research row read as empty while the runs were
+  there.** A labelled metric family is created by the first event carrying its label
+  set, so its first scraped sample is already `1` — there is no preceding zero for
+  `rate()` to subtract from, and `research_runs{model, done_reason}` normally sees
+  exactly one run per label set per process lifetime, so the series sat flat at 1
+  until restart and every panel built on `rate()` drew zero. The metrics themselves
+  were correct throughout, and high-traffic families hid the defect because their
+  second event arrives seconds after their first. Research counters and per-run
+  histograms are now charted with `increase()`, which counts a new series' first
+  sample, and drawn as bars with a `sum` legend rather than as a per-second line;
+  quantiles over a rare histogram are drawn as points with the gaps kept. The
+  "Unverified citation share" stat gained `or vector(0)` — the healthy case is that
+  no `unverified` series exists, and "No data" is indistinguishable from a broken
+  query.
+
 ## [1.0.1] — 2026-07-31
 
 Adds a second channel for research — **git history** — and reworks the VS Code

@@ -158,6 +158,14 @@ LEGEND_LIST = {
     "placement": "bottom",
     "calcs": [],
 }
+# For counted events the useful legend column is the range total, not the last
+# bar — a panel showing three bars in six hours has no meaningful "last value".
+LEGEND_TABLE_SUM = {
+    "showLegend": True,
+    "displayMode": "table",
+    "placement": "bottom",
+    "calcs": ["sum", "max"],
+}
 
 # Thin marks, recessive fills: the line carries the series, the fill only groups.
 TS_CUSTOM = {
@@ -171,6 +179,28 @@ TS_CUSTOM = {
 STACK_CUSTOM = dict(
     TS_CUSTOM, fillOpacity=55, lineWidth=1, stacking={"mode": "normal", "group": "A"}
 )
+# Per-run events are COUNTED, never rated, and that is a correctness matter
+# rather than a taste one. Every research family is a labelled `Family` created
+# lazily by the first run carrying that label set, so its first scraped sample
+# is already 1: there is no preceding 0 for `rate()` to subtract from, and a
+# label set that sees exactly one run in a process lifetime — the normal case
+# for {model, done_reason} — stays flat at 1 until restart. `rate()` over that
+# is 0 for the whole life of the series, which is how a row of research panels
+# reads as empty while `research_runs` plainly holds the runs. `increase()`
+# counts the first sample of a newly-appearing counter, so it sees them.
+# Bars, because a handful of runs a day drawn as a per-second line is a needle.
+BARS_CUSTOM = dict(
+    TS_CUSTOM, drawStyle="bars", fillOpacity=70, lineWidth=1, barAlignment=0
+)
+BARS_STACK_CUSTOM = dict(BARS_CUSTOM, stacking={"mode": "normal", "group": "A"})
+# A quantile over a rare histogram is defined only in the windows that contain a
+# run, so the marks must be points and the gaps must stay gaps.
+POINTS_CUSTOM = dict(TS_CUSTOM, showPoints="always", pointSize=7, spanNulls=False)
+
+
+def ev(expr, window="$__rate_interval"):
+    """Counted-event form of a counter — see BARS_CUSTOM for why not `rate`."""
+    return f"increase({expr}[{window}])"
 
 
 def ts(
@@ -874,31 +904,42 @@ P += [
         gp(8, 12, 0, y),
         targets(
             (
-                'sum by (done_reason) (rate(mindex_research_runs_total{model=~"$model"}[$__rate_interval]))',
+                "sum by (done_reason) ("
+                + ev('mindex_research_runs_total{model=~"$model"}')
+                + ")",
                 "{{done_reason}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="The 'is a budget binding?' panel. `finalized` means the model judged "
-        "the evidence sufficient; anything else is a wall it hit.",
-        custom=STACK_CUSTOM,
+        "the evidence sufficient; anything else is a wall it hit. Counted, not "
+        "rated: one run per label set per process lifetime is invisible to "
+        "`rate()`.",
+        custom=BARS_STACK_CUSTOM,
         overrides=by_name_overrides(DONE_REASON),
-        legend=LEGEND_TABLE,
+        legend=LEGEND_TABLE_SUM,
     ),
     ts(
         "Run duration",
         gp(8, 12, 12, y),
         targets(
             (
-                'histogram_quantile(0.50, sum by (le, model) (rate(mindex_research_duration_seconds_bucket{model=~"$model"}[$__rate_interval])))',
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_duration_seconds_bucket{model=~"$model"}')
+                + "))",
                 "p50 {{model}}",
             ),
             (
-                'histogram_quantile(0.95, sum by (le, model) (rate(mindex_research_duration_seconds_bucket{model=~"$model"}[$__rate_interval])))',
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_duration_seconds_bucket{model=~"$model"}')
+                + "))",
                 "p95 {{model}}",
             ),
         ),
         unit="s",
+        desc="One point per window that actually contained a run — with a few "
+        "runs a day there is nothing to join into a line.",
+        custom=POINTS_CUSTOM,
     ),
 ]
 y += 8
@@ -907,7 +948,7 @@ P += [
     heat(
         "Steps per run",
         gp(7, 8, 0, y),
-        'sum by (le) (rate(mindex_research_steps_bucket{model=~"$model"}[$__rate_interval]))',
+        "sum by (le) (" + ev('mindex_research_steps_bucket{model=~"$model"}') + ")",
         desc="A step is a poor unit — one turn may execute several, and `outline` "
         "is one indexed SELECT while `search` is a GPU embed plus a vector "
         "query. That is why it is the backstop and not the budget.",
@@ -915,14 +956,16 @@ P += [
     heat(
         "Turns per run",
         gp(7, 8, 8, y),
-        'sum by (le) (rate(mindex_research_turns_bucket{model=~"$model"}[$__rate_interval]))',
+        "sum by (le) (" + ev('mindex_research_turns_bucket{model=~"$model"}') + ")",
         desc="Turns above steps means turns that produced no step: rejected "
         "duplicates, or a model rephrasing instead of learning a name.",
     ),
     heat(
         "Context used",
         gp(7, 8, 16, y),
-        'sum by (le) (rate(mindex_research_context_used_ratio_bucket{model=~"$model"}[$__rate_interval]))',
+        "sum by (le) ("
+        + ev('mindex_research_context_used_ratio_bucket{model=~"$model"}')
+        + ")",
         unit="percentunit",
         desc="Peak prompt tokens over the run's num_ctx. Approaching 1.0 means "
         "Ollama is about to trim the transcript in silence.",
@@ -932,18 +975,20 @@ y += 7
 
 P += [
     ts(
-        "Token throughput",
+        "Tokens processed",
         gp(7, 8, 0, y),
         targets(
             (
-                'sum by (kind) (rate(mindex_research_tokens_total{model=~"$model"}[$__rate_interval]))',
+                "sum by (kind) ("
+                + ev('mindex_research_tokens_total{model=~"$model"}')
+                + ")",
                 "{{kind}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="The whole transcript is resent every turn, so prompt tokens grow "
         "super-linearly with turns. This is the real cost axis.",
-        custom=STACK_CUSTOM,
+        custom=BARS_STACK_CUSTOM,
         overrides=by_name_overrides({"prompt": "blue", "eval": "purple"}),
     ),
     ts(
@@ -951,26 +996,29 @@ P += [
         gp(7, 8, 8, y),
         targets(
             (
-                "sum by (tool) (rate(mindex_research_tool_calls_total[$__rate_interval]))",
+                "sum by (tool) (" + ev("mindex_research_tool_calls_total") + ")",
                 "{{tool}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="The intended path is list_files -> outline -> symbols/search/callers "
         "-> read_chunks. A run that only ever calls `search` never learned a name.",
-        custom=STACK_CUSTOM,
-        legend=LEGEND_TABLE,
+        custom=BARS_STACK_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
     ),
     ts(
         "Tool latency (p95)",
         gp(7, 8, 16, y),
         targets(
             (
-                "histogram_quantile(0.95, sum by (le, tool) (rate(mindex_research_tool_duration_seconds_bucket[$__rate_interval])))",
+                "histogram_quantile(0.95, sum by (le, tool) ("
+                + ev("mindex_research_tool_duration_seconds_bucket")
+                + "))",
                 "{{tool}}",
             ),
         ),
         unit="s",
+        custom=POINTS_CUSTOM,
     ),
 ]
 y += 7
@@ -981,22 +1029,26 @@ P += [
         gp(7, 12, 0, y),
         targets(
             (
-                "sum by (class) (rate(mindex_research_citations_total[$__rate_interval]))",
+                "sum by (class) (" + ev("mindex_research_citations_total") + ")",
                 "{{class}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="`unverified` = a path no tool returned this run, i.e. invented. "
         "`stale` is orthogonal to the other three: a citation can be "
         "impeccably verified and stale.",
-        custom=STACK_CUSTOM,
+        custom=BARS_STACK_CUSTOM,
         overrides=by_name_overrides(CITATION_CLASS),
-        legend=LEGEND_TABLE,
+        legend=LEGEND_TABLE_SUM,
     ),
     stat(
         "Unverified citation share",
         gp(7, 4, 12, y),
-        'sum(increase(mindex_research_citations_total{class="unverified"}[$__range])) / clamp_min(sum(increase(mindex_research_citations_total[$__range])), 1)',
+        # `or vector(0)` because the healthy case is that no `unverified` series
+        # exists at all — without it the best possible reading renders as "No
+        # data", which is indistinguishable from a broken query.
+        '(sum(increase(mindex_research_citations_total{class="unverified"}[$__range])) or vector(0))'
+        " / clamp_min(sum(increase(mindex_research_citations_total[$__range])), 1)",
         unit="percentunit",
         thresholds=[
             {"color": "green", "value": None},
@@ -1012,19 +1064,19 @@ P += [
         gp(7, 8, 16, y),
         targets(
             (
-                "rate(mindex_research_revalidations_total[$__rate_interval])",
+                ev("mindex_research_revalidations_total"),
                 "revalidations",
             ),
             (
-                "rate(mindex_research_tool_call_parse_retries_total[$__rate_interval])",
+                ev("mindex_research_tool_call_parse_retries_total"),
                 "ollama parse retries",
             ),
             (
-                "rate(mindex_research_transcript_truncations_total[$__rate_interval])",
+                ev("mindex_research_transcript_truncations_total"),
                 "transcript truncations",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="A revalidation is a draft sent back because its citations did not "
         "check out. A truncation means Ollama trimmed the transcript and "
         "streamed on — otherwise a completely silent failure.",
@@ -1035,6 +1087,7 @@ P += [
                 "transcript truncations": "red",
             }
         ),
+        custom=BARS_CUSTOM,
     ),
 ]
 y += 7
