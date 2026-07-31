@@ -9,7 +9,13 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
-## [Unreleased]
+## [1.0.1] — 2026-07-31
+
+Adds a second channel for research — **git history** — turns its stored reports into a
+validity-tracked corpus the model and the reader can both browse, streams indexing
+progress over SSE, and indexes TOML and YAML. The VS Code extension got the rest of the
+attention. Also fixes an indexing failure that could take a whole pass down with it,
+and a research run that could vanish without a trace.
 
 ### Added
 
@@ -89,6 +95,43 @@ changes of its own is still released, so "which version am I running" has one an
     devicon draws none, the second language after `sql` for which that is true.
   - CI and deployment YAML (`.github/**`, `deploy/**/*.yml`) are excluded from this
     repository's own `.mindex`.
+- **Git history channel.** `project_commits` and `project_commit_paths` (migration 2,
+  `v1.1.0_git_history.sql`) record what each commit touched and why. Opt-in and
+  metadata-only: no embeddings, no Qdrant points, no chunks, no derivation version.
+  - `POST /v0/{guid}/history` reconciles a commit set; `DELETE /v0/{guid}/history`
+    prunes it by `keep_last` and `older_than`, intersected.
+  - `mindex-index --history` walks the refs named by `git_refs` in `.mindex`;
+    `--history-only` runs that phase alone, `--git-ref` scopes it.
+  - `file_history` is the research loop's tenth tool. Historical claims must still be
+    anchored to a `path:start-end` with the sha named in prose — a sha is
+    content-addressed and needs no server-side citation grammar.
+- **`git_refs:`** as a `.mindex` key.
+- **VS Code — language marks.** Every language is drawn with its official mark
+  (devicon, vendored at build time) in the Ask view's filters and the status panel's
+  inventory and failed lists.
+- **VS Code — Sync all.** One action in the Drift view that reindexes every stale and
+  missing file and drops every orphan from the index. Present only while there is
+  drift to clear.
+- **VS Code — inline reindex progress**, in the Drift view itself rather than only in
+  a corner notification, and it reports the server's own in-flight work as well as
+  this window's uploads.
+- **VS Code — `mindex.statusPollSeconds`** (default 30, `0` disables): a background
+  health poll, which is what lets the Ask form stop offering work the server cannot
+  currently do.
+
+### Changed
+
+- **The slicer cuts on token boundaries where a line boundary does not exist**, and
+  both slicers clamp their configured window below what Qdrant can store.
+- **VS Code — the Ask form is gated on server health.** Research disables itself when
+  the server's Ollama goes away; the whole form disables when a *required* dependency
+  does, and a run in flight is aborted rather than left to time out.
+- **VS Code — the status panel reads as a dashboard**: health checks carry colour and
+  an `optional` badge, the SQLite pool is one inline meter, and the failed-files card
+  is hidden entirely when nothing has failed.
+- `PROMPT_VERSION` is `1.3`. Research reports written under 1.0.0 and 1.0.1 were
+  written under different instructions and are not directly comparable; if you are
+  keeping a corpus, partition on it.
 
 ### Fixed
 
@@ -138,54 +181,6 @@ changes of its own is still released, so "which version am I running" has one an
   "Unverified citation share" stat gained `or vector(0)` — the healthy case is that
   no `unverified` series exists, and "No data" is indistinguishable from a broken
   query.
-
-## [1.0.1] — 2026-07-31
-
-Adds a second channel for research — **git history** — and reworks the VS Code
-extension's status and drift surfaces. Also fixes an indexing failure that could take
-a whole pass down with it.
-
-### Added
-
-- **Git history channel.** `project_commits` and `project_commit_paths` (migration 2,
-  `v1.1.0_git_history.sql`) record what each commit touched and why. Opt-in and
-  metadata-only: no embeddings, no Qdrant points, no chunks, no derivation version.
-  - `POST /v0/{guid}/history` reconciles a commit set; `DELETE /v0/{guid}/history`
-    prunes it by `keep_last` and `older_than`, intersected.
-  - `mindex-index --history` walks the refs named by `git_refs` in `.mindex`;
-    `--history-only` runs that phase alone, `--git-ref` scopes it.
-  - `file_history` is the research loop's tenth tool. Historical claims must still be
-    anchored to a `path:start-end` with the sha named in prose — a sha is
-    content-addressed and needs no server-side citation grammar.
-- **`git_refs:`** as a `.mindex` key.
-- **VS Code — language marks.** Every language is drawn with its official mark
-  (devicon, vendored at build time) in the Ask view's filters and the status panel's
-  inventory and failed lists.
-- **VS Code — Sync all.** One action in the Drift view that reindexes every stale and
-  missing file and drops every orphan from the index. Present only while there is
-  drift to clear.
-- **VS Code — inline reindex progress**, in the Drift view itself rather than only in
-  a corner notification, and it reports the server's own in-flight work as well as
-  this window's uploads.
-- **VS Code — `mindex.statusPollSeconds`** (default 30, `0` disables): a background
-  health poll, which is what lets the Ask form stop offering work the server cannot
-  currently do.
-
-### Changed
-
-- **The slicer cuts on token boundaries where a line boundary does not exist**, and
-  both slicers clamp their configured window below what Qdrant can store.
-- **VS Code — the Ask form is gated on server health.** Research disables itself when
-  the server's Ollama goes away; the whole form disables when a *required* dependency
-  does, and a run in flight is aborted rather than left to time out.
-- **VS Code — the status panel reads as a dashboard**: health checks carry colour and
-  an `optional` badge, the SQLite pool is one inline meter, and the failed-files card
-  is hidden entirely when nothing has failed.
-- `PROMPT_VERSION` is `1.1`. Research reports written under 1.0.0 and 1.0.1 were
-  written under different instructions and are not directly comparable.
-
-### Fixed
-
 - **An oversized chunk could fail a whole indexing batch.** A file with no line
   boundaries — a minified JSON, one unwrapped paragraph of prose — produced a single
   chunk of unbounded size, which Qdrant refuses above 1 048 576 multivector elements
@@ -210,16 +205,31 @@ a whole pass down with it.
   With `http.proxySupport` at its default `"override"` the extension host may
   substitute its own proxy agent and discard ours — taking `rejectUnauthorized` with
   it. That is what made both settings look inert behind a corporate proxy.
+- **A Windows clone reported permanent drift.** Git's default `core.autocrlf=true`
+  rewrites the working tree to CRLF on checkout, and mindex hashes `code.as_bytes()` —
+  so every client saw every file as changed, reindexed the whole tree on every check,
+  and nothing errored anywhere. `.gitattributes` now declares `* text=auto eol=lf`
+  repo-wide, which overrides the setting rather than leaving it to each contributor,
+  and a minimal `.editorconfig` keeps an editor from putting CRLF back.
 
 ### Upgrading
 
-- **The database migrates in place.** Migration 2 is additive — two new tables — and
-  was verified non-destructive against a copy of a real 1.0.0 database. Nothing needs
-  reindexing.
+- **The database migrates in place**, on the next start. Migration 2 is additive — two
+  new tables — and was verified non-destructive against a copy of a real 1.0.0
+  database. Migrations 3 and 4 rebuild a table each (`project_files` for the widened
+  language CHECK, `research_runs` for `seq`/`expires_at`/`context_run_ids_json`),
+  which SQLite cannot express as an `ALTER`; both run under
+  `SQLite3Pool::migration_transaction`, which suspends foreign-key enforcement for the
+  rebuild and verifies the result with `PRAGMA foreign_key_check` before stamping
+  `user_version`. Nothing needs reindexing — `.toml` and `.yml` files simply appear on
+  the next indexing run.
 - **`.mindex` files using `git_refs:` require 1.0.1 tooling.** The parser rejects
   unknown keys by design, so a 1.0.0 `mindex-index` or `mindex-watch` will fail on
   one. Files that do not use the key are unaffected in both directions.
 - The git history channel stays off until `--history` is passed.
+- **An existing Windows clone must run `git add --renormalize .` once.**
+  `.gitattributes` applies at checkout, so a tree already written out as CRLF stays
+  that way until it is renormalised — and until then it keeps reporting drift.
 
 ## [1.0.0] — 2026-07-30
 
