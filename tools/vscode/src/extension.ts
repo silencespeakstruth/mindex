@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { MindexApi } from "./api";
 import { MindexFile, parseMindexFile } from "./mindexFile";
@@ -843,14 +844,41 @@ function openSettings(): void {
     );
 }
 
+/**
+ * Build the client from the settings.
+ *
+ * The CA is read here, and a failure is a *warning* — never a throw. This runs at
+ * activation and again on every settings change, so a `caCert` naming a file that
+ * is not on this machine (a settings profile synced from another one is the way it
+ * happens) used to abort activation with a bare ENOENT: every command dead, and
+ * `noVerify` unable to help, since the read that failed came first. Skipping the
+ * unreadable CA leaves the connection to succeed by whatever other means is
+ * configured, and says out loud which path was ignored.
+ */
 function createApi(): MindexApi {
     const cfg = config();
     const caCert = cfg.get<string>("caCert", "").trim();
     const apiKey = cfg.get<string>("apiKey", "").trim();
+    const noVerify = cfg.get<boolean>("noVerify", false);
+    let ca: Buffer | undefined;
+    if (caCert !== "" && !noVerify) {
+        try {
+            ca = fsSync.readFileSync(caCert);
+        } catch (e) {
+            void vscode.window.showWarningMessage(
+                say(
+                    `cannot read the CA certificate at ${caCert} — ignoring it. ` +
+                        `${e instanceof Error ? e.message : String(e)}. ` +
+                        "Clear mindex.caCert, point it at a file that exists on this " +
+                        "machine, or turn on mindex.noVerify."
+                )
+            );
+        }
+    }
     return new MindexApi({
         serverUrl: cfg.get<string>("serverUrl", "https://127.0.0.1:11111"),
-        noVerify: cfg.get<boolean>("noVerify", false),
-        caCertPath: caCert === "" ? undefined : caCert,
+        noVerify,
+        ca,
         apiKey: apiKey === "" ? undefined : apiKey,
     });
 }

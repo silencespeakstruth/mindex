@@ -183,7 +183,10 @@ intersected — because a sync only drops what your refs no longer reach.
   tools, `MINDEX_CACERT` for the MCP servers and `mindex-search.sh`, the
   `mindex.caCert` setting in VS Code. `--no-verify` / `MINDEX_NO_VERIFY` verifies
   nothing at all and exists for the self-signed certificate the container generates
-  on first start, which no store can vouch for.
+  on first start, which no store can vouch for. Where both are set, the skip wins:
+  in VS Code `mindex.noVerify` overrides `mindex.caCert`, and a `caCert` naming a
+  file this machine does not have is a warning naming the path, not a dead
+  extension.
 - **Everything is a knob, documented once.** `mindex --help` and each tool's `--help`;
   the full HTTP API with schemas is live at **`/swagger-ui`** (OpenAPI at
   `/api-docs/openapi.json`). Errors are RFC 7807 `problem+json` with stable machine

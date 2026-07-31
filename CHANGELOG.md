@@ -72,6 +72,16 @@ a whole pass down with it.
 - **VS Code: concurrent reindex runs.** A second press started a second run over the
   same paths; their drift checks then raced, and the view could settle showing
   just-indexed files as still stale.
+- **VS Code: `mindex.noVerify` could not be reached.** The client read `mindex.caCert`
+  with an unguarded `readFileSync` in its constructor, so a path naming a file absent
+  from this machine threw at activation — every command dead, and the one setting that
+  would have connected anyway unusable, because the read that failed came first. The
+  CA is now read outside the constructor, a failure is a warning naming the path, and
+  `noVerify` overrides `caCert` rather than queueing behind it.
+- **VS Code: TLS settings now ride on each request, not only on the shared agent.**
+  With `http.proxySupport` at its default `"override"` the extension host may
+  substitute its own proxy agent and discard ours — taking `rejectUnauthorized` with
+  it. That is what made both settings look inert behind a corporate proxy.
 
 ### Upgrading
 

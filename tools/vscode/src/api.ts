@@ -1,6 +1,5 @@
 import * as https from "node:https";
 import * as http from "node:http";
-import * as fs from "node:fs";
 import { ProblemDetails, ProblemError, UnreachableError } from "./problem";
 
 // ---- wire types (src/backend/v0/models.rs) ----
@@ -318,7 +317,13 @@ export interface ResearchCallbacks {
 export interface ApiOptions {
     serverUrl: string;
     noVerify: boolean;
-    caCertPath?: string;
+    /**
+     * Extra CA (PEM contents, already read from disk) to trust for the server.
+     * Reading it is the *caller's* job on purpose: an unreadable file must degrade
+     * to a warning, and a constructor that throws on it takes the whole extension
+     * down — including `noVerify`, the one setting that would have got past it.
+     */
+    ca?: Buffer;
     protocol?: string;
     /**
      * Sent as `X-Api-Key` on every request. mindex has no authentication of its
@@ -387,16 +392,29 @@ export class MindexApi {
     private readonly protocol: string;
     private readonly agent: https.Agent;
     private readonly apiKey?: string;
+    /**
+     * The same TLS settings the agent carries, repeated on every request.
+     * Redundant against a plain Node `https`, and not against VS Code's: with
+     * `http.proxySupport` at its default `"override"` the extension host patches
+     * `https.request` and may substitute its own proxy agent — which silently
+     * discards ours, and with it `rejectUnauthorized`. Options on the request
+     * itself are forwarded, so this is what makes `noVerify` mean something
+     * behind a corporate proxy.
+     */
+    private readonly tls: { rejectUnauthorized: boolean; ca?: Buffer };
 
     constructor(opts: ApiOptions) {
         this.base = opts.serverUrl.replace(/\/+$/, "");
         this.protocol = opts.protocol ?? "v0";
         this.apiKey = opts.apiKey && opts.apiKey !== "" ? opts.apiKey : undefined;
-        this.agent = new https.Agent({
+        // `noVerify` wins over `ca`: with verification off the extra CA can only
+        // confuse the picture, and a user who turned it on is asking to connect
+        // regardless of what the certificate says.
+        this.tls = {
             rejectUnauthorized: !opts.noVerify,
-            ca: opts.caCertPath ? fs.readFileSync(opts.caCertPath) : undefined,
-            keepAlive: true,
-        });
+            ca: opts.noVerify ? undefined : opts.ca,
+        };
+        this.agent = new https.Agent({ ...this.tls, keepAlive: true });
     }
 
     dispose(): void {
@@ -535,6 +553,7 @@ export class MindexApi {
                         ...(this.apiKey ? { "X-Api-Key": this.apiKey } : {}),
                     },
                     agent: this.agent,
+                    ...this.tls,
                     signal,
                 },
                 (res) => {
@@ -626,7 +645,7 @@ export class MindexApi {
             }
             const req = https.request(
                 url,
-                { method, headers, agent: this.agent, signal },
+                { method, headers, agent: this.agent, ...this.tls, signal },
                 (res) => {
                     const chunks: Buffer[] = [];
                     res.on("data", (c: Buffer) => chunks.push(c));
