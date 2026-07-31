@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::backend::error::ApiError;
-use crate::backend::v0::handlers::GREP_MIN_PATTERN_CHARS;
+use crate::backend::v0::handlers::{GREP_MIN_PATTERN_CHARS, research_title};
 use crate::backend::v0::models::{
     CallDirection, CallersResponse, ChangeType, FileHistoryResponse, GrepResponse,
     ListFilesResponse, OutlineResponse, ReadChunksResponse, SearchFilter, SearchRequest,
@@ -2922,6 +2922,11 @@ pub fn extract_report_title(report: &str, question: &str) -> Option<String> {
     Some(title.to_string())
 }
 
+/// The one problem [`validate_report_markdown`] reports that the server can fix
+/// itself — named as a const because [`repair_missing_heading`] keys on it, and a
+/// reworded complaint that no longer matched would silently turn the repair off.
+const MISSING_HEADING: &str = "The report must begin with a `# heading` naming the finding.";
+
 /// Honest structural checks on a finished report — empty vec means valid.
 ///
 /// tree-sitter-md accepts *anything* (an unclosed fence or stray HTML yields a
@@ -2947,7 +2952,7 @@ pub fn validate_report_markdown(report: &str) -> Vec<String> {
     let first_line = trimmed.lines().next().unwrap_or_default().trim();
     let hashes = first_line.chars().take_while(|&c| c == '#').count();
     if !(1..=6).contains(&hashes) || !first_line[hashes..].starts_with(char::is_whitespace) {
-        problems.push("The report must begin with a `# heading` naming the finding.".to_string());
+        problems.push(MISSING_HEADING.to_string());
     }
     let fences = report
         .lines()
@@ -2957,6 +2962,47 @@ pub fn validate_report_markdown(report: &str) -> Vec<String> {
         problems.push("An unclosed ``` code fence: every fence opened must be closed.".to_string());
     }
     problems
+}
+
+/// Write the heading a report is missing, rather than discarding the report over it.
+///
+/// The gate exists to keep malformed prose out of the corpus, because a stored report
+/// is fed to a later run as context. A missing top heading fails none of that: the
+/// analysis, the citations and the structure below it are whatever the model made
+/// them, and the defect is one line of syntax the server can supply as well as the
+/// model can. Measured here on 2026-07-31: of three runs that reached a finished
+/// report, one was thrown away for exactly this and nothing else — a full local
+/// investigation discarded over a `#`.
+///
+/// Repairs **only** when the missing heading is the *sole* problem. A report that
+/// also begins with JSON, or that leaves a fence open, is broken in ways no
+/// substitution fixes: prepending a heading to JSON would produce something that
+/// passes the gate while still being unusable as prose, which is worse than the
+/// refusal. Those keep going back to the model, then keep being refused.
+///
+/// The heading is derived from the question by the same rule the readers already
+/// fall back to (`research_title`), so a repaired report is titled exactly as an
+/// untitled one is displayed. Deliberately not recorded as a flag on the run: it is
+/// derivable from the row (`title IS NULL` and the report opens with that
+/// derivation) and a column costs a table rebuild.
+///
+/// Returns whether it wrote one. Idempotent — a second call on a repaired report
+/// finds no problem and changes nothing.
+fn repair_missing_heading(report: &mut String, question: &str) -> bool {
+    let problems = validate_report_markdown(report);
+    if problems.len() != 1 || problems[0] != MISSING_HEADING {
+        return false;
+    }
+    let derived = research_title(question);
+    // An empty question cannot happen through the API (validation rejects it), but a
+    // heading is what this function promises to produce, so it must not depend on that.
+    let title = if derived.trim().is_empty() {
+        "Research report"
+    } else {
+        derived.trim()
+    };
+    *report = format!("# {title}\n\n{}", report.trim_start());
+    true
 }
 
 /// Re-probe every path the run has been shown and fold the result into `evidence`.
@@ -3744,7 +3790,7 @@ pub async fn run_research(
         revalidation,
         tools: run_tools,
         file_baselines,
-        report,
+        mut report,
     } = match research_inner(&*ollama, &*tools, &params, &tx, &token).await {
         Ok(outcome) => outcome,
         Err(ResearchAbort::Cancelled) => {
@@ -3836,6 +3882,25 @@ pub async fn run_research(
     // prose. `done` then carries null run_id/seq — the same wire shape as a failed
     // journal write, which is what this is. A forced synthesis is server-written
     // and valid by construction, so the gate exempts it rather than re-parsing it.
+    //
+    // The title is read from the model's own text *before* the repair below, so a
+    // server-written heading is never mistaken for one the model chose: a repaired
+    // run stores no title and its readers keep falling back to the question — which
+    // is the same string the repair derived the heading from.
+    let title = extract_report_title(&report, &params.question);
+    // The second and last repair site. The first (in `research_inner`) catches an
+    // unstreamed draft; this one catches a rewrite, which the client has already
+    // watched arrive — so here, and only here, the stored report can carry a heading
+    // line the live view did not show. That divergence is one derived line weighed
+    // against losing the whole run, and it resolves towards the corpus, because the
+    // corpus is what a later run reads.
+    if repair_missing_heading(&mut report, &params.question) {
+        info!(
+            model = %params.model,
+            "The final report had no heading; the server wrote one so the run could be \
+             journalled."
+        );
+    }
     let md_problems = validate_report_markdown(&report);
     let recorded = if md_problems.is_empty() || run_tools.forced_synthesis {
         journal
@@ -3860,7 +3925,7 @@ pub async fn run_research(
                 // now can be told whether the report still describes the tree.
                 file_baselines,
                 context_run_ids: params.prior_reports.iter().map(|p| p.id.clone()).collect(),
-                title: extract_report_title(&report, &params.question),
+                title,
                 report,
             })
             .await
@@ -4730,6 +4795,15 @@ async fn research_inner(
     // ── citation revalidation ────────────────────────────────────────────────
     let mut citations = check_citations(&summary, &evidence);
     let mut revalidation = None;
+    // The heading is repaired before the gate reads the draft, and after the
+    // citations are counted: the derived heading comes from the question, which can
+    // itself contain a `path.rs:1-2`, and a server-written line must never enter the
+    // provenance report as a claim the model did not make. Nothing has streamed the
+    // draft at this point — the content gate held it — so the caller receives the
+    // repaired text, byte-for-byte what is journalled.
+    if repair_missing_heading(&mut summary, &params.question) {
+        info!("The draft report had no heading; the server wrote one rather than sending it back.");
+    }
     // Structural Markdown defects join the gate: a broken draft is never
     // journalled (see `run_research`), so sending it back while the gate is
     // already closed is the one chance to store the run at all.
@@ -5935,6 +6009,122 @@ mod tests {
             }
             other => panic!("expected a done event, got {other:?}"),
         }
+    }
+
+    /// The half the gate used to get wrong: a report whose only defect is a missing
+    /// heading is repaired and kept, not thrown away. The corpus is the point of the
+    /// run, and one line of syntax is not a reason to lose an investigation.
+    #[tokio::test]
+    async fn a_report_missing_only_its_heading_is_journalled_after_repair() {
+        struct CapturingJournal(std::sync::Mutex<Vec<RunRecord>>);
+        #[async_trait]
+        impl ResearchJournal for CapturingJournal {
+            async fn record(&self, r: RunRecord) -> Option<RecordedRun> {
+                self.0.lock().unwrap().push(r);
+                Some(RecordedRun {
+                    id: "run-uuid".into(),
+                    seq: 1,
+                })
+            }
+        }
+
+        let journal = Arc::new(CapturingJournal(std::sync::Mutex::new(Vec::new())));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut p = params(8);
+        p.question = "How does the GC sweep order its deletes?".into();
+        run_research(
+            Arc::new(NativeOllama::new(
+                vec![vec![call("finalize", json!({}))]],
+                // Valid Markdown in every respect but the heading. Only one report is
+                // scripted: a repair that instead sent this back would ask the fake for
+                // a second and fail the test by starving it.
+                vec!["The sweep deletes from SQLite only after Qdrant confirms."],
+            )),
+            Arc::new(FakeTools::default()),
+            journal.clone(),
+            p,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        let recorded = journal.0.lock().unwrap();
+        let record = match recorded.as_slice() {
+            [r] => r,
+            other => panic!(
+                "the run must be journalled exactly once, got {}",
+                other.len()
+            ),
+        };
+        assert!(
+            record
+                .report
+                .starts_with("# How does the GC sweep order its deletes?"),
+            "the stored report must carry the derived heading: {:?}",
+            record.report
+        );
+        assert!(
+            validate_report_markdown(&record.report).is_empty(),
+            "the repaired report must satisfy the gate it was refused by"
+        );
+        // The model wrote no heading, so no title is stored — the readers fall back to
+        // the question, which is what the heading was derived from anyway.
+        assert!(
+            record.title.is_none(),
+            "a server-written heading must not be stored as the model's title: {:?}",
+            record.title
+        );
+        // The draft was never streamed, so the caller must receive the repaired text —
+        // what it reads and what the corpus holds are the same bytes.
+        let summary = events.iter().find_map(|e| match e {
+            ResearchEvent::Summary { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            summary.as_deref(),
+            Some(record.report.as_str()),
+            "the streamed report and the stored one must not diverge"
+        );
+    }
+
+    /// The repair is not a way past the gate: a report broken in any other way is
+    /// still refused, heading or no heading.
+    #[test]
+    fn only_the_missing_heading_is_ever_repaired() {
+        let q = "How does GC work?";
+
+        let mut ok = "Prose with no heading.".to_string();
+        assert!(repair_missing_heading(&mut ok, q));
+        assert_eq!(ok, "# How does GC work?\n\nProse with no heading.");
+        // Idempotent: the repaired report has no problem left to key on.
+        assert!(!repair_missing_heading(&mut ok, q));
+
+        // JSON where prose was asked for: prepending a heading would produce something
+        // that passes the gate and is still unusable as prose.
+        let mut json = r#"{"action": "finalize"}"#.to_string();
+        assert!(!repair_missing_heading(&mut json, q));
+        assert_eq!(json, r#"{"action": "finalize"}"#);
+
+        // An unclosed fence swallows the document in every renderer; a heading above it
+        // fixes nothing.
+        let mut fence = "Prose.\n\n```rust\nfn f() {}\n".to_string();
+        assert!(!repair_missing_heading(&mut fence, q));
+
+        // Nothing to repair, and nothing to invent one from.
+        let mut empty = String::new();
+        assert!(!repair_missing_heading(&mut empty, q));
+        let mut headed = "# Title\n\nProse.".to_string();
+        assert!(!repair_missing_heading(&mut headed, q));
+
+        // A question that derives no title still yields a heading, because that is what
+        // this function promises.
+        let mut no_question = "Prose.".to_string();
+        assert!(repair_missing_heading(&mut no_question, "   "));
+        assert!(validate_report_markdown(&no_question).is_empty());
     }
 
     /// The server's own fallback report must pass the gate it is exempt from —

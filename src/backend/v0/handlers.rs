@@ -6104,13 +6104,15 @@ pub async fn delete_research_run(
     let guard = http3::CancellationGuard(CancellationToken::new());
     let pg = project_guid;
 
-    s.db_pool
+    let id = run_id.clone();
+    let deleted = s
+        .db_pool
         .transaction(guard.0.child_token(), move |tx| {
-            tx.execute(
+            let n = tx.execute(
                 "DELETE FROM research_runs WHERE project_guid = ?1 AND id = ?2",
-                rusqlite::params![pg, run_id],
+                rusqlite::params![pg, id],
             )?;
-            Ok(())
+            Ok(n as u64)
         })
         .await
         .map_err(|e| {
@@ -6121,6 +6123,20 @@ pub async fn delete_research_run(
             );
             ApiError::from(e)
         })?;
+
+    // Logged even though the response cannot say it: this is the only mutation that
+    // removes a stored run one at a time, and until it spoke, a corpus that had lost
+    // rows was indistinguishable from one that never recorded them — a research run
+    // vanishing has three possible causes (a disconnect before the journal, a report
+    // refused by the Markdown gate, and this), and the other two already say so.
+    // `deleted_runs` distinguishes a real removal from the idempotent no-op that
+    // returns the same 204.
+    info!(
+        project_guid = %project_guid.0,
+        run_id = %run_id,
+        deleted_runs = deleted,
+        "Deleted a stored research run."
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }

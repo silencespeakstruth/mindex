@@ -155,6 +155,26 @@ const DEFAULT_RESEARCH_SEARCH_TOP_K: u64 = 5;
 /// connection that has died in a way neither notices. `validate` enforces that it
 /// exceeds `max_request_seconds`, so a config cannot recreate the inversion.
 const DEFAULT_RESEARCH_TURN_TIMEOUT_MS: u64 = 3_900_000;
+/// How long a turn may produce **nothing at all** — not one thinking or content
+/// token — before it is abandoned.
+///
+/// The gap [`DEFAULT_RESEARCH_TURN_TIMEOUT_MS`] deliberately leaves open. That one is
+/// a dead-*socket* guard and must sit above every budget; a socket that is alive and
+/// simply silent falls to nothing but `max_seconds`, which means an Ollama that never
+/// starts answering spends the entire run and the client watches an empty stream for
+/// as long as the budget allows. Measured here 2026-08-01: one run burned 300 s of a
+/// 300 s budget at `steps: 0, turns: 0, prompt_tokens: 0` — Ollama was thrashing
+/// between two context sizes (`Load failed … timed out waiting for llama-server to
+/// start`) and mindex said nothing, because from its side the request had simply not
+/// answered yet.
+///
+/// Two minutes, because the thing it must not preempt is a legitimately slow *first*
+/// token: prompt evaluation of a long transcript on a loaded GPU is minutes of silence
+/// by nature, and this fires only when even that has not begun. It bounds the silent
+/// prefix of a turn, never the turn — once tokens flow, `turn_timeout_ms` is again the
+/// only ceiling. `0` disables it, for a host where a cold load of a huge model is
+/// normal and expected.
+const DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS: u64 = 120_000;
 /// How long the report phase gets *after* the investigation deadline. The whole
 /// point of a separate window is that a run which hits the wall still gets to
 /// synthesise what it found, so this cannot come out of the investigation's budget —
@@ -393,6 +413,17 @@ pub struct ResearchConfig {
     /// backstop against a wedged server, not the run's budget: `max_seconds` is the
     /// budget and it is enforced by cancelling the turn in flight.
     pub turn_timeout_ms: u64,
+    /// Abandon one turn if Ollama has not produced a single token within this many
+    /// milliseconds of the request going out. `0` disables the guard.
+    ///
+    /// The complement of the two guards around it: `turn_timeout_ms` catches a socket
+    /// that died, `max_turn_thinking_chars` catches a model that will not stop talking,
+    /// and this catches the case both are blind to — a live connection that says
+    /// nothing at all, which on this host means Ollama reloading a model it keeps
+    /// evicting. It bounds only the **silent prefix** of a turn: the moment any token
+    /// arrives, thinking or content, the guard is spent and `turn_timeout_ms` is again
+    /// the only ceiling.
+    pub first_token_timeout_ms: u64,
     /// Abandon one turn once its **thinking** channel has streamed this many
     /// characters. `0` disables the guard.
     ///
@@ -731,6 +762,7 @@ impl Default for ResearchConfig {
             max_request_tokens: DEFAULT_RESEARCH_MAX_REQUEST_TOKENS,
             max_request_steps: DEFAULT_RESEARCH_MAX_REQUEST_STEPS,
             turn_timeout_ms: DEFAULT_RESEARCH_TURN_TIMEOUT_MS,
+            first_token_timeout_ms: DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS,
             max_turn_thinking_chars: DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS,
             report_timeout_ms: DEFAULT_RESEARCH_REPORT_TIMEOUT_MS,
             health_timeout_ms: DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS,
@@ -1491,6 +1523,31 @@ impl Config {
                 self.research.max_request_seconds * 1000,
             ));
         }
+        // The silence guard must stay *under* the dead-socket one, or it is not a
+        // guard at all: above it, the transport timeout always fires first and the
+        // setting reads as enabled while never doing anything. A too-small value is
+        // the other trap — it would abandon turns whose prompt evaluation is merely
+        // long, so the floor is generous.
+        if self.research.first_token_timeout_ms > 0 {
+            if self.research.first_token_timeout_ms < 5000 {
+                e.push(format!(
+                    "[research].first_token_timeout_ms = {} would abandon a turn whose prompt \
+                     evaluation is merely long — a big transcript is minutes of silence before \
+                     the first token. Fix: use at least 5000 (default \
+                     {DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS}), or 0 to disable it.",
+                    self.research.first_token_timeout_ms
+                ));
+            }
+            if self.research.first_token_timeout_ms >= self.research.turn_timeout_ms {
+                e.push(format!(
+                    "[research].first_token_timeout_ms = {} is not below \
+                     [research].turn_timeout_ms = {}, so the whole-turn timeout would always \
+                     fire first and the silence guard would never catch anything. Fix: lower it \
+                     (default {DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS}), or 0 to disable it.",
+                    self.research.first_token_timeout_ms, self.research.turn_timeout_ms,
+                ));
+            }
+        }
         // A small non-zero value is the trap here, not a large one: the guard would
         // start abandoning turns that were only thinking, which is the same class of
         // mistake as a tight `turn_timeout_ms` and would look identical from outside
@@ -1669,6 +1726,30 @@ mod tests {
         .expect("parses");
         off.validate()
             .expect("an unused context cap must not fail startup");
+    }
+
+    /// The silence guard has to sit strictly between "long prompt evaluation" and
+    /// "dead socket", and both walls are rejected at startup rather than discovered
+    /// as runs that end early or a setting that reads as on and never fires.
+    #[test]
+    fn a_silence_guard_that_could_never_fire_is_rejected() {
+        // At or above the dead-socket timeout the transport always wins.
+        let cfg = parse("[research]\nfirst_token_timeout_ms = 3900000\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("first_token_timeout_ms") && m.contains("turn_timeout_ms")),
+            "{err:?}"
+        );
+
+        // Too small preempts a turn that was merely thinking about a long transcript.
+        let cfg = parse("[research]\nfirst_token_timeout_ms = 500\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(err.iter().any(|m| m.contains("at least 5000")), "{err:?}");
+
+        // Off is a legal setting, for a host where a cold load is expected.
+        let cfg = parse("[research]\nfirst_token_timeout_ms = 0\n").expect("parses");
+        cfg.validate().expect("0 disables the guard");
     }
 
     /// Zero retention is not a tight setting, it is a corpus that cannot exist: the

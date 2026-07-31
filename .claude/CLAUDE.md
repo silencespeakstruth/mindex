@@ -384,7 +384,18 @@ is the `research_runs` table.) The hard invariants:
   the citation complaint but re-opens **no** tools; a failing final report is
   streamed but **not journalled** (`done` carries null `run_id`/`seq`);
   `forced_synthesis` is exempt
-  (`forced_synthesis_passes_the_markdown_gate`).
+  (`forced_synthesis_passes_the_markdown_gate`). **The missing heading is
+  repaired, never refused** — `repair_missing_heading` writes
+  `# {research_title(question)}` when that is the *sole* problem (a report also
+  starting with JSON or leaving a fence open is still refused: a heading over
+  JSON would pass the gate and remain unusable). Two sites, each **after** its
+  `check_citations` — the derived heading comes from the question, which can
+  itself contain a `path.rs:1-2`, and a server-written line must never enter
+  the provenance report. The draft site (`research_inner`) also spares the run
+  a rewrite turn; the final site (`run_research`) catches a *streamed* rewrite,
+  so there — and only there — the stored report carries a line the live view
+  did not show. `title` is read **before** the repair, so a repaired run stores
+  none and its readers fall back to the question the heading came from.
 - **Budgets**: `effort` selects `[research.effort.{low,medium,high}]`; a
   request overrides axis-by-axis (`Budget::resolve`), capped by
   `[research].max_request_{seconds,tokens,steps}` (edge check
@@ -399,7 +410,16 @@ is the `research_runs` table.) The hard invariants:
     the report; the sufficiency turn is skipped.
   - **`turn_timeout_ms` must sit ABOVE every budget** — startup-enforced
     (`validate` refuses `<= max_request_seconds`); it is a dead-socket guard,
-    not a bound.
+    not a bound. Its blind spot is a socket that is **alive and mute**:
+    `[research].first_token_timeout_ms` (120 s, `0` = off) abandons a turn that
+    produced no token of any channel, as `OllamaError::Silent` → a named
+    `ollama.unavailable` failure instead of a whole budget spent waiting on an
+    Ollama that is (re)loading a model. It bounds the **silent prefix only** —
+    armed across `post_chat` *and* the wait for the first delta (the stall can
+    be in either; Ollama holds the connection open while it loads), spent by
+    the first thinking/content/tool-call delta. Startup keeps it strictly under
+    `turn_timeout_ms` (above it, it could never fire) and at/above 5 s (below,
+    it preempts a merely long prompt evaluation).
   - **Runaway-thinking guard** `[research].max_turn_thinking_chars` (8192,
     `0` = off): abandons the turn as an **empty** `ChatOutcome` (every phase
     already recovers from one); instrumented in place

@@ -19,6 +19,9 @@ pub struct OllamaTuning {
     /// Whole-turn timeout (connect + full streamed reply). Thinking models can
     /// legitimately think for minutes, so this is generous.
     pub turn_timeout_ms: u64,
+    /// How long a turn may stay completely silent — no thinking, no content — before
+    /// it is abandoned. Bounds the silent prefix only; `0` disables it.
+    pub first_token_timeout_ms: u64,
     /// Liveness-ping timeout for `/health`'s optional Ollama check. Short: a
     /// health probe must not hold the response hostage to a wedged Ollama.
     pub health_timeout_ms: u64,
@@ -216,6 +219,14 @@ pub enum OllamaError {
     /// discards it, and for months that turned Ollama's own explanation of a
     /// failed turn into a bare "500", which is unactionable.
     Decode(String),
+    /// The connection was alive and produced nothing for `ms` — no thinking, no
+    /// content. Separate from [`Self::Request`] because the diagnosis is different
+    /// and specific: the socket did not die, Ollama simply never began answering,
+    /// which on a single-GPU host means it is loading (or repeatedly reloading) a
+    /// model. Carrying it as its own variant is what lets the run say so.
+    Silent {
+        ms: u64,
+    },
 }
 
 impl From<reqwest::Error> for OllamaError {
@@ -230,6 +241,11 @@ impl std::fmt::Display for OllamaError {
             OllamaError::Cancelled => write!(f, "cancelled"),
             OllamaError::Request(e) => write!(f, "{e}"),
             OllamaError::Decode(msg) => write!(f, "{msg}"),
+            OllamaError::Silent { ms } => write!(
+                f,
+                "ollama produced no token within {ms} ms — it is most likely still \
+                 loading the model (check `journalctl -u ollama` for repeated loads)"
+            ),
         }
     }
 }
@@ -543,6 +559,25 @@ impl OllamaHttpClient {
         }
     }
 
+    /// Report an abandoned silent turn once, in the one place that knows why.
+    ///
+    /// A `warn!` rather than a bare error return because this failure is almost never
+    /// mindex's: the run will report `ollama.unavailable` to its client, and the line
+    /// that says the connection was *alive and mute* — with the model name — is what
+    /// points at the right log next.
+    fn silent_turn(&self, model: &str, ms: u64) -> OllamaError {
+        warn!(
+            %model,
+            first_token_timeout_ms = ms,
+            "Ollama accepted the turn and produced no token at all within the silence \
+             window; abandoning it rather than spending the run's budget waiting. The \
+             usual cause is a model being loaded or repeatedly evicted and reloaded — \
+             check `journalctl -u ollama` for `Load failed` and for other clients \
+             asking the same model for a different context size."
+        );
+        OllamaError::Silent { ms }
+    }
+
     /// One `/api/chat` request body.
     fn chat_body(
         &self,
@@ -615,19 +650,47 @@ impl OllamaModel for OllamaHttpClient {
         token: &CancellationToken,
     ) -> Result<ChatOutcome, OllamaError> {
         let num_ctx = self.effective_num_ctx(model).await;
-        let response = self
-            .post_chat(model, messages, tools, sampling, num_ctx, token)
-            .await?;
+        // The silence guard spans the request *and* the wait for the first token,
+        // because the two are one silence from the caller's side and the stall can
+        // land in either: Ollama holds the connection open while it loads, so the
+        // response headers themselves may be what never arrives. It is armed here,
+        // once, and disarmed by the first delta of any channel — after that a turn is
+        // bounded by `turn_timeout_ms` and the run's own deadline, as before.
+        let silence = self.tuning.first_token_timeout_ms;
+        let silent_until =
+            (silence > 0).then(|| tokio::time::Instant::now() + Duration::from_millis(silence));
+        let post = self.post_chat(model, messages, tools, sampling, num_ctx, token);
+        let response = match silent_until {
+            Some(deadline) => match tokio::time::timeout_at(deadline, post).await {
+                Ok(r) => r?,
+                Err(_) => return Err(self.silent_turn(model, silence)),
+            },
+            None => post.await?,
+        };
 
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         let mut content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Disarmed by the first delta, not by the first *chunk*: Ollama's stream can
+        // open with keep-alive-ish lines carrying an empty message, and a byte that
+        // says nothing is not the model answering.
+        let mut spoke = false;
 
         loop {
-            let chunk = tokio::select! {
-                _ = token.cancelled() => return Err(OllamaError::Cancelled),
-                chunk = tokio_stream::StreamExt::next(&mut stream) => chunk,
+            let next = tokio_stream::StreamExt::next(&mut stream);
+            let chunk = match silent_until.filter(|_| !spoke) {
+                Some(deadline) => tokio::select! {
+                    _ = token.cancelled() => return Err(OllamaError::Cancelled),
+                    chunk = tokio::time::timeout_at(deadline, next) => match chunk {
+                        Ok(c) => c,
+                        Err(_) => return Err(self.silent_turn(model, silence)),
+                    },
+                },
+                None => tokio::select! {
+                    _ = token.cancelled() => return Err(OllamaError::Cancelled),
+                    chunk = next => chunk,
+                },
             };
             let Some(chunk) = chunk else { break };
             let chunk = chunk?;
@@ -650,13 +713,18 @@ impl OllamaModel for OllamaHttpClient {
                     if let Some(t) = msg.thinking
                         && !t.is_empty()
                     {
+                        spoke = true;
                         on_delta(ChatDelta::Thinking(t));
                     }
                     if !msg.content.is_empty() {
+                        spoke = true;
                         content.push_str(&msg.content);
                         on_delta(ChatDelta::Content(msg.content));
                     }
-                    // A turn may carry several calls, spread over chunks.
+                    // A turn may carry several calls, spread over chunks. A tool call
+                    // is the model answering as much as prose is — a turn that emits
+                    // one and nothing else must not read as silence.
+                    spoke |= !msg.tool_calls.is_empty();
                     tool_calls.extend(msg.tool_calls);
                 }
                 if parsed.done {
@@ -747,6 +815,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 2000,
             },
         )
@@ -812,6 +881,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -874,6 +944,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -978,6 +1049,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 500,
             },
         )
@@ -1104,6 +1176,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 8192,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1125,6 +1198,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 2048,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1140,6 +1214,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 32768,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -1170,6 +1245,7 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1195,5 +1271,111 @@ mod tests {
             )
             .await;
         assert!(matches!(res, Err(OllamaError::Cancelled)));
+    }
+
+    /// An Ollama that accepts the turn and says nothing — a model being loaded, or
+    /// evicted and reloaded under a second client. The socket is healthy, so
+    /// `turn_timeout_ms` never fires and, before this guard, the run's own deadline
+    /// was the first thing to notice: a whole budget spent producing nothing.
+    ///
+    /// Real time in small increments, deliberately: `start_paused` would auto-advance
+    /// past the guard and prove only that `timeout_at` exists.
+    #[tokio::test]
+    async fn a_turn_that_never_answers_is_abandoned_long_before_the_turn_timeout() {
+        let app = Router::new()
+            .route(
+                "/api/chat",
+                post(|| async {
+                    // Longer than the guard, shorter than the test's patience.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    r#"{"message":{"content":"too late"},"done":true}"#
+                }),
+            )
+            .route(
+                "/api/show",
+                post(|| async { r#"{"model_info":{"testarch.context_length":4096}}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                // The whole point: the dead-socket timeout is far above the silence
+                // window, exactly as the config validation requires.
+                turn_timeout_ms: 30_000,
+                first_token_timeout_ms: 200,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let (res, deltas) = run(&client).await;
+        assert!(
+            matches!(res, Err(OllamaError::Silent { ms: 200 })),
+            "a mute turn must be abandoned as silent, got {res:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the guard must fire on its own window, not on the turn timeout"
+        );
+        assert!(deltas.is_empty(), "nothing was said: {deltas:?}");
+    }
+
+    /// The other half: the guard bounds the silent *prefix* only. A model that starts
+    /// answering and then thinks for a long stretch is healthy, and abandoning it
+    /// would be the tight-timeout mistake the whole design avoids.
+    #[tokio::test]
+    async fn the_silence_guard_is_spent_by_the_first_token() {
+        let app = Router::new()
+            .route(
+                "/api/chat",
+                post(|| async {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Result<_, std::io::Error>>(2);
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(
+                                "{\"message\":{\"thinking\":\"hm\"}}\n",
+                            )))
+                            .await;
+                        // Well past the guard: it must already be disarmed.
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(
+                                "{\"message\":{\"content\":\"answer\"},\"done\":true}\n",
+                            )))
+                            .await;
+                    });
+                    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+                }),
+            )
+            .route(
+                "/api/show",
+                post(|| async { r#"{"model_info":{"testarch.context_length":4096}}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                turn_timeout_ms: 30_000,
+                first_token_timeout_ms: 200,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        let (res, deltas) = run(&client).await;
+        let outcome = res.expect("a turn that spoke must not be abandoned");
+        assert_eq!(outcome.content, "answer");
+        assert_eq!(
+            deltas,
+            vec![
+                ChatDelta::Thinking("hm".into()),
+                ChatDelta::Content("answer".into())
+            ]
+        );
     }
 }

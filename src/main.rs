@@ -323,6 +323,7 @@ async fn main() -> Result<(), BoxError> {
             OllamaTuning {
                 max_num_ctx_tokens: cfg.research.max_num_ctx_tokens,
                 turn_timeout_ms: cfg.research.turn_timeout_ms,
+                first_token_timeout_ms: cfg.research.first_token_timeout_ms,
                 health_timeout_ms: cfg.research.health_timeout_ms,
             },
         )

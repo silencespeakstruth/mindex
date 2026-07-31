@@ -224,6 +224,33 @@ streams a Markdown report. Non-obvious invariants:
   `forced_synthesis` is exempt by flag
   (`forced_synthesis_passes_the_markdown_gate`); the skipped run is invisible
   to `MeteredJournal`'s counters, accepted with a `warn!`.
+- **The missing heading is the one defect the server repairs itself**
+  (`repair_missing_heading`). Measured 2026-07-31: of three runs that reached a
+  finished report, one was discarded for a missing `#` and nothing else — a
+  whole local investigation lost to a line of syntax the server can write as
+  well as the model can, while the analysis, structure and citations below it
+  were untouched. So the gate keeps its four checks, and the repair fires only
+  when the heading is the **sole** problem: a report that also opens with JSON,
+  or leaves a fence open, is broken in a way no substitution fixes — prepending
+  a heading there would produce something that *passes* the gate and is still
+  unusable as prose, which is worse than the refusal. The heading is
+  `# {research_title(question)}`, the same derivation the readers already fall
+  back to, so a repaired report is titled exactly as an untitled one is
+  displayed. Three consequences worth keeping: the repair runs **after**
+  `check_citations` at both sites (the question can itself contain a
+  `path.rs:1-2`, and a server-written line must never enter the provenance
+  report as a claim the model did not make); at the draft site it also spares
+  the run a rewrite turn, since a heading-only complaint was one whole report
+  window spent on formatting; and at the final site the rewrite has *already
+  been streamed*, so there — uniquely — the stored report carries a line the
+  live view did not, which is one derived line weighed against losing the run,
+  resolved towards the corpus because the corpus is what a later run reads.
+  `title` is extracted **before** the repair, so a server-written heading is
+  never stored as the model's own. Not recorded as a flag on the row: it is
+  derivable (`title IS NULL` plus a report opening with that derivation) and a
+  column costs a table rebuild. Pinned by
+  `a_report_missing_only_its_heading_is_journalled_after_repair` and
+  `only_the_missing_heading_is_ever_repaired`.
 - **`expires_at IS NULL` means pinned — the whole retention mechanism.** The
   deadline is stamped at insert from `[research].retention_days`, so a setting
   change moves future runs only; `prune_expired_research` takes no retention
@@ -276,6 +303,36 @@ streams a Markdown report. Non-obvious invariants:
     the run died at step 0 with `ollama.unavailable` — while the deadline would
     have cancelled the turn and still shipped a report. It is a dead-socket
     guard, not a bound.
+  - **The silence guard bounds a turn's mute prefix**
+    (`[research].first_token_timeout_ms`, default **120 s**, `0` = off). The
+    hole the two guards above leave between them: `turn_timeout_ms` sees a
+    socket that died, `max_turn_thinking_chars` sees a model that will not stop,
+    and neither sees a connection that is **alive and produces nothing** —
+    which is what an Ollama loading (or repeatedly evicting and reloading) a
+    model looks like from the client. Measured 2026-08-01: a run spent 300 s of
+    its 300 s budget at `steps: 0, turns: 0, prompt_tokens: 0` while Ollama
+    logged five `Load failed … timed out waiting for llama-server to start`,
+    thrashing between `-c 32768` (another client) and `-c 98304` (mindex); the
+    caller watched an empty stream for seven minutes and mindex said nothing,
+    because from its side the request had merely not answered yet. The guard is
+    armed once across **`post_chat` and the wait for the first delta** — the
+    stall lands in either half, since Ollama holds the connection open while it
+    loads, so the response headers themselves may be what never arrives — and
+    is spent by the first delta of any channel, tool calls included (a turn
+    that emits one call and nothing else is answering, not silent). Two minutes
+    because what it must not preempt is a legitimately slow *first* token:
+    prompt evaluation of a long transcript is minutes of silence by nature, and
+    this fires only when even that has not begun. It surfaces as
+    `OllamaError::Silent` — its own variant, because the diagnosis is specific
+    and the `warn!` can then name the model and point at `journalctl -u ollama`
+    — which reaches the client as `ollama.unavailable` in seconds instead of a
+    budget spent waiting. Startup keeps it strictly below `turn_timeout_ms`
+    (above it, the transport always wins and the setting reads as on while
+    never firing) and at or above 5 s. Pinned by
+    `a_turn_that_never_answers_is_abandoned_long_before_the_turn_timeout` and
+    `the_silence_guard_is_spent_by_the_first_token` (real time in small
+    increments — `start_paused` would auto-advance past the window and prove
+    only that `timeout_at` exists).
   - **The runaway-thinking guard counts volume, not time**
     (`[research].max_turn_thinking_chars`, default **8192**, `0` = off) — for
     the turn that never leaves the thinking channel (socket healthy, deltas

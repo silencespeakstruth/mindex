@@ -117,6 +117,20 @@ turn_timeout_ms = 3900000             # DEAD-SOCKET guard only, NOT the run's bo
                                       # looping in its thinking channel is exactly what the
                                       # deadline is for, so letting this fire first inverts the
                                       # design. Startup refuses a value that would.
+first_token_timeout_ms = 120000       # abandon ONE turn if Ollama produces NO token at all within
+                                      # this window; 0 disables. The third guard, for what the
+                                      # other two cannot see: a connection that is alive and mute.
+                                      # turn_timeout_ms catches a dead socket and the thinking cap
+                                      # catches a model that will not stop, but an Ollama that is
+                                      # (re)loading a model answers neither — it just holds the
+                                      # request, and before this guard the run's whole budget went
+                                      # into waiting (measured: 300 s of a 300 s budget at
+                                      # steps 0, turns 0, tokens 0). Bounds the SILENT PREFIX
+                                      # only: the first token of any channel spends the guard, so
+                                      # a long prompt evaluation is untouched. Must stay below
+                                      # turn_timeout_ms or it can never fire; startup refuses a
+                                      # value that would, and one small enough to preempt a merely
+                                      # slow first token.
 max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking channel has streamed
                                       # this many characters; 0 disables. Catches the pathology
                                       # turn_timeout_ms structurally cannot see: a model that
