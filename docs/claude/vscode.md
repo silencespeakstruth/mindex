@@ -93,6 +93,32 @@ modifying `tools/vscode`.
   lives in `viewsWelcome`, not `TreeView.message` (VS Code renders the
   message *instead of* the welcome view when the tree is empty — set it only
   once a check has produced rows).
+  **The generated `.mindex` reads the project's `.gitignore` files rather
+  than guessing** (`gitignore.ts`, pure, no `vscode` import). The rest of the
+  template is guesswork and says so — a `dist/` may be checked-in output —
+  but a `.gitignore` is the project's own statement of what is generated, so
+  those excludes go in live, blocked per source file. Four things make that
+  safe, each of which fails *silently* if dropped. **The Rust parser rejects
+  what this one accepted**: `mindexfile::build_globset` bails on a leading
+  `/` or any `\`, so gitignore's anchoring and escape syntax must be resolved
+  at translation time, never carried. **A `!` must never reach the file** —
+  picomatch reads it as negation, globset as a literal, and `.mindex` has no
+  negation to express it with; since `include_paths` cannot re-admit what an
+  exclude dropped, a negation instead *disarms* (comments out) the positive
+  rules it overlaps, decided by materializing it into sample paths. Dropping
+  them silently is the jemalloc `.gitignore` case — `/test/unit/[A-Za-z]*`
+  plus `!…*.*` would delete every unit test from the index with no error.
+  **Both glob forms are emitted** for a pattern that could name a file or a
+  directory (`target` → `**/target` *and* `**/target/**`): globs are matched
+  against file paths only, so the second is what actually excludes a build
+  tree. And **the walk prunes as it goes** — a directory the rules so far
+  already exclude is not entered, which is what keeps forty `.gitignore`
+  files inside `perf/corpus/.clones/` and `.ruff_cache/.gitignore` (content:
+  `*`) out of the result. Anything untranslatable is written as a comment
+  naming the pattern and the reason; the empty case renders byte-for-byte
+  what it always did, which is both the no-git path and the revert switch.
+  Nothing re-reads `.gitignore` afterwards — mindex's scope is the `.mindex`,
+  and this happens once.
   **A reindex must show the server's claims, not just its own upload.**
   `post_index` swallows the claim conflict (`Err(ApiError::FileInFlight) =>
   {}`) and still 200s with the claimed file *absent from the response* —

@@ -7,6 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseMindexFile } from "./mindexFile";
 import { NOISE_DOT_DIRS, renderMindexTemplate } from "./mindexTemplate";
+import { reconcileSections, translateGitignore } from "./gitignore";
 
 const GUID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -56,4 +57,109 @@ void test("a generated guid round-trips unchanged", () => {
             .guid,
         guid
     );
+});
+
+// This repository's own .gitignore files, verbatim — the corpus the feature was
+// designed against, and the one place the whole pipeline is exercised end to end.
+const CORPUS: [dir: string, text: string][] = [
+    ["", "/target\n\n__pycache__/\n*.pyc\n\n*pem\n\n.vscode\n\n*.db*\n\ncerts/\n"],
+    [
+        "tools/vscode",
+        "node_modules/\ndist/\n*.vsix\n\n# Generated\nmedia/js/\nout/\nmedia/codicons/\n",
+    ],
+    [
+        "perf",
+        "# Fetched corpus\ncorpus/data/\ncorpus/.clones/\n\nresults/\nresults.csv\nplots/\n",
+    ],
+    ["embedder", ".venv/\n.venv-*/\n__pycache__/\n*.pyc\n.ruff_cache/\n"],
+];
+
+function renderCorpus(): string {
+    const sections = reconcileSections(
+        CORPUS.map(([dir, text]) => translateGitignore(dir, text)),
+        [".git/**"]
+    );
+    return renderMindexTemplate({
+        guid: GUID,
+        activeDotDirs: [".git"],
+        otherDotDirs: [],
+        gitignoreSections: sections,
+    });
+}
+
+void test("this repository's .gitignore files translate to the expected scope", () => {
+    // The assertion is on the *parsed* result, so it guards the YAML quoting too: a
+    // glob starting with `*` emitted bare is a YAML alias, i.e. a .mindex that does
+    // not parse at all.
+    assert.deepEqual(parseMindexFile(renderCorpus()).excludePaths, [
+        ".git/**",
+        "target",
+        "target/**",
+        "**/__pycache__/**",
+        "**/*.pyc",
+        "**/*pem",
+        "**/*pem/**",
+        "**/.vscode",
+        "**/.vscode/**",
+        "**/*.db*",
+        "**/certs/**",
+        "tools/vscode/**/node_modules/**",
+        "tools/vscode/**/dist/**",
+        "tools/vscode/**/*.vsix",
+        "tools/vscode/media/js/**",
+        "tools/vscode/**/out/**",
+        "tools/vscode/media/codicons/**",
+        "perf/corpus/data/**",
+        "perf/corpus/.clones/**",
+        "perf/**/results/**",
+        "perf/**/results.csv",
+        "perf/**/plots/**",
+        "embedder/**/.venv/**",
+        // `.venv-*/` carries a trailing slash, so only the directory form — and the
+        // embedder's `__pycache__/`/`*.pyc` are already covered by the root file's.
+        "embedder/**/.venv-*/**",
+        "embedder/**/.ruff_cache/**",
+    ]);
+});
+
+void test("a suggestion already answered by .gitignore is not offered again", () => {
+    const text = renderCorpus();
+    // `**/__pycache__/**` is live, so its commented twin must be gone; `**/*.lock`
+    // was never in a .gitignore here and must survive.
+    assert.ok(!text.includes('# - "**/__pycache__/**"'), "stale suggestion");
+    assert.ok(text.includes('# - "**/*.lock"'), "unrelated suggestion dropped");
+});
+
+void test("a project with no .gitignore renders exactly what it always did", () => {
+    // The revert switch: the whole feature is additive on the empty case.
+    const before = renderMindexTemplate({
+        guid: GUID,
+        activeDotDirs: [".git"],
+        otherDotDirs: [".claude"],
+    });
+    const after = renderMindexTemplate({
+        guid: GUID,
+        activeDotDirs: [".git"],
+        otherDotDirs: [".claude"],
+        gitignoreSections: [],
+    });
+    assert.equal(before, after);
+    assert.ok(!before.includes("From "), "provenance block leaked into the empty case");
+});
+
+void test("a disarmed rule is commented out and says why, and still parses", () => {
+    const sections = reconcileSections(
+        [translateGitignore("", "build/\n!build/keep.txt\nfoo\\ bar\n")],
+        []
+    );
+    const text = renderMindexTemplate({
+        guid: GUID,
+        activeDotDirs: [],
+        otherDotDirs: [],
+        gitignoreSections: sections,
+    });
+    assert.deepEqual(parseMindexFile(text).excludePaths, []);
+    assert.match(text, /# - "\*\*\/build\/\*\*"/);
+    assert.match(text, /re-admitted by `!build\/keep\.txt`/);
+    assert.match(text, /backslashes/);
 });

@@ -40,7 +40,13 @@ Nothing runs in the background — every action is explicit.
   unambiguously tool or VCS state (`.git`, `.venv`, caches) go in as live excludes;
   every other dot-directory found and the usual build-artifact globs ride along
   commented out, since a `dist/` may well be worth indexing and guessing wrong shrinks
-  the index in silence. Never overwrites an existing file — it opens it instead.
+  the index in silence. What does *not* need guessing is read instead: every
+  `.gitignore` in the project, nested ones included, is translated into `exclude_paths`
+  and written in live, each block naming the file it came from. git's pattern language
+  is not this one, so the translation is explicit about its edges — a `!` re-inclusion
+  has no equivalent here, and the rules it would have re-admitted are commented out
+  with the reason rather than applied. Never overwrites an existing file — it opens it
+  instead, and nothing re-reads `.gitignore` afterwards.
 - **Status bar → Server Status.** The status bar carries one indicator — **MINDex** in
   green, yellow or red — and clicking it refreshes and opens the Server Status panel in
   an editor tab: `/health`, `/status`, this project's per-language inventory, and the
