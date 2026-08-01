@@ -57,6 +57,20 @@ TOTAL_TIMEOUT = float(os.environ.get("RESEARCH_TOTAL_TIMEOUT", "4200"))
 # repeated here: three separate copies of them had drifted before this comment.
 DEFAULT_EFFORT = os.environ.get("RESEARCH_DEFAULT_EFFORT", "medium")
 
+# Excerpt bytes below which the verbatim code comes back without being asked for.
+#
+# `include_excerpts` defaults to False because two dozen chunks is ~100 KB into the
+# caller's context, which is the cost this layer exists to prevent. But the same
+# default made every *small* excerpt set cost a second full round trip — and worse,
+# it made the caller decide from a hint whether the code was worth asking for, which
+# is precisely the judgement it cannot make without seeing it. Field experience says
+# the corrections that matter (a `list(set(...))`, a default argument) are visible
+# only in the literal text and never in the summary.
+#
+# So: cheap sets come back, expensive ones stay behind the flag. 32 KiB is roughly a
+# handful of chunks — noticeable but not a context event.
+AUTO_EXCERPT_BYTES = int(os.environ.get("RESEARCH_EXCERPT_AUTO_BYTES", str(32 * 1024)))
+
 _EFFORTS = {"low", "medium", "high"}
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -77,6 +91,11 @@ _STEP_KEYS = (
     "plan",
     "seq",
     "hits",
+    # Where the call actually landed, as `path:start-end`. `hits: 3` says three rows
+    # came back and nothing about where they were, which made the trace unusable for
+    # the one thing it is for — judging what the run actually looked at.
+    "spans",
+    "spans_truncated",
 )
 
 # Fields kept from the last `progress`/`done` snapshot, reported as `usage`. Only
@@ -95,6 +114,10 @@ _USAGE_KEYS = (
     "eval_tokens",
     "turns",
     "binding",
+    # The four percentages `binding` is the maximum of. Without them `binding` is
+    # routinely read as "this run is running out of X" when it means "X is the
+    # largest of four shares, and it is 12%".
+    "shares",
     # Which prompt generation drove the run. Cheap to carry and impossible to
     # recover later: two reports written under different instructions are not
     # comparable, and without this a prompt change reads as model variance.
@@ -260,10 +283,19 @@ given as background, not as evidence: the model is told it may not cite it, so a
 chained follow-up is no less grounded than a cold one. `run_id` is absent only when
 the server could not store the run.
 
-The result's `usage` says what the run spent against what it was granted, and
-`usage.binding` names the axis that came closest to running out. Read it when you
-are about to ask a *broader* follow-up: a "finalized" report whose binding axis
-was nearly full means the next question needs a higher effort to finish at all.
+The result's `usage` says what the run spent against what it was granted. `binding`
+(also flat, beside `done_reason`) names the axis with the LARGEST SHARE SPENT — a
+maximum, not a warning. Read it together with `usage.shares`, the four percentages
+it was chosen from: `binding: "time"` at `shares.time: 12` means the run used an
+eighth of its clock and less of everything else, which is a comfortable run, not one
+about to expire. It is worth reading before a *broader* follow-up: a "finalized"
+report whose winning share is near 100 means the next question needs a higher
+effort to finish at all. What actually stopped a run is `done_reason`, never this.
+
+`citations_verified` and `citations_total` are flat too. They are the grounds for
+the instruction above — the count of the report's claims the server checked against
+locations the run really saw. High `verified` with zero `unverified` is why you do
+not re-read anything.
 
 IF THE REPORT IS NOT ENOUGH — it left a gap, it contradicts itself, it says the
 evidence was insufficient, `done_reason` was not "finalized", or your next step
@@ -273,13 +305,16 @@ never do instead is fall back to investigating it yourself.
 
 WHEN YOU NEED THE LITERAL TEXT, the server already has it — do not ask the report
 for it. The indexed code at every verified citation is on the server's side of the
-wire, and the result tells you so in `excerpts_available`. Ask for it by calling
-`research` again with `include_excerpts=True`, and you get `excerpts` — path, line
-range and verbatim code — for one SQL read and no model tokens. This is the right
-answer to "reproduce this config file", "show me the exact rule text", "what does
-that function actually say". It is NOT the default, because two dozen chunks is
-~100 KB of your context and this server exists to keep that out; ask when you
-genuinely need the bytes.
+wire. A small set comes back on its own, in `excerpts` (path, line range, verbatim
+code), with `excerpts_note` saying it was sent unasked; READ IT rather than
+trusting the report's paraphrase, because the corrections that matter — a
+`list(set(...))`, a default argument value — are visible only in the literal text.
+A large set is withheld and `excerpts_hint` tells you its size; ask for it by
+calling `research` again with `include_excerpts=True`. Either way it costs one SQL
+read and no model tokens. This is the right answer to "reproduce this config file",
+"show me the exact rule text", "what does that function actually say". Large sets
+are not sent by default because two dozen chunks is ~100 KB of your context and
+this server exists to keep that out.
 
 What you must never do is put that job in the question. Asking a report to
 reproduce files verbatim is the most reliable way to make a run fail: the local
@@ -306,7 +341,20 @@ clear question in `question` (a full question, not keywords — the local model
 decomposes it into its own searches). Pick `effort` by how much the answer is
 worth: "low" for a narrow lookup, "medium" for normal understanding, "high" for
 a genuinely broad or cross-cutting investigation. Higher effort costs you
-nothing in tokens — only wall-clock time.
+nothing in tokens — only wall-clock time, and that cost is real: on a 30B-class
+local model a "high" run is typically several minutes to a quarter of an hour.
+Spend it on questions that earn it. A mechanical extraction — "list the keys in
+that dict literal" — is a "low" question, and asking it at "high" buys nothing but
+the wait. The server publishes what each level has actually cost lately in
+`GET /config` under `research.observed`, if you need the real numbers rather than
+this rule of thumb.
+
+ONE RUN AT A TIME is the normal configuration (`research.max_concurrent` in
+`GET /config`, usually 1 on a single-GPU host). A second call while one is running
+is refused outright, so plan investigations as a queue rather than firing several
+and hoping. If a call of yours is interrupted or times out, the run keeps going on
+the server and keeps its slot: the result carries `live_run_id` and `still_running`
+for exactly that case, and `DELETE /research/active/{run_id}` frees it.
 
 You can also NARROW WHERE IT LOOKS, and it is worth doing when you already know:
 `include` keeps only matching files and `exclude` drops them, both shaped
@@ -420,17 +468,21 @@ async def research(
             rediscovering names, and they are NOT evidence: the local model is told it
             may not cite them, and anything it copies from one is reported back as
             ``unverified``. The server caps how many may be given.
-        include_excerpts: Return the verbatim indexed code at every verified
-            citation, not just the count of it. Default False on purpose: two dozen
-            chunks is ~100 KB landing in YOUR context, which is the cost this server
-            exists to prevent. Set it when you actually need the literal text —
-            about to edit that code, or reproducing a config/schema file — and leave
-            it off when you only need to understand something.
+        include_excerpts: Force the verbatim indexed code at every verified citation
+            into the result. Not needed for a SMALL excerpt set — that comes back on
+            its own — so set it when the result said the code was withheld
+            (``excerpts_hint``) and you actually need the literal text: about to edit
+            that code, or reproducing a config/schema file. A large set is not sent
+            by default because two dozen chunks is ~100 KB landing in YOUR context,
+            which is the cost this server exists to prevent.
 
-    Returns ``{"report", "steps": [{n, action, query|name|path|glob, hits}],
-    "elapsed_ms", "done_reason", "usage"}``. ``steps`` is just the trace of what
-    the local model looked at — read it only if you need to judge how well the
-    question was covered.
+    Returns ``{"report", "steps": [{n, action, query|name|path|glob, hits, spans}],
+    "elapsed_ms", "done_reason", "binding", "usage"}``, plus
+    ``citations``/``citations_verified``/``citations_total`` and ``excerpts`` when
+    the run produced them. ``steps`` is the trace of what the local model looked at,
+    and ``spans`` on each step are the ``path:start-end`` locations that call
+    actually returned — read them if you need to judge how well the question was
+    covered.
 
     ``done_reason`` is "finalized" when the local model judged the evidence
     sufficient. Any other value means it was stopped
@@ -441,9 +493,11 @@ async def research(
     the wall-clock rather than a waste of it.
 
     ``usage`` is what the run spent against what it was granted (time, local
-    tokens, steps, turns) plus ``binding``: the axis that came closest to
-    exhausted. On a "finalized" report a nearly-exhausted axis means the next,
-    broader question needs a higher effort to finish at all.
+    tokens, steps, turns) plus ``shares``, the four percentages spent. ``binding``
+    names the largest of those shares — a maximum, not a warning: read it with
+    ``usage.shares`` beside it, because "time" at 12% is a comfortable run. Only on
+    a share near 100 does the next, broader question need a higher effort to finish
+    at all.
 
     ``run_id`` (with a short per-project ``seq``) names the stored report. Pass it as
     ``context_run_ids`` on a follow-up so the next run reads this one first. Absent
@@ -486,9 +540,11 @@ async def research(
     citations: dict[str, Any] = {}
     excerpts: list[dict[str, Any]] = []
     excerpts_truncated = False
+    excerpts_total = 0
     elapsed_ms = 0
     done_reason: str | None = None
     run_id: str | None = None
+    live_run_id: str | None = None
     run_seq: int | None = None
     failure: str | None = None
 
@@ -501,6 +557,21 @@ async def research(
         ):
             if resp.status_code != 200:
                 await resp.aread()
+                if resp.status_code == 429:
+                    # Told apart from every other refusal because the caller's next
+                    # move is different: this is not a bad request, it is a queue.
+                    # The server publishes how many slots exist
+                    # (GET /config → research.max_concurrent) and what is holding
+                    # them (GET /research/active), so say where to look instead of
+                    # leaving "retry later" as the whole advice.
+                    raise RuntimeError(
+                        f"mindex is already running its maximum number of research "
+                        f"runs — {_problem(resp.text, resp.status_code)} Wait and "
+                        f"re-ask; do NOT retry in a loop. One run at a time is the "
+                        f"normal setting on a single-GPU host, so treat research as "
+                        f"a queue of one: finish this question before starting the "
+                        f"next."
+                    )
                 raise RuntimeError(
                     f"mindex research failed — {_problem(resp.text, resp.status_code)}"
                 )
@@ -516,7 +587,15 @@ async def research(
                     data = json.loads(line[len("data:") :].strip())
                 except json.JSONDecodeError:
                     continue
-                if event == "summary":
+                if event == "started":
+                    # The run's name, before any work — kept apart from the stored
+                    # id `done` reports. The interesting case is the one where `done`
+                    # never arrives: a run this end stops listening to is still
+                    # running on the server, holding a slot, and this is the id that
+                    # lets the caller cancel it (DELETE /research/active/{run_id})
+                    # instead of waiting it out.
+                    live_run_id = data.get("run_id") or None
+                elif event == "summary":
                     report_parts.append(data.get("text", ""))
                 elif event == "step":
                     steps.append({k: v for k, v in data.items() if k in _STEP_KEYS})
@@ -541,6 +620,10 @@ async def research(
                     # token-economy argument this server exists for. Null when the
                     # server's best-effort journal write failed, and absent on servers
                     # older than the field; both mean "cannot be referenced".
+                    # Deliberately NOT falling back to the id `started` gave: a null
+                    # here means the journal write failed, so the run exists but
+                    # nothing can fetch it. Substituting the live id would hand the
+                    # caller a name for a report it cannot read.
                     run_id = data.get("run_id") or None
                     run_seq = data.get("seq")
                 elif event == "citations":
@@ -570,6 +653,11 @@ async def research(
                         if isinstance(item, dict)
                     ]
                     excerpts_truncated = bool(data.get("truncated", False))
+                    # The server's own count of verified citations, BEFORE its caps.
+                    # `len(excerpts)` is what survived them, so reporting only that
+                    # would quietly under-report how much evidence the report rests
+                    # on.
+                    excerpts_total = int(data.get("total", len(excerpts)))
                 elif event == "error":
                     failure = f"{data.get('code', 'error')}: {data.get('detail', '')}"
                 # `thinking` deltas are deliberately dropped: they are the local
@@ -616,26 +704,46 @@ async def research(
         "done_reason": done_reason,
         "usage": usage,
     }
+    # Flat, beside `done_reason`, because the instructions name it as something to
+    # read: buried in `usage` it was a field the caller was told to consult and had
+    # to go looking for. It names the axis with the largest share spent — a maximum,
+    # not a warning — which is why `usage.shares` beside it is what makes it legible.
+    if "binding" in usage:
+        out["binding"] = usage["binding"]
     if run_id is not None:
         out["run_id"] = run_id
         if run_seq is not None:
             out["seq"] = run_seq
-    # The count always; the bytes only when asked for. This asymmetry is the whole
-    # design: the caller learns the literal text exists and is one cheap re-ask away,
-    # without ~100 KB of it arriving unbidden in a layer whose entire purpose is to
-    # keep that out.
+    # The count always; the bytes when asked for, or when they are cheap enough that
+    # asking would cost more than sending. The asymmetry is the design: the caller
+    # must never receive ~100 KB unbidden in a layer whose whole purpose is to keep
+    # that out — but a few KB withheld behind a hint buys a second round trip and a
+    # judgement the caller cannot make without seeing the code.
     if excerpts:
         out["excerpts_available"] = len(excerpts)
-        if include_excerpts:
+        if excerpts_total > len(excerpts):
+            # The server capped before we did; say so, or the count reads as the
+            # whole evidence base.
+            out["excerpts_verified_total"] = excerpts_total
+        excerpt_bytes = sum(len(e.get("code", "")) for e in excerpts)
+        if include_excerpts or excerpt_bytes <= AUTO_EXCERPT_BYTES:
             out["excerpts"] = excerpts
             if excerpts_truncated:
                 out["excerpts_truncated"] = True
+            if not include_excerpts:
+                out["excerpts_note"] = (
+                    f"Included unasked: {excerpt_bytes} bytes is under the "
+                    f"{AUTO_EXCERPT_BYTES}-byte threshold, so this is cheaper than "
+                    f"the re-ask it saves. This is the indexed code itself — read it "
+                    f"rather than trusting the report's paraphrase of it."
+                )
         else:
             out["excerpts_hint"] = (
                 f"The server holds the verbatim indexed code at "
-                f"{len(excerpts)} verified citation(s). Ask for it with "
-                f"include_excerpts=True rather than reading the files or "
-                f"calling mindex.search."
+                f"{len(excerpts)} verified citation(s), about {excerpt_bytes} bytes — "
+                f"over the {AUTO_EXCERPT_BYTES}-byte threshold, so it was not sent "
+                f"unasked. Ask for it with include_excerpts=True rather than reading "
+                f"the files or calling mindex.search."
             )
     # Echoed back so a report read later knows what it was allowed to see. A scoped
     # report and an unscoped one are otherwise the same document, and the scoped one
@@ -651,8 +759,29 @@ async def research(
             f"server said it was done — the report may be cut off mid-sentence and "
             f"its citation check never arrived."
         )
+        if live_run_id is not None:
+            # The run did not stop when we stopped reading: it is still on the
+            # server, still holding one of `max_concurrent` slots, and it will keep
+            # it until its own deadlines expire. Handing back the id is what makes
+            # that recoverable instead of a wait.
+            out["live_run_id"] = live_run_id
+            out["still_running"] = (
+                f"The server was not told to stop and is probably still running this "
+                f"job, holding a research slot. Cancel it with "
+                f"DELETE /research/active/{live_run_id}, or check "
+                f"GET /research/active, before starting another research run."
+            )
     if citations:
         out["citations"] = citations
+        # Promoted out of the nested object. The instructions tell the caller to
+        # trust the report *because* the server checked its provenance — and the
+        # number backing that instruction sat one level down while every exception
+        # to it (`citations_warning`, `freshness_warning`) was already flat. The
+        # grounds for trusting were harder to find than the grounds for doubting.
+        if "verified" in citations:
+            out["citations_verified"] = citations["verified"]
+        if "total" in citations:
+            out["citations_total"] = citations["total"]
         if citations.get("unverified"):
             # Stated in the result, not left for the caller to infer from a count:
             # the instructions say to trust the report, so the exception has to be
@@ -674,7 +803,15 @@ async def research(
                 f"claims are likely still true, but the line ranges may have moved — "
                 f"re-read those ranges before editing them."
             )
-    if done_reason is not None and done_reason != "finalized":
+    # Only when the *server* named a stop reason. `client_timeout` is this end's own
+    # verdict and already carries a more specific note above; overwriting it with the
+    # generic fallback traded a precise message ("we stopped listening, the run may
+    # still be going") for a vague one about the model.
+    if (
+        done_reason is not None
+        and done_reason != "finalized"
+        and not truncated_by_client
+    ):
         out["incomplete"] = _INCOMPLETE_HINTS.get(
             done_reason,
             "The local model stopped before it was satisfied with the evidence.",
