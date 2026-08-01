@@ -426,6 +426,25 @@ impl RunProgress {
 /// and nowhere else is simply never seen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResearchEvent {
+    /// The run's identity, before any work. Always the first frame.
+    ///
+    /// `run_id` used to arrive only in `done`, because it did not exist until the
+    /// journal insert — so for the whole life of a run there was no name to list it
+    /// under, cancel it by, or quote in a bug report, and a run that was cancelled
+    /// (never journalled) had no name ever. The id is now minted at admission and
+    /// announced here; `done` still carries it, unchanged, for a consumer that
+    /// reads only the last frame.
+    ///
+    /// The grants ride along because they are what a caller needs to interpret the
+    /// wait: `worst_case_ms` is `max_seconds * 1000 + report_timeout_ms`, the two
+    /// windows being separate phases rather than one budget.
+    Started {
+        run_id: String,
+        model: String,
+        effort: &'static str,
+        granted_seconds: u64,
+        worst_case_ms: u64,
+    },
     /// A delta of the model's thinking (thinking models only).
     Thinking { text: String },
     /// One executed tool call.
@@ -593,6 +612,7 @@ impl StepCall {
 impl ResearchEvent {
     pub fn name(&self) -> &'static str {
         match self {
+            ResearchEvent::Started { .. } => "started",
             ResearchEvent::Thinking { .. } => "thinking",
             ResearchEvent::Step { .. } => "step",
             ResearchEvent::Progress { .. } => "progress",
@@ -606,6 +626,19 @@ impl ResearchEvent {
 
     pub fn data(&self) -> Value {
         match self {
+            ResearchEvent::Started {
+                run_id,
+                model,
+                effort,
+                granted_seconds,
+                worst_case_ms,
+            } => json!({
+                "run_id": run_id,
+                "model": model,
+                "effort": effort,
+                "granted_seconds": granted_seconds,
+                "worst_case_ms": worst_case_ms,
+            }),
             ResearchEvent::Thinking { text } => json!({ "text": text }),
             ResearchEvent::Step { n, call, hits } => {
                 // One argument key per action, named for what it is; scout's step
@@ -11737,6 +11770,34 @@ mod tests {
         // The rest of the record is unaffected: the run happened.
         assert_eq!(d["reason"], "finalized");
         assert_eq!(d["steps"], 3);
+    }
+
+    /// The frame that gives a run its name. Without it the id existed only from
+    /// `done` onwards, which is to say only for runs that finished — so nothing
+    /// could list or cancel a run while it was running, which is precisely when
+    /// someone needs to.
+    #[test]
+    fn a_run_names_itself_before_it_does_any_work() {
+        let ev = ResearchEvent::Started {
+            run_id: "0198f2d1-0000-7000-8000-000000000000".into(),
+            model: "gemma4:31b".into(),
+            effort: "high",
+            granted_seconds: 3600,
+            worst_case_ms: 3_900_000,
+        };
+        assert_eq!(ev.name(), "started");
+        let d = ev.data();
+        for (key, want) in [
+            ("run_id", json!("0198f2d1-0000-7000-8000-000000000000")),
+            ("model", json!("gemma4:31b")),
+            ("effort", json!("high")),
+            ("granted_seconds", json!(3600)),
+            // The investigation deadline *plus* the report window: two phases, and
+            // a caller reading only the first understates the wait.
+            ("worst_case_ms", json!(3_900_000)),
+        ] {
+            assert_eq!(d[key], want, "started.{key} changed shape: {d}");
+        }
     }
 
     #[test]

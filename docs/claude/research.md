@@ -11,12 +11,14 @@ measurement history. Read it before modifying `research.rs`,
 (`search_core`/`symbols_core` in `handlers.rs`; never HTTP-to-self), then
 streams a Markdown report. Non-obvious invariants:
 
-- **Cancellation = disconnect.** No cancel endpoint. `ResearchEventStream`'s
-  `Drop` cancels the job token (axum drops the SSE body on disconnect); a
-  closed mpsc channel is the same signal from the other side. The semaphore
-  permit rides **in the spawned job**, not the stream — the job is detached, so
-  releasing on stream-drop would over-admit past `max_concurrent` while the old
-  job still spends GPU/DB time.
+- **Cancellation = cancelling the job token.** `SseEventStream`'s `Drop` does it
+  on disconnect (axum drops the SSE body); a closed mpsc channel is the same
+  signal from the other side. Since 2026-08-01 `DELETE
+  /research/active/{run_id}` is a second hand on the same lever, for the case
+  disconnect cannot reach — see *A run became something you can see and stop*
+  below. The semaphore permit rides **in the spawned job**, not the stream — the
+  job is detached, so releasing on stream-drop would over-admit past
+  `max_concurrent` while the old job still spends GPU/DB time.
 - **Dedicated runtime.** Jobs run on a small separate multi-thread runtime
   (`[research].worker_threads`, leaked in `main.rs` — dropping a runtime from
   async context panics). Admission via `Arc<Semaphore>`

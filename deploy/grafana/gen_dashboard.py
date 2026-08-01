@@ -483,15 +483,30 @@ P += [
             ("mindex_indexing_claims", "indexing claims"),
             ("mindex_research_active", "research active"),
             ("mindex_gc_running", "gc running"),
+            # Minutes rather than raw seconds: the number matters only when it is
+            # large, and at panel scale a healthy run's seconds would flatten the
+            # lock lines beside it.
+            ("mindex_research_inflight_oldest_age_seconds / 60", "oldest run (min)"),
+            # Expected to stay absent (a never-incremented counter has no series):
+            # any point here means a run outlived every deadline it had and the
+            # watchdog freed its slot.
+            (
+                "increase(mindex_research_watchdog_cancels_total[$__rate_interval])",
+                "watchdog cancel",
+            ),
         ),
-        desc="The three in-process locks. `research_active` is derived from the "
-        "semaphore rather than counted, because a run's normal exit is a "
-        "dropped stream that no decrement would survive.",
+        desc="The three in-process locks, plus the two research-slot pathology "
+        "signals. `research_active` is derived from the semaphore rather than "
+        "counted, because a run's normal exit is a dropped stream that no "
+        "decrement would survive; `oldest run` is what tells a busy slot from a "
+        "wedged one, and `watchdog cancel` should never fire.",
         overrides=by_name_overrides(
             {
                 "indexing claims": "blue",
                 "research active": "purple",
                 "gc running": "yellow",
+                "oldest run (min)": "green",
+                "watchdog cancel": "red",
             }
         ),
     ),

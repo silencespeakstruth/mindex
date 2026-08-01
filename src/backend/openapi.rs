@@ -91,6 +91,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::post_research_pin,
         handlers::delete_research_run,
         handlers::delete_research_runs,
+        handlers::get_research_active,
+        handlers::delete_research_active,
         // Projects
         handlers::get_projects,
         handlers::get_project_stats,
@@ -150,8 +152,11 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ResearchPinRequest,
         crate::backend::v0::models::DeleteResearchRunsRequest,
         crate::backend::v0::models::DeleteResearchRunsResponse,
+        crate::backend::v0::models::ActiveResearchRun,
+        crate::backend::v0::models::ActiveResearchResponse,
         crate::backend::v0::models::VersionResponse,
         crate::backend::v0::models::HealthChecks,
+        crate::backend::v0::models::ResearchHealth,
         crate::backend::v0::models::HealthResponse,
         crate::backend::v0::models::FileInfo,
         crate::backend::v0::models::FileListResponse,
@@ -200,7 +205,7 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (19 routes; three carry two methods each).
+        // Every routed path is documented (21 routes; three carry two methods each).
         for p in [
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",
@@ -216,6 +221,8 @@ mod tests {
             "/projects/{project_guid}/research",
             "/projects/{project_guid}/research/{run_id}",
             "/projects/{project_guid}/research/{run_id}/pin",
+            "/research/active",
+            "/research/active/{run_id}",
             "/gc",
             "/status",
             "/config",
@@ -224,7 +231,7 @@ mod tests {
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 19, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 21, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak

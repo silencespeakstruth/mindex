@@ -373,7 +373,13 @@ impl ApiError {
                     .into()
             }
             ApiError::ResearchBusy => {
-                "All research slots are in use ([research].max_concurrent); retry later.".into()
+                // Names where to look rather than only what happened: a refused
+                // caller's next question is always "busy with what, and for how
+                // long", and until `/research/active` existed there was no answer.
+                "All research slots are in use ([research].max_concurrent, published as \
+                 research.max_concurrent by GET /config); see GET /research/active for what \
+                 holds them and how long it has, then retry."
+                    .into()
             }
             ApiError::ResearchModelMissing => {
                 "The request names no model and the server has no [research].default_model.".into()

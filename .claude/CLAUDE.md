@@ -270,6 +270,11 @@ let GC clean up.
   the detail query indexes its four columns *from* that constant (a summary
   column added without moving it once handed the caller `invalid_flag` where
   `report` belonged).
+- **Live research runs** (`GET /research/active`, `DELETE
+  /research/active/{run_id}`): global, not per project — the semaphore is. Kept
+  off `/projects/{guid}/research` because that list is keyset-paged by `seq`,
+  which a live run has not got yet. See the `/research` section for the registry
+  behind them.
 - The read-only set (`GET /projects[/{guid}][/files]`, `/status`, `/config`,
   `/health`, `/version`) + `POST /gc` are self-describing in OpenAPI.
   `GET /config` serves the canonical supported-language list (read by the
@@ -295,12 +300,36 @@ contract.** (Design decisions marked "measured" point to the 2026-07-28
 108-run and 2026-07-30 28-run corpora summarized there; the corpus of record
 is the `research_runs` table.) The hard invariants:
 
-- **Cancellation = disconnect** — no cancel endpoint. `ResearchEventStream`'s
-  `Drop` cancels the job token; the semaphore permit rides **in the spawned
-  job**, not the stream (releasing on stream-drop would over-admit past
-  `max_concurrent`).
+- **Cancellation = cancelling the job token; two hands reach it.**
+  `SseEventStream`'s `Drop` (disconnect) is the primary one and still the only one
+  the loop knows about; `DELETE /research/active/{run_id}` is the second, for the
+  case disconnect cannot cover — a caller that abandoned the run while its socket
+  stays open (scout holds its connection up to `RESEARCH_TOTAL_TIMEOUT`, 70 min).
+  The semaphore permit rides **in the spawned job**, not the stream (releasing on
+  stream-drop would over-admit past `max_concurrent`).
+- **A run is named from admission, and listed while it runs.** `run_id` is minted
+  in `post_research` (not by `insert_run`), streamed as the first frame
+  (`started`), and registered in `backend::inflight::ResearchRegistry` — whose
+  guard rides in the **same** spawned future as the permit, so the list can never
+  describe a slot that is free or hide one that is not. A cancelled run is still
+  never journalled; the registry, not the table, is what makes it visible. Before
+  this a run had no id until it ended: nothing could list, cancel or name one while
+  it ran, and with `max_concurrent = 1` an occupied slot was an unattributable
+  total outage whose only remedy was a restart.
+- **`GET /health` reports the slots** (`research.{slots_total, slots_busy,
+  oldest_inflight_age_ms}`), and this is the one place research moves the verdict:
+  a **busy** slot is never a degradation (permanent at `max_concurrent = 1`), while
+  a run past `max_seconds + report_timeout_ms + inflight::WEDGE_GRACE` is. That
+  same predicate is `worker::research_watchdog`'s cancel rule — one const, so
+  health and the watchdog cannot disagree about "wedged". The watchdog is spawned
+  **unconditionally**, unlike the metrics collector: gating a recovery mechanism on
+  `[metrics].enabled` would let an observability switch decide whether the service
+  can recover. It exists for the awaits that are not under a token (`/api/show`,
+  Ollama's error-body read, the deliberately uncancellable journal write);
+  `research_watchdog_cancels_total` is expected to stay at zero.
 - **Dedicated runtime**, leaked in `main.rs` (`[research].worker_threads`);
-  admission via `Arc<Semaphore>` (`max_concurrent`) → 429 `research.busy`.
+  admission via `Arc<Semaphore>` (`max_concurrent`, published by `GET /config`) →
+  429 `research.busy`, whose detail names `/research/active`.
 - **Two seams** keep the loop testable: `OllamaModel` (`models/ollama.rs`) and
   `ResearchTools` (`research.rs`). Mocks: `tests/mock_ollama` (scripted via
   `POST /script`; `force_text_calls` covers `research.model_lacks_tools`),
@@ -650,9 +679,9 @@ is the `research_runs` table.) The hard invariants:
   `citations_wire_fields_are_stable`,
   `a_server_written_report_says_so_on_the_wire`. `done` carries nullable
   `run_id`/`seq` (null when the journal write failed; rendered as "not
-  saved" in VS Code). Event order after the report is fixed:
-  `summary` → `citations` → `excerpts` (only with a verified citation) →
-  `done`.
+  saved" in VS Code). `started` is always the **first** frame; event order after
+  the report is fixed: `summary` → `citations` → `excerpts` (only with a verified
+  citation) → `done`.
 - **A stream ending without a terminal event is a failure**:
   `SseEventStream` synthesises one `error` (`internal.error`) when the
   channel closes without `done`/`error` (a detached-job panic otherwise reads

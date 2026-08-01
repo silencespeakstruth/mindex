@@ -337,6 +337,11 @@ async fn main() -> Result<(), BoxError> {
     // a run's normal exit is a dropped SSE stream, which no `dec()` would survive.
     let research_semaphore = Arc::new(tokio::sync::Semaphore::new(cfg.research.max_concurrent));
 
+    // The identity half of admission: the semaphore says how many slots are gone,
+    // this says which runs took them and holds the tokens that stop them. Hoisted
+    // because three things share it — the handlers, `GET /health`, and the watchdog.
+    let research_registry = backend::inflight::ResearchRegistry::new();
+
     // Hoisted for the same reason: the catalog worker writes it, `GET /config` reads
     // it. Starts empty and unstamped — nothing blocks startup on Ollama, which is an
     // optional dependency, and `interval`'s first tick fires immediately anyway.
@@ -402,6 +407,16 @@ async fn main() -> Result<(), BoxError> {
         ));
     }
 
+    // Unconditional on purpose, unlike the collector above: this is the backstop
+    // that keeps a research slot from being held forever, and gating a safety
+    // mechanism on `[metrics].enabled` would make an observability switch decide
+    // whether the service can recover.
+    tokio::spawn(worker::research_watchdog::run(
+        research_registry.clone(),
+        metrics.clone(),
+        sigterm_token.child_token(),
+    ));
+
     // Unconditional: an Ollama that comes up an hour from now must still be picked
     // up, so there is nothing to gate this on. A failed tick keeps the last list.
     tokio::spawn(worker::ollama_catalog::run(
@@ -454,6 +469,8 @@ async fn main() -> Result<(), BoxError> {
                 db_schema_version,
                 research_handle,
                 research_semaphore: research_semaphore.clone(),
+                research_max_concurrent: cfg.research.max_concurrent,
+                research_registry: research_registry.clone(),
                 research_ollama,
                 research_default_model: cfg.research.default_model.clone(),
                 research_effort: cfg.research.effort.clone(),

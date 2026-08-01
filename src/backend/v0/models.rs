@@ -1420,16 +1420,43 @@ pub struct HealthChecks {
     pub ollama: String,
 }
 
+/// Research admission, as `GET /health` reports it.
+///
+/// This block exists because of a real outage shape: with `max_concurrent = 1` a
+/// single occupied slot is a total outage of `/research`, and health said `"ok"`
+/// throughout — every *dependency* was alive, and the pool of slots, the thing that
+/// was actually exhausted, was not checked at all. A health endpoint that is green
+/// while the main scenario is dead is worse than none: it actively misleads.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchHealth {
+    /// `[research].max_concurrent`.
+    pub slots_total: usize,
+    /// Slots held right now. `slots_busy == slots_total` means the next request is
+    /// refused with 429 `research.busy` — normal under load, not a defect.
+    pub slots_busy: usize,
+    /// Age of the oldest live run, `null` when none is running. Busy says nothing
+    /// on its own; this is what separates a queue from a wedge.
+    pub oldest_inflight_age_ms: Option<u64>,
+}
+
 #[derive(Serialize, Debug, ToSchema)]
 pub struct HealthResponse {
     /// `"ok"` only when the required checks pass (SQLite, Qdrant, embedder, and
     /// the query embedder when deployed separately), else `"degraded"`.
     /// `checks.ollama` never affects it.
+    ///
+    /// Research affects it in exactly one narrow case: a run that has outlived
+    /// `max_seconds + report_timeout_ms` is holding a slot no deadline of its own
+    /// will free. A merely *busy* slot never degrades the verdict — that is the
+    /// service working.
     pub status: &'static str,
     pub version: &'static str,
     /// Files in `status='indexing'` across *all* projects right now.
     pub indexing_files: i64,
     pub checks: HealthChecks,
+    /// Research concurrency. Reported unconditionally, including when Ollama is
+    /// down: the slots are mindex's own state, not a dependency's.
+    pub research: ResearchHealth,
 }
 
 /// `GET /projects/{guid}/files` query string — optional filters. `language`
@@ -1503,6 +1530,47 @@ pub struct StatusResponse {
     pub indexing_files: i64,
     /// Global `project_files` counts by status.
     pub files_by_status: FileStatusCounts,
+}
+
+/// `GET /research/active` — one research run that is still running.
+///
+/// Deliberately separate from [`ResearchRunSummary`], which describes a **stored**
+/// run: a live run has no `seq`, no `done_reason` and no report, and giving it
+/// nullable versions of all three would invite a client to render one shape for two
+/// different things.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ActiveResearchRun {
+    /// The id `DELETE /research/active/{run_id}` takes, and the id this run will be
+    /// stored under if it finishes and its journal write succeeds.
+    pub run_id: String,
+    pub project_guid: String,
+    /// The opening of the question, so a human recognises their own run.
+    pub question: String,
+    pub model: String,
+    pub effort: String,
+    /// Unix seconds when the run was admitted.
+    pub started_at: i64,
+    /// How long it has been running.
+    pub age_ms: u64,
+    /// The investigation deadline it was granted (`budget.max_seconds`).
+    pub granted_seconds: u64,
+    /// `granted_seconds * 1000 + report_timeout_ms` — the longest this run may
+    /// legitimately take, since the report phase gets its own window *after* the
+    /// investigation deadline. An `age_ms` past this is a defect, not a queue, and
+    /// it is what the watchdog and `GET /health` both act on.
+    pub worst_case_ms: u64,
+}
+
+/// `GET /research/active` — every research run holding a concurrency permit.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ActiveResearchResponse {
+    /// Oldest first: the order that puts a suspected wedge at the top.
+    pub runs: Vec<ActiveResearchRun>,
+    /// `[research].max_concurrent`.
+    pub slots_total: usize,
+    /// Slots held right now. Equal to `runs.len()`, restated so a caller planning a
+    /// queue reads one number instead of counting.
+    pub slots_busy: usize,
 }
 
 /// `GET /config` — server capabilities and tuning knobs. `languages` is the
@@ -1579,6 +1647,20 @@ pub struct ResearchConfigInfo {
     pub max_request_report_words: usize,
     /// Ceiling on `budget.evidence_width` (floor: 1).
     pub max_evidence_width: u64,
+    /// `[research].max_concurrent` — how many runs this server admits at once.
+    ///
+    /// Published because a caller could otherwise learn it only by being refused:
+    /// there was no way to tell "one slot, so queue your two investigations" from
+    /// "plenty of slots, run them together", and on a single-GPU host the answer is
+    /// almost always 1. A 429 `research.busy` means this many are already running.
+    pub max_concurrent: usize,
+    /// How many earlier runs one request may name in `context_run_ids`; `0` = the
+    /// feature is off and any id is a 400.
+    pub max_context_runs: usize,
+    /// Total characters of prior reports injected into a run's transcript. A real
+    /// budget axis — the transcript is resent every turn — so a caller chaining
+    /// follow-ups is choosing how much of `max_tokens` to spend on hearsay.
+    pub max_context_chars: usize,
     /// How long the report phase gets after the investigation deadline, in
     /// milliseconds. Published because it is the other half of what a caller waits:
     /// `effort.*.max_seconds` bounds the investigation, and the longest a request can
@@ -1642,10 +1724,23 @@ pub struct ResearchEffortInfo {
     /// Multiplier on the per-call evidence widths — the default a request's
     /// `budget.evidence_width` overrides, capped by `max_evidence_width`.
     pub evidence_width: u64,
+    /// `max_seconds + report_timeout_ms / 1000` — the longest a request at this
+    /// level may take before its last frame.
+    ///
+    /// Derived, and published because deriving it is exactly what callers were not
+    /// doing: `max_seconds` and `report_timeout_ms` bound **different phases**, so
+    /// neither is the answer to "how long might I wait", and reading `max_seconds`
+    /// as the whole wait understates `high` by five minutes. Stated once, by the
+    /// server that owns both numbers.
+    pub worst_case_seconds: u64,
 }
 
-impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
-    fn from(b: &crate::config::EffortBudget) -> Self {
+impl ResearchEffortInfo {
+    /// Built with `report_timeout_ms` rather than through `From` so the derived
+    /// worst case cannot be forgotten: the report window is not part of
+    /// [`crate::config::EffortBudget`], and a conversion that could not see it is
+    /// how the two halves stayed unrelated on the wire.
+    pub fn new(b: &crate::config::EffortBudget, report_timeout_ms: u64) -> Self {
         Self {
             max_seconds: b.max_seconds,
             max_tokens: b.max_tokens,
@@ -1655,6 +1750,7 @@ impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
             max_report_words: b.max_report_words,
             max_report_sections: b.max_report_sections,
             evidence_width: b.evidence_width,
+            worst_case_seconds: b.max_seconds.saturating_add(report_timeout_ms / 1000),
         }
     }
 }

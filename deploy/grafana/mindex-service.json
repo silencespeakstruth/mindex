@@ -1121,7 +1121,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Concurrency",
-      "description": "The three in-process locks. `research_active` is derived from the semaphore rather than counted, because a run's normal exit is a dropped stream that no decrement would survive.",
+      "description": "The three in-process locks, plus the two research-slot pathology signals. `research_active` is derived from the semaphore rather than counted, because a run's normal exit is a dropped stream that no decrement would survive; `oldest run` is what tells a busy slot from a wedged one, and `watchdog cancel` should never fire.",
       "datasource": {
         "type": "prometheus",
         "uid": "${ds}"
@@ -1168,6 +1168,30 @@
           "range": true,
           "instant": false,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "mindex_research_inflight_oldest_age_seconds / 60",
+          "legendFormat": "oldest run (min)",
+          "range": true,
+          "instant": false,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_watchdog_cancels_total[$__rate_interval])",
+          "legendFormat": "watchdog cancel",
+          "range": true,
+          "instant": false,
+          "refId": "E"
         }
       ],
       "fieldConfig": {
@@ -1236,6 +1260,36 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "oldest run (min)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "watchdog cancel"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
                 }
               }
             ]

@@ -82,6 +82,21 @@ export interface HealthResponse {
      * hence the `| undefined`.
      */
     checks: Record<string, string | undefined> & { ollama?: string };
+    /**
+     * Research admission. Dependencies being alive says nothing about whether a run
+     * can start: with `slots_total: 1` a single occupied slot is a total outage of
+     * research, and health used to report `"ok"` right through it.
+     *
+     * A *busy* slot is not a degradation — that is the service working. Only
+     * `oldest_inflight_age_ms` past a run's own worst case is, and that is what
+     * moves `status` here. Absent on older servers.
+     */
+    research?: {
+        slots_total: number;
+        slots_busy: number;
+        /** `null` when nothing is running. */
+        oldest_inflight_age_ms: number | null;
+    };
 }
 /**
  * `GET /status` — a live runtime snapshot. Its file counts (`indexing_files`,
@@ -121,6 +136,12 @@ export interface ResearchEffortInfo {
     max_report_sections?: number;
     /** Multiplier on the per-call evidence tool widths. Absent on older servers. */
     evidence_width?: number;
+    /**
+     * `max_seconds + report_timeout_ms / 1000` — the longest a run at this level may
+     * take, derived by the server because the two bound different phases and reading
+     * `max_seconds` as the whole wait understates `high` by five minutes.
+     */
+    worst_case_seconds?: number;
 }
 /** `[research].temperature`/`top_p`/`seed`; `null` means the model's own default. */
 export interface ResearchSamplingInfo {
@@ -155,6 +176,15 @@ export interface ResearchConfigInfo {
      * and the longest a request can take is that plus this.
      */
     report_timeout_ms?: number;
+    /**
+     * How many runs the server admits at once. A second request while they are all
+     * busy is refused with 429, not queued — so this is what says whether two
+     * investigations can be started together. Absent on older servers.
+     */
+    max_concurrent?: number;
+    /** Caps on `context_run_ids` and the injected prior-report block. */
+    max_context_runs?: number;
+    max_context_chars?: number;
     sampling?: ResearchSamplingInfo;
 }
 /**
@@ -500,8 +530,29 @@ export interface ResearchExcerpts {
     truncated: boolean;
 }
 
+/**
+ * The run's identity, streamed before any work — always the first frame.
+ *
+ * `run_id` names the run for its whole life: it is what `GET /research/active`
+ * lists and what `DELETE /research/active/{run_id}` cancels. Before it existed an
+ * id arrived only with `done`, so a *running* job could not be named at all.
+ */
+export interface ResearchStarted {
+    run_id: string;
+    model: string;
+    effort: string;
+    granted_seconds: number;
+    /**
+     * `granted_seconds * 1000 + report_timeout_ms`. The two bound different phases,
+     * so this sum — not `granted_seconds` — is how long the run may take.
+     */
+    worst_case_ms: number;
+}
+
 /** One-way SSE events of a research stream (wire contract of POST /research). */
 export interface ResearchCallbacks {
+    /** Optional: a server older than the started frame never fires it. */
+    onStarted?(started: ResearchStarted): void;
     onThinking(text: string): void;
     onStep(step: ResearchStep): void;
     onProgress(progress: ResearchProgress): void;
@@ -573,6 +624,11 @@ function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
     const { event, data } = parsed;
     const d = data as Record<string, unknown>;
     switch (event) {
+        case "started":
+            // Optional on both ends: an older server never sends it, and a view
+            // that does not render the run id need not implement it.
+            cb.onStarted?.(d as unknown as ResearchStarted);
+            break;
         case "thinking":
             cb.onThinking(asString(d.text));
             break;

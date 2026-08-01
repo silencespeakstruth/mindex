@@ -10,6 +10,8 @@ use crate::backend::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::backend::http3;
 use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
+use crate::backend::v0::models::ActiveResearchResponse;
+use crate::backend::v0::models::ActiveResearchRun;
 use crate::backend::v0::models::CallDirection;
 use crate::backend::v0::models::CallSite;
 use crate::backend::v0::models::CallersResponse;
@@ -45,7 +47,9 @@ use crate::backend::v0::models::ProjectListResponse;
 use crate::backend::v0::models::ProjectStats;
 use crate::backend::v0::models::ProjectSummary;
 use crate::backend::v0::models::ReadChunksResponse;
+use crate::backend::v0::models::ResearchEffortInfo;
 use crate::backend::v0::models::ResearchFreshness;
+use crate::backend::v0::models::ResearchHealth;
 use crate::backend::v0::models::ResearchListQuery;
 use crate::backend::v0::models::ResearchPinRequest;
 use crate::backend::v0::models::ResearchRequest;
@@ -4536,6 +4540,15 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 /// citation evidence), and only *valid* runs are offered. Events (`text/event-stream`, named events with JSON
 /// `data`):
 ///
+/// - `started` `{run_id, model, effort, granted_seconds, worst_case_ms}` — always the
+///   first frame, before any work. `run_id` names this run for its whole life:
+///   `GET /research/active` lists it, `DELETE /research/active/{run_id}` cancels it,
+///   and it is the id the run will be stored under if it finishes. Previously an id
+///   existed only from `done` onwards (it was minted by the journal write), so a
+///   running job could not be named at all — and a cancelled one, which is never
+///   journalled, never could. `worst_case_ms` is `granted_seconds * 1000 +
+///   [research].report_timeout_ms`: the two bound different phases, so this sum, not
+///   `granted_seconds`, is how long the caller may wait;
 /// - `thinking` `{text}` — deltas of the model's thinking (thinking models only);
 /// - `step` `{n, action, <arg>, hits}` — one executed tool call. `action` is
 ///   `search`, `grep`, `symbols`, `outline`, `callers`, `list_files`, `read_chunks`,
@@ -4625,10 +4638,14 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   streamed is **not** a report and must be discarded, not shown.
 ///
 /// SSE comments are sent as keep-alive every 15 s. **Closing the connection
-/// cancels the research job** — that is the cancellation interface; there is no
-/// cancel endpoint. Jobs run on a small dedicated runtime; when all
-/// `[research].max_concurrent` slots are busy the request is rejected up front
-/// with **429** `research.busy`.
+/// cancels the research job** — that is still the primary cancellation interface.
+/// It is not the only one: `DELETE /research/active/{run_id}` cancels the same
+/// token, for the case the disconnect rule cannot cover — a caller that has
+/// abandoned the run while its socket is still open (an MCP client holds its
+/// connection for as long as its own read timeout allows). Jobs run on a small
+/// dedicated runtime; when all `[research].max_concurrent` slots are busy — a
+/// number `GET /config` publishes, and `GET /research/active` accounts for — the
+/// request is rejected up front with **429** `research.busy`.
 ///
 /// **How long this can take.** `max_seconds` (the effort preset, or the request's
 /// `budget`) is a *hard* deadline on the investigation, enforced by cancelling the
@@ -4650,7 +4667,11 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
     request_body = ResearchRequest,
     responses(
         (status = 200, description = "SSE stream of research events \
-(thinking/step/progress/summary/citations/excerpts/done/error). `citations` reports the server's \
+(started/thinking/step/progress/summary/citations/excerpts/done/error). `started` is always the \
+first frame and carries `run_id` — the name this run answers to for its whole life, in \
+`GET /research/active` and in `DELETE /research/active/{run_id}` — plus `worst_case_ms`, the \
+investigation deadline and the report window summed, which is the longest the caller may wait. \
+`citations` reports the server's \
 provenance check on the report's `path:start-end` references — \
 `verified`/`path_only`/`unverified` counts plus the invented paths — scored against the \
 locations this run's own tool calls returned, and its freshness check beside it: \
@@ -4731,6 +4752,13 @@ pub async fn post_research(
     let token = CancellationToken::new();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Minted here rather than at the journal insert, which is where it used to be
+    // born. A run that has no id until it ends cannot be listed, cancelled or named
+    // in a bug report while it runs — and a cancelled run, which is never
+    // journalled, had no id at all. Same uuid on the wire, in the registry and in
+    // the row.
+    let run_id = uuid::Uuid::new_v4().to_string();
+
     let params = crate::research::ResearchParams {
         question: req.question,
         model,
@@ -4796,6 +4824,7 @@ pub async fn post_research(
             Arc::new(SqliteResearchJournal {
                 db_pool: s.db_pool.clone(),
                 context: crate::db::research::RunContext {
+                    id: run_id.clone(),
                     // Simple form, like every other table. `Uuid::to_string()` is
                     // hyphenated, which nothing else in the schema uses — and a
                     // per-project metric label in that spelling would never line up
@@ -4814,11 +4843,50 @@ pub async fn post_research(
             effort,
         ));
     let job_token = token.clone();
+
+    // The longest this run may legitimately take. The two windows are separate
+    // phases, not one budget — the report gets `report_timeout_ms` *after* the
+    // investigation deadline — so neither number alone answers "how long might I
+    // wait", and the sum is what `/research/active`, `/health` and the watchdog all
+    // reason about.
+    let worst_case_ms = params
+        .budget
+        .max_seconds
+        .saturating_mul(1000)
+        .saturating_add(params.report_timeout_ms);
+
+    // Announced before the first turn, so a client holds the run's name for the
+    // whole stream rather than only at `done`.
+    let _ = tx.send(crate::research::ResearchEvent::Started {
+        run_id: run_id.clone(),
+        model: params.model.clone(),
+        effort,
+        granted_seconds: params.budget.max_seconds,
+        worst_case_ms,
+    });
+
+    let registration = s.research_registry.register(
+        run_id.clone(),
+        project_guid.0.simple().to_string(),
+        &params.question,
+        params.model.clone(),
+        effort,
+        params.budget.max_seconds,
+        worst_case_ms,
+        job_token.clone(),
+    );
+
     s.research_handle.spawn(async move {
         // The permit is held by the *work*, not by the reader: it is released when
         // this future unwinds, so an abandoned job cannot let a replacement in while
-        // it is still spending GPU and DB time. See `ResearchEventStream`.
+        // it is still spending GPU and DB time. See `SseEventStream`.
+        //
+        // The registry entry rides in the same future for the same reason, and it
+        // has to be this future specifically: held anywhere else the two would
+        // drift, and the list would either describe a slot that is free or hide one
+        // that is not.
         let _permit = permit;
+        let _registration = registration;
         crate::research::run_research(ollama, tools, journal, params, tx, job_token).await;
     });
 
@@ -5720,9 +5788,15 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
             models: catalog.models,
             models_refreshed_at: catalog.refreshed_at,
             effort: ResearchEffortLadder {
-                low: (&s.research_effort.low).into(),
-                medium: (&s.research_effort.medium).into(),
-                high: (&s.research_effort.high).into(),
+                low: ResearchEffortInfo::new(&s.research_effort.low, s.research_report_timeout_ms),
+                medium: ResearchEffortInfo::new(
+                    &s.research_effort.medium,
+                    s.research_report_timeout_ms,
+                ),
+                high: ResearchEffortInfo::new(
+                    &s.research_effort.high,
+                    s.research_report_timeout_ms,
+                ),
             },
             max_request_seconds: s.research_max_request_seconds,
             max_request_tokens: s.research_max_request_tokens,
@@ -5730,6 +5804,9 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
             max_request_report_sections: s.research_max_request_report_sections,
             max_request_report_words: s.research_max_request_report_words,
             max_evidence_width: s.research_max_evidence_width,
+            max_concurrent: s.research_max_concurrent,
+            max_context_runs: s.research_max_context_runs,
+            max_context_chars: s.research_max_context_chars,
             report_timeout_ms: s.research_report_timeout_ms,
             checkpoint_every_steps: s.research_checkpoint_every_steps,
             sampling: ResearchSamplingInfo {
@@ -6449,8 +6526,20 @@ pub async fn get_metrics(State(s): State<RouterState>) -> Result<Response, ApiEr
         s.gc_flag.load(std::sync::atomic::Ordering::Acquire),
     ));
 
+    // Both gauges, from the same read. Only `permits_available` used to be
+    // refreshed here while `research_active` was left to the collector's tick, so
+    // one scrape could report a free permit *and* an active run — two numbers that
+    // are each other's complement disagreeing inside a single response.
     let permits = s.research_semaphore.available_permits();
     m.state.research_permits_available.set(permits as i64);
+    m.state
+        .research_active
+        .set(s.research_max_concurrent.saturating_sub(permits) as i64);
+    // Free in-memory read, like the claim table above, and the one number that
+    // tells a busy slot from a wedged one.
+    m.state
+        .research_inflight_oldest_age_seconds
+        .set((s.research_registry.oldest_age_ms().unwrap_or(0) / 1000) as i64);
 
     m.db.pool_size.set(s.db_pool.size() as i64);
     m.db.pool_available.set(s.db_pool.available().await as i64);
@@ -6537,10 +6626,32 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
         Err(e) => format!("error: {e}"),
     };
 
+    // Research slots. Free reads off in-process state, so they cost nothing and are
+    // reported even when Ollama is down — the slots are mindex's own.
+    let slots_busy = s.research_registry.len();
+    let oldest_inflight_age_ms = s.research_registry.oldest_age_ms();
+    // The narrow rule: a *busy* slot is the service working, and must never read as
+    // a degradation (with `max_concurrent = 1` that would be permanent). Only a run
+    // that has outlived `max_seconds + report_timeout_ms` — every deadline it has —
+    // is a defect, and it is one worth surfacing: it is holding a slot nothing else
+    // will free until the watchdog gets to it.
+    let wedged = s.research_registry.wedged();
+    if let Some(oldest) = wedged.iter().max_by_key(|r| r.age_ms()) {
+        warn!(
+            wedged_runs = wedged.len(),
+            oldest_run_id = %oldest.run_id,
+            oldest_age_ms = oldest.age_ms(),
+            "Research runs are holding slots past their own worst case; reporting \
+             degraded. Sysadmin: see GET /research/active, and the watchdog will \
+             cancel them on its next sweep."
+        );
+    }
+
     let status = if sqlite == "ok"
         && qdrant == "ok"
         && embedder == "ok"
         && query_embedder.as_deref().unwrap_or("ok") == "ok"
+        && wedged.is_empty()
     {
         "ok"
     } else {
@@ -6558,7 +6669,100 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
             query_embedder,
             ollama,
         },
+        research: ResearchHealth {
+            slots_total: s.research_max_concurrent,
+            slots_busy,
+            oldest_inflight_age_ms,
+        },
     })
+}
+
+/// `GET /research/active` — every research run holding a concurrency permit right
+/// now, oldest first.
+///
+/// The stored-research list (`GET /projects/{guid}/research`) shows only runs that
+/// **finished**: a run has no `seq` until it is journalled, and a cancelled run is
+/// never journalled at all. So a live run was invisible everywhere — which, with
+/// `[research].max_concurrent` typically small, meant an occupied slot could not be
+/// attributed to a project, a question or an age, and could not be ended short of
+/// restarting the process. This endpoint and `DELETE /research/active/{run_id}` are
+/// the two halves of that fix.
+///
+/// Global rather than per-project, because the semaphore is: a caller planning a
+/// queue needs to know the slots are gone, not merely that none of *its* runs hold
+/// them.
+///
+/// **Concurrency:** safe — read-only, one in-memory lock, no I/O.
+#[utoipa::path(
+    get,
+    path = "/research/active",
+    tag = "Research",
+    responses((status = 200, description = "Live research runs, oldest first.", body = ActiveResearchResponse)),
+)]
+#[debug_handler]
+pub async fn get_research_active(State(s): State<RouterState>) -> Json<ActiveResearchResponse> {
+    let runs: Vec<ActiveResearchRun> = s
+        .research_registry
+        .snapshot()
+        .into_iter()
+        .map(|r| ActiveResearchRun {
+            age_ms: r.age_ms(),
+            run_id: r.run_id,
+            project_guid: r.project_guid,
+            question: r.question,
+            model: r.model,
+            effort: r.effort.to_string(),
+            started_at: r.started_at,
+            granted_seconds: r.granted_seconds,
+            worst_case_ms: r.worst_case_ms,
+        })
+        .collect();
+
+    Json(ActiveResearchResponse {
+        slots_total: s.research_max_concurrent,
+        slots_busy: runs.len(),
+        runs,
+    })
+}
+
+/// `DELETE /research/active/{run_id}` — cancel a running research job.
+///
+/// Cancellation has always been *disconnect*: dropping the SSE stream cancels the
+/// job token. That is still the mechanism — this endpoint cancels the very same
+/// token — but it was the only hand on the lever, and it is the wrong one whenever
+/// the client that opened the stream is gone while its socket is not. An
+/// MCP-shaped caller holds its connection for as long as its own read timeout
+/// allows (scout: 70 minutes), so an abandoned tool call leaves the server
+/// correctly believing a client is still waiting, with the slot spoken for and no
+/// way to say otherwise.
+///
+/// Idempotent: 204 whether or not the run was found, because "already finished" and
+/// "never existed" are the same observable state a moment later and neither is an
+/// error the caller can act on differently. The registry entry is **not** removed
+/// here — it is released by the job as it unwinds, so a cancelled run keeps
+/// (correctly) reporting its slot until it actually lets go.
+///
+/// **Concurrency:** safe — one in-memory lock, no I/O. Does **not** take an
+/// `IndexClaim` or any other lock, and is deliberately callable while the run is
+/// mid-turn.
+#[utoipa::path(
+    delete,
+    path = "/research/active/{run_id}",
+    tag = "Research",
+    params(("run_id" = String, Path, description = "Run id from the `started` event, `done`, or `GET /research/active`.")),
+    responses((status = 204, description = "Cancellation requested (or the run was already gone).")),
+)]
+#[debug_handler]
+pub async fn delete_research_active(
+    ApiPath(run_id): ApiPath<String>,
+    State(s): State<RouterState>,
+) -> StatusCode {
+    if s.research_registry.cancel(&run_id) {
+        info!(%run_id, "Cancelled a research run on request.");
+    } else {
+        info!(%run_id, "No live research run with this id; nothing to cancel.");
+    }
+    StatusCode::NO_CONTENT
 }
 
 #[cfg(test)]

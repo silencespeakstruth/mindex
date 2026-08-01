@@ -26,6 +26,14 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// projects or HTTP: whoever builds the journal already holds these.
 #[derive(Debug, Clone)]
 pub struct RunContext {
+    /// The run's identity, minted at **admission** rather than here.
+    ///
+    /// It used to be created in this function, which meant a run had no name until
+    /// the moment it ended: nothing could list it while it ran, and nothing could
+    /// cancel it by name. The id now comes from `post_research`, which registers it
+    /// in `backend::inflight::ResearchRegistry` and streams it as the `started`
+    /// event — so the id on the wire at second zero is the id in this row.
+    pub id: String,
     pub project_guid: String,
     pub effort: &'static str,
     pub seed: Option<i64>,
@@ -58,7 +66,7 @@ pub async fn insert_run(
     record: RunRecord,
     token: CancellationToken,
 ) -> Option<RecordedRun> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = ctx.id.clone();
     let retention_secs = (ctx.retention_days as i64).saturating_mul(SECONDS_PER_DAY);
     let context_run_ids =
         serde_json::to_string(&record.context_run_ids).unwrap_or_else(|_| "[]".to_string());
@@ -423,6 +431,7 @@ mod tests {
 
     fn ctx() -> RunContext {
         RunContext {
+            id: uuid::Uuid::new_v4().to_string(),
             scope_json: None,
             retention_days: 90,
             project_guid: "c2d7e2c1-3165-42f5-9366-0ff1492b4bab".into(),

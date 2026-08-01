@@ -28,11 +28,11 @@ use crate::backend::metrics::{
 };
 use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
-    delete_files, delete_history, delete_project, delete_research_run, delete_research_runs,
-    get_config, get_files, get_health, get_metrics, get_project_stats, get_projects,
-    get_research_run, get_research_runs, get_status, get_version, post_cancel, post_drift, post_gc,
-    post_history, post_index, post_research, post_research_pin, post_retry, post_search,
-    post_symbols,
+    delete_files, delete_history, delete_project, delete_research_active, delete_research_run,
+    delete_research_runs, get_config, get_files, get_health, get_metrics, get_project_stats,
+    get_projects, get_research_active, get_research_run, get_research_runs, get_status,
+    get_version, post_cancel, post_drift, post_gc, post_history, post_index, post_research,
+    post_research_pin, post_retry, post_search, post_symbols,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -116,6 +116,13 @@ pub struct RouterState {
     pub research_handle: tokio::runtime::Handle,
     /// Research admission: `[research].max_concurrent` permits; empty → 429.
     pub research_semaphore: Arc<tokio::sync::Semaphore>,
+    /// `[research].max_concurrent` itself, published by `GET /config` and
+    /// `GET /health`: without it a caller learns the limit only by being refused,
+    /// which is what makes planning a queue guesswork.
+    pub research_max_concurrent: usize,
+    /// Which runs are live right now, and the tokens that stop them. The permit
+    /// count alone says a slot is busy; this says *what* is holding it.
+    pub research_registry: crate::backend::inflight::ResearchRegistry,
     /// The Ollama chat client driving research loops.
     pub research_ollama: Arc<dyn crate::models::ollama::OllamaModel>,
     /// Model used when a research request names none ("" = none configured).
@@ -468,6 +475,16 @@ fn build_router(
         .route(
             "/projects/{project_guid}/research/{run_id}/pin",
             post(post_research_pin),
+        )
+        // Live runs, unlike the stored ones above, are not per project: the
+        // semaphore they contend for is global, and a caller planning a queue needs
+        // to know the slots are gone rather than that none of its own runs hold
+        // them. Kept off `/projects/{guid}/research` for a second reason too — that
+        // list is keyset-paged by `seq`, which a live run does not have yet.
+        .route("/research/active", get(get_research_active))
+        .route(
+            "/research/active/{run_id}",
+            axum::routing::delete(delete_research_active),
         )
         .route("/gc", post(post_gc))
         .route("/status", get(get_status))

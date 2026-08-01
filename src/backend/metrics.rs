@@ -391,6 +391,16 @@ pub struct ResearchMetrics {
     /// is wrong; `timed_out`/`skipped` mean `report_timeout_ms` is too tight for the
     /// number of sections the plans are producing.
     pub report_sections: Family<OutcomeLabels, Counter>,
+    /// Runs the watchdog cancelled because they outlived
+    /// `max_seconds + report_timeout_ms` and were therefore holding a
+    /// `max_concurrent` slot no deadline of their own was going to free.
+    ///
+    /// Expected to stay at **zero**, like `report_length_caps`: every phase of a run
+    /// is already bounded by a token, so a non-zero value means one of the awaits
+    /// that is *not* under a token has wedged (Ollama's `/api/show`, its error-body
+    /// read, or the journal write) and names the day it started happening.
+    /// Unlabelled — the actionable fact is that it happened at all.
+    pub watchdog_cancels: Counter,
 }
 
 #[derive(Clone)]
@@ -460,6 +470,12 @@ pub struct StateMetrics {
     pub indexing_claims: Gauge,
     pub research_active: Gauge,
     pub research_permits_available: Gauge,
+    /// Age of the longest-running live research run, `0` when none is running.
+    ///
+    /// `research_active` says a slot is taken; only this says whether it has been
+    /// taken for four minutes or four hours — the difference between a queue and a
+    /// wedge, and the number the `/health` verdict and the watchdog both act on.
+    pub research_inflight_oldest_age_seconds: Gauge,
     pub research_worker_threads: Gauge,
     pub build_info: Family<BuildLabels, Gauge>,
     pub start_time: Gauge,
@@ -709,6 +725,7 @@ impl Metrics {
             // is itself the finding.
             report_words: hist_family(count_hist),
             report_sections: Family::default(),
+            watchdog_cancels: Counter::default(),
         };
         registry.register(
             "research_runs",
@@ -819,6 +836,11 @@ impl Metrics {
             "research_report_sections",
             "Sections of a sectioned report, by what became of each one",
             research.report_sections.clone(),
+        );
+        registry.register(
+            "research_watchdog_cancels",
+            "Research runs cancelled by the watchdog after outliving their worst case",
+            research.watchdog_cancels.clone(),
         );
 
         // ── GC ──
@@ -936,6 +958,7 @@ impl Metrics {
             indexing_claims: Gauge::default(),
             research_active: Gauge::default(),
             research_permits_available: Gauge::default(),
+            research_inflight_oldest_age_seconds: Gauge::default(),
             research_worker_threads: Gauge::default(),
             build_info: Family::default(),
             start_time: Gauge::default(),
@@ -1024,6 +1047,11 @@ impl Metrics {
             "research_permits_available",
             "Free research concurrency permits",
             state.research_permits_available.clone(),
+        );
+        registry.register(
+            "research_inflight_oldest_age_seconds",
+            "Age of the longest-running live research run, 0 when none is running",
+            state.research_inflight_oldest_age_seconds.clone(),
         );
         registry.register(
             "research_worker_threads",
@@ -1435,6 +1463,7 @@ mod tests {
             ("mindex_research_citations_total", "counter"),
             ("mindex_research_context_used_ratio", "histogram"),
             ("mindex_research_duration_seconds", "histogram"),
+            ("mindex_research_inflight_oldest_age_seconds", "gauge"),
             ("mindex_research_permits_available", "gauge"),
             ("mindex_research_revalidations_total", "counter"),
             ("mindex_research_forced_syntheses_total", "counter"),
@@ -1454,6 +1483,7 @@ mod tests {
             ("mindex_research_report_words", "histogram"),
             ("mindex_research_transcript_truncations_total", "counter"),
             ("mindex_research_turns", "histogram"),
+            ("mindex_research_watchdog_cancels_total", "counter"),
             ("mindex_research_worker_threads", "gauge"),
             ("mindex_retry_files_total", "counter"),
             ("mindex_retry_sweeps_total", "counter"),

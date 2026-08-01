@@ -348,9 +348,10 @@ def test_progress_reports_the_budget_and_what_it_spent(
     progress = [json.loads(d) for e, d in events if e == "progress"]
     assert progress, f"a live run must report its budget consumption: {events}"
 
-    # The announcement comes first, before any model turn, and carries the
-    # *resolved* budget — the override applied to the effort preset.
-    assert events[0][0] == "progress", [e for e, _ in events]
+    # `started` names the run before any work; the budget announcement follows it,
+    # still before any model turn, and carries the *resolved* budget — the override
+    # applied to the effort preset.
+    assert [e for e, _ in events[:2]] == ["started", "progress"], [e for e, _ in events]
     first = progress[0]
     assert (first["steps"], first["tokens"], first["turns"]) == (0, 0, 0), first
     assert first["max_steps"] == 3, first
@@ -374,6 +375,84 @@ def test_progress_reports_the_budget_and_what_it_spent(
     assert done["turns"] >= 1, done
 
 
+def test_a_live_run_can_be_listed_and_cancelled_by_name(
+    client: httpx.Client, project: str, ollama_knobs: object
+) -> None:
+    """The outage this endpoint pair exists for.
+
+    A run used to be invisible while it ran: its id was minted by the journal write
+    at the very end, the stored-run list only shows finished runs, and there was no
+    cancel endpoint. With `max_concurrent = 1` an occupied slot was therefore a total
+    outage of research that could not be attributed to anything or ended short of
+    restarting the service.
+    """
+    assert index(client, project, RUST_V1).status_code == 200
+    ollama_knobs(turn_delay_secs=6.0)  # type: ignore[operator]
+
+    with client.stream(
+        "POST",
+        f"{MINDEX_URL}/v0/{project}/research",
+        json={"question": QUESTION, "effort": "low"},
+        timeout=30.0,
+    ) as resp:
+        assert resp.status_code == 200
+        # The run names itself in its first frame, before any work. The line
+        # iterator is BOUND, not consumed anonymously: breaking out of a bare
+        # `resp.iter_lines()` drops the generator, whose close() closes the whole
+        # response — httpx hangs up, and the server (correctly) reads that as a
+        # disconnect and cancels the very run this test is trying to observe.
+        lines = resp.iter_lines()
+        run_id = None
+        for line in lines:
+            if line.startswith("data:"):
+                run_id = json.loads(line[len("data:") :])["run_id"]
+                break
+        assert run_id, "the first frame must carry the run id"
+
+        # It is listed while it runs, with what it is and how long it has been going.
+        active = client.get(f"{MINDEX_URL}/research/active").json()
+        assert active["slots_busy"] == 1, active
+        assert active["slots_total"] >= 1, active
+        listed = [r for r in active["runs"] if r["run_id"] == run_id]
+        assert listed, active
+        assert listed[0]["project_guid"].replace("-", "") == project.replace("-", "")
+        assert listed[0]["age_ms"] >= 0 and listed[0]["worst_case_ms"] > 0, listed[0]
+
+        # /health says the same thing, and a busy slot is NOT a degradation.
+        health = client.get(f"{MINDEX_URL}/health").json()
+        assert health["research"]["slots_busy"] == 1, health
+        assert health["status"] == "ok", health
+
+        # And it can be ended by name, without closing this connection.
+        assert (
+            client.delete(f"{MINDEX_URL}/research/active/{run_id}").status_code == 204
+        )
+
+    ollama_knobs(turn_delay_secs=0.0)  # type: ignore[operator]
+    deadline = time.monotonic() + 10
+    while client.get(f"{MINDEX_URL}/research/active").json()["slots_busy"] > 0:
+        assert time.monotonic() < deadline, "a cancelled run never freed its slot"
+        time.sleep(0.5)
+
+
+def test_cancelling_an_unknown_run_is_not_an_error(client: httpx.Client) -> None:
+    # "Already finished" and "never existed" are the same observable state a moment
+    # later, and neither is something the caller can act on differently.
+    resp = client.delete(
+        f"{MINDEX_URL}/research/active/00000000-0000-0000-0000-000000000000"
+    )
+    assert resp.status_code == 204
+
+
+def test_health_reports_research_slots_when_idle(client: httpx.Client) -> None:
+    body = client.get(f"{MINDEX_URL}/health").json()
+    assert body["research"]["slots_total"] >= 1, body
+    assert body["research"]["slots_busy"] == 0, body
+    # Null rather than 0: nothing running is not the same as something running for
+    # no time.
+    assert body["research"]["oldest_inflight_age_ms"] is None, body
+
+
 def test_config_publishes_the_research_budgets(client: httpx.Client) -> None:
     # The clients render effort labels from this instead of their own copies —
     # three separate hardcoded ladders had drifted from the server before it.
@@ -388,6 +467,19 @@ def test_config_publishes_the_research_budgets(client: httpx.Client) -> None:
     assert research["max_request_seconds"] >= research["effort"]["high"]["max_seconds"]
     assert research["max_request_tokens"] >= research["effort"]["high"]["max_tokens"]
     assert research["max_request_steps"] >= research["effort"]["high"]["max_steps"]
+
+    # How many runs may start at once. Without it a caller learns the limit only by
+    # being refused, which is no way to plan a queue.
+    assert research["max_concurrent"] >= 1, research
+
+    # The wait a caller actually faces: the investigation deadline plus the report
+    # window, which bound different phases and were never summed anywhere.
+    for level in ("low", "medium", "high"):
+        row = research["effort"][level]
+        assert (
+            row["worst_case_seconds"]
+            == row["max_seconds"] + research["report_timeout_ms"] // 1000
+        ), row
 
 
 def test_config_publishes_the_ollama_model_catalog(client: httpx.Client) -> None:
