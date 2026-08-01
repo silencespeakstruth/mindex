@@ -160,6 +160,32 @@ details.thinking pre {
     padding: 0;
 }
 
+/*
+ * The verbatim indexed code behind the report's verified citations.
+ *
+ * Collapsed, and set apart by a rule: it is reference material rather than the
+ * answer, and a report trailing several screens of source reads as though the
+ * source were the point. The server sends it because asking the model to retype a
+ * file into the report is what makes a run fail — so it is here, and it is quiet.
+ */
+.excerpts {
+    margin-top: 18px;
+    border-top: 1px solid var(--mx-border);
+    padding-top: 8px;
+}
+
+.excerpts > summary {
+    cursor: pointer;
+    color: var(--vscode-descriptionForeground);
+}
+
+.excerpt-path {
+    margin-top: 10px;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
 #toolbar {
     margin-top: 16px;
 }

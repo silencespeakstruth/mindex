@@ -112,7 +112,14 @@ _USAGE_KEYS = (
 # same check and was sent back for correction. The counts above always describe the
 # report that shipped, so these are the only way to tell a report that was right
 # the first time from one that had to be repaired.
+# `server_written` has to be read BEFORE any of the counts. A report the server
+# assembled (the report window expired before the model produced one) contains no
+# `path:start-end` at all, so it scores total/verified/unverified = 0 — byte-for-byte
+# what a perfectly clean report scores, in the one field this layer tells the caller
+# to trust. Field reports of "verified: 0 even though it read the files" are that
+# collision and nothing else.
 _CITATION_KEYS = (
+    "server_written",
     "total",
     "verified",
     "path_only",
@@ -125,6 +132,10 @@ _CITATION_KEYS = (
     "draft_stale",
     "revalidation_steps",
 )
+
+# Fields kept from one entry of the `excerpts` event: the indexed code at a verified
+# citation, verbatim, read from the index rather than written by the model.
+_EXCERPT_KEYS = ("path", "start_line", "end_line", "code")
 
 # mindex's `done` event says why the loop stopped. Anything but "finalized" means
 # the report was written on partial evidence, and the caller — who is told not to
@@ -258,12 +269,35 @@ needs something it didn't cover — ASK SCOUT AGAIN. Send a sharper, narrower fo
 is missing. Follow-ups are cheap and they are the intended path. What you must
 never do instead is fall back to investigating it yourself.
 
-The ONLY thing the raw `mindex` tools (`search`, `symbols`) are for, once you
-have a report, is fetching the verbatim text of a specific location the report
-already cited, when you are about to EDIT that code and need it byte-exact.
-Fetch that one spot and nothing more. Using them to explore, to survey, to
-double-check the report, or to answer a question you could have asked scout is
-off-limits.
+WHEN YOU NEED THE LITERAL TEXT, the server already has it — do not ask the report
+for it. The indexed code at every verified citation is on the server's side of the
+wire, and the result tells you so in `excerpts_available`. Ask for it by calling
+`research` again with `include_excerpts=True`, and you get `excerpts` — path, line
+range and verbatim code — for one SQL read and no model tokens. This is the right
+answer to "reproduce this config file", "show me the exact rule text", "what does
+that function actually say". It is NOT the default, because two dozen chunks is
+~100 KB of your context and this server exists to keep that out; ask when you
+genuinely need the bytes.
+
+What you must never do is put that job in the question. Asking a report to
+reproduce files verbatim is the most reliable way to make a run fail: the local
+model's ceiling is on how much it can WRITE, not on how much it can read, and a
+question that demands pages of transcription burns the whole budget and returns
+nothing. Ask what something does; take the bytes from `excerpts`.
+
+That also shrinks what the raw `mindex` tools (`search`, `symbols`) are for. Once
+you have a report, they are the fallback for a byte-exact location the excerpt
+channel did not carry, when you are about to EDIT that code. Fetch that one spot
+and nothing more. Using them to explore, to survey, to double-check the report, or
+to answer a question you could have asked scout is off-limits.
+
+ONE MORE FIELD THAT IS NOT OPINION: `citations.server_written`. When it is true the
+report is not the model's at all — the report window expired and the server
+assembled one from what the run had. Such a report cites nothing, so it scores
+`total: 0, verified: 0, unverified: 0`, which is exactly what a flawless report
+scores. Read the flag, not the counts: "verified 0" with `server_written` false
+means the model wrote ungrounded prose; with it true it means there was no model
+report at all, and the right move is to ask again.
 
 How to call it: pass the project GUID from the repo-root `.mindex` file and ONE
 clear question in `question` (a full question, not keywords — the local model
@@ -311,6 +345,7 @@ async def research(
     exclude: dict[str, Any] | None = None,
     budget: dict[str, Any] | None = None,
     context_run_ids: list[str] | None = None,
+    include_excerpts: bool = False,
 ) -> dict:
     """Investigate the codebase and return a report — without spending your tokens.
 
@@ -331,8 +366,17 @@ async def research(
     already established instead of rediscovering the same file names, which is where
     a cold run spends its first steps.
 
+    NEED THE LITERAL TEXT of something the report cites? Call this again with
+    ``include_excerpts=True`` and the same question, or read ``excerpts_available``
+    on the result: the server holds the indexed code at every verified citation and
+    hands it over verbatim for one SQL read and no model tokens. That is cheaper
+    than `mindex.search`, and far cheaper than asking a report to reproduce a file —
+    which is the single most reliable way to make a run fail. Never open the files
+    yourself.
+
     The raw `mindex` tools are only for pulling the byte-exact text of a location
-    this report already cited, immediately before you edit that code.
+    this report already cited when the excerpt channel did not carry it,
+    immediately before you edit that code.
 
     Args:
         project_guid: The project's mindex GUID (from the repo-root .mindex file).
@@ -362,6 +406,12 @@ async def research(
             rediscovering names, and they are NOT evidence: the local model is told it
             may not cite them, and anything it copies from one is reported back as
             ``unverified``. The server caps how many may be given.
+        include_excerpts: Return the verbatim indexed code at every verified
+            citation, not just the count of it. Default False on purpose: two dozen
+            chunks is ~100 KB landing in YOUR context, which is the cost this server
+            exists to prevent. Set it when you actually need the literal text —
+            about to edit that code, or reproducing a config/schema file — and leave
+            it off when you only need to understand something.
 
     Returns ``{"report", "steps": [{n, action, query|name|path|glob, hits}],
     "elapsed_ms", "done_reason", "usage"}``. ``steps`` is just the trace of what
@@ -384,6 +434,12 @@ async def research(
     ``run_id`` (with a short per-project ``seq``) names the stored report. Pass it as
     ``context_run_ids`` on a follow-up so the next run reads this one first. Absent
     when the server could not store the run, which only means it cannot be referenced.
+
+    ``excerpts_available`` counts the verified citations whose verbatim indexed code
+    the server is holding. With ``include_excerpts=True`` that code comes back in
+    ``excerpts`` as ``[{path, start_line, end_line, code}]`` (``excerpts_truncated``
+    if the server's caps dropped some). This is how you get literal text — never by
+    asking the report to reproduce it.
     """
     question = question.strip()
     if not question:
@@ -414,6 +470,8 @@ async def research(
     steps: list[dict[str, Any]] = []
     usage: dict[str, Any] = {}
     citations: dict[str, Any] = {}
+    excerpts: list[dict[str, Any]] = []
+    excerpts_truncated = False
     elapsed_ms = 0
     done_reason: str | None = None
     run_id: str | None = None
@@ -485,6 +543,19 @@ async def research(
                         for k, v in data.items()
                         if k in _CITATION_KEYS and v is not None
                     }
+                elif event == "excerpts":
+                    # The indexed code at the verified citations, read from the
+                    # index by the server. Collected always, RETURNED only on
+                    # request: two dozen chunks is ~100 KB into the caller's
+                    # context, which is the exact cost this server exists to
+                    # prevent. What always goes back is the count, so the caller
+                    # knows the text is one cheap re-ask away.
+                    excerpts = [
+                        {k: v for k, v in item.items() if k in _EXCERPT_KEYS}
+                        for item in data.get("excerpts", [])
+                        if isinstance(item, dict)
+                    ]
+                    excerpts_truncated = bool(data.get("truncated", False))
                 elif event == "error":
                     failure = f"{data.get('code', 'error')}: {data.get('detail', '')}"
                 # `thinking` deltas are deliberately dropped: they are the local
@@ -535,6 +606,23 @@ async def research(
         out["run_id"] = run_id
         if run_seq is not None:
             out["seq"] = run_seq
+    # The count always; the bytes only when asked for. This asymmetry is the whole
+    # design: the caller learns the literal text exists and is one cheap re-ask away,
+    # without ~100 KB of it arriving unbidden in a layer whose entire purpose is to
+    # keep that out.
+    if excerpts:
+        out["excerpts_available"] = len(excerpts)
+        if include_excerpts:
+            out["excerpts"] = excerpts
+            if excerpts_truncated:
+                out["excerpts_truncated"] = True
+        else:
+            out["excerpts_hint"] = (
+                f"The server holds the verbatim indexed code at "
+                f"{len(excerpts)} verified citation(s). Ask for it with "
+                f"include_excerpts=True rather than reading the files or "
+                f"calling mindex.search."
+            )
     # Echoed back so a report read later knows what it was allowed to see. A scoped
     # report and an unscoped one are otherwise the same document, and the scoped one
     # can only speak about its scope.

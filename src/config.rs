@@ -134,6 +134,25 @@ const DEFAULT_RESEARCH_MAX_REQUEST_STEPS: usize = 200;
 /// answer were already getting five hits per search and losing on query
 /// formulation, not on evidence width. Kept as a knob so a harness can sweep it.
 const DEFAULT_RESEARCH_SEARCH_TOP_K: u64 = 5;
+/// Floor on a non-zero `[research.effort.*].max_report_words`.
+///
+/// Below this the instruction stops shaping a report and starts forbidding one:
+/// the model writes a stub, the run's whole cost is spent, and the caller gets
+/// less than the plan it already had. `0` — announce no length at all — is the
+/// supported way to disable the ceiling; a tiny number is a mistake.
+pub const MIN_REPORT_WORDS: usize = 150;
+/// Tokens reserved per granted report word when arming `num_predict` on the
+/// report turn.
+///
+/// Deliberately ~3× the honest prose ratio (~1.3-1.5 tokens/word, higher inside
+/// code fences). `num_predict` is a **runaway** backstop, not the ceiling — the
+/// ceiling is the word count in the prompt. Sizing it tight would make a report
+/// that merely overshoots get cut mid-fence, which fails
+/// `validate_report_markdown` and buys a full-volume rewrite of the document
+/// that just failed: a long run turned into a lost one. So it must be
+/// unreachable by anything but a genuine runaway, and `research_report_length_caps`
+/// firing at all means this number (or the model) is wrong.
+pub const REPORT_WORDS_TO_TOKENS: u64 = 4;
 /// Per-turn transport ceiling, set **above every research budget on purpose** so it
 /// can never fire first.
 ///
@@ -583,6 +602,27 @@ pub struct EffortBudget {
     /// research loop inside that cap: it builds `SearchRequest` directly and never
     /// passes through the request-validation layer.
     pub search_top_k: u64,
+    /// Ceiling, in words, announced to the model for the final report. `0` = say
+    /// nothing about length (the behaviour before this knob existed).
+    ///
+    /// The one axis that is about **output** rather than input. It exists because
+    /// retrieval is not where a research run fails: a field report over a real
+    /// project found the loop locating the right files every time and failing at
+    /// the report turn, deterministically by request shape — a broad question with
+    /// five sub-questions failed, the same question narrowed to one file with a
+    /// word limit succeeded in minutes. Nothing in the prompt had ever mentioned
+    /// length, so the de-facto size of a report was `PLAN_REQUEST`'s "3-6
+    /// sub-questions" multiplied by whatever the model felt like writing.
+    ///
+    /// A ceiling, not a target — the prompt says so — and it also drives
+    /// `num_predict` on the report turn as a runaway backstop. Deliberately **not**
+    /// overridable per request, for `context_fraction`'s reason: every value a
+    /// caller would pick is "bigger", and bigger is the failure.
+    ///
+    /// The numbers are unmeasured. `0` is what makes that honest: the whole
+    /// mechanism reverts from config while a harness sweeps for where the cliff
+    /// actually is, which is certainly per-model.
+    pub max_report_words: usize,
 }
 
 /// Prometheus exposition and the state-gauge collector.
@@ -800,6 +840,12 @@ impl Default for EffortBudgets {
         // 20 → 48 was measured to change nothing (median depth 16 → 16, citations
         // 60 → 32), which is precisely why time and tokens are the budgets and a step
         // is not.
+        //
+        // `max_report_words` is the newest axis and the only unmeasured one. It rises
+        // with the ladder because a deeper run has more to say, not because 1800 was
+        // observed anywhere; the field report that motivated it establishes only the
+        // direction (shrinking the required answer is what worked) and not the cliff.
+        // Sweep it per model before trusting any of these three numbers.
         Self {
             low: EffortBudget {
                 max_seconds: 300,
@@ -807,6 +853,7 @@ impl Default for EffortBudgets {
                 context_fraction: 0.5,
                 max_steps: 8,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
+                max_report_words: 400,
             },
             medium: EffortBudget {
                 max_seconds: 900,
@@ -814,6 +861,7 @@ impl Default for EffortBudgets {
                 context_fraction: 0.7,
                 max_steps: 20,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
+                max_report_words: 900,
             },
             high: EffortBudget {
                 max_seconds: 3600,
@@ -821,6 +869,7 @@ impl Default for EffortBudgets {
                 context_fraction: 0.85,
                 max_steps: 64,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
+                max_report_words: 1800,
             },
         }
     }
@@ -1401,6 +1450,30 @@ impl Config {
                     b.search_top_k, self.search.max_top_k
                 ));
             }
+            // Zero is the sanctioned "say nothing about length" setting, so only a
+            // small *non-zero* value is a mistake.
+            if b.max_report_words > 0 && b.max_report_words < MIN_REPORT_WORDS {
+                e.push(format!(
+                    "[research.effort.{level}].max_report_words = {} cannot hold an answer to a \
+                     research question, so the run would spend its whole budget investigating and \
+                     then be told to write a stub. Fix: use at least {MIN_REPORT_WORDS} (defaults \
+                     400/900/1800), or 0 to announce no length at all.",
+                    b.max_report_words
+                ));
+            }
+            // The report turn shares one window with the transcript it is written
+            // from. Reserving more than half of it for generation means the evidence
+            // cannot fit beside the report it is supposed to produce.
+            let report_tokens = b.max_report_words as u64 * REPORT_WORDS_TO_TOKENS;
+            if report_tokens >= self.research.max_num_ctx_tokens / 2 {
+                e.push(format!(
+                    "[research.effort.{level}].max_report_words = {} reserves about {} tokens for \
+                     generation, which is at least half of [research].max_num_ctx_tokens = {} — \
+                     the evidence would not fit in the window it has to share with the report. \
+                     Fix: lower max_report_words, or raise max_num_ctx_tokens.",
+                    b.max_report_words, report_tokens, self.research.max_num_ctx_tokens
+                ));
+            }
         }
         if self.research.retention_days < 1 {
             e.push(
@@ -1719,13 +1792,54 @@ mod tests {
         );
 
         // Switching the feature off makes the same numbers harmless.
+        //
+        // The report budgets go with it, and that is the new rule working rather
+        // than a fixture patched to be quiet: a 4096-token window genuinely cannot
+        // hold the default 900-word report *and* the evidence it is written from, so
+        // an operator who shrinks the window for VRAM is told to shrink this too.
         let off = parse(
             "[research]\nmax_num_ctx_tokens = 4096\nmax_context_runs = 0\n\
-             max_context_chars = 65536\n",
+             max_context_chars = 65536\n\
+             [research.effort.low]\nmax_report_words = 0\n\
+             [research.effort.medium]\nmax_report_words = 0\n\
+             [research.effort.high]\nmax_report_words = 0\n",
         )
         .expect("parses");
         off.validate()
             .expect("an unused context cap must not fail startup");
+    }
+
+    /// A window this small cannot hold the report *and* what the report is written
+    /// from, and the two keys are set in different places by different people — an
+    /// operator lowering `max_num_ctx_tokens` for VRAM has no reason to look at the
+    /// effort ladder. Startup is where that collision is cheap to find.
+    #[test]
+    fn a_report_budget_that_cannot_share_the_window_is_refused() {
+        let cfg = parse("[research]\nmax_num_ctx_tokens = 4096\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_report_words") && m.contains("max_num_ctx_tokens")),
+            "the error must name both keys: {err:?}"
+        );
+    }
+
+    /// Below the floor the instruction stops shaping a report and starts forbidding
+    /// one: the run spends its whole budget investigating and is then told to write
+    /// a stub. `0` is the supported way to say "announce no length"; a tiny number
+    /// is a mistake, and the message has to say which of the two the operator wants.
+    #[test]
+    fn a_report_word_budget_too_small_is_refused() {
+        let cfg = parse("[research.effort.low]\nmax_report_words = 20\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_report_words = 20") && m.contains("or 0 to announce")),
+            "{err:?}"
+        );
+        // Zero is not a small number here, it is the off switch.
+        let off = parse("[research.effort.low]\nmax_report_words = 0\n").expect("parses");
+        off.validate().expect("0 switches the ceiling off");
     }
 
     /// The silence guard has to sit strictly between "long prompt evaluation" and

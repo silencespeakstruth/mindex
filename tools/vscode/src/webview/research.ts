@@ -62,6 +62,11 @@ interface Step {
 }
 
 interface Citations {
+    /**
+     * The report came from the server, not the model — the report window expired.
+     * It cites nothing, so every count below reads as a flawless report would.
+     */
+    server_written?: boolean;
     total: number;
     unverified: number;
     unverified_paths?: string[];
@@ -71,12 +76,26 @@ interface Citations {
     draft_path_only?: number | null;
 }
 
+interface Excerpt {
+    path: string;
+    start_line: number;
+    end_line: number;
+    code: string;
+}
+
+interface Excerpts {
+    excerpts: Excerpt[];
+    total: number;
+    truncated: boolean;
+}
+
 type Incoming =
     | { type: "thinking"; text: string }
     | { type: "step"; step: Step }
     | { type: "progress"; progress: Progress }
     | { type: "summary"; text: string }
     | { type: "citations"; citations: Citations }
+    | { type: "excerpts"; excerpts: Excerpts }
     | { type: "done"; info: Done }
     | { type: "error"; detail: string; code?: string }
     | { type: "cancelled" };
@@ -148,6 +167,8 @@ let currentThinking: HTMLDetailsElement | null = null;
 let markdown = "";
 /** The server's citation verdict, held until `done` builds the report markup. */
 let citations: Citations | null = null;
+/** Verbatim code for the report's verified citations, appended after it renders. */
+let excerpts: Excerpts | null = null;
 let renderQueued = false;
 
 // ── budget meter ─────────────────────────────────────────────────────────────
@@ -264,6 +285,39 @@ function prependNote(glyph: string, text: string): void {
     report.prepend(note);
 }
 
+/**
+ * The indexed code behind the report's verified citations, appended below it.
+ *
+ * Collapsed by default: it is reference material, not the answer, and a report
+ * followed by several screens of source reads as though the source were the point.
+ * Built with DOM nodes and `textContent` rather than through `marked` — this is
+ * code from the index, and round-tripping it through a Markdown parser would let a
+ * fenced block inside a source file end the fence that was supposed to contain it.
+ */
+function renderExcerpts(data: Excerpts): void {
+    if (data.excerpts.length === 0) {
+        return;
+    }
+    const box = document.createElement("details");
+    box.className = "excerpts";
+    const head = document.createElement("summary");
+    head.textContent =
+        `Cited code — ${data.excerpts.length} location(s), read from the index` +
+        (data.truncated ? " (some were too large to include)" : "");
+    box.appendChild(head);
+    for (const e of data.excerpts) {
+        const label = document.createElement("div");
+        label.className = "excerpt-path";
+        label.textContent = `${e.path}:${e.start_line}-${e.end_line}`;
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        code.textContent = e.code;
+        pre.appendChild(code);
+        box.append(label, pre);
+    }
+    report.appendChild(box);
+}
+
 function renderStep(step: Step): void {
     const div = document.createElement("div");
     div.className = "step";
@@ -323,6 +377,12 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
             citations = msg.citations;
             break;
         }
+        case "excerpts": {
+            // Held for the same reason as `citations`: `done` replaces the report
+            // markup wholesale, so anything appended before it would be lost.
+            excerpts = msg.excerpts;
+            break;
+        }
         case "done": {
             closeThinking();
             // "done" repeats every progress field, so the meter freezes on the run's
@@ -343,12 +403,31 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
                 status.title = `prompt ${msg.info.prompt_version}`;
             }
             report.innerHTML = marked.parse(markdown) as string;
+            // After the parse that replaces the markup, before the notes that
+            // prepend to it: the excerpts belong below the report, the warnings
+            // above it.
+            if (excerpts !== null) {
+                renderExcerpts(excerpts);
+            }
             // Anything but "finalized" means the model was stopped rather than
             // satisfied, so the report rests on partial evidence. Say so above it —
             // the reader cannot tell from the prose.
             const cutShort = CUT_SHORT[msg.info.reason ?? ""];
             if (cutShort !== undefined) {
                 prependNote("warning", cutShort);
+            }
+            // Before any count, because it changes what they mean. A server-written
+            // report cites nothing, so it scores zero unverified and zero stale —
+            // exactly what a flawless report scores. Without this line the reader
+            // sees a clean citation record on a report no model wrote.
+            if (citations !== null && citations.server_written === true) {
+                prependNote(
+                    "warning",
+                    "The report window expired before the model wrote anything, so this " +
+                        "report was assembled by the server from what the run had found. " +
+                        "It cites nothing — the citation counts below say zero because " +
+                        "there was nothing to check, not because everything checked out."
+                );
             }
             // Only the failure is worth screen space. A fully verified report is the
             // expected case, and saying so every time trains the reader to ignore the

@@ -470,6 +470,10 @@ async fn main() -> Result<(), BoxError> {
                     temperature: cfg.research.temperature,
                     top_p: cfg.research.top_p,
                     seed: cfg.research.seed,
+                    // Not config: `write_report` arms it from the effort level's
+                    // `max_report_words`, and only for the turn that writes the
+                    // report. Every other turn sends no `num_predict` at all.
+                    num_predict: None,
                 },
                 research_models: research_models.clone(),
                 metrics: metrics.clone(),

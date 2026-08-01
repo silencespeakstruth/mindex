@@ -72,10 +72,10 @@ streams a Markdown report. Non-obvious invariants:
   request's `seed` overrides config. `PROMPT_VERSION` (`research.rs`) rides on
   `done` and into the journal; **bump it on any edit to `system_prompt`,
   `PLAN_REQUEST`, `SUFFICIENCY_REQUEST`, `REVALIDATION_SYSTEM_PROMPT`,
-  `format_citation_complaint`, `REPORT_SYSTEM_PROMPT`, either report turn's
-  user message, the budget nudges or `tool_specs`** — nothing else on the
-  stream says which instructions were in force. The run-state note is in scope
-  for its *labels* only.
+  `format_citation_complaint`, `REPORT_ROLE`/`report_system_prompt`, either
+  report turn's user message, the budget nudges or `tool_specs`** — nothing
+  else on the stream says which instructions were in force. The run-state note
+  is in scope for its *labels* only.
 - **Citations are provenance-checked server-side** (`parse_citations` →
   `Evidence` → `CitationReport`, the `citations` event between `summary` and
   `done`). Every `path:start-end` is bucketed against what the run's own tools
@@ -615,7 +615,7 @@ streams a Markdown report. Non-obvious invariants:
 - **The report turn passes no tools at all** — the field is *omitted*, not
   sent empty, so there is structurally nothing to call (on the old protocol ~1
   run in 5 answered "write the report" with one more tool call). It swaps in
-  `REPORT_SYSTEM_PROMPT` (a writer role). Two backstops for a model that
+  `report_system_prompt` (a writer role). Two backstops for a model that
   writes JSON anyway: the **content gate** in `chat_turn` withholds a reply
   whose first non-whitespace char is `{` (`is_withheld` tells the caller
   nothing reached the client, making a re-ask safe), and a second such reply
@@ -633,6 +633,132 @@ streams a Markdown report. Non-obvious invariants:
   which limit binds. Wire contract (`done_reason_wire_values_are_stable`).
   Scout surfaces `done_reason` + an `incomplete` hint. Adding a `break` means
   adding a variant.
+
+## Output volume is where runs fail (2026-08-01)
+
+A field report from a real investigation on another project, run through
+mindex + scout, is the source for everything in this section. Its finding is
+sharp and one-sided: **retrieval never failed, writing always did.** The loop
+found the right files every time — the step traces confirm it even in the
+failed runs, and the author never once had to supply a path. Every failure
+landed in the report phase, and the shape of the request predicted it:
+
+- a broad question (five sub-questions, "list everything") → failed;
+- "reproduce these three JSON files verbatim" → failed 5 times running, across
+  efforts and across `context_run_ids`;
+- one file + numbered short questions + a word limit → succeeded, in minutes.
+
+Symptoms were `done_reason: repeated_calls`, `unparseable`, and empty final
+reports; one 15-minute run returned nothing at all. The author's own summary:
+*"the bottleneck is the writing model, not the index. Ollama collapsed under
+output volume, not read volume. Raising `num_ctx` does not help — only
+shrinking the required answer does."*
+
+Reading the code against that report corrected two natural assumptions and
+turned up one defect nobody had named.
+
+**Nothing had ever bounded the output.** `REPORT_SYSTEM_PROMPT` and
+`report_request` carried no length, section or word instruction, and `Sampling`
+had three fields — `num_predict` was never sent on any turn of any run. The
+de-facto size of a report was `PLAN_REQUEST`'s "3-6 sub-questions" times
+whatever the model felt like writing. So `[research.effort.*].max_report_words`
+(400/900/1800, `0` = off) now rides in the prompt as a **ceiling** — "at most",
+never "about", because a target makes a model write to the number — and arms
+`num_predict` at `REPORT_WORDS_TO_TOKENS` (4) × the grant.
+
+That multiplier is ~3× the honest prose ratio on purpose. `num_predict` is a
+runaway backstop, not the ceiling: Ollama cuts at a token, so a tight value
+severs a code fence, fails `validate_report_markdown`, and buys a full-volume
+rewrite of the document that just failed — a long run turned into a lost one.
+`research_report_length_caps` firing at all therefore means the multiplier or
+the model is wrong. Having the server close a dangling fence was rejected: the
+heading is the one defect the server repairs, and a closed fence over a
+sentence that stops mid-word passes the gate and is still unusable.
+
+**`verified: 0 / unverified: 0` was `forced_synthesis` on the wire.** This is
+the defect the report surfaced without naming. The `citations` event is sent
+unconditionally, and for a server-written report `check_citations` runs over a
+notice that by construction contains no `path:start-end` — so it scores
+`total: 0, verified: 0, unverified: 0`, byte-for-byte what a flawless report
+scores, in the exact field scout tells the caller to trust. Every "verified 0
+even though it read the files" observation is that collision. The fix is a wire
+field, **not** a gate change: `citations.server_written`, sourced from the flag
+the journal has always recorded. The fact existed; it just never reached the
+wire.
+
+**The ungrounded gate's length exemption was too wide.** `< 800 chars` stays
+for a run the *budget* stopped — it had no chance to gather more, and demanding
+citations from it demands a fabrication — but a run that `Finalized` declared
+its own evidence sufficient, so a short uncited report from it is a
+self-contradiction rather than the honest short version.
+
+**`grep` could not say how much it searched.** It already distinguished
+out-of-scope, but "the literal is absent" and "nothing here was searchable"
+shared one sentence — so a glob matching no file read as proof of absence. That
+is exactly how the same literal is honestly reported 0 times by one run and 5
+times by the next, which the field report saw and could not resolve.
+`GrepResponse` now carries `searched_chunks`/`searched_files`, read with one
+extra `COUNT` **only on a miss** (the `out_of_scope` probe's rule: pay for the
+second scan where it changes the answer), and `format_grep`'s empty branch is
+three-way — the `file_history` three-flag honesty, expressed as counts.
+
+**The report turn's prompt was measured by nothing.** `context_fraction` guards
+*between* turns and against the *previous* turn's size; the report turn runs
+after the loop breaks, adds the notes block, and in the repair path carries the
+whole draft plus a complaint — the largest prompt of the run. It now gets an
+`estimate_prompt_tokens` check and `shed_for_report`, which drops the
+prior-reports block first (hearsay, never citable, its value already spent),
+then oldest tool replies, each **replaced by a naming stub, never removed** —
+the pairing invariant is absolute, and a turn announcing three calls followed
+by two replies is a malformed transcript. The instructions, question, plan,
+notes, verdict, digest and request are never shed.
+
+Two honest caveats on that guard. `CHARS_PER_TOKEN_ESTIMATE` (4) comes from
+prose and code tokenizes denser; log the estimate against the turn's real
+`prompt_tokens` before trusting it. And measured on this host a run's peak
+prompt was ~12k against a 65k window, so `research_report_context_sheds` may
+stay at zero forever — in which case this is insurance, and its correctness has
+to be *tested* (fabricated transcript, tiny window), not measured. Rebuilding
+the report turn from `Evidence` alone was rejected for the same reason: it is
+the cleaner architecture, but it changes what the model sees on **every** run,
+including the ~100% that already fit.
+
+An **evidence digest** is pushed unconditionally before the report request —
+paths and merged spans, no code. It is what the system prompt has always
+claimed sits below it, it is what `check_citations` actually scores against,
+and it is what makes shedding safe: a tool result can be dropped without
+dropping the citability of what it showed.
+
+**The excerpt channel is the answer to "reproduce these three files".** That
+request has no good form: it asks the model to retype pages of exact text, and
+transcription volume is precisely what breaks. But the server already holds the
+bytes — `Evidence` has the paths and spans, SQLite has the code — so the new
+`excerpts` event (between `citations` and `done`) ships the indexed code at
+every **verified** citation for one SQL read and no GPU. `path_only` and
+`unverified` citations are excluded: they name no location worth reading, and
+attaching real bytes would dress up a claim the check just refused. Read
+through `read_chunks_core`, so the run's scope is enforced — this must never
+become how a scoped run hands over bytes its scope refused. Caps drop **whole
+chunks**, never cut one.
+
+That channel is what makes the prompt's new "do NOT reproduce code you were
+shown" sentence honest rather than a demand the caller pays for; the two ship
+together. Scout returns `excerpts_available` always and the bytes only under
+`include_excerpts=True` — two dozen chunks is ~100 KB into the caller's
+context, the exact cost scout exists to prevent, and defaulting it on would
+invert that layer's economics overnight.
+
+`PROMPT_VERSION` 1.3 → **1.4**, MINOR: the job — read this evidence, write one
+cited report — is unchanged; only how it is asked for is.
+
+**What is unmeasured, and must not be reasoned about.** 400/900/1800 are
+guesses: the field report establishes the direction (shrinking the answer is
+what worked) and not the cliff, which is certainly per-model — sweep
+`max_report_words` at fixed effort/seed/model and score completion rate.
+Whether announcing a budget changes anything at all is the open question
+`research_report_words{model}` exists to answer; if granted and actual turn out
+uncorrelated, the prompt half of the knob is dead weight and only `num_predict`
+earns its place.
 
 ### What was measured (2026-07-28)
 

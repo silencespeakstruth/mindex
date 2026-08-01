@@ -3485,12 +3485,44 @@ pub(crate) async fn grep_core(
     );
     let unscoped_binds = [
         Bind::Guid(project_guid),
-        Bind::Path(model_id),
+        Bind::Path(model_id.clone()),
         Bind::Path(format!("%{}%", like_escape(pattern))),
     ];
 
+    // How much was in reach at all — the same scope and glob, minus the pattern.
+    //
+    // Read only on a miss, the `out_of_scope` probe's rule: a second scan of the
+    // biggest column in the schema is worth paying for exactly when it changes the
+    // answer, and on a hit it changes nothing. It changes a great deal on a miss:
+    // "no indexed chunk contains this" and "nothing here was searchable" are
+    // different facts and were reported with the same sentence, so a glob that
+    // matched no file read as proof that a literal does not exist. That is the
+    // `file_history` three-flag problem in counter form — and it is what makes one
+    // run report 0 occurrences of a string another run finds five times.
+    let (cov_scope_sql, mut cov_binds) = scope_subquery(project_guid, scope, 1);
+    let mut cn = cov_binds.len() + 1;
+    let (c_guid, c_model) = (cn, cn + 1);
+    cn += 2;
+    cov_binds.push(Bind::Guid(project_guid));
+    cov_binds.push(Bind::Path(model_id));
+    let cov_glob_clause = match glob {
+        Some(g) => {
+            cov_binds.push(Bind::Path(g.to_string()));
+            format!(" AND c.file_path GLOB ?{cn}")
+        }
+        None => String::new(),
+    };
+    let coverage_sql = format!(
+        "SELECT COUNT(*), COUNT(DISTINCT c.file_path)
+         FROM project_file_chunks c
+         WHERE c.project_guid = ?{c_guid} AND c.model_id = ?{c_model}
+           AND c.status = 'active'
+           AND c.file_path IN ({cov_scope_sql}){cov_glob_clause}"
+    );
+
     let owned_pattern = pattern.to_string();
-    let (rows, total, all): (Vec<GrepMatch>, u64, u64) = s
+    #[allow(clippy::type_complexity)]
+    let (rows, total, all, coverage): (Vec<GrepMatch>, u64, u64, Option<(u64, u64)>) = s
         .db_pool
         .transaction(token.child_token(), move |tx| {
             let mut stmt = tx.prepare(&sql)?;
@@ -3528,7 +3560,16 @@ pub(crate) async fn grep_core(
                     }
                 })
                 .collect();
-            Ok((matches, total, all))
+            let coverage = if total == 0 {
+                Some(
+                    tx.query_row(&coverage_sql, params_from_iter(cov_binds.iter()), |r| {
+                        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+                    })?,
+                )
+            } else {
+                None
+            };
+            Ok((matches, total, all, coverage))
         })
         .await
         .map_err(|e| {
@@ -3544,6 +3585,8 @@ pub(crate) async fn grep_core(
         matches: rows,
         total,
         out_of_scope: all.saturating_sub(total),
+        searched_chunks: coverage.map(|c| c.0),
+        searched_files: coverage.map(|c| c.1),
     })
 }
 
@@ -4479,9 +4522,9 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 /// - `summary` `{text}` — the final Markdown report. Streamed as deltas when the
 ///   report was rewritten after its citation check; sent as one event otherwise,
 ///   because the first draft is withheld until that check has run;
-/// - `citations` `{total, verified, path_only, unverified, unverified_paths, stale,
-///   stale_paths, draft_unverified, draft_path_only, draft_stale,
-///   revalidation_steps}` —
+/// - `citations` `{server_written, total, verified, path_only, unverified,
+///   unverified_paths, stale, stale_paths, draft_unverified, draft_path_only,
+///   draft_stale, revalidation_steps}` —
 ///   emitted once, after the report and before `done`: the server's provenance
 ///   check on the report's `path:start-end` references, scored against the
 ///   locations this run's own tool calls actually returned. `verified` = the path
@@ -4502,7 +4545,24 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   with the offending locations named and, for a run that stopped by choice
 ///   rather than by budget, the tools briefly re-opened so it could read what it
 ///   had cited blindly or what had moved. Their presence is what distinguishes a
-///   report that was right the first time from one that was repaired;
+///   report that was right the first time from one that was repaired.
+///   `server_written` says the report was not the model's: the report window
+///   expired and the server assembled one. Read it before the counts — a
+///   server-written report contains no `path:start-end`, so it always scores
+///   `total: 0, verified: 0, unverified: 0`, which is byte-for-byte what a clean
+///   report scores. Without this flag those two are indistinguishable, and "verified
+///   0 even though it read the files" is exactly that confusion;
+/// - `excerpts` `{excerpts: [{path, start_line, end_line, code}], total, truncated}`
+///   — emitted once between `citations` and `done`, and only when the report has at
+///   least one **verified** citation: the indexed code at those locations,
+///   verbatim. The server already holds these bytes, so this costs one SQL read and
+///   no model tokens — which is the point. Asking the model to reproduce a file in
+///   its report is the most reliable way to make it fail, so the report cites and
+///   the server quotes. Only verified citations are shipped (a `path_only` or
+///   `unverified` one names no location worth reading), the run's scope is enforced
+///   on every read, and the caps drop whole chunks rather than cutting one —
+///   `truncated` says some code did not fit. Best-effort: a read failure costs the
+///   excerpt, never the run, so the event may be absent or short;
 /// - `done` `{reason, prompt_version, run_id, seq, …every `progress` field}` — completion
 ///   (closes the stream), carrying the run's final cost as well as
 ///   `steps`/`elapsed_ms`. `prompt_version` identifies the generation of the
@@ -4556,7 +4616,7 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
     request_body = ResearchRequest,
     responses(
         (status = 200, description = "SSE stream of research events \
-(thinking/step/progress/summary/citations/done/error). `citations` reports the server's \
+(thinking/step/progress/summary/citations/excerpts/done/error). `citations` reports the server's \
 provenance check on the report's `path:start-end` references — \
 `verified`/`path_only`/`unverified` counts plus the invented paths — scored against the \
 locations this run's own tool calls returned, and its freshness check beside it: \
@@ -4564,7 +4624,16 @@ locations this run's own tool calls returned, and its freshness check beside it:
 while the run was reading (indexing is never blocked by research, so a verified citation can \
 still describe replaced code). Its \
 `draft_unverified`/`draft_path_only`/`draft_stale`/`revalidation_steps` fields are null \
-unless the first draft failed those checks and was sent back for correction. `progress` \
+unless the first draft failed those checks and was sent back for correction. Read \
+`server_written` before any of the counts: it says the report window expired and the server \
+assembled the report, which therefore cites nothing and scores `total: 0, verified: 0, \
+unverified: 0` — byte-for-byte what a clean report scores, and indistinguishable from it \
+without the flag. `excerpts` follows `citations` when the report has at least one verified \
+citation and carries the indexed code at those locations verbatim \
+(`{path, start_line, end_line, code}`), so a caller needing a file's literal text gets it \
+from the index rather than by asking the model to retype it into the report; scope is \
+enforced, caps drop whole chunks, `truncated` says some did not fit, and the whole event is \
+best-effort. `progress` \
 reports budget consumption during the run (steps/time/tokens/context plus `binding`, the \
 axis closest to exhaustion); `done` repeats those fields and adds a `reason` — `finalized`, \
 or one of \

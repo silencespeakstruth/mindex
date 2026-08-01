@@ -731,6 +731,21 @@ pub struct GrepResponse {
     /// [`SymbolsResponse::out_of_scope_definitions`].
     #[serde(skip_serializing_if = "is_zero")]
     pub out_of_scope: u64,
+    /// How much was in reach when the search found nothing: chunks searched, and
+    /// the files they came from. `None` on a hit — the second scan is only worth
+    /// paying for when it changes the answer.
+    ///
+    /// It changes the answer a great deal on a miss. "No indexed chunk contains
+    /// this" and "nothing here was searchable" are different facts and were
+    /// reported with one sentence, so a glob matching no file, or a scope holding
+    /// none, read as proof that a literal does not exist anywhere. Two runs of the
+    /// same question could then honestly report 0 and 5 occurrences of the same
+    /// string. `file_history` answers this with three flags; `grep`'s version of
+    /// the same honesty is a count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub searched_chunks: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub searched_files: Option<u64>,
 }
 
 /// One literal match: the chunk that contains it, plus the line the match itself is
@@ -1576,6 +1591,12 @@ pub struct ResearchEffortInfo {
     /// — published because a measurement harness must record what produced a run,
     /// and this is the one evidence-width knob that changes the answer.
     pub search_top_k: u64,
+    /// Word ceiling announced to the model for the final report; `0` = no length
+    /// is announced. Published for the same reason as `search_top_k` and not
+    /// overridable for the same reason as `context_fraction`: every value a caller
+    /// would choose is "bigger", and an over-long report is the failure this
+    /// bounds.
+    pub max_report_words: usize,
 }
 
 impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
@@ -1586,6 +1607,7 @@ impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
             max_steps: b.max_steps,
             context_fraction: b.context_fraction,
             search_top_k: b.search_top_k,
+            max_report_words: b.max_report_words,
         }
     }
 }

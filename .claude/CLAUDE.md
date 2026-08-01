@@ -178,7 +178,7 @@ current consts; both nullable, and NULL never matches. `post_search` returns
 the *way* something is produced changed; MAJOR = its *shape* did. All compared
 by plain equality, never ordered — both halves trigger the identical rebuild.
 The set: `CHUNKS_DERIVATION_VERSION`, `SYMBOLS_DERIVATION_VERSION` (both
-`"1.0"`), `PROMPT_VERSION` (`"1.3"`). Deliberately outside it:
+`"1.0"`), `PROMPT_VERSION` (`"1.4"`). Deliberately outside it:
 `COLLECTION_SCHEMA_VERSION` (`"v1"`, a collection-*name* component) and the
 migration `i32` in `PRAGMA user_version`.
 
@@ -329,10 +329,33 @@ is the `research_runs` table.) The hard invariants:
   appended to `include` (a union — the run could search out of its scope).
 - **Bump `PROMPT_VERSION`** (`research.rs`) on any edit to `system_prompt`,
   `PLAN_REQUEST`, `SUFFICIENCY_REQUEST`, `REVALIDATION_SYSTEM_PROMPT`,
-  `format_citation_complaint`, `REPORT_SYSTEM_PROMPT`, either report turn's
-  user message, the budget nudges or `tool_specs`. Sampling
+  `format_citation_complaint`, `REPORT_ROLE`/`report_system_prompt`, either
+  report turn's user message, the budget nudges or `tool_specs`. Sampling
   (`temperature/top_p/seed`) is `Option` — absent = model default; a request's
   `seed` overrides config.
+- **Output volume, not retrieval, is where runs fail** (measured in the field;
+  full record in `docs/claude/research.md`). Nothing had ever bounded the
+  report: no length in any prompt, and `num_predict` sent on no turn ever.
+  `[research.effort.*].max_report_words` (400/900/1800, `0` = off) is announced
+  as a **ceiling** — "at most", never "about" — and arms `num_predict` at
+  `REPORT_WORDS_TO_TOKENS` (4) × the grant, ~3× the prose ratio so only a
+  runaway meets it: a tight cut severs a fence, fails the markdown gate, and
+  buys a full-volume rewrite of what just failed. Not request-overridable, for
+  `context_fraction`'s reason. The numbers are **unmeasured**; `0` is what
+  keeps that honest.
+- **The report turn's prompt is guarded too.** `context_fraction` only checks
+  *between* turns against the *previous* turn's size, so the run's largest
+  prompt (report turn + notes, or the rewrite with the whole draft) went
+  unmeasured. `estimate_prompt_tokens` + `shed_for_report`: prior reports go
+  first (hearsay, never citable), then oldest `role:"tool"` replies, each
+  **replaced by a naming stub, never removed** (the pairing invariant is
+  absolute); instructions/question/plan/notes/verdict/digest/request are never
+  shed, and the shed is announced in the prompt. `tally.num_ctx == 0` skips the
+  guard rather than substituting the configured ceiling. An **evidence digest**
+  (paths + merged spans, no code) is pushed unconditionally — it is what
+  `check_citations` scores against, and what makes shedding safe.
+  `CHARS_PER_TOKEN_ESTIMATE` (4) is prose-derived and code tokenizes denser;
+  this path may never fire on this hardware, so test it, don't measure it.
 - **Citations are provenance-checked server-side** (`parse_citations` →
   `Evidence` → `CitationReport`; the `citations` event): `verified` /
   `path_only` / `unverified`; range existence deliberately unchecked; parser
@@ -344,7 +367,28 @@ is the `research_runs` table.) The hard invariants:
   failed rewrite ships the draft; draft counts ride as `draft_*`, null when no
   repair. An **ungrounded** report (`total: 0`) also trips the gate
   (`format_ungrounded_complaint`), with two load-bearing exemptions:
-  `evidence.paths()` empty, or under `MIN_GROUNDED_REPORT_CHARS` (800).
+  `evidence.paths()` empty, or under `MIN_GROUNDED_REPORT_CHARS` (800) **from a
+  budget-stopped run only** — a run that `Finalized` declared its evidence
+  sufficient, so a short uncited report from it is a self-contradiction.
+- **`citations.server_written` is not a nicety.** A `forced_synthesis` report
+  cites nothing by construction, so `check_citations` scores it
+  `total: 0, verified: 0, unverified: 0` — byte-for-byte what a clean report
+  scores, in the field scout tells callers to trust. Every "verified 0 even
+  though it read the files" is that collision. The flag comes from the same
+  `RunTools.forced_synthesis` the journal already recorded; the fact existed
+  and never reached the wire.
+- **The `excerpts` event ships code, so the model never has to.** Between
+  `citations` and `done`: the indexed code at every **verified** citation,
+  verbatim, via `read_chunks_core` (pure SQL, **scope-enforced** — this must
+  not become how a scoped run leaks refused bytes). `path_only`/`unverified`
+  are excluded (no location worth reading; real bytes would dress up a refused
+  claim). `MAX_EXCERPT_CITATIONS` 24 / `MAX_EXCERPT_BYTES` 256 KiB, enforced by
+  dropping **whole chunks** — never cutting one, since a report and its code
+  are both arbitrary UTF-8. Best-effort: a failure costs the excerpt, never the
+  run. This is what makes the prompt's "do NOT reproduce code you were shown"
+  honest; the two ship together. Scout returns `excerpts_available` always and
+  the bytes only under `include_excerpts=True` (~100 KB is the cost scout
+  exists to prevent).
 - **Indexing is never blocked by research; the run reports what moved.**
   Per-file consistency holds (the prepare tx is atomic); currency:
   `probe_freshness` re-reads `baseline_sha` per shown path before every turn +
@@ -470,7 +514,14 @@ is the `research_runs` table.) The hard invariants:
   (`MAX_NOTES` 24, `MAX_NOTE_CHARS` 500). **`grep`** is a case-insensitive
   `LIKE` over `project_file_chunks.code` (`grep_core`); **`like_escape` is
   mandatory** (`_` is a wildcard); reports line + chunk span; bounded by the
-  scope subquery, `GREP_LIMIT`, `GREP_MIN_PATTERN_CHARS`. FTS5 deferred.
+  scope subquery, `GREP_LIMIT`, `GREP_MIN_PATTERN_CHARS`. FTS5 deferred. **An
+  empty result has three meanings, not one** — out-of-scope, nothing
+  searchable, genuinely absent — so `GrepResponse` carries
+  `searched_chunks`/`searched_files` (one extra `COUNT` over the same scope
+  subquery, read **only on a miss**, the `out_of_scope` probe's rule) and
+  `format_grep`'s empty branch is three-way. A glob matching no file used to
+  read as proof of absence, which is how one run honestly reports 0 hits for a
+  literal the next finds 5 times.
 - **`callers` is deliberately approximate** (no target column;
   `parent_name` by byte-span containment; `direction: "out"` via
   `idx_project_file_symbols_parent`); the collision/alias caveat is repeated
@@ -520,9 +571,13 @@ is the `research_runs` table.) The hard invariants:
   `progress_wire_fields_are_stable`,
   `done_event_carries_the_reason_and_the_run_cost_on_the_wire`,
   `done_names_no_run_when_the_journal_write_failed`,
-  `each_action_names_its_argument_on_the_wire`. `done` carries nullable
+  `each_action_names_its_argument_on_the_wire`,
+  `citations_wire_fields_are_stable`,
+  `a_server_written_report_says_so_on_the_wire`. `done` carries nullable
   `run_id`/`seq` (null when the journal write failed; rendered as "not
-  saved" in VS Code).
+  saved" in VS Code). Event order after the report is fixed:
+  `summary` → `citations` → `excerpts` (only with a verified citation) →
+  `done`.
 - **A stream ending without a terminal event is a failure**:
   `SseEventStream` synthesises one `error` (`internal.error`) when the
   channel closes without `done`/`error` (a detached-job panic otherwise reads
@@ -934,6 +989,16 @@ defect. Paired rendering rules: a handful of events a day is drawn as **bars**
 with a `sum` legend; a quantile over a rare histogram as **points with gaps
 kept**; a share-of-total stat needs `or vector(0)` (the healthy case is that
 the `unverified` series does not exist).
+
+**Three families exist to answer one open question**: does announcing a length
+ceiling change what a model writes? `research_report_words{model}` against the
+granted `max_report_words` is the measurement — if they are uncorrelated, the
+prompt half of that knob is dead weight and only `num_predict` earns its place.
+`research_report_length_caps` is expected to stay at **zero** (any value means
+`REPORT_WORDS_TO_TOKENS` or the model is wrong, and a cut landed mid-token);
+`research_report_context_sheds` may legitimately stay at zero forever on this
+hardware, in which case the shed path is insurance and should be described as
+such rather than as a mechanism.
 
 **What is deliberately not measured.** Per-project code bytes as a gauge
 (`SUM(LENGTH(code))` full-scans the biggest column every tick and evicts the

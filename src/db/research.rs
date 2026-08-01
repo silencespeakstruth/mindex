@@ -328,6 +328,7 @@ mod tests {
                 context_fraction: 0.7,
                 max_steps: 20,
                 search_top_k: 5,
+                max_report_words: 900,
             },
             reason: DoneReason::Finalized,
             steps: 3,
@@ -346,6 +347,8 @@ mod tests {
                 unverified_paths: vec!["src/nope.rs".into()],
                 stale_paths: vec!["src/gc.rs".into()],
                 cited_paths: vec!["src/gc.rs".into(), "src/nope.rs".into()],
+                // Not journalled — the excerpt channel's input, not the record's.
+                verified_locations: Vec::new(),
             },
             staleness: RunStaleness {
                 changed_files: 1,

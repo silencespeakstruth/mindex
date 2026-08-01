@@ -412,6 +412,17 @@ export interface ResearchRunDetail extends ResearchRunSummary {
  * of the report is anchored in locations the investigation actually retrieved.
  */
 export interface ResearchCitations {
+    /**
+     * The report was written by the *server*, not the model: the report window
+     * expired first. Read this before any of the counts. A server-written report
+     * contains no `path:start-end`, so it always scores `total: 0, verified: 0,
+     * unverified: 0` — byte-for-byte what a flawless report scores, and
+     * indistinguishable from one without this flag.
+     *
+     * Optional because a server older than the flag simply omits it; treat a
+     * missing value as false, which is what it was before.
+     */
+    server_written?: boolean;
     total: number;
     /** Path and an overlapping line range were both shown to the model. */
     verified: number;
@@ -440,6 +451,31 @@ export interface ResearchCitations {
     /** Tool calls the correction pass spent re-reading what the draft cited. */
     revalidation_steps: number | null;
 }
+
+/** One location's indexed code, shipped verbatim beside the report that cites it. */
+export interface ResearchExcerpt {
+    path: string;
+    start_line: number;
+    end_line: number;
+    code: string;
+}
+
+/**
+ * The indexed code at every verified citation, emitted once between `citations`
+ * and `done` — and only when the report has at least one.
+ *
+ * The server already holds these bytes, so quoting them costs one query and no
+ * model tokens. That is the point: asking a report to reproduce a file is the most
+ * reliable way to make a run fail, so the report cites and the server quotes.
+ */
+export interface ResearchExcerpts {
+    excerpts: ResearchExcerpt[];
+    /** Verified citations found, before the server's caps. */
+    total: number;
+    /** Some code did not fit the caps; whole chunks were dropped, never cut. */
+    truncated: boolean;
+}
+
 /** One-way SSE events of a research stream (wire contract of POST /research). */
 export interface ResearchCallbacks {
     onThinking(text: string): void;
@@ -447,6 +483,8 @@ export interface ResearchCallbacks {
     onProgress(progress: ResearchProgress): void;
     onSummary(text: string): void;
     onCitations(citations: ResearchCitations): void;
+    /** Optional: a server older than the excerpt channel never fires it. */
+    onExcerpts?(excerpts: ResearchExcerpts): void;
     onDone(info: ResearchDone): void;
     /** A server-side failure after the stream started (HTTP status was already 200). */
     onError(code: string, detail: string): void;
@@ -525,6 +563,11 @@ function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
             break;
         case "citations":
             cb.onCitations(d as unknown as ResearchCitations);
+            break;
+        case "excerpts":
+            // Optional on both ends: an older server never sends it, and a view
+            // that does not render it need not implement it.
+            cb.onExcerpts?.(d as unknown as ResearchExcerpts);
             break;
         case "done":
             cb.onDone(d as unknown as ResearchDone);

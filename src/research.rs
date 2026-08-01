@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::backend::error::ApiError;
 use crate::backend::v0::handlers::{GREP_MIN_PATTERN_CHARS, research_title};
@@ -41,7 +41,7 @@ use crate::models::ollama::{
 /// [`SUFFICIENCY_REQUEST`], the re-open nudge that follows it,
 /// [`REVALIDATION_SYSTEM_PROMPT`], [`format_citation_complaint`],
 /// [`format_ungrounded_complaint`], [`format_markdown_complaint`],
-/// [`REPORT_SYSTEM_PROMPT`], either report turn's
+/// [`REPORT_ROLE`] or [`report_system_prompt`], either report turn's
 /// user message, the
 /// budget-exhausted nudges, [`format_prior_reports`], or [`tool_specs`] — anything
 /// that changes what the model is asked or what it may call. The run-state note counts too, but only its
@@ -54,7 +54,13 @@ use crate::models::ollama::{
 /// Nothing ever compares this one — it is pure provenance — so the split between
 /// the two numbers is the only thing that gives it meaning: MINOR for reworded
 /// instructions, MAJOR for a run that asks the model to do a different job.
-pub const PROMPT_VERSION: &str = "1.3";
+///
+/// 1.3 → 1.4: the report turn learned a length ceiling, a section shape taken from
+/// the plan, an evidence digest, a shed notice, a cut-off notice on the rewrite, and
+/// the anti-speculation rule that used to reach only truncated runs; `grep`'s spec
+/// gained a sentence about what an empty result means. MINOR: the job — read this
+/// evidence, write one cited report — is unchanged; only how it is asked for is.
+pub const PROMPT_VERSION: &str = "1.4";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -185,6 +191,14 @@ pub struct Budget {
     /// validated against `[search].max_top_k` at startup (research builds its
     /// `SearchRequest` directly and so never meets the request validator).
     pub search_top_k: u64,
+    /// Word ceiling announced to the report turn, and the source of its
+    /// `num_predict`. `0` = announce nothing, the behaviour before this existed.
+    ///
+    /// Not a budget axis either — nothing stops on it — but it is the only axis
+    /// about **output**, and output is where runs were measured to fail: the loop
+    /// found the right files every time and then failed to write them up. Like
+    /// `context_fraction`, it never comes from the request.
+    pub max_report_words: usize,
 }
 
 impl Budget {
@@ -192,7 +206,8 @@ impl Budget {
     ///
     /// A partial override keeps the preset for every axis it does not name, so
     /// `{"max_seconds": 60}` shortens the run without silently deepening anything
-    /// else. `context_fraction` never comes from the request — see the struct docs.
+    /// else. `context_fraction` and `max_report_words` never come from the request
+    /// — see the struct docs.
     ///
     /// The overrides are range-checked at the edge (`validate::research_budget`),
     /// so by the time they get here they are within `[research].max_request_*`.
@@ -207,6 +222,7 @@ impl Budget {
             context_fraction: preset.context_fraction,
             max_steps: over.max_steps.unwrap_or(preset.max_steps),
             search_top_k: preset.search_top_k,
+            max_report_words: preset.max_report_words,
         }
     }
 }
@@ -403,9 +419,39 @@ pub enum ResearchEvent {
     /// `revalidation` is present only when that report is a *corrected* one, and
     /// says what the draft had got wrong — without it, a clean report and a
     /// repaired one look identical on the wire.
+    ///
+    /// `server_written` says the report was not the model's at all — the report
+    /// window expired and the server assembled one. That distinction was invisible
+    /// here for its whole life, and its absence is a real defect rather than a
+    /// missing nicety: a server-written report contains no `path:start-end`, so
+    /// `check_citations` scores it `total: 0, verified: 0, unverified: 0` — byte-for-byte
+    /// what a clean report emits, in the exact field a caller is told to trust.
+    /// Field reports of "verified: 0 / unverified: 0 even though it read the files"
+    /// are this, and nothing else.
     Citations {
         report: CitationReport,
         revalidation: Option<Revalidation>,
+        server_written: bool,
+    },
+    /// The indexed code at every **verified** citation, verbatim. Emitted once,
+    /// after `citations` and before `done`.
+    ///
+    /// The server already has these bytes — the paths and spans are in `Evidence`
+    /// and the code is in SQLite — so shipping them costs one query and no GPU. What
+    /// it buys is the thing the loop could not do: a caller who wants a file's
+    /// literal text used to have to make the *model* retype it into the report,
+    /// which is precisely the output-volume failure this generation is about. Now
+    /// the report cites and the server quotes.
+    ///
+    /// Verified citations only. A `path_only` or `unverified` citation names no
+    /// location worth reading, and attaching real bytes to one would dress up a
+    /// claim the provenance check has just refused.
+    Excerpts {
+        excerpts: Vec<ReportExcerpt>,
+        /// Verified citations found, before the caps. `truncated` says some of
+        /// their code did not fit.
+        total: usize,
+        truncated: bool,
     },
     /// The run's final state and full cost. Carries every `progress` field, so a
     /// consumer that only reads `done` still gets the whole record.
@@ -519,6 +565,7 @@ impl ResearchEvent {
             ResearchEvent::Progress { .. } => "progress",
             ResearchEvent::Summary { .. } => "summary",
             ResearchEvent::Citations { .. } => "citations",
+            ResearchEvent::Excerpts { .. } => "excerpts",
             ResearchEvent::Done { .. } => "done",
             ResearchEvent::Error { .. } => "error",
         }
@@ -546,7 +593,9 @@ impl ResearchEvent {
             ResearchEvent::Citations {
                 report,
                 revalidation,
+                server_written,
             } => json!({
+                "server_written": server_written,
                 "total": report.total,
                 "verified": report.verified,
                 "path_only": report.path_only,
@@ -565,6 +614,23 @@ impl ResearchEvent {
                 "draft_path_only": revalidation.map(|r| r.draft_path_only),
                 "draft_stale": revalidation.map(|r| r.draft_stale),
                 "revalidation_steps": revalidation.map(|r| r.steps),
+            }),
+            ResearchEvent::Excerpts {
+                excerpts,
+                total,
+                truncated,
+            } => json!({
+                "total": total,
+                "truncated": truncated,
+                "excerpts": excerpts
+                    .iter()
+                    .map(|e| json!({
+                        "path": e.path,
+                        "start_line": e.start_line,
+                        "end_line": e.end_line,
+                        "code": e.code,
+                    }))
+                    .collect::<Vec<Value>>(),
             }),
             ResearchEvent::Done {
                 progress,
@@ -1297,7 +1363,10 @@ fn tool_specs() -> Vec<ToolSpec> {
              for an error code, a config key, a magic number, a log message, a string \
              literal, or any token `symbols` does not know because the language's tags \
              query never tagged it. Case-insensitive substring match; wildcards are NOT \
-             interpreted, the pattern is taken literally. At least 3 characters.",
+             interpreted, the pattern is taken literally. At least 3 characters. An \
+             empty result says how much it searched, so \"the text is not there\" and \
+             \"nothing here was searchable\" read differently — do not report the \
+             second as the first.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1663,13 +1732,41 @@ const NO_TOOLS: &[ToolSpec] = &[];
 /// (a bare JSON action, prose forbidden) will keep producing it unless told the
 /// game has changed. Stating the new role is cheaper and more reliable than
 /// arguing with the old instruction from a user message.
-const REPORT_SYSTEM_PROMPT: &str = "You are a technical writer. Below is a research \
+const REPORT_ROLE: &str = "You are a technical writer. Below is a research \
     question about a codebase and the evidence a research agent gathered for it — \
     code excerpts, symbol locations and file outlines. Your only job now is to write \
     the report. You have NO tools: there is nothing left to call, and any JSON you \
     emit would be discarded. Write Markdown prose, grounded in the evidence, citing \
     locations as `path:start-end`. Begin with a single `# heading` that names the \
     finding.";
+
+/// [`REPORT_ROLE`] plus the length ceiling, when the effort level sets one.
+///
+/// The second paragraph exists because output volume, not retrieval, is where runs
+/// were measured to fail: the loop found the right files every time and then failed
+/// to write them up, deterministically by how broad the question was. Nothing in the
+/// prompt had ever mentioned length.
+///
+/// Two things it is careful about. It says **at most**, not "about": a target makes a
+/// model write to the number, and the whole finding is that shorter answers survive.
+/// And it forbids reproducing code — which is only honest because the server ships
+/// the verbatim text of every verified citation itself, on the `excerpts` event. That
+/// sentence and that event must ship together; without the channel this would be a
+/// demand that the caller pay for what the run already had.
+fn report_system_prompt(budget: Budget) -> String {
+    if budget.max_report_words == 0 {
+        return REPORT_ROLE.to_string();
+    }
+    format!(
+        "{REPORT_ROLE}\n\nLENGTH IS PART OF THE TASK. Write AT MOST {} words. That is a \
+         ceiling, not a target: a shorter report that answers the question is a better \
+         report, and a long one is the failure this instruction exists to prevent. Do \
+         NOT reproduce code you were shown — the server ships the verbatim text of every \
+         location you cite alongside your report, so quoting it buys the reader nothing \
+         and costs you the report. Cite the location and say what it does.",
+        budget.max_report_words
+    )
+}
 
 /// The report turn's user message: the standing instruction, plus a truncation
 /// preamble when the run did not finish on its own terms.
@@ -1689,16 +1786,57 @@ fn report_request(
     state: &RunState,
     budget: Budget,
     elapsed: Duration,
+    shed: usize,
 ) -> String {
-    let base = "The investigation is over and the tools are closed. Write the final report \
+    let mut base = String::from(
+        "The investigation is over and the tools are closed. Write the final report \
          answering the original research question, using only the evidence above. \
          Output a complete, self-contained Markdown document (headings, code spans \
          where useful) and NOTHING else — no JSON, no tool call, no preamble. Cite \
          evidence as `path:start-end`, and cite only locations a tool returned in \
-         this run. If the evidence was insufficient, say so explicitly and state \
-         what is missing.";
+         this run.",
+    );
+    // The shape clause needs both halves to mean anything: a per-section word
+    // allowance without a plan to divide by is a number with no denominator, and a
+    // plan with no ceiling is what the run already had.
+    if budget.max_report_words > 0
+        && let Some(sections) = state.plan_item_count()
+    {
+        base.push_str(&format!(
+            "\n\nShape it like this: a `# heading`, then one `##` section per sub-question \
+             of your plan, in the plan's order, and nothing else. Keep the whole document \
+             under {} words — roughly {} per section. Where a sub-question was not \
+             answered, say so in its section in one line rather than filling it.",
+            budget.max_report_words,
+            (budget.max_report_words / sections.max(1)).max(1)
+        ));
+    }
+    // The anti-speculation rule used to live only in the truncated branch, so a run
+    // that finished on its own terms was never told not to guess — and a report that
+    // reasoned from a naming convention and presented it as a finding is exactly what
+    // that omission buys.
+    base.push_str(
+        "\n\nGround every claim: state what the evidence shows, and where a claim rests on \
+         inference rather than on something a tool returned, say so in the sentence that \
+         makes it. Do not pad a gap with what you would expect the code to do. If the \
+         evidence was insufficient, say so explicitly and state what is missing.",
+    );
+    // Silence about a shed transcript is Ollama's failure mode restated in Rust: the
+    // model would find holes where results used to be and have no way to know whether
+    // it may still cite what they showed. It may — that is the whole point of the
+    // digest — and it has to be told so.
+    if shed > 0 {
+        base.push_str(
+            "\n\nNOTE FROM THE SERVER: some of the tool output above was removed to make \
+             room for this turn. Nothing you may cite was lost — the list headed \
+             \"Evidence: every location this run was shown\" is complete, and it is the \
+             full set of locations that will pass the citation check. Where a removed \
+             result is what a claim rested on, cite the location and describe it from \
+             your notes rather than quoting it.",
+        );
+    }
     if !reason.is_truncated() {
-        return base.to_string();
+        return base;
     }
     let limit = match reason {
         // Named in minutes, and the elapsed time alongside it: a model told only
@@ -1725,13 +1863,15 @@ fn report_request(
         ),
         None => String::new(),
     };
+    // "Do not pad the gaps" used to live here as well; it now sits in `base`, which
+    // every report gets. What stays is the part only a truncated run needs: not
+    // presenting an unfinished finding as a settled one.
     format!(
         "IMPORTANT: this investigation did NOT finish — it was stopped by {limit}. Begin \
          the report by saying so in one sentence, so nobody reads it as a complete \
          answer. Then report what you did establish, and be explicit about which parts \
          of the question remain open and what you would have looked at next. Do not \
-         present a partial finding as a settled one, and do not pad the gaps with what \
-         you would expect the code to do.{plan}\n\n{base}"
+         present a partial finding as a settled one.{plan}\n\n{base}"
     )
 }
 
@@ -1836,6 +1976,30 @@ struct RunState {
 }
 
 impl RunState {
+    /// How many numbered sub-questions the plan states, if it states any.
+    ///
+    /// `PLAN_REQUEST` asks for 3-6 numbered lines, and models comply often enough
+    /// for this to be worth reading — but not reliably enough to depend on, so
+    /// every caller must handle `None`. Counts a line whose first non-space
+    /// characters are digits followed by `.` or `)`; anything else is prose the run
+    /// wrapped its plan in.
+    ///
+    /// Scanned by `char_indices` rather than by byte offset: a plan is model output,
+    /// hence arbitrary UTF-8, and slicing it by byte is the panic this codebase has
+    /// already paid for once.
+    fn plan_item_count(&self) -> Option<usize> {
+        let plan = self.plan.as_deref()?;
+        let n = plan
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                let digits = t.chars().take_while(char::is_ascii_digit).count();
+                digits > 0 && matches!(t.chars().nth(digits), Some('.') | Some(')'))
+            })
+            .count();
+        (n > 0).then_some(n)
+    }
+
     /// Record an action that is about to execute. Duplicates never reach here —
     /// they are rejected upstream — so the lists stay short by construction.
     fn record(&mut self, action: &Action) {
@@ -2701,12 +2865,36 @@ enum Verdict {
     Unverified,
 }
 
+/// One chunk of indexed code, shipped verbatim beside the report that cites it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportExcerpt {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub code: String,
+}
+
+/// Verified citations the excerpt channel will read code for.
+///
+/// A report that cites forty locations is not asking for forty files to be pasted
+/// after it; past this point the channel has stopped being a convenience and become
+/// a second copy of the index.
+const MAX_EXCERPT_CITATIONS: usize = 24;
+
+/// Total bytes of code the excerpt channel will ship.
+///
+/// Enforced by dropping **whole chunks**, never by cutting one. A report is
+/// arbitrary UTF-8 and so is the code beside it; slicing either by byte is the panic
+/// this codebase has already paid for once, and a chunk cut mid-token is not a
+/// smaller excerpt but a wrong one.
+const MAX_EXCERPT_BYTES: usize = 262_144;
+
 /// A `path:start-end` reference parsed out of a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Citation {
-    path: String,
-    start: usize,
-    end: usize,
+pub struct Citation {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 /// How many of a report's citations the run's own tool results support.
@@ -2732,6 +2920,15 @@ pub struct CitationReport {
     /// way.
     pub stale_paths: Vec<String>,
     pub cited_paths: Vec<String>,
+    /// The citations that came back `Verified` — the report's own claim about where
+    /// it got something, checked against what the run's tools actually returned.
+    ///
+    /// Not on the wire and not journalled: it exists so the excerpt channel can ship
+    /// the *code* at those locations without re-parsing the report or re-deriving
+    /// the verdicts. `Verified` only, deliberately — a `path_only` or `unverified`
+    /// citation names no location worth reading, and shipping bytes for it would
+    /// dress up a claim the check just refused.
+    pub verified_locations: Vec<Citation>,
 }
 
 /// Distinct `unverified_paths` (and `stale_paths`) reported. Enough to act on,
@@ -2860,7 +3057,12 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
     };
     for c in &citations {
         match evidence.verdict(c) {
-            Verdict::Verified => r.verified += 1,
+            Verdict::Verified => {
+                r.verified += 1;
+                if !r.verified_locations.contains(c) {
+                    r.verified_locations.push(c.clone());
+                }
+            }
             Verdict::PathOnly => r.path_only += 1,
             Verdict::Unverified => {
                 r.unverified += 1;
@@ -2886,6 +3088,76 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
         }
     }
     r
+}
+
+/// Read the indexed code at every verified citation, for the `excerpts` event.
+///
+/// Best-effort by construction: every failure is a `warn!` and a shorter list, never
+/// an error. The report has already shipped, and a run must not be turned into a
+/// failure by the convenience channel that follows it.
+///
+/// Scope is enforced because `read_chunks` enforces it — this channel must never
+/// become the way a scoped run hands over bytes its scope refused. Deduplicated by
+/// `(path, chunk span)`: several citations into one chunk are one excerpt, which is
+/// also why the caps are counted over chunks rather than over citations.
+async fn collect_excerpts(
+    tools: &dyn ResearchTools,
+    params: &ResearchParams,
+    citations: &CitationReport,
+    token: &CancellationToken,
+) -> (Vec<ReportExcerpt>, usize, bool) {
+    let total = citations.verified_locations.len();
+    let mut out: Vec<ReportExcerpt> = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated = total > MAX_EXCERPT_CITATIONS;
+    for c in citations
+        .verified_locations
+        .iter()
+        .take(MAX_EXCERPT_CITATIONS)
+    {
+        if token.is_cancelled() {
+            return (out, total, true);
+        }
+        let resp = match tools
+            .read_chunks(c.path.clone(), c.start, c.end, &params.scope, token)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    path = %c.path,
+                    "Failed to read the code for a verified citation; the report ships \
+                     without that excerpt."
+                );
+                truncated = true;
+                continue;
+            }
+        };
+        for chunk in resp.chunks {
+            if out
+                .iter()
+                .any(|x| x.path == c.path && x.start_line == chunk.start_line)
+            {
+                continue;
+            }
+            // Whole chunks only: the byte cap drops the next one rather than
+            // cutting this one in half.
+            if bytes + chunk.code.len() > MAX_EXCERPT_BYTES {
+                truncated = true;
+                continue;
+            }
+            bytes += chunk.code.len();
+            out.push(ReportExcerpt {
+                path: c.path.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                code: chunk.code,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.start_line.cmp(&b.start_line)));
+    (out, total, truncated)
 }
 
 /// The report's first ATX heading, as the stored display title.
@@ -3053,20 +3325,42 @@ fn out_of_scope_reply(path: &str, scope: &ToolScope) -> String {
 
 /// Literal matches, with the line each one is on.
 fn format_grep(pattern: &str, resp: &GrepResponse, scope: &ToolScope) -> String {
+    // An empty result has three meanings and used to have one sentence — the
+    // `file_history` three-flag problem, in counter form. The middle branch is the
+    // one that was missing: a glob matching no file, or a scope holding none, is not
+    // evidence about the pattern at all, and reporting it as "no chunk contains
+    // this" is how the same literal is honestly reported absent by one run and found
+    // five times by the next.
     if resp.matches.is_empty() {
-        return if resp.out_of_scope > 0 {
-            format!(
+        if resp.out_of_scope > 0 {
+            return format!(
                 "No occurrence of \"{pattern}\" within this run's scope ({}), though {} \
                  exist outside it.",
                 scope.describe(),
                 resp.out_of_scope
-            )
-        } else {
-            format!(
+            );
+        }
+        if resp.searched_files == Some(0) {
+            return format!(
+                "Nothing here was searchable: no indexed chunk was in reach of this \
+                 search. This is NOT a fact about \"{pattern}\" — the files it would \
+                 live in are out of reach, so do not read it as \"the text does not \
+                 exist\". Check the glob you passed, or say in your report that the \
+                 text is not reachable from this index."
+            );
+        }
+        return match (resp.searched_chunks, resp.searched_files) {
+            (Some(chunks), Some(files)) => format!(
+                "No occurrence of \"{pattern}\" in the {chunks} indexed chunk(s) across \
+                 {files} file(s) this search could reach. The match is literal and \
+                 case-insensitive, so check the spelling — or the text may live in a \
+                 part of a file the slicer left out of every chunk."
+            ),
+            _ => format!(
                 "No indexed chunk contains \"{pattern}\". The match is literal and \
                  case-insensitive, so check the spelling — or the text may live in a \
                  part of a file the slicer left out of every chunk."
-            )
+            ),
         };
     }
     let mut out = format!(
@@ -3386,6 +3680,124 @@ fn format_list_files(glob: &str, resp: &ListFilesResponse) -> String {
 /// window in use.
 fn context_ceiling(tally: &TokenTally, fraction: f64) -> Option<u64> {
     (tally.num_ctx > 0).then_some((tally.num_ctx as f64 * fraction) as u64)
+}
+
+/// Characters per token when sizing a prompt the server assembled but has not sent.
+///
+/// A rough ratio, and the number in this module most likely to be wrong: it comes
+/// from prose, and code tokenizes far denser — a transcript full of `read_chunks`
+/// fences may be closer to 3. It is only used to decide whether to shed, where
+/// erring low means shedding a little early and erring high means not shedding when
+/// it was needed. Log the estimate against the turn's real `prompt_tokens` before
+/// trusting it; do not tune it from intuition, which has already lost twice here.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Size an assembled transcript without asking Ollama.
+///
+/// The alternative is to send it and find out, which is exactly the failure this
+/// guards: Ollama trims an over-long prompt to `num_ctx` and streams on as if
+/// nothing happened.
+fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u64 {
+    let chars: usize = messages.iter().map(|m| m.content.chars().count()).sum();
+    (chars / CHARS_PER_TOKEN_ESTIMATE) as u64
+}
+
+/// The complete list of locations the run was shown, pushed before the report
+/// request.
+///
+/// It is what [`REPORT_SYSTEM_PROMPT`](REPORT_ROLE) has always claimed sits below it
+/// ("the evidence a research agent gathered"), and what `check_citations` actually
+/// scores against — so stating it explicitly costs a few hundred tokens and removes
+/// the gap between what the model is told it may cite and what will pass. It is also
+/// what makes shedding safe: a tool result can be dropped from the transcript
+/// without dropping the *citability* of what it showed.
+///
+/// Paths and spans only, never code. A path with no span is marked as such rather
+/// than omitted, so the model does not invent a range for a file it only knows
+/// exists.
+fn format_evidence_digest(evidence: &Evidence) -> String {
+    let paths = evidence.paths();
+    let mut out = format!(
+        "Evidence: every location this run was shown ({} file(s)). These, and only \
+         these, are what your citations are checked against.\n\n",
+        paths.len()
+    );
+    for path in &paths {
+        let Some(e) = evidence.by_path.get(path) else {
+            continue;
+        };
+        if e.spans.is_empty() {
+            out.push_str(&format!("{path} — shown, no line range\n"));
+            continue;
+        }
+        let mut spans: Vec<&Span> = e.spans.iter().collect();
+        spans.sort_by_key(|s| (s.start, s.end));
+        let ranges: Vec<String> = spans
+            .iter()
+            .map(|s| format!("{}-{}", s.start, s.end))
+            .collect();
+        out.push_str(&format!("{path}:{}\n", ranges.join(", ")));
+    }
+    out
+}
+
+/// Drop old tool output until the report turn's prompt fits the window.
+///
+/// Returns how many replies were shed. The order is deliberate and the floor is
+/// load-bearing:
+///
+/// - The prior-reports block goes first. It is hearsay by contract, was never
+///   citable, and by the report turn its whole value — telling the run what names to
+///   look for — has already been spent.
+/// - Then `role: "tool"` replies, oldest first, because a run's early turns are
+///   orientation (`list_files`, `outline`) that the run-state note already
+///   summarises, while its late reads are what its conclusions rest on.
+/// - Nothing else is ever shed: the system prompt, the question, the plan, the
+///   notes, the sufficiency verdict, the evidence digest and the report request are
+///   short, and they are what the report's structure and grounding rest on. If even
+///   that floor is over the ceiling, this gives up and says so rather than shipping
+///   nothing.
+///
+/// A shed reply is **replaced by a stub, never removed**. Every announced tool call
+/// gets exactly one `role: "tool"` reply, in order; an assistant turn asking for
+/// three calls followed by two replies is a malformed transcript, and some templates
+/// fail on it outright.
+fn shed_for_report(
+    messages: &mut [ChatMessage],
+    prior_reports_idx: Option<usize>,
+    ceiling: u64,
+) -> usize {
+    let mut shed = 0;
+    if let Some(i) = prior_reports_idx
+        && estimate_prompt_tokens(messages) > ceiling
+        && let Some(m) = messages.get_mut(i)
+        && !m.content.is_empty()
+    {
+        m.content = "[Removed by the server to fit the context window: the earlier \
+                     reports given to this run as context. They were hearsay and were \
+                     never citable.]"
+            .to_string();
+        shed += 1;
+    }
+    for i in 0..messages.len() {
+        if estimate_prompt_tokens(messages) <= ceiling {
+            break;
+        }
+        let m = &mut messages[i];
+        if m.role != "tool" || m.content.starts_with("[Removed by the server") {
+            continue;
+        }
+        // Naming what was there keeps the reply honest about being a hole rather
+        // than about being empty — and points at where the location still lives.
+        let tool = m.tool_name.clone().unwrap_or_else(|| "a tool".to_string());
+        m.content = format!(
+            "[Removed by the server to fit the context window: this was the result of \
+             `{tool}`. Whatever it showed is still citable — the evidence list below \
+             is complete.]"
+        );
+        shed += 1;
+    }
+    shed
 }
 
 /// What the run has spent so far, in the shape both `progress` and `done` carry.
@@ -3870,7 +4282,38 @@ pub async fn run_research(
     let _ = tx.send(ResearchEvent::Citations {
         report: citations.clone(),
         revalidation,
+        // The one thing that tells a `total: 0` written by the server apart from a
+        // `total: 0` the model chose. Sourced from the same flag the journal has
+        // always recorded — the fact existed, it just never reached the wire.
+        server_written: run_tools.forced_synthesis,
     });
+    // The code behind the citations, verbatim. Under the **job** token, not the
+    // report window: that window bounds what the *model* is given to write in, and
+    // this is one SQL read the server owes the caller afterwards. Emitted between
+    // `citations` and `done` so a reader that stops at `done` has already seen it.
+    if !citations.verified_locations.is_empty() {
+        let (excerpts, total, truncated) =
+            collect_excerpts(&*tools, &params, &citations, &token).await;
+        if !excerpts.is_empty() {
+            let _ = tx.send(ResearchEvent::Excerpts {
+                excerpts,
+                total,
+                truncated,
+            });
+        }
+    }
+    // Granted-versus-actual, the measurement the length ceiling exists to produce.
+    // Counted in words rather than characters or tokens because words are what the
+    // model was asked for; comparing the grant against a different unit answers
+    // nothing.
+    if let Some(m) = &params.metrics {
+        m.research
+            .report_words
+            .get_or_create(&crate::backend::metrics::ModelLabels {
+                model: params.model.clone(),
+            })
+            .observe(report.split_whitespace().count() as f64);
+    }
     // Journalled after the events are queued, not before: the client's report must
     // never wait on a database write, and a write failure must not change what the
     // client saw.
@@ -4090,12 +4533,18 @@ async fn research_inner(
     // Before the plan turn on purpose: the plan is the run's only sufficiency
     // criterion, and prior work is exactly the input that should change which
     // sub-questions are worth asking.
+    // Remembered so the report turn's size guard can shed it first: it is hearsay by
+    // contract, never citable, and by then its whole value — telling the run what
+    // names to look for — has already been spent. Safe as a fixed index because it
+    // sits before every message the loop later removes and re-pins.
+    let mut prior_reports_idx = None;
     if !params.prior_reports.is_empty() {
         let (block, truncated) =
             format_prior_reports(&params.prior_reports, params.max_context_chars);
         if truncated && let Some(m) = params.metrics.as_ref() {
             m.research.context_truncations.inc();
         }
+        prior_reports_idx = Some(messages.len());
         messages.push(ChatMessage::user(block));
     }
 
@@ -4734,7 +5183,7 @@ async fn research_inner(
         messages[0].role, "system",
         "the report turn replaces the system prompt in place; index 0 must be it"
     );
-    messages[0] = ChatMessage::system(REPORT_SYSTEM_PROMPT);
+    messages[0] = ChatMessage::system(report_system_prompt(params.budget));
     // The notes, pinned once for the report. The run-state *note* is deliberately not
     // rebuilt here, but these are different in kind: they are the conclusions the model
     // reached and chose to keep, and the report is what they were kept for. A message of
@@ -4744,12 +5193,59 @@ async fn research_inner(
     if let Some(notes) = format_notes_note(&state) {
         messages.push(ChatMessage::user(notes));
     }
+    // Unconditional: it is what the system prompt above already promises sits below
+    // it, it is what `check_citations` scores against, and two prompt shapes would be
+    // two things to measure. Cheap — paths and spans, no code.
+    messages.push(ChatMessage::user(format_evidence_digest(&evidence)));
+    // The transcript's own guard runs *between* turns and against the previous turn's
+    // prompt, so the report turn — the only one that adds the notes block and the
+    // instruction on top, and the largest prompt of the run once a draft and a
+    // complaint join it — has until now been measured by nothing. `None` here means no
+    // turn ever reported a window; do not substitute the configured ceiling, which
+    // over-estimates the real one precisely when shedding would matter.
+    let shed = match context_ceiling(&tally, params.budget.context_fraction) {
+        None => {
+            debug!("No turn reported a context window; skipping the report-turn size guard.");
+            0
+        }
+        Some(ceiling) => {
+            // What the report turn is allowed to generate is not available for the
+            // prompt, so the ceiling it must fit under is the window minus the grant.
+            let reserved =
+                params.budget.max_report_words as u64 * crate::config::REPORT_WORDS_TO_TOKENS;
+            let ceiling = ceiling.saturating_sub(reserved).max(1);
+            let estimated = estimate_prompt_tokens(&messages);
+            if estimated <= ceiling {
+                0
+            } else {
+                let shed = shed_for_report(&mut messages, prior_reports_idx, ceiling);
+                warn!(
+                    estimated_prompt_tokens = estimated,
+                    ceiling,
+                    num_ctx = tally.num_ctx,
+                    shed,
+                    after = estimate_prompt_tokens(&messages),
+                    "The report turn's prompt was over the context ceiling; dropped old \
+                     tool output to fit rather than letting Ollama trim it in silence."
+                );
+                if let Some(m) = &params.metrics {
+                    m.research.report_context_sheds.inc();
+                }
+                shed
+            }
+        }
+    };
     messages.push(ChatMessage::user(report_request(
         reason,
         &state,
         params.budget,
         started.elapsed(),
+        shed,
     )));
+    // Set (never cleared) by any report turn whose reply was cut at `num_predict`.
+    // Its only use is the rewrite instruction below: a report that was cut is the
+    // one case where "write it again" should also say "write it shorter".
+    let mut length_capped = false;
     let drafted = write_report(
         ollama,
         params,
@@ -4759,6 +5255,7 @@ async fn research_inner(
         writing,
         &mut tally,
         false,
+        &mut length_capped,
     )
     .await;
     // Whether the report the caller receives was written by the server rather than
@@ -4822,11 +5319,15 @@ async fn research_inner(
     //    question cannot be answered from this scope" report is the correct outcome,
     //    not a defect;
     //  - a report under `MIN_GROUNDED_REPORT_CHARS` is the short honest version of
-    //    the same answer.
+    //    the same answer — but only from a run the budget stopped. A run that
+    //    *finalized* declared its own evidence sufficient; a short uncited report
+    //    from it is not the honest short version, it is a self-contradiction, and
+    //    exempting it is how a run that read a dozen files ships prose citing none.
     let ungrounded = !forced
         && citations.total == 0
         && !evidence.paths().is_empty()
-        && summary.chars().count() >= MIN_GROUNDED_REPORT_CHARS;
+        && (summary.chars().count() >= MIN_GROUNDED_REPORT_CHARS
+            || reason == DoneReason::Finalized);
     // Staleness joins the two provenance defects in the gate: a claim cited to a
     // file the index has since rewritten is as unsupported as one cited nowhere,
     // and the remedy is the same — re-read it, then correct or drop the claim.
@@ -5032,15 +5533,24 @@ async fn research_inner(
         }
 
         // ── rewrite ──────────────────────────────────────────────────────────
-        messages[0] = ChatMessage::system(REPORT_SYSTEM_PROMPT);
-        messages.push(ChatMessage::user(
+        messages[0] = ChatMessage::system(report_system_prompt(params.budget));
+        let mut rewrite_request = String::from(
             "Now write the final report. It replaces the draft entirely, so repeat \
              everything that should survive. Keep every claim the evidence supports, \
              fix the citations that did not check out — point them at a location a \
              tool actually returned — and drop any claim you could not ground. \
-             Markdown only, no preamble, no JSON."
-                .to_string(),
-        ));
+             Markdown only, no preamble, no JSON.",
+        );
+        // Only when the draft was actually severed. Saying it unconditionally would
+        // teach every rewrite to shrink a report that was the right length.
+        if length_capped {
+            rewrite_request.push_str(
+                "\n\nYour previous reply was cut off at the generation limit before it \
+                 finished, which is why the draft ends where it does. Write a shorter \
+                 report — cover the same ground in fewer words.",
+            );
+        }
+        messages.push(ChatMessage::user(rewrite_request));
         // A failed rewrite must not lose a draft that was merely mis-cited: the
         // draft is still the better of the two answers, and its citation report
         // already tells the caller which parts to distrust. That covers a rewrite
@@ -5054,6 +5564,7 @@ async fn research_inner(
             writing,
             &mut tally,
             true,
+            &mut length_capped,
         )
         .await
         {
@@ -5424,6 +5935,12 @@ impl ReportOutcome {
 /// the whole run. `writing` is the report window's, which bounds the model turns:
 /// keeping them apart is what lets the caller tell "the window expired" (ship what we
 /// have) from "the client left" (there is nobody to ship to).
+///
+/// `length_capped` is an out-flag, set (never cleared) when a turn here reached its
+/// `num_predict` ceiling. It is not part of the outcome because it is not a result:
+/// the report may be perfectly usable and merely long. The caller needs it because
+/// the one useful response — telling the rewrite turn to be shorter — belongs to the
+/// message the caller owns.
 async fn write_report(
     ollama: &dyn OllamaModel,
     params: &ResearchParams,
@@ -5433,6 +5950,7 @@ async fn write_report(
     writing: &CancellationToken,
     tally: &mut TokenTally,
     stream_content: bool,
+    length_capped: &mut bool,
 ) -> Result<ReportOutcome, ResearchAbort> {
     // An empty reply to the report turn is not a model that has nothing to say: it
     // generated 1157-2273 tokens in the four measured cases and left `content`
@@ -5443,6 +5961,12 @@ async fn write_report(
     // Safe for the same reason: an empty content streamed nothing, so the client saw
     // no partial report. Thinking deltas *are* re-sent, which is a live-view
     // cosmetic, not a corrupted result.
+    // The one turn of the run that bounds its own generation. `0` (the knob off)
+    // means no bound at all, exactly as before this existed.
+    let num_predict = match params.budget.max_report_words {
+        0 => None,
+        w => Some(w as u64 * crate::config::REPORT_WORDS_TO_TOKENS),
+    };
     let mut report_attempt = 0;
     let mut summary = loop {
         let sampling = Sampling {
@@ -5450,15 +5974,38 @@ async fn write_report(
                 .sampling
                 .seed
                 .map(|s| s.wrapping_add(report_attempt as i64)),
+            num_predict,
             ..params.sampling
         };
         let opts = TurnOpts {
             stream_content,
             sampling,
         };
-        let content = tally
-            .record(chat_turn(ollama, params, messages, NO_TOOLS, tx, writing, opts).await?)
-            .content;
+        let outcome =
+            tally.record(chat_turn(ollama, params, messages, NO_TOOLS, tx, writing, opts).await?);
+        // Ollama does not tell us *why* it stopped, so reaching the ceiling is the
+        // only signal that it cut the reply rather than the model finishing. It is a
+        // defect either way: the cap is sized ~3x the honest prose ratio precisely so
+        // an overshooting report never meets it, so meeting it means the multiplier
+        // or the model is wrong — and a cut lands mid-token, which can sever a fence
+        // and cost a full rewrite.
+        let capped = matches!((num_predict, outcome.eval_tokens), (Some(n), Some(e)) if e >= n);
+        if capped {
+            warn!(
+                model = %params.model,
+                num_predict = ?num_predict,
+                eval_tokens = ?outcome.eval_tokens,
+                granted_report_words = params.budget.max_report_words,
+                "The report turn hit its generation ceiling, so the reply was cut \
+                 rather than finished. Sysadmin: raise [research.effort.*].max_report_words \
+                 or lower it so the model stops writing before the ceiling stops it."
+            );
+            if let Some(m) = &params.metrics {
+                m.research.report_length_caps.inc();
+            }
+        }
+        *length_capped |= capped;
+        let content = outcome.content;
         if !content.trim().is_empty() || report_attempt >= MAX_EMPTY_REPORT_RETRIES {
             break content;
         }
@@ -5503,7 +6050,13 @@ async fn write_report(
                     writing,
                     TurnOpts {
                         stream_content,
-                        sampling: params.sampling,
+                        // The re-ask is still a report turn and is bounded like one.
+                        // The seed is deliberately *not* shifted: the transcript
+                        // changed, which is the whole point of asking again.
+                        sampling: Sampling {
+                            num_predict,
+                            ..params.sampling
+                        },
                     },
                 )
                 .await?,
@@ -6706,6 +7259,10 @@ mod tests {
                 }],
                 total: 1,
                 out_of_scope: 0,
+                // A hit, so the coverage probe never ran — the real core reads it
+                // only on a miss.
+                searched_chunks: None,
+                searched_files: None,
             })
         }
 
@@ -6828,6 +7385,10 @@ mod tests {
                 context_fraction: 1.0,
                 max_steps,
                 search_top_k: 5,
+                // Off by default: an unrelated test must not have its report turn
+                // reshaped by a length clause. The tests that are about the budget
+                // set it.
+                max_report_words: 0,
             },
             sampling: Sampling::default(),
             // Generous too: a test about the investigation must not be ended by the
@@ -6908,7 +7469,11 @@ mod tests {
                 vec![call("symbols", json!({"name": "collection_for"}))],
                 vec![call("finalize", json!({}))],
             ],
-            vec!["# Report\n\nGC works by sweeping."],
+            // Cited, because this test is about the loop's event cadence and an
+            // uncited report from a finalized run now (correctly) takes the
+            // citation-repair path, adding a turn that has nothing to do with what
+            // is being asserted here.
+            vec!["# Report\n\nGC works by sweeping — src/worker/gc.rs:10-40."],
             8,
         )
         .await;
@@ -6932,6 +7497,10 @@ mod tests {
                 "progress",
                 "summary",
                 "citations",
+                // The report cites a location the run was shown, so the server
+                // reads that code out of the index and ships it — between
+                // `citations` and `done`, which is where the contract puts it.
+                "excerpts",
                 "done"
             ],
             "unexpected event sequence: {events:?}"
@@ -6958,9 +7527,12 @@ mod tests {
         // `citations` sits between the report and `done` — the verdict is about the
         // report, so it cannot be emitted before one exists.
         assert!(matches!(&events[12], ResearchEvent::Citations { .. }));
+        // Then the code behind those citations, read from the index rather than
+        // written by the model — the ordering the wire contract fixes.
+        assert!(matches!(&events[13], ResearchEvent::Excerpts { .. }));
         assert!(
             matches!(
-                &events[13],
+                &events[14],
                 ResearchEvent::Done {
                     reason: DoneReason::Finalized,
                     ..
@@ -7226,6 +7798,11 @@ mod tests {
         /// stay the turn numbers) because the one thing a rewrite must be told —
         /// *which* citations failed — is only visible here.
         report_prompts: Mutex<Vec<String>>,
+        /// `(offered tools, options)` for every turn, in order. The report turn is
+        /// the only one production arms `num_predict` on, and "arms it there" and
+        /// "arms it nowhere else" are equally load-bearing: the second is what keeps
+        /// every other request byte-for-byte what it was.
+        samplings: Mutex<Vec<(bool, Sampling)>>,
     }
 
     impl NativeOllama {
@@ -7239,6 +7816,7 @@ mod tests {
                 verdict: FAKE_VERDICT_COMPLETE,
                 transcripts: Mutex::new(Vec::new()),
                 report_prompts: Mutex::new(Vec::new()),
+                samplings: Mutex::new(Vec::new()),
             }
         }
     }
@@ -7254,6 +7832,10 @@ mod tests {
             on_delta: &mut (dyn FnMut(ChatDelta) + Send),
             _token: &CancellationToken,
         ) -> Result<ChatOutcome, OllamaError> {
+            self.samplings
+                .lock()
+                .unwrap()
+                .push((!tools.is_empty(), _sampling));
             // A turn with no tools is one of the three framing turns — plan,
             // sufficiency, report — told apart by what was last asked, exactly as
             // production tells them apart by which of them it pushed.
@@ -7478,6 +8060,7 @@ mod tests {
                 ResearchEvent::Citations {
                     report,
                     revalidation,
+                    ..
                 } => Some((report.clone(), *revalidation)),
                 _ => None,
             })
@@ -7518,6 +8101,7 @@ mod tests {
                 ResearchEvent::Citations {
                     report,
                     revalidation,
+                    ..
                 } => Some((report.clone(), *revalidation)),
                 _ => None,
             })
@@ -7981,7 +8565,11 @@ mod tests {
                 vec![call("search", json!({"query": "prune_deleted_files"}))],
                 vec![call("finalize", json!({}))],
             ],
-            vec!["# Report"],
+            // Cited: this test counts re-entries into the *tool loop*, and the
+            // citation-repair phase re-opens tools too. An uncited report from a
+            // finalized run would consume the next scripted call and read as the
+            // second re-entry this asserts cannot happen.
+            vec!["# Report\n\nsrc/worker/gc.rs:10-40"],
         );
         fake.verdict = "1. UNANSWERED — nothing found yet";
         let ollama = Arc::new(fake);
@@ -8028,6 +8616,146 @@ mod tests {
         assert_eq!(steps, 2, "the step cap must still bind: {events:?}");
     }
 
+    // ── the report's length ceiling ──────────────────────────────────────────
+
+    /// A run whose report is bounded says so, in words, and derives the per-section
+    /// allowance from the plan it is being held to. Output volume — not retrieval —
+    /// is where runs were measured to fail, and until this existed nothing in the
+    /// whole prompt mentioned length.
+    #[tokio::test]
+    async fn the_report_turn_announces_its_word_budget() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![vec![call("finalize", json!({}))]],
+            vec!["# Report\n\nsrc/worker/gc.rs:10-40"],
+        ));
+        let mut p = params(8);
+        p.budget.max_report_words = 900;
+        run_native_shared(ollama.clone(), p).await;
+
+        let prompt = ollama.report_prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("under 900 words"), "{prompt}");
+        // A ceiling, never a target: a target makes a model write *to* the number,
+        // and the whole finding is that shorter answers survive.
+        assert!(!prompt.contains("about 900 words"), "{prompt}");
+        // `FAKE_PLAN` numbers two sub-questions, so the allowance is 900/2 — the
+        // denominator is the plan the run is actually being held to, not a constant.
+        assert!(prompt.contains("roughly 450 per section"), "{prompt}");
+    }
+
+    /// `0` is the off switch, and it has to be a real one: an unmeasured number
+    /// shipped without a way back is a number nobody can sweep.
+    #[tokio::test]
+    async fn a_zero_word_budget_announces_no_length() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![vec![call("finalize", json!({}))]],
+            vec!["# Report\n\nsrc/worker/gc.rs:10-40"],
+        ));
+        let mut p = params(8);
+        p.budget.max_report_words = 0;
+        run_native_shared(ollama.clone(), p).await;
+
+        let prompt = ollama.report_prompts.lock().unwrap()[0].clone();
+        assert!(
+            !prompt.contains("words"),
+            "no length is announced: {prompt}"
+        );
+    }
+
+    /// The report turn is the only one that bounds generation, and "only" is as
+    /// load-bearing as "does": an unset `num_predict` is omitted from the request
+    /// entirely, so every other turn stays byte-for-byte what it was.
+    #[tokio::test]
+    async fn the_report_turn_asks_for_the_report_it_can_afford_to_generate() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec!["# Report\n\nsrc/worker/gc.rs:10-40"],
+        ));
+        let mut p = params(8);
+        p.budget.max_report_words = 900;
+        run_native_shared(ollama.clone(), p).await;
+
+        let samplings = ollama.samplings.lock().unwrap().clone();
+        // Every turn that was offered tools is an investigation turn.
+        for (had_tools, s) in samplings.iter().filter(|(t, _)| *t) {
+            assert!(
+                s.num_predict.is_none(),
+                "an investigation turn must be unbounded ({had_tools}): {s:?}"
+            );
+        }
+        let bounded: Vec<u64> = samplings
+            .iter()
+            .filter_map(|(_, s)| s.num_predict)
+            .collect();
+        assert_eq!(
+            bounded,
+            vec![900 * crate::config::REPORT_WORDS_TO_TOKENS],
+            "exactly one turn — the report — is bounded: {samplings:?}"
+        );
+    }
+
+    // ── the verbatim excerpt channel ─────────────────────────────────────────
+
+    fn excerpts_of(events: &[ResearchEvent]) -> Option<(Vec<ReportExcerpt>, usize, bool)> {
+        events.iter().find_map(|e| match e {
+            ResearchEvent::Excerpts {
+                excerpts,
+                total,
+                truncated,
+            } => Some((excerpts.clone(), *total, *truncated)),
+            _ => None,
+        })
+    }
+
+    /// The channel exists so a caller never has to make the *model* retype a file —
+    /// the failure the whole generation is about. It ships only what the provenance
+    /// check verified: a `path_only` or `unverified` citation names no location
+    /// worth reading, and attaching real bytes to one would dress up a claim that
+    /// was just refused.
+    #[tokio::test]
+    async fn excerpts_carry_only_verified_citations() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                // One verified location, one path no tool ever returned. The second
+                // is what the draft is sent back for; the rewrite drops it.
+                "# Report\n\nsrc/worker/gc.rs:10-40 and src/invented.rs:1-9",
+                "# Report\n\nsrc/worker/gc.rs:10-40",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+
+        let (excerpts, total, truncated) = excerpts_of(&events).expect("an excerpts event");
+        assert_eq!(total, 1);
+        assert!(!truncated);
+        assert_eq!(excerpts.len(), 1);
+        assert_eq!(excerpts[0].path, "src/worker/gc.rs");
+        // The code itself, from the index — not a summary of it, and not something
+        // the model wrote.
+        assert_eq!(excerpts[0].code, "fn collect() {}");
+        assert!(
+            !excerpts.iter().any(|e| e.path == "src/invented.rs"),
+            "an invented path has no code to ship: {excerpts:?}"
+        );
+    }
+
+    /// No verified citation, no event. The alternative — an empty `excerpts` frame
+    /// on every ungrounded run — would make "the channel fired" mean nothing.
+    #[tokio::test]
+    async fn a_report_with_no_verified_citation_ships_no_excerpts() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![vec![call("search", json!({"query": "gc sweep"}))]],
+            vec!["# Report\n\nNothing here was settled."],
+        ));
+        let events = run_native_shared(ollama.clone(), params(1)).await;
+        assert!(excerpts_of(&events).is_none(), "{events:?}");
+    }
+
     /// The draft is withheld until its citations are checked, and a report citing
     /// a location no tool returned is sent back rather than shipped. This is the
     /// failure the citation check could only *log* before: fluent, cited and
@@ -8070,6 +8798,7 @@ mod tests {
                 ResearchEvent::Citations {
                     report,
                     revalidation,
+                    ..
                 } => Some((report.clone(), *revalidation)),
                 _ => None,
             })
@@ -8142,6 +8871,7 @@ mod tests {
                 ResearchEvent::Citations {
                     report,
                     revalidation,
+                    ..
                 } => Some((report.clone(), *revalidation)),
                 _ => None,
             })
@@ -8198,19 +8928,19 @@ mod tests {
         assert_eq!(summaries, 1, "the report ships once: {events:?}");
     }
 
-    /// The short honest refusal keeps shipping as it stands. Only a *substantial*
-    /// uncited report is a provenance failure; below the floor, "I could not settle
-    /// this" is an answer, not an ungrounded claim.
+    /// The short honest refusal keeps shipping as it stands — from a run the budget
+    /// cut off. It had no chance to gather more, so "I could not settle this" is an
+    /// answer, not an ungrounded claim, and sending it back would only ask for a
+    /// fabrication.
     #[tokio::test]
-    async fn a_short_uncited_report_is_not_sent_back() {
+    async fn a_short_uncited_report_from_a_budget_stopped_run_is_not_sent_back() {
+        // One step granted, one taken: the loop breaks on the step budget, so
+        // `reason` is `BudgetExhausted` and the length exemption applies.
         let ollama = Arc::new(NativeOllama::new(
-            vec![
-                vec![call("search", json!({"query": "gc sweep"}))],
-                vec![call("finalize", json!({}))],
-            ],
+            vec![vec![call("search", json!({"query": "gc sweep"}))]],
             vec!["# Report\n\nThe evidence I gathered does not settle this."],
         ));
-        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let events = run_native_shared(ollama.clone(), params(1)).await;
 
         let (report, revalidation) = events
             .iter()
@@ -8218,6 +8948,7 @@ mod tests {
                 ResearchEvent::Citations {
                     report,
                     revalidation,
+                    ..
                 } => Some((report.clone(), *revalidation)),
                 _ => None,
             })
@@ -8225,7 +8956,40 @@ mod tests {
         assert_eq!(report.total, 0);
         assert!(
             revalidation.is_none(),
-            "a short uncited report is taken at its word: {revalidation:?}"
+            "a short uncited report from a stopped run is taken at its word: {revalidation:?}"
+        );
+    }
+
+    /// The same report from a run that *finalized* is a different thing, and the
+    /// length exemption must not cover it. Finalizing is the model declaring its own
+    /// evidence sufficient; following that with prose that cites none of it is a
+    /// self-contradiction, not the short honest version — and exempting it by length
+    /// is how a run that read a dozen files ships an ungrounded report under 800
+    /// characters and no gate ever sees it.
+    #[tokio::test]
+    async fn a_finalized_run_that_cites_nothing_is_sent_back_however_short_it_is() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                "# Report\n\nThe evidence I gathered does not settle this.",
+                "# Report\n\nThe sweep is at src/worker/gc.rs:10-40.",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+
+        let revalidation = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Citations { revalidation, .. } => Some(*revalidation),
+                _ => None,
+            })
+            .expect("a citations event");
+        assert!(
+            revalidation.is_some(),
+            "a finalized run that cites nothing must be sent back: {events:?}"
         );
     }
 
@@ -9176,6 +9940,194 @@ mod tests {
         );
     }
 
+    // ── what an empty grep result means ──────────────────────────────────────
+
+    fn empty_grep(searched_chunks: Option<u64>, searched_files: Option<u64>) -> GrepResponse {
+        GrepResponse {
+            matches: Vec::new(),
+            total: 0,
+            out_of_scope: 0,
+            searched_chunks,
+            searched_files,
+        }
+    }
+
+    /// "The literal is absent" and "nothing here was searchable" are different
+    /// facts, and they used to share one sentence. That is how the same string is
+    /// honestly reported absent by one run and found five times by the next: a glob
+    /// matching no file, or a scope holding none, read as proof of absence.
+    #[test]
+    fn a_grep_that_searched_nothing_says_so_rather_than_no_match() {
+        let text = format_grep(
+            "process_ir.schema.json",
+            &empty_grep(Some(0), Some(0)),
+            &ToolScope::default(),
+        );
+        assert!(text.contains("Nothing here was searchable"), "{text}");
+        // The refusal has to be explicit, or the model reports it as absence.
+        assert!(text.contains("NOT a fact about"), "{text}");
+        assert!(
+            !text.contains("No indexed chunk contains"),
+            "the absence sentence must not appear: {text}"
+        );
+    }
+
+    /// A genuine miss states how much it looked at. Without the number the reader
+    /// cannot tell a thorough miss from a narrow one, which is the whole complaint.
+    #[test]
+    fn a_grep_miss_reports_how_much_it_searched() {
+        let text = format_grep(
+            "GcGuard",
+            &empty_grep(Some(1421), Some(88)),
+            &ToolScope::default(),
+        );
+        assert!(text.contains("1421 indexed chunk(s)"), "{text}");
+        assert!(text.contains("88 file(s)"), "{text}");
+        // Still says the useful things it always said.
+        assert!(text.contains("case-insensitive"), "{text}");
+    }
+
+    /// A server too old to send the counts degrades to the sentence it always sent,
+    /// rather than to a claim of having searched nothing.
+    #[test]
+    fn a_grep_miss_without_coverage_counts_reads_as_it_always_did() {
+        let text = format_grep("GcGuard", &empty_grep(None, None), &ToolScope::default());
+        assert!(text.contains("No indexed chunk contains"), "{text}");
+    }
+
+    // ── the report turn's size guard ─────────────────────────────────────────
+
+    /// The digest is what makes shedding safe: it states the full set of citable
+    /// locations independently of the tool results that showed them, so dropping a
+    /// result never drops a location's citability. If it under-reports, the model is
+    /// told it may not cite something the check will happily verify.
+    #[test]
+    fn the_evidence_digest_names_every_shown_location() {
+        let ev = evidence_of(&[
+            ("src/research.rs", Some((500, 560))),
+            ("src/research.rs", Some((10, 40))),
+            ("README.md", None),
+        ]);
+        let digest = format_evidence_digest(&ev);
+        // Spans sorted, both kept, on the path's one line.
+        assert!(
+            digest.contains("src/research.rs:10-40, 500-560"),
+            "{digest}"
+        );
+        // A path with no span says so rather than being dropped or given a range.
+        assert!(
+            digest.contains("README.md — shown, no line range"),
+            "{digest}"
+        );
+        assert!(digest.contains("2 file(s)"), "{digest}");
+    }
+
+    fn tool_reply(name: &str, body: &str) -> ChatMessage {
+        ChatMessage::tool(name.to_string(), body.to_string())
+    }
+
+    /// The anti-regression that matters most in this change: on every run whose
+    /// prompt already fits — measured on this host, essentially all of them — the
+    /// transcript handed to the report turn must be exactly what it was before the
+    /// guard existed.
+    #[test]
+    fn a_report_prompt_that_fits_is_not_shed() {
+        let mut messages = vec![
+            ChatMessage::system("you are a writer"),
+            ChatMessage::user("Research question:\nhow does GC work?"),
+            tool_reply("search", "some evidence"),
+        ];
+        let before: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        let shed = shed_for_report(&mut messages, None, 100_000);
+        assert_eq!(shed, 0);
+        let after: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(after, before, "a fitting prompt must be untouched");
+    }
+
+    /// Oldest first, because a run's early turns are orientation the state note has
+    /// already summarised while its late reads are what its conclusions rest on.
+    #[test]
+    fn the_report_turn_sheds_the_oldest_evidence_first() {
+        let mut messages = vec![
+            ChatMessage::system("s"),
+            tool_reply("list_files", &"a".repeat(4000)),
+            tool_reply("read_chunks", &"b".repeat(4000)),
+        ];
+        // ~2000 estimated tokens; room for one of the two bodies, not both. The
+        // bodies are far larger than the stub that replaces one, so the arithmetic
+        // does not hinge on the stub's wording.
+        let shed = shed_for_report(&mut messages, None, 1200);
+        assert_eq!(shed, 1, "one is enough, so it stops at one");
+        assert!(messages[1].content.starts_with("[Removed by the server"));
+        assert!(
+            messages[1].content.contains("list_files"),
+            "names what went"
+        );
+        assert_eq!(messages[2].content, "b".repeat(4000), "the late read stays");
+    }
+
+    /// The prior-reports block goes before any tool result: it is hearsay by
+    /// contract, was never citable, and by the report turn its whole value — telling
+    /// the run what names to look for — has already been spent.
+    #[test]
+    fn shedding_drops_hearsay_before_evidence() {
+        let mut messages = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user("prior report ".repeat(60)),
+            tool_reply("search", &"real evidence ".repeat(60)),
+        ];
+        shed_for_report(&mut messages, Some(1), 100);
+        assert!(messages[1].content.contains("hearsay"), "{:?}", messages[1]);
+        assert!(
+            messages[2].content.contains("Removed by the server"),
+            "both go when one is not enough: {:?}",
+            messages[2]
+        );
+    }
+
+    /// A shed reply is **replaced**, never removed. Every announced tool call gets
+    /// exactly one `role: "tool"` reply, in order — an assistant turn announcing
+    /// three calls followed by two replies is a malformed transcript, and some
+    /// templates fail on it outright rather than degrading.
+    #[test]
+    fn a_shed_transcript_still_answers_every_announced_call() {
+        let mut messages = vec![
+            ChatMessage::system("s"),
+            ChatMessage::assistant_calls(
+                "",
+                vec![
+                    call("search", json!({"query": "gc"})),
+                    call("outline", json!({"path": "src/worker/gc.rs"})),
+                ],
+            ),
+            tool_reply("search", &"x".repeat(500)),
+            tool_reply("outline", &"y".repeat(500)),
+        ];
+        let announced: usize = messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .map(|c| c.len())
+            .sum();
+        shed_for_report(&mut messages, None, 1);
+        let answered = messages.iter().filter(|m| m.role == "tool").count();
+        assert_eq!(announced, answered, "{messages:?}");
+    }
+
+    /// The floor: the system prompt, the question and the report request are short
+    /// and are what the report's structure and grounding rest on. A ceiling nothing
+    /// can satisfy must leave them alone and give up, not strip the turn bare.
+    #[test]
+    fn shedding_never_touches_the_instructions() {
+        let mut messages = vec![
+            ChatMessage::system("you are a writer"),
+            ChatMessage::user("Research question:\nhow does GC work?"),
+            tool_reply("search", "evidence"),
+        ];
+        shed_for_report(&mut messages, None, 1);
+        assert_eq!(messages[0].content, "you are a writer");
+        assert!(messages[1].content.starts_with("Research question:"));
+    }
+
     #[test]
     fn a_cited_range_the_tools_showed_is_verified() {
         let ev = evidence_of(&[("src/research.rs", Some((500, 560)))]);
@@ -9233,6 +10185,7 @@ mod tests {
                 unverified_paths: vec!["src/nope.rs".into()],
                 stale_paths: vec!["src/moved.rs".into()],
                 cited_paths: vec!["src/nope.rs".into()],
+                verified_locations: Vec::new(),
             },
             revalidation: Some(Revalidation {
                 draft_unverified: 4,
@@ -9240,9 +10193,11 @@ mod tests {
                 draft_stale: 1,
                 steps: 3,
             }),
+            server_written: false,
         };
         assert_eq!(ev.name(), "citations");
         let d = ev.data();
+        assert_eq!(d["server_written"], false);
         assert_eq!(d["total"], 9);
         assert_eq!(d["verified"], 7);
         assert_eq!(d["path_only"], 1);
@@ -9270,12 +10225,38 @@ mod tests {
         let ev = ResearchEvent::Citations {
             report: CitationReport::default(),
             revalidation: None,
+            server_written: false,
         };
         let d = ev.data();
         assert_eq!(d["draft_unverified"], Value::Null);
         assert_eq!(d["draft_path_only"], Value::Null);
         assert_eq!(d["draft_stale"], Value::Null);
         assert_eq!(d["revalidation_steps"], Value::Null);
+    }
+
+    /// A report the *server* wrote scores `total: 0, verified: 0, unverified: 0` —
+    /// byte-for-byte what a clean report scores, because `check_citations` runs over
+    /// a notice that by construction cites nothing. For its whole life that made the
+    /// two indistinguishable in the one field a caller is told to trust, and every
+    /// "verified: 0 even though it read the files" report is this. The flag is the
+    /// only thing that separates them, so it is a wire contract in its own right.
+    #[test]
+    fn a_server_written_report_says_so_on_the_wire() {
+        let model_written = ResearchEvent::Citations {
+            report: CitationReport::default(),
+            revalidation: None,
+            server_written: false,
+        };
+        let server_written = ResearchEvent::Citations {
+            report: CitationReport::default(),
+            revalidation: None,
+            server_written: true,
+        };
+        // Same counts, opposite meanings.
+        assert_eq!(model_written.data()["total"], 0);
+        assert_eq!(server_written.data()["total"], 0);
+        assert_eq!(model_written.data()["server_written"], false);
+        assert_eq!(server_written.data()["server_written"], true);
     }
 
     /// A `RunProgress` with every field distinct, so a wire test cannot pass by

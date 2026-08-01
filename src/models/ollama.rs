@@ -27,8 +27,8 @@ pub struct OllamaTuning {
     pub health_timeout_ms: u64,
 }
 
-/// Sampling parameters for one chat turn, from `[research]` config plus the
-/// request's optional `seed`.
+/// Per-turn generation options, from `[research]` config plus the request's
+/// optional `seed`.
 ///
 /// Every field is optional and is **omitted** from the request when `None`, so the
 /// model's own Modelfile defaults stay in force — which is the right production
@@ -38,11 +38,24 @@ pub struct OllamaTuning {
 /// `gemma4` top_k 64), so an unpinned bake-off compares Modelfiles and sampling
 /// noise rather than models. `seed` is the axis a measurement harness varies to
 /// get repetitions that mean something.
+///
+/// Three of the four are sampling; `num_predict` is not, which is why the struct
+/// no longer calls itself that. It is set on the **report turn only**, so every
+/// other turn's request body is byte-for-byte what it was before the field
+/// existed.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Sampling {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub seed: Option<i64>,
+    /// Hard ceiling on generated tokens for this turn.
+    ///
+    /// A **runaway backstop**, not the report's length ceiling — that is the word
+    /// count the prompt announces. Ollama cuts at a token, so a tight value would
+    /// sever a code fence, fail `validate_report_markdown`, and buy a full-volume
+    /// rewrite of the document that just failed. Size it out of reach
+    /// (`REPORT_WORDS_TO_TOKENS`) and treat it firing as a defect worth a `warn!`.
+    pub num_predict: Option<u64>,
 }
 
 impl Sampling {
@@ -57,6 +70,9 @@ impl Sampling {
         }
         if let Some(s) = self.seed {
             options.insert("seed".into(), serde_json::json!(s));
+        }
+        if let Some(n) = self.num_predict {
+            options.insert("num_predict".into(), serde_json::json!(n));
         }
     }
 }
@@ -1081,6 +1097,10 @@ mod tests {
         assert!(opts.get("temperature").is_none(), "{opts}");
         assert!(opts.get("top_p").is_none(), "{opts}");
         assert!(opts.get("seed").is_none(), "{opts}");
+        // The report turn is the only one that arms this. Its absence everywhere
+        // else is what keeps every non-report request byte-for-byte what it was
+        // before the field existed.
+        assert!(opts.get("num_predict").is_none(), "{opts}");
     }
 
     /// Pinned sampling is what makes a model comparison a comparison: without it
@@ -1092,12 +1112,16 @@ mod tests {
             temperature: Some(0.2),
             top_p: Some(0.9),
             seed: Some(7),
+            num_predict: Some(3600),
         })
         .await;
         assert_eq!(opts["temperature"], 0.2);
         assert_eq!(opts["top_p"], 0.9);
         assert_eq!(opts["seed"], 7);
+        assert_eq!(opts["num_predict"], 3600);
         // The window is still decided by the model/ceiling logic, not by sampling.
+        // `num_predict` bounds what is *generated* into that window; it is not the
+        // window.
         assert_eq!(opts["num_ctx"], 4096);
     }
 

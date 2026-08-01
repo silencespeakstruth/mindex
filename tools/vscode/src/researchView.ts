@@ -4,6 +4,7 @@ import {
     ResearchCitations,
     ResearchDone,
     ResearchEffort,
+    ResearchExcerpts,
     ResearchProgress,
     ResearchStep,
     SearchFilter,
@@ -135,6 +136,9 @@ export class ResearchPanel {
     }
     citations(citations: ResearchCitations): void {
         this.post({ type: "citations", citations });
+    }
+    excerpts(excerpts: ResearchExcerpts): void {
+        this.post({ type: "excerpts", excerpts });
     }
     done(info: ResearchDone): void {
         this.post({ type: "done", info });

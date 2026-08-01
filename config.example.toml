@@ -251,12 +251,29 @@ list_page_limit = 50
 # width — so raising it buys transcript (every hit is resent every later turn) and
 # not coverage. It is a knob so a harness can sweep it, not a lever to reach for.
 # Must not exceed [search].max_top_k; startup refuses if it does.
+#
+# max_report_words is the only axis about OUTPUT, and output is where runs were
+# measured to fail. A field report over a real project found the loop locating the
+# right files every time and then failing at the report turn, deterministically by
+# request shape: a broad question with five sub-questions failed; the same question
+# narrowed to one file with a word limit succeeded in minutes. Nothing in the prompt
+# had ever mentioned length, and no turn had ever bounded generation. It is a CEILING
+# announced to the model (the prompt says "at most", not "about"), and it also arms
+# num_predict on the report turn as a runaway backstop.
+#
+# THESE THREE NUMBERS ARE UNMEASURED. They rise with the ladder because a deeper run
+# has more to say, not because 1800 was observed anywhere. 0 = announce no length at
+# all, which is the behaviour before this knob existed and the honest way to disable
+# it while a harness sweeps for where the cliff actually is (it is per-model). A
+# non-zero value under 150 is refused at startup: below that the instruction stops
+# shaping a report and starts forbidding one.
 [research.effort.low]
 max_seconds = 300
 max_tokens = 400000
 context_fraction = 0.5
 max_steps = 8
 search_top_k = 5
+max_report_words = 400
 
 [research.effort.medium]
 max_seconds = 900
@@ -264,6 +281,7 @@ max_tokens = 1200000
 context_fraction = 0.7
 max_steps = 20
 search_top_k = 5
+max_report_words = 900
 
 [research.effort.high]
 max_seconds = 3600
@@ -271,6 +289,7 @@ max_tokens = 6000000
 context_fraction = 0.85
 max_steps = 64
 search_top_k = 5
+max_report_words = 1800
 
 [workers]
 gc_interval_seconds = 3600          # how often the GC sweep runs

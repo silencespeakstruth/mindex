@@ -307,6 +307,7 @@ export function activate(context: vscode.ExtensionContext): void {
                     onProgress: (progress) => panel.progress(progress),
                     onSummary: (text) => panel.summary(text),
                     onCitations: (citations) => panel.citations(citations),
+                    onExcerpts: (excerpts) => panel.excerpts(excerpts),
                     onDone: (info) => panel.done(info),
                     onError: (code, detail) => {
                         panel.error(`${code}: ${detail}`, code);

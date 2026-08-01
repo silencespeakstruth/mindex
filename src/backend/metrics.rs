@@ -355,6 +355,32 @@ pub struct ResearchMetrics {
     /// report truncated. Without it that cap is untunable from evidence — the same
     /// argument `report_window_ms` granted-vs-taken makes.
     pub context_truncations: Counter,
+    /// Report turns whose reply reached `num_predict` and was therefore cut rather
+    /// than finished.
+    ///
+    /// Expected to stay at **zero**: the ceiling is sized ~3x the honest prose
+    /// ratio so a report that merely overshoots its word budget never meets it.
+    /// Any non-zero value means `REPORT_WORDS_TO_TOKENS` or the model is wrong, and
+    /// that a cut landed mid-token — which can sever a code fence and cost a
+    /// full-volume rewrite. Unlabelled: the actionable fact is that it happened at
+    /// all.
+    pub report_length_caps: Counter,
+    /// Report turns whose assembled prompt was over the context ceiling, so the
+    /// server dropped old tool output to fit.
+    ///
+    /// The alternative is Ollama trimming the same transcript in silence. Measured
+    /// on this host a run's peak prompt was ~12k against a 65k window, so this may
+    /// legitimately stay at zero forever — in which case the shed path is insurance
+    /// and should be described as such rather than as a mechanism.
+    pub report_context_sheds: Counter,
+    /// Words in the report a run actually shipped, by model.
+    ///
+    /// The measurement `max_report_words` exists to produce: granted-versus-actual
+    /// is the only thing that says whether announcing a length ceiling changes what
+    /// a model writes. If the two turn out uncorrelated, the prompt half of that
+    /// knob is dead weight and only `num_predict` earns its place. Labelled by
+    /// model because the answer is certainly per-model.
+    pub report_words: HistFamily<ModelLabels>,
 }
 
 #[derive(Clone)]
@@ -666,6 +692,12 @@ impl Metrics {
             runs_with_context: Family::default(),
             context_runs_used: Counter::default(),
             context_truncations: Counter::default(),
+            report_length_caps: Counter::default(),
+            report_context_sheds: Counter::default(),
+            // 1 → 8192 words. The granted ladder is 400/900/1800, so the ceiling
+            // sits three buckets above the deepest grant: a report landing in +Inf
+            // is itself the finding.
+            report_words: hist_family(count_hist),
         };
         registry.register(
             "research_runs",
@@ -756,6 +788,21 @@ impl Metrics {
             "research_context_truncations",
             "Context blocks whose last report was truncated to fit max_context_chars",
             research.context_truncations.clone(),
+        );
+        registry.register(
+            "research_report_length_caps",
+            "Report turns cut off by num_predict instead of finishing",
+            research.report_length_caps.clone(),
+        );
+        registry.register(
+            "research_report_context_sheds",
+            "Report turns whose prompt was over the context ceiling, so old tool output was dropped",
+            research.report_context_sheds.clone(),
+        );
+        registry.register(
+            "research_report_words",
+            "Words in the report a research run shipped, by model",
+            research.report_words.clone(),
         );
 
         // ── GC ──
@@ -1198,6 +1245,9 @@ mod tests {
             .inc();
         m.research.context_runs_used.inc();
         m.research.context_truncations.inc();
+        m.research.report_length_caps.inc();
+        m.research.report_context_sheds.inc();
+        m.research.report_words.get_or_create(&model).observe(742.0);
 
         m.gc.runs
             .get_or_create(&TriggerOutcomeLabels {
@@ -1383,6 +1433,9 @@ mod tests {
             ("mindex_research_runs_with_context_total", "counter"),
             ("mindex_research_context_runs_used_total", "counter"),
             ("mindex_research_context_truncations_total", "counter"),
+            ("mindex_research_report_context_sheds_total", "counter"),
+            ("mindex_research_report_length_caps_total", "counter"),
+            ("mindex_research_report_words", "histogram"),
             ("mindex_research_transcript_truncations_total", "counter"),
             ("mindex_research_turns", "histogram"),
             ("mindex_research_worker_threads", "gauge"),
@@ -1435,6 +1488,9 @@ mod tests {
             "mindex_research_active",
             "mindex_research_context_used_ratio",
             "mindex_research_permits_available",
+            // A count of words, like `steps` and `turns` beside it: the unit is the
+            // thing being counted, and `_words` would only restate the name.
+            "mindex_research_report_words",
             "mindex_research_steps",
             "mindex_research_turns",
             "mindex_research_worker_threads",
