@@ -337,7 +337,17 @@ P += [
         desc="Since the process started serving. A sawtooth here is a crash loop.",
     ),
     stat(
-        "Projects", gp(4, 3, 6, y), "mindex_projects", desc="Projects in the database."
+        "Projects",
+        gp(4, 3, 6, y),
+        # Counted over per-project series, not `mindex_projects`: that gauge counts
+        # database rows, and a project with zero files emits no series at all — so
+        # the stat read 3 while the dropdown and the Projects table both showed 2,
+        # which looked like "All" being counted as a project. This form always
+        # agrees with the rest of the dashboard and respects the filter.
+        'count(count by (project_guid) (mindex_project_files{project_guid=~"$project"}))',
+        desc="Projects with at least one file, matching $project. "
+        "`mindex_projects` (the raw DB row count) can be higher when a "
+        "project exists but holds no files.",
     ),
     stat(
         "Indexed files",
@@ -959,31 +969,79 @@ P += [
 ]
 y += 8
 
+# These three were heatmaps and read as permanently empty: a handful of runs a
+# day paints isolated one-interval columns, and the bucket axis runs to 8192
+# while real values sit in the tens — the cells were invisible twice over. A
+# rare histogram is a quantile-points panel here (the Run duration precedent),
+# where the axis follows the data instead of the bucket table.
 P += [
-    heat(
+    ts(
         "Steps per run",
         gp(7, 8, 0, y),
-        "sum by (le) (" + ev('mindex_research_steps_bucket{model=~"$model"}') + ")",
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_steps_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_steps_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
+        unit="short",
         desc="A step is a poor unit — one turn may execute several, and `outline` "
         "is one indexed SELECT while `search` is a GPU embed plus a vector "
-        "query. That is why it is the backstop and not the budget.",
+        "query. That is why it is the backstop and not the budget. One point "
+        "per window that contained a run; the gaps are real.",
+        custom=POINTS_CUSTOM,
     ),
-    heat(
+    ts(
         "Turns per run",
         gp(7, 8, 8, y),
-        "sum by (le) (" + ev('mindex_research_turns_bucket{model=~"$model"}') + ")",
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_turns_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_turns_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
+        unit="short",
         desc="Turns above steps means turns that produced no step: rejected "
         "duplicates, or a model rephrasing instead of learning a name.",
+        custom=POINTS_CUSTOM,
     ),
-    heat(
+    ts(
         "Context used",
         gp(7, 8, 16, y),
-        "sum by (le) ("
-        + ev('mindex_research_context_used_ratio_bucket{model=~"$model"}')
-        + ")",
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_context_used_ratio_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_context_used_ratio_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
         unit="percentunit",
         desc="Peak prompt tokens over the run's num_ctx. Approaching 1.0 means "
         "Ollama is about to trim the transcript in silence.",
+        custom=dict(POINTS_CUSTOM, axisSoftMax=1),
     ),
 ]
 y += 7
@@ -1111,12 +1169,25 @@ y += 7
 # right files every time and the writing did not survive. These four families exist
 # to answer whether bounding and sectioning the output changed that.
 P += [
-    heat(
+    ts(
         "Report length (words)",
         gp(7, 8, 0, y),
-        "sum by (le) ("
-        + ev('mindex_research_report_words_bucket{model=~"$model"}')
-        + ")",
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_report_words_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_report_words_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
+        unit="short",
+        custom=POINTS_CUSTOM,
         desc="Granted versus actual is the whole measurement: the per-effort "
         "max_report_words is announced to the model as a ceiling, and nothing "
         "makes it obey. If this sits wherever it likes regardless of the grant, "
