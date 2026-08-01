@@ -6026,6 +6026,13 @@ pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusRespo
 )]
 #[debug_handler]
 pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
+    Json(config_snapshot(&s).await)
+}
+
+/// The assembled `/config` answer, shared by [`get_config`] and [`get_llms_txt`]
+/// so the numbers the bootstrap document quotes can never disagree with what
+/// `/config` serves — one assembly, two renderings.
+async fn config_snapshot(s: &RouterState) -> ConfigResponse {
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
     // Cloned out and the guard dropped before anything else: the writer is a worker
     // on a tick, and this handler never holds the lock across an `.await`.
@@ -6033,7 +6040,7 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
     // Same treatment, same reason: a worker writes it, this handler clones it out
     // and drops the guard rather than holding a lock across anything.
     let stats = s.research_stats.read().await.clone();
-    Json(ConfigResponse {
+    ConfigResponse {
         version: env!("CARGO_PKG_VERSION"),
         model_id: model_id.clone(),
         languages: ProgrammingLanguage::ALL.iter().map(|l| l.name()).collect(),
@@ -6104,7 +6111,183 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
                     .collect(),
             },
         },
-    })
+    }
+}
+
+/// The `content-type` `/llms.txt` is served as. Markdown, not `text/plain`: the
+/// document *is* markdown and its consumers render or reason over structure.
+pub const LLMS_TXT_CONTENT_TYPE: &str = "text/markdown; charset=utf-8";
+
+/// `GET /llms.txt` — the bootstrap document for AI agents: a hand-written
+/// workflow narrative (`llms_doc.md`, embedded at compile time) plus a live
+/// configuration section rendered from the same [`config_snapshot`] that
+/// `GET /config` serves, so the numbers the prose quotes cannot drift from the
+/// JSON. The point is that a model handed only this URL can drive the whole
+/// search/research workflow without MCP configuration or repo access.
+///
+/// **Deliberately undocumented in OpenAPI.** It is not JSON, not versioned, not
+/// problem+json, and its consumer is a language model reading prose rather than
+/// an API client — the `/metrics` precedent, which
+/// `openapi_spec_is_complete_and_versioned` asserts on purpose. The
+/// `llms_doc_mentions_only_routes_that_exist` test is the drift guard in the
+/// other direction: every route the narrative names must exist in the spec.
+///
+/// **Concurrency:** safe — in-memory values plus two uncontended snapshot
+/// reads; no I/O.
+#[debug_handler]
+pub async fn get_llms_txt(State(s): State<RouterState>) -> Response {
+    let body = llms_document(&config_snapshot(&s).await);
+    (
+        [(axum::http::header::CONTENT_TYPE, LLMS_TXT_CONTENT_TYPE)],
+        body,
+    )
+        .into_response()
+}
+
+/// The whole `/llms.txt` body: the static narrative plus the live section.
+/// Pure over the snapshot so tests can render it without a `RouterState`.
+fn llms_document(c: &ConfigResponse) -> String {
+    format!(
+        "{}\n{}",
+        include_str!("llms_doc.md"),
+        render_llms_live_section(c)
+    )
+}
+
+/// The "Live configuration" markdown appended to the narrative: the numbers a
+/// caller needs before its first request — models, ladder, measured costs,
+/// ceilings — restated from [`ConfigResponse`] rather than written, so they are
+/// current by construction. Absent data is stated as absent (an unrefreshed
+/// catalog, no observed runs), never papered over with an invented value.
+fn render_llms_live_section(c: &ConfigResponse) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    // Infallible: `write!` into a `String` cannot fail.
+    let _ = writeln!(out, "## Live configuration\n");
+    let _ = writeln!(
+        out,
+        "Rendered at request time from the same snapshot `GET /config` serves \
+         (mindex {}, embedding model `{}`).\n",
+        c.version, c.model_id
+    );
+
+    let r = &c.research;
+    let _ = writeln!(out, "### Research models\n");
+    if r.models.is_empty() {
+        if r.models_refreshed_at.is_none() {
+            let _ = writeln!(
+                out,
+                "The model catalog has not been refreshed yet — what Ollama has is \
+                 unknown right now. Re-check `GET /config` shortly.\n"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "No models are currently available to `/research` (Ollama reports \
+                 none, or none pass the `allowed_models` whitelist).\n"
+            );
+        }
+    } else {
+        for m in &r.models {
+            let _ = writeln!(out, "- `{m}`");
+        }
+        let _ = writeln!(out);
+    }
+    if r.default_model.is_empty() {
+        let _ = writeln!(
+            out,
+            "There is no default model: every research request must name one.\n"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "Requests that name no model run on `{}`.\n",
+            r.default_model
+        );
+    }
+
+    let _ = writeln!(out, "### Effort ladder (what each level grants)\n");
+    let _ = writeln!(
+        out,
+        "| effort | max_seconds | max_tokens | max_steps | report sections | \
+         report words | worst_case_seconds |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+    for (name, e) in [
+        ("low", &r.effort.low),
+        ("medium", &r.effort.medium),
+        ("high", &r.effort.high),
+    ] {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            name,
+            e.max_seconds,
+            e.max_tokens,
+            e.max_steps,
+            e.max_report_sections,
+            e.max_report_words,
+            e.worst_case_seconds
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "### Measured cost (what a run actually takes)\n");
+    if r.observed.efforts.is_empty() {
+        let _ = writeln!(
+            out,
+            "No (model, effort) pair has enough journalled runs for an estimate \
+             yet — fall back to the grants above.\n"
+        );
+    } else {
+        let _ = writeln!(out, "| model | effort | runs | p50 s | p90 s |");
+        let _ = writeln!(out, "|---|---|---|---|---|");
+        for o in &r.observed.efforts {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                o.model, o.effort, o.runs, o.p50_seconds, o.p90_seconds
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    let _ = writeln!(out, "### Bounds\n");
+    let _ = writeln!(
+        out,
+        "- Research slots (`max_concurrent`): {} — a 429 `research.busy` means \
+         all are taken.",
+        r.max_concurrent
+    );
+    let _ = writeln!(
+        out,
+        "- Budget override ceilings: {} seconds, {} tokens, {} steps, {} report \
+         sections, {} report words, evidence width {}.",
+        r.max_request_seconds,
+        r.max_request_tokens,
+        r.max_request_steps,
+        r.max_request_report_sections,
+        r.max_request_report_words,
+        r.max_evidence_width
+    );
+    let _ = writeln!(
+        out,
+        "- Context chaining: up to {} prior runs, {} chars of their reports \
+         injected.",
+        r.max_context_runs, r.max_context_chars
+    );
+    let _ = writeln!(
+        out,
+        "- Search: top_k defaults to {} (max {}), queries up to {} bytes.",
+        c.search.default_top_k, c.search.max_top_k, c.search.max_query_bytes
+    );
+    let _ = writeln!(
+        out,
+        "- Indexed languages the server supports: {}.",
+        c.languages.join(", ")
+    );
+    out
 }
 
 /// The columns a summary is built from, shared by the list and the detail so the two
@@ -9747,5 +9930,157 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(got[0].change_type, ChangeType::Renamed);
         assert_eq!(got[0].old_path.as_deref(), Some("src/old.rs"));
+    }
+
+    /// A [`ConfigResponse`] with just enough shape to render the `/llms.txt`
+    /// live section — the tests below vary the model catalog and the observed
+    /// stats, everything else is inert.
+    fn llms_test_config(
+        models: Vec<String>,
+        models_refreshed_at: Option<i64>,
+        observed: Vec<ResearchObservedEffort>,
+    ) -> ConfigResponse {
+        let effort = || ResearchEffortInfo {
+            max_seconds: 300,
+            max_tokens: 400_000,
+            max_steps: 8,
+            context_fraction: 0.5,
+            search_top_k: 5,
+            max_report_words: 400,
+            max_report_sections: 6,
+            evidence_width: 1,
+            worst_case_seconds: 420,
+        };
+        ConfigResponse {
+            version: "0.0.0-test",
+            model_id: "test-embedder".into(),
+            languages: vec!["rust"],
+            embed_batch: 256,
+            db_pool_size: 4,
+            stuck_grace_mins: 30,
+            max_retries: 3,
+            search: SearchConfigInfo {
+                default_top_k: 5,
+                max_top_k: 100,
+                max_query_bytes: 8192,
+            },
+            research: ResearchConfigInfo {
+                default_model: "test-model:8b".into(),
+                models,
+                allowed_models: vec![],
+                models_refreshed_at,
+                effort: ResearchEffortLadder {
+                    low: effort(),
+                    medium: effort(),
+                    high: effort(),
+                },
+                max_request_seconds: 3600,
+                max_request_tokens: 6_000_000,
+                max_request_steps: 64,
+                max_request_report_sections: 12,
+                max_request_report_words: 1800,
+                max_evidence_width: 4,
+                max_concurrent: 1,
+                max_context_runs: 4,
+                max_context_chars: 24_000,
+                report_timeout_ms: 120_000,
+                checkpoint_every_steps: 6,
+                sampling: ResearchSamplingInfo {
+                    temperature: None,
+                    top_p: None,
+                    seed: None,
+                },
+                observed: ResearchObservedInfo {
+                    refreshed_at: models_refreshed_at,
+                    efforts: observed,
+                },
+            },
+        }
+    }
+
+    /// Every backtick-quoted route the bootstrap document names, with an
+    /// optional leading HTTP method stripped. This is what the drift guard
+    /// checks against the OpenAPI spec.
+    fn llms_route_mentions(doc: &str) -> Vec<String> {
+        doc.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|span| {
+                let path = ["GET ", "POST ", "DELETE ", "PUT ", "PATCH "]
+                    .iter()
+                    .find_map(|m| span.strip_prefix(m))
+                    .unwrap_or(span);
+                path.starts_with('/').then(|| path.to_string())
+            })
+            .collect()
+    }
+
+    /// The drift guard on the narrative half of `/llms.txt`: the document is
+    /// the fourth copy of the workflow prose (after the OpenAPI description and
+    /// the two MCP instruction blocks), and the routes it names are the part a
+    /// test can hold still. Every backticked path must exist in the OpenAPI
+    /// spec — a renamed or removed endpoint fails here instead of leaving the
+    /// bootstrap document teaching a route that 404s.
+    #[test]
+    fn llms_doc_mentions_only_routes_that_exist() {
+        // Deliberately outside the spec, each asserted so there by
+        // `openapi_spec_is_complete_and_versioned` or served by the Swagger
+        // merge rather than a documented handler.
+        const OUTSIDE_SPEC: &[&str] = &[
+            "/llms.txt",
+            "/metrics",
+            "/swagger-ui",
+            "/api-docs/openapi.json",
+        ];
+
+        let doc = llms_document(&llms_test_config(vec![], None, vec![]));
+        let spec =
+            serde_json::to_value(crate::backend::openapi::api_doc()).expect("spec serializes");
+        let paths = spec["paths"].as_object().expect("paths object");
+
+        let mentions = llms_route_mentions(&doc);
+        assert!(
+            mentions.iter().any(|p| p.starts_with("/v0/")),
+            "the extractor found no data-plane route at all — it is broken, not the doc"
+        );
+        for m in &mentions {
+            assert!(
+                paths.contains_key(m.as_str()) || OUTSIDE_SPEC.contains(&m.as_str()),
+                "llms_doc.md names a route the OpenAPI spec does not know: {m}"
+            );
+        }
+    }
+
+    /// The content-type is a wire contract like the OpenMetrics one on
+    /// `/metrics`: markdown, never `text/plain`.
+    #[test]
+    fn llms_txt_content_type_is_markdown() {
+        assert_eq!(LLMS_TXT_CONTENT_TYPE, "text/markdown; charset=utf-8");
+    }
+
+    /// An unrefreshed catalog must be stated as unknown, an empty-but-refreshed
+    /// one as empty — and neither may invent a model name. The distinction is
+    /// the same one `models_refreshed_at` carries on `/config`.
+    #[test]
+    fn llms_doc_is_honest_about_an_empty_model_catalog() {
+        let never = llms_document(&llms_test_config(vec![], None, vec![]));
+        assert!(never.contains("has not been refreshed"));
+
+        let empty = llms_document(&llms_test_config(vec![], Some(1_700_000_000), vec![]));
+        assert!(empty.contains("No models are currently available"));
+
+        let populated = llms_document(&llms_test_config(
+            vec!["glm-4:9b".into()],
+            Some(1_700_000_000),
+            vec![ResearchObservedEffort {
+                model: "glm-4:9b".into(),
+                effort: "medium".into(),
+                runs: 12,
+                p50_seconds: 180,
+                p90_seconds: 420,
+            }],
+        ));
+        assert!(populated.contains("- `glm-4:9b`"));
+        assert!(populated.contains("| glm-4:9b | medium | 12 | 180 | 420 |"));
     }
 }

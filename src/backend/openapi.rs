@@ -254,6 +254,15 @@ mod tests {
             "/metrics must stay out of the OpenAPI spec — see the handler's doc comment"
         );
 
+        // `/llms.txt` gets the same treatment for the same reasons: it serves
+        // markdown prose to a language model, not JSON to an API client. Its own
+        // drift guard runs the other way — `llms_doc_mentions_only_routes_that_exist`
+        // checks the document against this spec.
+        assert!(
+            !paths.contains_key("/llms.txt"),
+            "/llms.txt must stay out of the OpenAPI spec — see the handler's doc comment"
+        );
+
         // The two dual-method routes expose both verbs.
         assert!(paths["/projects/{project_guid}"].get("get").is_some());
         assert!(paths["/projects/{project_guid}"].get("delete").is_some());

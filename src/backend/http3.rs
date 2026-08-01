@@ -29,8 +29,8 @@ use crate::backend::metrics::{
 use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
     delete_files, delete_history, delete_project, delete_research_active, delete_research_run,
-    delete_research_runs, get_config, get_files, get_health, get_metrics, get_project_stats,
-    get_projects, get_research_active, get_research_run, get_research_runs,
+    delete_research_runs, get_config, get_files, get_health, get_llms_txt, get_metrics,
+    get_project_stats, get_projects, get_research_active, get_research_run, get_research_runs,
     get_research_verification, get_status, get_version, post_cancel, post_drift, post_gc,
     post_history, post_index, post_research, post_research_challenge, post_research_pin,
     post_retry, post_search, post_symbols,
@@ -510,6 +510,10 @@ fn build_router(
         .route("/gc", post(post_gc))
         .route("/status", get(get_status))
         .route("/config", get(get_config))
+        // The AI-agent bootstrap document (llms.txt convention). Unconditional,
+        // unlike `/metrics`: there is no config gate whose absence it should
+        // mirror, and a 404 here would read as "this server has no such doc".
+        .route("/llms.txt", get(get_llms_txt))
         .route("/health", get(get_health))
         .route("/version", get(get_version));
 
