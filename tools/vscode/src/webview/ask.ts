@@ -34,10 +34,19 @@ interface EffortBudget {
     max_report_words?: number;
     evidence_width?: number;
 }
+interface ObservedEffort {
+    model: string;
+    effort: string;
+    runs: number;
+    p50_seconds: number;
+    p90_seconds: number;
+}
 interface ResearchConfig {
     default_model: string;
     models?: string[];
     effort: Record<string, EffortBudget>;
+    /** Measured cost per (model, effort) — what a level *takes*, not what it grants. */
+    observed?: { efforts?: ObservedEffort[] };
     max_request_seconds: number;
     max_request_tokens: number;
     max_request_steps: number;
@@ -610,6 +619,11 @@ for (const control of controls.values()) {
         node.addEventListener("change", persist);
     }
 }
+// The measured-cost line in the effort tooltips is per model, so it follows the
+// model picker rather than freezing at whatever was selected when config arrived.
+for (const node of controls.get("model")?.nodes ?? []) {
+    node.addEventListener("change", refreshEffortTitles);
+}
 
 restore();
 render();
@@ -696,12 +710,7 @@ window.addEventListener("message", (e: MessageEvent<Record<string, unknown>>) =>
                 // label: three labels reading "medium · 900s · 1.2M tok · 20 steps"
                 // do not fit a sidebar, and the Budget summary already carries the
                 // active one.
-                for (const level of ["low", "medium", "high"]) {
-                    const b = researchConfig.effort[level];
-                    if (b !== undefined) {
-                        modeSegmentTitle(level, b);
-                    }
-                }
+                refreshEffortTitles();
             }
             renderPanels();
             break;
@@ -752,12 +761,37 @@ function asText(v: unknown): string {
     return typeof v === "string" ? v : "";
 }
 
+function refreshEffortTitles(): void {
+    if (researchConfig === undefined) {
+        return;
+    }
+    for (const level of ["low", "medium", "high"]) {
+        const b = researchConfig.effort[level];
+        if (b !== undefined) {
+            modeSegmentTitle(level, b);
+        }
+    }
+}
+
 function modeSegmentTitle(level: string, b: EffortBudget): void {
     const button = el("effort").querySelector<HTMLButtonElement>(`[data-value="${level}"]`);
-    if (button !== null) {
-        button.title =
-            `${formatValue("seconds", b.max_seconds)} · ` +
-            `${formatValue("ktokens", Math.round(b.max_tokens / 1000))} tokens · ` +
-            `${b.max_steps} steps`;
+    if (button === null) {
+        return;
     }
+    let title =
+        `${formatValue("seconds", b.max_seconds)} · ` +
+        `${formatValue("ktokens", Math.round(b.max_tokens / 1000))} tokens · ` +
+        `${b.max_steps} steps`;
+    // The grant says what the level allows; the measured line says what it takes,
+    // which is the number a user waiting on a run actually wants. Per model,
+    // because a 31B model and a 3B model at the same level are different waits;
+    // absent (no row for this model+level yet) the grant stands alone.
+    const model = controls.get("model")?.read() || researchConfig?.default_model || "";
+    const seen = researchConfig?.observed?.efforts?.find(
+        (o) => o.effort === level && o.model === model
+    );
+    if (seen !== undefined) {
+        title += ` · measured ~${formatValue("seconds", seen.p50_seconds)} (p50 of ${seen.runs})`;
+    }
+    button.title = title;
 }

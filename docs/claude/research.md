@@ -992,3 +992,126 @@ from `GET /config`, presets from the ladder (checkpoint's preset is the
 subtlety: `readBudget`'s `num()` drops 0 (`n > 0`), so `bcheckpoint` has its
 own zero-preserving reader, and it rounds a slider's 1 up to 2 rather than
 letting the server's floor turn a slider position into a 400.
+
+## A run became something you can see and stop (2026-08-01)
+
+Field report, after four clean runs (39 citations, all verified) followed by an
+outage: `/research` stopped answering, and **every instrument said it was fine**.
+`GET /health` returned `{"status":"ok"}` with all four dependencies green;
+`GET /projects/{guid}/research?status=running` returned `[]`; there was no cancel
+endpoint; and `max_concurrent` was published nowhere, so the one number that
+would have explained the 429s was unavailable. The only honest advice the session
+could produce was "restart the service".
+
+What the code actually said, once read:
+
+- **A run had no name until it ended.** `run_id` was minted inside
+  `db::research::insert_run`, i.e. by the journal write at the very end. So
+  nothing could name a *running* run — and a cancelled run, which is never
+  journalled at all, could never be named.
+- **The stored-run list only ever showed finished runs**, by construction: it is
+  keyset-paged by `seq`, which a live run does not have. The `status=running`
+  filter the operator reached for had never existed.
+- **The only live signal was `mindex_research_active`** in `/metrics` — a count
+  with no identities. Worse, the scrape handler refreshed
+  `research_permits_available` and *not* `research_active`, so a single response
+  could report a free permit and an active run at once.
+
+And the likely cause was not a wedge at all. scout holds its SSE connection for
+`RESEARCH_TOTAL_TIMEOUT` (4200 s), and an abandoned MCP tool call does not close
+the socket. From the server's side a client was still waiting, every deadline was
+ticking correctly, and the slot was legitimately spoken for — for up to seventy
+minutes. **Externally that is indistinguishable from a hung run**, which is the
+real defect: not the holding, the not-being-able-to-tell.
+
+Decisions of record:
+
+- **The id moves to admission.** `post_research` mints it, hands it to
+  `RunContext`, streams it as a new first frame (`started`, with the grants and
+  the derived `worst_case_ms`), and registers it. One uuid from second zero to the
+  stored row.
+- **The registry guard rides in the same future as the permit**
+  (`backend::inflight`). Anywhere else and the two drift, and a list that
+  describes a free slot is worse than no list. Same reasoning as the SQLite
+  connection returning itself from inside its blocking task.
+- **Cancelling does not remove the registry entry.** The job removes it as it
+  unwinds. A cancelled-but-unwinding run still holds its permit, and hiding it
+  would report a slot that is not free.
+- **`DELETE /research/active/{run_id}` is idempotent (204 either way).** "Already
+  finished" and "never existed" are the same state a moment later and the caller
+  cannot act on the difference. It takes no lock and is deliberately callable
+  mid-turn.
+- **The endpoints are global, not per project.** The semaphore is. A caller
+  planning a queue needs to know the slots are gone, not that none of *its* runs
+  hold them. Folding live runs into `/projects/{guid}/research` was rejected: two
+  data sources under one keyset cursor, one of which has no cursor value.
+- **A busy slot is not a degradation.** With `max_concurrent = 1` that rule would
+  make `degraded` the steady state. `/health` moves its verdict only for a run
+  past `max_seconds + report_timeout_ms + WEDGE_GRACE` — which is also exactly the
+  watchdog's cancel rule, sharing one const so the two cannot disagree.
+- **The watchdog is unconditional**, unlike the metrics collector it would
+  otherwise have lived in: gating a recovery mechanism on `[metrics].enabled`
+  makes an observability switch decide whether the service can recover. It exists
+  for the three awaits not under a token — `effective_num_ctx`'s `/api/show`, the
+  error-body read in `post_chat`, and the deliberately uncancellable journal write
+  — and for the fourth nobody has added yet. `research_watchdog_cancels_total` is
+  expected to stay at **zero**; a non-zero value names the day one of them wedged.
+
+### The instruments that were lying quietly
+
+- **`binding` never meant what it reads as.** It names the axis with the largest
+  *share spent*, seeded at `Time`, so a run 12.5% into its clock and less into
+  everything else reports `binding: "time"` — read in the field as "this run is
+  running out of time". `shares` (the four percentages) now ships beside it, and
+  scout promotes both to the top of its result. The field itself is unchanged:
+  it is a wire contract, and renaming it would break the consumers that read it
+  correctly.
+- **`step` reported the request, never the result.** `{action: "read_chunks",
+  path: …, hits: 3}` on a 4000-line file names no lines at all, so the trace could
+  not answer the one question it exists for. The locations were already collected
+  for citation provenance (`Executed::shown`); `spans` is that same list, capped
+  with `spans_truncated` rather than cut silently.
+- **`effort` had no price.** The ladder publishes what a level *grants* (`high`:
+  3600 s); nothing said what it *takes* (measured here: ~400 s). So `effort: high`
+  lands on questions that read one dictionary literal, and a queue of two
+  investigations is planned as if it were an hour when it is fifteen minutes — or
+  the reverse. `research.observed` publishes p50/p90 per `(model, effort)` from
+  the journal, on the model catalog's tick and with its keep-the-last-snapshot
+  rule. Below `MIN_RUNS_FOR_ESTIMATE` (3) a pair is absent rather than noisy: one
+  cold start must not become "what high effort costs".
+- **`worst_case_seconds` is derived and published** because `max_seconds` and
+  `report_timeout_ms` were both already on the wire and *nobody adds them*. They
+  bound different phases; the sum is the only number that answers "how long might
+  I wait", and reading the first alone understates `high` by five minutes.
+- **A new effort level was considered and rejected.** The complaint that produced
+  it ("no fast tier") was really that the existing levels had no published cost.
+  `observed` answers that without changing a contract three clients render.
+
+### scout
+
+- **Small excerpt sets now come back unasked** (`AUTO_EXCERPT_BYTES`, 32 KiB).
+  `include_excerpts=False` was right about the ~100 KB case and wrong about every
+  small one: it charged a second round trip, and it asked the caller to decide
+  from a hint whether the literal text was worth reading — the judgement it cannot
+  make without seeing it. Field evidence: the two corrections that mattered in a
+  real session (a `list(set(...))`, a default argument value) were visible only in
+  the verbatim code.
+- **`citations_verified`/`citations_total`/`binding` are promoted to the top
+  level.** Every *exception* to "trust the report" was already flat
+  (`citations_warning`, `freshness_warning`) while the grounds for trusting it sat
+  one level down — and `binding`, which `_INSTRUCTIONS` explicitly tells the
+  caller to read, was buried in `usage`.
+- **429 is handled apart from every other non-200.** It is a queue, not a bad
+  request, and the caller's next move differs; the message names the slot count
+  and `/research/active` instead of "retry later".
+- **A client timeout keeps its own note and gains `live_run_id`.** The generic
+  `done_reason` fallback used to overwrite the more specific message, and the
+  result never said the obvious thing: the run is still going, still holding a
+  slot, and here is the id that ends it.
+- **The README was wrong in the way that matters**: it documented
+  `RESEARCH_TOTAL_TIMEOUT` as 1800 (code: 4200) and `MCP_TOOL_TIMEOUT=1800000`,
+  the exact setting whose old value killed every high-effort run — and its
+  signature omitted `budget`, `context_run_ids` and `include_excerpts` entirely.
+  A stale README is also, on inspection, the likeliest source of the "docs mention
+  effort levels beyond low/medium/high" report: the repo has exactly three
+  everywhere, and the budget shape-knob table reads like a fourth if skimmed.

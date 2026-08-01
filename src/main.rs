@@ -407,6 +407,19 @@ async fn main() -> Result<(), BoxError> {
         ));
     }
 
+    // What a run at each level has actually cost, for `GET /config`. Shares the
+    // model catalog's interval deliberately: both are the parts of `/config` that
+    // are not static, and a second interval key would be a knob nobody tunes.
+    let research_stats: worker::research_stats::SharedRunStats = Arc::new(
+        tokio::sync::RwLock::new(worker::research_stats::RunStats::default()),
+    );
+    tokio::spawn(worker::research_stats::run(
+        db_pool.clone(),
+        research_stats.clone(),
+        cfg.research.models_refresh_interval_seconds,
+        sigterm_token.child_token(),
+    ));
+
     // Unconditional on purpose, unlike the collector above: this is the backstop
     // that keeps a research slot from being held forever, and gating a safety
     // mechanism on `[metrics].enabled` would make an observability switch decide
@@ -471,6 +484,7 @@ async fn main() -> Result<(), BoxError> {
                 research_semaphore: research_semaphore.clone(),
                 research_max_concurrent: cfg.research.max_concurrent,
                 research_registry: research_registry.clone(),
+                research_stats: research_stats.clone(),
                 research_ollama,
                 research_default_model: cfg.research.default_model.clone(),
                 research_effort: cfg.research.effort.clone(),

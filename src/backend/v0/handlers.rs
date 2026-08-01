@@ -51,6 +51,8 @@ use crate::backend::v0::models::ResearchEffortInfo;
 use crate::backend::v0::models::ResearchFreshness;
 use crate::backend::v0::models::ResearchHealth;
 use crate::backend::v0::models::ResearchListQuery;
+use crate::backend::v0::models::ResearchObservedEffort;
+use crate::backend::v0::models::ResearchObservedInfo;
 use crate::backend::v0::models::ResearchPinRequest;
 use crate::backend::v0::models::ResearchRequest;
 use crate::backend::v0::models::ResearchRunDependency;
@@ -4550,7 +4552,14 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   [research].report_timeout_ms`: the two bound different phases, so this sum, not
 ///   `granted_seconds`, is how long the caller may wait;
 /// - `thinking` `{text}` — deltas of the model's thinking (thinking models only);
-/// - `step` `{n, action, <arg>, hits}` — one executed tool call. `action` is
+/// - `step` `{n, action, <arg>, hits, spans, spans_truncated}` — one executed tool
+///   call. `spans` are the `path:start-end` locations the call actually put in front
+///   of the model — the same ones citation provenance is scored against — so the
+///   trace says what was *read*, not merely what was asked for: `hits: 3` on a
+///   4000-line file names no lines at all. Empty for calls that read nothing
+///   (`note`, `revise_plan`) or return paths without usable spans (`list_files`).
+///   Capped, with `spans_truncated` saying so rather than the cut being silent.
+///   `action` is
 ///   `search`, `grep`, `symbols`, `outline`, `callers`, `list_files`, `read_chunks`,
 ///   `note` or `revise_plan`, and the argument key is named for what it is: `query`,
 ///   `pattern`, `name`, `path`, `name`, `glob`, `path`, `text` and `plan`
@@ -4560,12 +4569,16 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   one), and cost a step like any other call;
 /// - `progress` `{steps, max_steps, elapsed_ms, max_ms, tokens, max_tokens,
 ///   prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx, context_pct, turns,
-///   binding}` — budget consumption, so a live run is steerable instead of opaque.
-///   Emitted once before the first turn (all limits, nothing spent), then after
-///   every executed step and every completed turn. `binding` is the axis closest to
-///   exhaustion (`time`, `tokens`, `steps` or `context`) — i.e. what this run will
-///   run out of. Not emitted on a timer: interpolate `elapsed_ms` locally between
-///   events;
+///   binding, shares}` — budget consumption, so a live run is steerable instead of
+///   opaque. Emitted once before the first turn (all limits, nothing spent), then
+///   after every executed step and every completed turn. `binding` is the axis with
+///   the largest **share spent** (`time`, `tokens`, `steps` or `context`), and
+///   `shares` `{time, tokens, steps, context}` are those four shares as percentages.
+///   Read them together: `binding` names a maximum, not a problem — a run 12% into
+///   its time budget and less into everything else reports `binding: "time"`, which
+///   without the shares beside it reads as a run about to expire. What actually
+///   stopped a run is `done.reason`. Not emitted on a timer: interpolate
+///   `elapsed_ms` locally between events;
 /// - `summary` `{text}` — the final Markdown report. Streamed as deltas when the
 ///   report was rewritten after its citation check; sent as one event otherwise,
 ///   because the first draft is withheld until that check has run;
@@ -4688,9 +4701,13 @@ citation and carries the indexed code at those locations verbatim \
 (`{path, start_line, end_line, code}`), so a caller needing a file's literal text gets it \
 from the index rather than by asking the model to retype it into the report; scope is \
 enforced, caps drop whole chunks, `truncated` says some did not fit, and the whole event is \
-best-effort. `progress` \
+best-effort. `step` carries \
+`spans`, the `path:start-end` locations that call actually returned, so the trace says what was \
+read rather than only what was asked for. `progress` \
 reports budget consumption during the run (steps/time/tokens/context plus `binding`, the \
-axis closest to exhaustion); `done` repeats those fields and adds a `reason` — `finalized`, \
+axis with the largest share spent, and `shares`, the four percentages it was chosen from — \
+`binding` names a maximum, not a problem, and without the shares beside it a run at 12% of its \
+time budget reads as one that is running out); `done` repeats those fields and adds a `reason` — `finalized`, \
 or one of \
 `time_exhausted`/`tokens_exhausted`/`budget_exhausted`/`context_exhausted`/`unparseable`/`repeated_calls` \
 when the report was cut short — plus `prompt_version`, the generation of the server's \
@@ -5770,6 +5787,9 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
     // Cloned out and the guard dropped before anything else: the writer is a worker
     // on a tick, and this handler never holds the lock across an `.await`.
     let catalog = s.research_models.read().await.clone();
+    // Same treatment, same reason: a worker writes it, this handler clones it out
+    // and drops the guard rather than holding a lock across anything.
+    let stats = s.research_stats.read().await.clone();
     Json(ConfigResponse {
         version: env!("CARGO_PKG_VERSION"),
         model_id: model_id.clone(),
@@ -5813,6 +5833,20 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
                 temperature: s.research_sampling.temperature,
                 top_p: s.research_sampling.top_p,
                 seed: s.research_sampling.seed,
+            },
+            observed: ResearchObservedInfo {
+                refreshed_at: stats.refreshed_at,
+                efforts: stats
+                    .observed
+                    .into_iter()
+                    .map(|o| ResearchObservedEffort {
+                        model: o.model,
+                        effort: o.effort,
+                        runs: o.runs,
+                        p50_seconds: o.p50_seconds,
+                        p90_seconds: o.p90_seconds,
+                    })
+                    .collect(),
             },
         },
     })
@@ -6192,6 +6226,11 @@ pub async fn get_research_run(
 /// *extending* a run's life, and a client toggling a checkbox twice would silently
 /// renew everything it touched.
 ///
+/// `pinned` **defaults to `true`**, so `{}` pins. Requiring it made the obvious
+/// call on an endpoint named `/pin` a 400 naming a field the caller had no reason
+/// to guess; unpinning is the surprising direction, and that is the one worth
+/// spelling out.
+///
 /// **Concurrency:** safe — one row, one statement, no locks.
 #[utoipa::path(
     post,
@@ -6201,7 +6240,7 @@ pub async fn get_research_run(
         ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
         ("run_id" = String, Path, description = "The run's stable id."),
     ),
-    request_body = ResearchPinRequest,
+    request_body(content = ResearchPinRequest, description = "`{\"pinned\": false}` returns the run to the retention sweep. `pinned` defaults to `true`, so `{}` pins."),
     responses(
         (status = 200, description = "The updated run summary, so the client renders the server's answer rather than its own guess.", body = ResearchRunSummary),
         (status = 404, description = "This project has no such run.", body = ProblemDetails),

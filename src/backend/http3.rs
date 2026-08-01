@@ -123,6 +123,10 @@ pub struct RouterState {
     /// Which runs are live right now, and the tokens that stop them. The permit
     /// count alone says a slot is busy; this says *what* is holding it.
     pub research_registry: crate::backend::inflight::ResearchRegistry,
+    /// What a run at each `(model, effort)` has actually cost lately, refreshed by
+    /// `worker::research_stats` and published by `GET /config`. The ladder says what
+    /// a level *grants*; this is the only thing that says what it *takes*.
+    pub research_stats: crate::worker::research_stats::SharedRunStats,
     /// The Ollama chat client driving research loops.
     pub research_ollama: Arc<dyn crate::models::ollama::OllamaModel>,
     /// Model used when a research request names none ("" = none configured).

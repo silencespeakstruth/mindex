@@ -370,12 +370,19 @@ impl RunProgress {
         (self.peak_prompt_tokens as f64 * 100.0) / self.num_ctx as f64
     }
 
-    /// The axis with the largest consumed share. Ties resolve towards the primary
-    /// budget (time first, context — a guard, not a budget — last).
-    pub fn binding(&self, context_fraction: f64) -> Binding {
+    /// Each axis's consumed share of its own grant, as a fraction.
+    ///
+    /// Published beside `binding` because `binding` alone is routinely misread. It
+    /// names the axis with the **largest share spent**, which is not the axis that
+    /// stopped the run (`done.reason` is) and not necessarily an axis under any
+    /// pressure at all: a run reporting `binding: "time"` at 450 s of a granted
+    /// 3600 s is saying "12.5%, and the other three are lower" — a fact that reads
+    /// as alarming and means the opposite. With the four numbers on the wire the
+    /// claim is checkable instead of oracular.
+    pub fn shares(&self, context_fraction: f64) -> [(Binding, f64); 4] {
         let ratio = |used: f64, max: f64| if max > 0.0 { used / max } else { 0.0 };
         let context_ceiling = self.num_ctx as f64 * context_fraction;
-        let axes = [
+        [
             (
                 Binding::Time,
                 ratio(self.elapsed_ms as f64, self.max_ms as f64),
@@ -392,8 +399,14 @@ impl RunProgress {
                 Binding::Context,
                 ratio(self.peak_prompt_tokens as f64, context_ceiling),
             ),
-        ];
-        axes.into_iter()
+        ]
+    }
+
+    /// The axis with the largest consumed share. Ties resolve towards the primary
+    /// budget (time first, context — a guard, not a budget — last).
+    pub fn binding(&self, context_fraction: f64) -> Binding {
+        self.shares(context_fraction)
+            .into_iter()
             .fold((Binding::Time, f64::MIN), |best, axis| {
                 if axis.1 > best.1 { axis } else { best }
             })
@@ -401,6 +414,12 @@ impl RunProgress {
     }
 
     fn to_json(self, context_fraction: f64) -> Value {
+        // Percentages, one decimal, like `context_pct` beside them — and nested so
+        // the share of the context *ceiling* (peak / (num_ctx × context_fraction))
+        // cannot be confused with the top-level `context_pct`, which is the share of
+        // the whole window.
+        let pct = |v: f64| (v * 1000.0).round() / 10.0;
+        let shares = self.shares(context_fraction);
         json!({
             "steps": self.steps,
             "max_steps": self.max_steps,
@@ -415,6 +434,12 @@ impl RunProgress {
             "context_pct": (self.context_pct() * 10.0).round() / 10.0,
             "turns": self.turns,
             "binding": self.binding(context_fraction).as_str(),
+            "shares": {
+                "time": pct(shares[0].1),
+                "tokens": pct(shares[1].1),
+                "steps": pct(shares[2].1),
+                "context": pct(shares[3].1),
+            },
         })
     }
 }
@@ -452,6 +477,8 @@ pub enum ResearchEvent {
         n: usize,
         call: StepCall,
         hits: usize,
+        /// Where the call actually landed — see [`StepShown`].
+        shown: StepShown,
     },
     /// Budget consumption, so a live run is steerable instead of opaque. Emitted
     /// once before the first turn (limits, zero spent), then after every executed
@@ -519,6 +546,44 @@ pub enum ResearchEvent {
     },
     /// A failure after the stream started (the HTTP status is already 200).
     Error { code: String, detail: String },
+}
+
+/// The locations one executed step put in front of the model.
+///
+/// A step used to report only its *request* — `{action: "read_chunks", path: "…",
+/// hits: 3}` — which says a call was made and how many rows came back, and not one
+/// thing about what was read. Three hits in a 4000-line file could be anywhere, so
+/// the trace was unusable for judging coverage, which is the only reason to read a
+/// trace at all. The server already has the answer: these are exactly the locations
+/// it records for citation provenance.
+///
+/// `path:start-end` strings, the same grammar citations use, so one parser reads
+/// both. Bounded, because `callers` can return fifty rows and the frame must not
+/// become the response: past [`MAX_STEP_SPANS`] the list is cut and `truncated`
+/// says so rather than the cut being silent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StepShown {
+    pub spans: Vec<String>,
+    pub truncated: bool,
+}
+
+/// Locations one `step` frame will carry before it starts eliding.
+const MAX_STEP_SPANS: usize = 16;
+
+impl StepShown {
+    fn new(shown: &[(String, Option<Span>)]) -> Self {
+        let mut spans: Vec<String> = shown
+            .iter()
+            .filter_map(|(path, span)| {
+                span.as_ref()
+                    .map(|s| format!("{path}:{}-{}", s.start, s.end))
+            })
+            .collect();
+        spans.dedup();
+        let truncated = spans.len() > MAX_STEP_SPANS;
+        spans.truncate(MAX_STEP_SPANS);
+        Self { spans, truncated }
+    }
 }
 
 /// The tool call a `step` event describes.
@@ -640,7 +705,12 @@ impl ResearchEvent {
                 "worst_case_ms": worst_case_ms,
             }),
             ResearchEvent::Thinking { text } => json!({ "text": text }),
-            ResearchEvent::Step { n, call, hits } => {
+            ResearchEvent::Step {
+                n,
+                call,
+                hits,
+                shown,
+            } => {
                 // One argument key per action, named for what it is; scout's step
                 // whitelist and the VS Code renderer both key on these.
                 let (arg_key, argument) = call.argument();
@@ -649,6 +719,9 @@ impl ResearchEvent {
                     "action": call.action(),
                     arg_key: argument,
                     "hits": hits,
+                    // What the call actually returned, not just what it asked for.
+                    "spans": shown.spans,
+                    "spans_truncated": shown.truncated,
                 })
             }
             ResearchEvent::Progress {
@@ -5413,6 +5486,9 @@ async fn research_inner(
                             n: steps,
                             call,
                             hits,
+                            // `note`/`revise_plan` read nothing: they write to the
+                            // run's own state, so there is no location to report.
+                            shown: StepShown::default(),
                         },
                     )?;
                     send(tx, token, emit_progress(steps, &tally))?;
@@ -5447,6 +5523,10 @@ async fn research_inner(
                     shown,
                 } = executed;
                 tally_tool_use(&mut run_tools, action, &result_text, hits);
+                // Built before `shown` is consumed below: the wire trace and the
+                // citation evidence are the same locations, and taking them from
+                // one place is what keeps the trace honest about what was read.
+                let step_shown = StepShown::new(&shown);
                 for (path, span) in shown {
                     evidence.record(&path, span);
                 }
@@ -5457,6 +5537,7 @@ async fn research_inner(
                         n: steps,
                         call,
                         hits,
+                        shown: step_shown,
                     },
                 )?;
                 // Per executed step: within a multi-call turn this is the only thing
@@ -6077,6 +6158,7 @@ async fn research_inner(
                         text,
                         shown,
                     } = executed;
+                    let step_shown = StepShown::new(&shown);
                     for (path, span) in shown {
                         evidence.record(&path, span);
                     }
@@ -6091,6 +6173,7 @@ async fn research_inner(
                             n: steps + rv.steps,
                             call: step_call,
                             hits,
+                            shown: step_shown,
                         },
                     )?;
                     messages.push(ChatMessage::tool(name, text));
@@ -8582,6 +8665,7 @@ mod tests {
                 n: 1,
                 call: StepCall::Search { .. },
                 hits: 1,
+                ..
             }
         ));
         assert!(matches!(
@@ -8590,6 +8674,7 @@ mod tests {
                 n: 2,
                 call: StepCall::Symbols { .. },
                 hits: 1,
+                ..
             }
         ));
         assert!(
@@ -11165,6 +11250,7 @@ mod tests {
                 n: 1,
                 call,
                 hits: 2,
+                shown: StepShown::default(),
             }
             .data();
             assert_eq!(d["action"], action);
@@ -11772,6 +11858,74 @@ mod tests {
         assert_eq!(d["steps"], 3);
     }
 
+    /// A step that reports only its request is unreadable as a trace: "read_chunks
+    /// on a 4000-line file, 3 hits" could be anywhere in it. The locations are the
+    /// same ones citation provenance is scored against, so reporting them costs
+    /// nothing and makes coverage judgeable.
+    #[test]
+    fn a_step_reports_where_it_landed_not_only_what_it_asked_for() {
+        let shown = vec![
+            (
+                "src/research.rs".to_string(),
+                Some(Span { start: 10, end: 40 }),
+            ),
+            (
+                "src/research.rs".to_string(),
+                Some(Span {
+                    start: 120,
+                    end: 160,
+                }),
+            ),
+            // A path with no usable span (a `list_files` hit) is not a location.
+            ("src/main.rs".to_string(), None),
+        ];
+        let d = ResearchEvent::Step {
+            n: 1,
+            call: StepCall::ReadChunks {
+                path: "src/research.rs".into(),
+            },
+            hits: 2,
+            shown: StepShown::new(&shown),
+        }
+        .data();
+
+        assert_eq!(
+            d["spans"],
+            json!(["src/research.rs:10-40", "src/research.rs:120-160"])
+        );
+        assert_eq!(d["spans_truncated"], json!(false));
+    }
+
+    /// `callers` can return fifty rows; the frame must not become the response. A
+    /// cut is fine, a *silent* cut is not.
+    #[test]
+    fn a_step_that_shows_too_much_says_it_was_cut() {
+        let shown: Vec<(String, Option<Span>)> = (0..MAX_STEP_SPANS + 5)
+            .map(|i| {
+                (
+                    format!("src/f{i}.rs"),
+                    Some(Span {
+                        start: i,
+                        end: i + 1,
+                    }),
+                )
+            })
+            .collect();
+        let d = ResearchEvent::Step {
+            n: 1,
+            call: StepCall::Callers { name: "x".into() },
+            hits: shown.len(),
+            shown: StepShown::new(&shown),
+        }
+        .data();
+
+        assert_eq!(
+            d["spans"].as_array().expect("spans array").len(),
+            MAX_STEP_SPANS
+        );
+        assert_eq!(d["spans_truncated"], json!(true));
+    }
+
     /// The frame that gives a run its name. Without it the id existed only from
     /// `done` onwards, which is to say only for runs that finished — so nothing
     /// could list or cancel a run while it was running, which is precisely when
@@ -11829,6 +11983,19 @@ mod tests {
         ] {
             assert_eq!(d[key], want, "progress.{key} changed shape: {d}");
         }
+
+        // The four shares `binding` picks its winner from. Published because the
+        // winner alone says nothing about pressure: here it is 15%.
+        let shares = &d["shares"];
+        assert_eq!(shares["steps"], json!(15.0));
+        assert_eq!(shares["context"], json!(14.0));
+        // 10ms of 240s, and 1300 of 400k: both far from binding.
+        assert_eq!(shares["time"], json!(0.0));
+        assert_eq!(shares["tokens"], json!(0.3));
+        assert_eq!(
+            d["binding"], "steps",
+            "binding must name the largest of shares: {shares}"
+        );
     }
 
     #[test]

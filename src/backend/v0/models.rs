@@ -1391,7 +1391,18 @@ pub struct ResearchPinRequest {
     /// `created_at + [research].retention_days` — so unpinning a run older than the
     /// window makes it eligible at the very next sweep, which is what "let it age
     /// normally" honestly means.
+    ///
+    /// Defaults to `true`, so `POST …/pin` with a body of `{}` pins. It was
+    /// required, which made the obvious call — pin this run — a 400 naming a field
+    /// the caller had no reason to guess, on an endpoint whose own name already
+    /// says what it does. Unpinning is the surprising direction and is the one that
+    /// must be spelled out.
+    #[serde(default = "pinned_by_default")]
     pub pinned: bool,
+}
+
+fn pinned_by_default() -> bool {
+    true
 }
 
 #[derive(Serialize, Debug, ToSchema)]
@@ -1673,6 +1684,44 @@ pub struct ResearchConfigInfo {
     pub checkpoint_every_steps: usize,
     /// The sampling every research turn runs at.
     pub sampling: ResearchSamplingInfo,
+    /// What runs at each `(model, effort)` have actually cost on this server
+    /// lately. See [`ResearchObservedInfo`].
+    pub observed: ResearchObservedInfo,
+}
+
+/// Measured cost of a research run, as served by `GET /config`.
+///
+/// The effort ladder says what a level **grants** — `high` allows an hour. Nothing
+/// said what a level **takes**, and the two are not close: measured here, `high`
+/// runs finish in about seven minutes against that hour. A caller had no way to
+/// price a level before choosing it, which is how `effort: high` ends up on a
+/// question that reads one dictionary literal, and how a caller queues two
+/// investigations without knowing whether that is fifteen minutes or two hours.
+///
+/// Percentiles over real runs from the journal, per `(model, effort)` because a
+/// 31B model and a 3B model at the same level are not the same wait. A pair with
+/// too few runs to say anything is simply absent — a client with no row falls back
+/// to the grant.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchObservedInfo {
+    /// Unix seconds of the last successful read; `null` = never read, which is a
+    /// different statement from "no runs recorded" (an empty `efforts`).
+    pub refreshed_at: Option<i64>,
+    pub efforts: Vec<ResearchObservedEffort>,
+}
+
+/// One `(model, effort)` pair's measured cost.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchObservedEffort {
+    pub model: String,
+    pub effort: String,
+    /// Runs the estimate is built from — the basis for trusting it.
+    pub runs: usize,
+    /// Typical wall clock, end to end. This is the number to show a user waiting.
+    pub p50_seconds: u64,
+    /// The slow tail. Compare against the level's `worst_case_seconds`: the gap
+    /// between them is how much of the grant is headroom rather than expectation.
+    pub p90_seconds: u64,
 }
 
 /// `[research].temperature`/`top_p`/`seed` as served by `GET /config`.

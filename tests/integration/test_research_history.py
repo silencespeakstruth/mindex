@@ -179,6 +179,14 @@ def test_pinning_clears_the_expiry_and_delete_is_idempotent(
     assert unpinned.status_code == 200, unpinned.text
     assert unpinned.json()["expires_at"] is not None
 
+    # `pinned` defaults to true, so the obvious call on an endpoint named `/pin`
+    # works. It used to be required, which made `{}` a 400 naming a field the
+    # caller had no reason to guess.
+    defaulted = client.post(f"{base}/pin", json={})
+    assert defaulted.status_code == 200, defaulted.text
+    assert defaulted.json()["pinned"] is True
+    assert client.post(f"{base}/pin", json={"pinned": False}).status_code == 200
+
     assert client.delete(base).status_code == 204
     # Idempotent, matching DELETE /projects/{guid}: deleting what is already gone is
     # the outcome the caller asked for.

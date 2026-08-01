@@ -258,7 +258,10 @@ let GC clean up.
   `question` **and** `report` with `like_escape` (FTS5 is the next ladder rung;
   `LIKE` unmeasured-insufficient at this corpus size), and never selects the
   report body — which is why it is a separate endpoint from the detail. `pin`
-  is the one mutation on an otherwise append-only row. `DELETE …/research` (no
+  is the one mutation on an otherwise append-only row; its `pinned` **defaults to
+  true**, so `{}` pins — required, it made the obvious call on an endpoint named
+  `/pin` a 400 naming a field the caller had no reason to guess, and unpinning is
+  the direction worth spelling out. `DELETE …/research` (no
   `run_id`) is the **batch** form, body `{"ids": […]}`; empty list = 400
   `selector.empty`, capped by `[limits].max_research_delete_ids`; unknown ids
   ignored (idempotent). Each summary carries `references_count` (direct edges
@@ -279,8 +282,8 @@ let GC clean up.
   `/health`, `/version`) + `POST /gc` are self-describing in OpenAPI.
   `GET /config` serves the canonical supported-language list (read by the
   search frontend); `/files?status=failed` is the dead-letter view. `/config`
-  is static **except `research.models`** — see the model catalog; don't cache
-  it once.
+  is static **except `research.models` and `research.observed`** — both worker
+  -refreshed on a tick; don't cache it once.
 - `GET /projects/{guid}` is the per-project **inventory**; the per-language
   *file* count is the load-bearing half. Keyed on chunks alone, a language
   whose files are all `failed` or sliced to zero chunks was absent from the map
@@ -528,7 +531,15 @@ is the `research_runs` table.) The hard invariants:
   shape axes get their own code, `validation.research_shape_out_of_range`,
   because they carry floors and two accept `0` = off; config validation
   rejects any ceiling below `effort.high`). `GET /config` publishes ladder +
-  ceilings. The axes:
+  ceilings + `max_concurrent`, the context caps, a derived `worst_case_seconds`
+  per level (`max_seconds + report_timeout_ms`, since the two bound *different
+  phases* and reading the first as the whole wait understates `high` by five
+  minutes) and `observed` — measured p50/p90 per `(model, effort)` from
+  `research_runs` (`worker::research_stats`, model-catalog tick and its
+  keep-the-last-snapshot rule; a pair under `MIN_RUNS_FOR_ESTIMATE` is absent
+  rather than noisy). The ladder says what a level *grants*; `observed` is the only
+  thing that says what it *takes*, which is what makes `effort` priceable before
+  the fact. The axes:
   - **`max_seconds`** (300/900/3600) is a HARD deadline — poll **and**
     `DeadlineToken` (child of the job token; `stopped_by` tells it from a
     disconnect, job token tested first). A deadline stop is not a failure.
@@ -587,9 +598,17 @@ is the `research_runs` table.) The hard invariants:
   Each stop has a loop-level test; the time one uses **real** `Instant` in
   small increments (`tokio::test(start_paused)` does not move it).
 - **`progress`**: `RunProgress` (spent vs granted per axis + `turns` +
-  `binding`) emitted before the first turn, after every step and turn; `done`
-  carries it + `reason`. **No ticker** (would race the cancellation token and
-  make tests clock-dependent).
+  `binding` + `shares`) emitted before the first turn, after every step and turn;
+  `done` carries it + `reason`. **No ticker** (would race the cancellation token
+  and make tests clock-dependent). `binding` names the axis with the largest
+  **share spent** — a maximum, not a warning, and not what stopped the run
+  (`done.reason` is); its fold seeds at `Time`, so an all-zero progress reports
+  `"time"`. It was read as "about to run out" for its whole life, so `shares` (the
+  four percentages it is chosen from) now ships beside it and scout promotes both.
+- **A step reports where it landed** (`spans`, `path:start-end`, from the same
+  `shown` locations citation provenance is scored against; capped with
+  `spans_truncated`). `hits: 3` on a 4000-line file names no lines, which made the
+  trace unusable for the only thing it is for.
 - **The identifier rule governs code; documentation inverts it.** `*.md` is
   indexed, and `system_prompt`'s identifier paragraph carries the exception
   (*documentation is written in English; ask it in English*) — the corpus

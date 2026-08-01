@@ -169,6 +169,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ResearchEffortLadder,
         crate::backend::v0::models::ResearchEffortInfo,
         crate::backend::v0::models::ResearchSamplingInfo,
+        crate::backend::v0::models::ResearchObservedInfo,
+        crate::backend::v0::models::ResearchObservedEffort,
     )),
     tags(
         (name = INDEXING, description = "Index lifecycle: (re)index files, cancel in-flight work, requeue failures, soft-delete files, and detect working-tree drift."),

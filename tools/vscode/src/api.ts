@@ -143,6 +143,14 @@ export interface ResearchEffortInfo {
      */
     worst_case_seconds?: number;
 }
+/** What a `(model, effort)` pair has actually cost lately, from `GET /config`. */
+export interface ResearchObservedEffort {
+    model: string;
+    effort: string;
+    runs: number;
+    p50_seconds: number;
+    p90_seconds: number;
+}
 /** `[research].temperature`/`top_p`/`seed`; `null` means the model's own default. */
 export interface ResearchSamplingInfo {
     temperature: number | null;
@@ -186,6 +194,11 @@ export interface ResearchConfigInfo {
     max_context_runs?: number;
     max_context_chars?: number;
     sampling?: ResearchSamplingInfo;
+    /**
+     * Measured cost per `(model, effort)`, as opposed to what the ladder *grants*.
+     * A pair with too few runs to be meaningful is simply absent.
+     */
+    observed?: { refreshed_at: number | null; efforts: ResearchObservedEffort[] };
 }
 /**
  * What `/search` accepts, from `GET /config`.
@@ -311,6 +324,17 @@ export interface ResearchStep {
     text?: string;
     plan?: string;
     hits: number;
+    /**
+     * Where the call actually landed, as `path:start-end` — the same locations the
+     * server scores citations against. `hits` alone says how many rows came back
+     * and nothing about where, which is the difference between a trace you can
+     * judge coverage from and a list of verbs. Absent on an older server; empty for
+     * calls that read nothing (`note`, `revise_plan`) or return paths without spans
+     * (`list_files`).
+     */
+    spans?: string[];
+    /** The span list hit the server's per-frame cap; some were dropped. */
+    spans_truncated?: boolean;
 }
 /**
  * Budget consumption of a live run. Emitted once before the first turn (limits,
@@ -331,8 +355,14 @@ export interface ResearchProgress {
     num_ctx: number;
     context_pct: number;
     turns: number;
-    /** The axis closest to exhaustion — what this run will run out of. */
+    /**
+     * The axis with the largest **share spent** — a maximum, not a warning. What
+     * stopped a run is `done.reason`; read this with `shares` beside it, since a run
+     * 12% into its clock and less into everything else also reports `"time"`.
+     */
     binding?: "time" | "tokens" | "steps" | "context";
+    /** The four shares `binding` is the maximum of, as percentages. */
+    shares?: { time: number; tokens: number; steps: number; context: number };
 }
 /** `done` repeats every `progress` field and adds `reason`. */
 export interface ResearchDone extends Partial<ResearchProgress> {
