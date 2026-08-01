@@ -333,6 +333,22 @@ def test_validation_errors_before_the_stream(
         assert body["field"] == field, body
 
 
+def test_disallowed_model_gets_400(client: httpx.Client, project: str) -> None:
+    # The test config sets [research].allowed_models = ["mock-*"]; a model outside
+    # it is a policy refusal at the edge — before a slot is taken, so the 400 must
+    # leave every research slot free.
+    resp = client.post(
+        f"{MINDEX_URL}/v0/{project}/research",
+        json={"question": "x", "effort": "low", "model": "forbidden:1b"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "research.model_not_allowed", body
+    assert body["field"] == "model", body
+    assert body["meta"]["model"] == "forbidden:1b", body
+    assert client.get(f"{MINDEX_URL}/research/active").json()["slots_busy"] == 0
+
+
 def test_progress_reports_the_budget_and_what_it_spent(
     client: httpx.Client, project: str
 ) -> None:
@@ -495,6 +511,10 @@ def test_config_publishes_the_ollama_model_catalog(client: httpx.Client) -> None
     # The timestamp is what separates "Ollama has no models" from "Ollama was never
     # reached" — both of which are an empty `models`.
     assert isinstance(cfg["models_refreshed_at"], int), cfg
+    # The whitelist is published raw, and the catalog above is already filtered by
+    # it — "mock-model" surviving is the filter keeping what the patterns allow.
+    assert cfg["allowed_models"] == ["mock-*"], cfg
+    assert all(m.startswith("mock-") for m in cfg["models"]), cfg
 
 
 def test_busy_second_request_gets_429(

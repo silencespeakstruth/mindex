@@ -131,6 +131,10 @@ pub struct RouterState {
     pub research_ollama: Arc<dyn crate::models::ollama::OllamaModel>,
     /// Model used when a research request names none ("" = none configured).
     pub research_default_model: String,
+    /// Compiled `[research].allowed_models` globs; empty = any model. Checked
+    /// against every resolved research model before a slot is taken, and used to
+    /// filter the catalog `GET /config` publishes.
+    pub research_allowed_models: crate::config::AllowedModels,
     /// What each `effort` level buys (`[research].effort.*`).
     pub research_effort: crate::config::EffortBudgets,
     /// Ceilings on a request's `budget` override (`[research].max_request_*`;

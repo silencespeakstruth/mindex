@@ -114,6 +114,10 @@ pub enum ApiError {
     ResearchBusy,
     /// A research request named no model and `[research].default_model` is unset. 400.
     ResearchModelMissing,
+    /// The resolved model matches no `[research].allowed_models` pattern. 400.
+    /// A policy refusal, not a shape error — hence the `research.*` namespace,
+    /// like its sibling `research.model_missing`.
+    ResearchModelNotAllowed { model: String },
     /// A `budget` override axis was outside `1..=[research].max_request_*`. 400.
     /// One code for the spend axes + `evidence_width`; `field`/`meta.field` names
     /// the offender.
@@ -189,6 +193,7 @@ impl ApiError {
             ApiError::HistoryBoundMissing => "validation.history_bound_missing",
             ApiError::ResearchBusy => "research.busy",
             ApiError::ResearchModelMissing => "research.model_missing",
+            ApiError::ResearchModelNotAllowed { .. } => "research.model_not_allowed",
             ApiError::ResearchBudgetOutOfRange { .. } => "validation.research_budget_out_of_range",
             ApiError::ResearchShapeOutOfRange { .. } => "validation.research_shape_out_of_range",
             ApiError::ResearchContextTooMany { .. } => "validation.research_context_too_many",
@@ -252,6 +257,7 @@ impl ApiError {
             ApiError::CommitInvalid { .. } => "Invalid commit",
             ApiError::ResearchBusy => "Research capacity exhausted",
             ApiError::ResearchModelMissing => "No research model",
+            ApiError::ResearchModelNotAllowed { .. } => "Research model not allowed",
             ApiError::ResearchBudgetOutOfRange { .. } => "Invalid research budget",
             ApiError::ResearchShapeOutOfRange { .. } => "Invalid research report shape",
             ApiError::ResearchContextTooMany { .. } => "Too much prior research",
@@ -279,7 +285,9 @@ impl ApiError {
             | ApiError::CommitMessageTooLarge { .. }
             | ApiError::CommitInvalid { .. } => Some("commits"),
             ApiError::HistoryBoundMissing => Some("keep_last/older_than"),
-            ApiError::ResearchModelMissing => Some("model"),
+            ApiError::ResearchModelMissing | ApiError::ResearchModelNotAllowed { .. } => {
+                Some("model")
+            }
             ApiError::ResearchBudgetOutOfRange { field, .. }
             | ApiError::ResearchShapeOutOfRange { field, .. } => Some(field),
             ApiError::ResearchContextTooMany { .. } | ApiError::ResearchContextInvalid { .. } => {
@@ -384,6 +392,11 @@ impl ApiError {
             ApiError::ResearchModelMissing => {
                 "The request names no model and the server has no [research].default_model.".into()
             }
+            ApiError::ResearchModelNotAllowed { model } => format!(
+                "Model {model:?} is not permitted by [research].allowed_models. GET /config \
+                 lists the allowed models in research.models and the patterns in \
+                 research.allowed_models."
+            ),
             ApiError::ResearchBudgetOutOfRange { field, got, max } => format!(
                 "budget.{field} must be between 1 and {max} (got {got}); the ceiling is \
                  [research].{}.",
@@ -488,6 +501,7 @@ impl ApiError {
                     .map(|(id, reason)| json!({ "id": id, "reason": reason }))
                     .collect::<Vec<_>>()
             })),
+            ApiError::ResearchModelNotAllowed { model } => Some(json!({ "model": model })),
             ApiError::ResearchRunNotFound { run_id } => Some(json!({ "run_id": run_id })),
             ApiError::ResearchListLimitOutOfRange { got, max } => {
                 Some(json!({ "got": got, "min": 1, "max": max }))
@@ -634,6 +648,9 @@ mod tests {
             ApiError::HistoryBoundMissing,
             ApiError::ResearchBusy,
             ApiError::ResearchModelMissing,
+            ApiError::ResearchModelNotAllowed {
+                model: String::new(),
+            },
             ApiError::ResearchBudgetOutOfRange {
                 field: "max_seconds",
                 got: 0,
@@ -670,6 +687,7 @@ mod tests {
             "request.malformed_path",
             "research.busy",
             "research.model_missing",
+            "research.model_not_allowed",
             "research.run_not_found",
             "search.no_match",
             "selector.empty",

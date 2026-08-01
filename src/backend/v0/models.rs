@@ -1637,9 +1637,16 @@ pub struct ResearchConfigInfo {
     /// field whose typo comes back as `ollama.unavailable` mid-run — the same reason
     /// the effort ladder is published instead of copied.
     ///
-    /// Empty means either "Ollama has no models" or "Ollama has not been reached",
-    /// and those are told apart by `models_refreshed_at`, never by the list.
+    /// Empty means "Ollama has no models", "Ollama has not been reached", or
+    /// "everything Ollama has is outside `allowed_models`" — the first two are
+    /// told apart by `models_refreshed_at`, the third by `allowed_models`, never
+    /// by the list. When `allowed_models` is non-empty this list is already
+    /// filtered to it, so a client's picker offers only what a request may name.
     pub models: Vec<String>,
+    /// The `[research].allowed_models` glob patterns bounding which models
+    /// `/research` will run; empty = unrestricted. A request naming a model
+    /// outside them is refused with 400 `research.model_not_allowed`.
+    pub allowed_models: Vec<String>,
     /// Unix seconds of the last successful model-registry read; `null` = never
     /// succeeded (so an empty `models` says nothing about what Ollama has).
     pub models_refreshed_at: Option<i64>,

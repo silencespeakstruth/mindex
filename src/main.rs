@@ -487,6 +487,10 @@ async fn main() -> Result<(), BoxError> {
                 research_stats: research_stats.clone(),
                 research_ollama,
                 research_default_model: cfg.research.default_model.clone(),
+                research_allowed_models: config::AllowedModels::compile(
+                    &cfg.research.allowed_models,
+                )
+                .expect("validated at startup"),
                 research_effort: cfg.research.effort.clone(),
                 research_max_request_seconds: cfg.research.max_request_seconds,
                 research_max_request_tokens: cfg.research.max_request_tokens,

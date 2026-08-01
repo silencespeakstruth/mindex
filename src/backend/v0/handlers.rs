@@ -4721,7 +4721,7 @@ out-of-scope path is refused by name rather than answered empty; the stored-repo
 tools (`list_research`/`read_research`) are the one unscoped exception, offer only valid \
 runs, and their content is hearsay that cannot be cited. A run whose `context_run_ids` name \
 an invalid run is refused up front with 400 `validation.research_context_invalid`.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, out-of-range budget, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
+        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
     ),
 )]
@@ -4752,6 +4752,11 @@ pub async fn post_research(
         _ if !s.research_default_model.is_empty() => s.research_default_model.clone(),
         _ => return Err(ApiError::ResearchModelMissing),
     };
+    // Policy gate, before any slot or read is paid for: a model outside
+    // `[research].allowed_models` is a 400 the caller can act on, not a run.
+    if !s.research_allowed_models.allows(&model) {
+        return Err(ApiError::ResearchModelNotAllowed { model });
+    }
 
     // Loaded before the permit is taken: a request naming an unknown run is a 400/404
     // that should not first occupy one of `max_concurrent` slots, and the read is a
@@ -5805,7 +5810,19 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
         },
         research: ResearchConfigInfo {
             default_model: s.research_default_model.clone(),
-            models: catalog.models,
+            // Filtered at read time, not in the catalog worker: the raw catalog
+            // is "what Ollama has", the whitelist is presentation policy, and a
+            // config reload story is simpler when only one of them owns it.
+            models: if s.research_allowed_models.is_unrestricted() {
+                catalog.models
+            } else {
+                catalog
+                    .models
+                    .into_iter()
+                    .filter(|m| s.research_allowed_models.allows(m))
+                    .collect()
+            },
+            allowed_models: s.research_allowed_models.patterns(),
             models_refreshed_at: catalog.refreshed_at,
             effort: ResearchEffortLadder {
                 low: ResearchEffortInfo::new(&s.research_effort.low, s.research_report_timeout_ms),

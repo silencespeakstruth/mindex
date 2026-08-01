@@ -26,6 +26,10 @@ max_commit_message_bytes = 4096
 [research]
 ollama_url = "http://mock-ollama:11434"
 default_model = "mock-model"
+# Exercises the whitelist end-to-end: the default model passes it, the /config
+# catalog filter keeps mock-model visible, and test_research.py trips the 400
+# with a model outside it.
+allowed_models = ["mock-*"]
 worker_threads = 1
 max_concurrent = 1
 # Request-budget ceilings pinned to exactly what effort = "high" grants, so

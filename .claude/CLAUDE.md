@@ -678,6 +678,13 @@ is the `research_runs` table.) The hard invariants:
   "no models" vs "never reached" signal); gated on nothing; never primed at
   startup; `health()` is a provided method over `list_models`; the
   `/api/tags` reader is `#[serde(default)]` throughout.
+- **`[research].allowed_models`** (glob whitelist, compiled once at startup;
+  empty = any): the resolved model is checked in `post_research` *before* the
+  semaphore → 400 `research.model_not_allowed`; `GET /config` publishes
+  `research.models` already filtered by it plus the raw patterns; a non-empty
+  list must cover a non-empty `default_model` — startup refuses otherwise
+  (every defaulted request would 400). Match is case-sensitive and includes
+  the tag: `"gemma4:*"` does not cover bare `"gemma4"`.
 - **Ollama errors**: `chat_stream` reads the error body (never
   `error_for_status`); a 500 containing `error parsing tool call` is resent
   with the same transcript at the next seed (`MAX_TOOL_CALL_PARSE_RETRIES`;

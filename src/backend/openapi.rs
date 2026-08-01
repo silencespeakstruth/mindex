@@ -69,7 +69,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.research_shape_out_of_range`, \
 `validation.too_many_commits`, `validation.commit_message_too_large`, \
 `validation.commit_invalid`, `validation.history_bound_missing`, `research.busy`, \
-`research.model_missing`, `validation.research_context_too_many`, \
+`research.model_missing`, `research.model_not_allowed`, \
+`validation.research_context_too_many`, \
 `validation.research_context_invalid`, `validation.research_delete_too_many`, \
 `validation.research_list_limit_out_of_range`, `research.run_not_found`.",
     ),

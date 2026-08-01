@@ -19,6 +19,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::Deserialize;
@@ -468,6 +469,16 @@ pub struct ResearchConfig {
     /// Model used when a request omits `model`. Empty = no default: a request
     /// without an explicit model is then rejected (400 `research.model_missing`).
     pub default_model: String,
+    /// Glob whitelist of models `/research` may run (e.g. `["gemma4:*"]`). Empty =
+    /// any model. Matched case-sensitively against the *resolved* model — request
+    /// `model` or `default_model`, tag included, so `"gemma4:*"` matches
+    /// `"gemma4:27b"` but not bare `"gemma4"`; list both, or use `"gemma4*"`. A
+    /// request naming anything outside the list is refused with 400
+    /// `research.model_not_allowed`, and `GET /config` publishes `research.models`
+    /// already filtered to the allowed set. A non-empty list must cover a
+    /// non-empty `default_model` (startup refuses otherwise — every defaulted
+    /// request would be a 400).
+    pub allowed_models: Vec<String>,
     /// Threads in the dedicated research runtime (research is rare — keep small).
     pub worker_threads: usize,
     /// Concurrent research jobs; beyond this a request gets 429 `research.busy`.
@@ -632,6 +643,51 @@ pub struct ResearchConfig {
     /// A request-shape limit, so TOML-only like `[limits]` — tuning it in a container
     /// means mounting a `config.toml`.
     pub list_page_limit: usize,
+}
+
+/// The compiled form of `[research].allowed_models`: the glob patterns, parsed
+/// once at startup and shared by `Arc` so cloning `RouterState` per request stays
+/// free. Empty = unrestricted — the compiled default, so an absent key changes
+/// nothing.
+#[derive(Debug, Clone, Default)]
+pub struct AllowedModels(Arc<[glob::Pattern]>);
+
+impl AllowedModels {
+    /// Compile every pattern, collecting one message per invalid glob (the
+    /// config-validation contract: all problems at once, never fail-fast).
+    pub fn compile(patterns: &[String]) -> Result<Self, Vec<String>> {
+        let mut errors = Vec::new();
+        let mut compiled = Vec::with_capacity(patterns.len());
+        for (i, pat) in patterns.iter().enumerate() {
+            match glob::Pattern::new(pat) {
+                Ok(p) => compiled.push(p),
+                Err(err) => errors.push(format!(
+                    "[research].allowed_models[{i}] = {pat:?} is not a valid glob: {err}. \
+                     Fix: correct the pattern (glob syntax: `*`, `?`, `[..]`)."
+                )),
+            }
+        }
+        if errors.is_empty() {
+            Ok(Self(compiled.into()))
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// An empty list means the whitelist is off, not that nothing is allowed.
+    pub fn is_unrestricted(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Case-sensitive match against the resolved model name, tag included.
+    pub fn allows(&self, model: &str) -> bool {
+        self.is_unrestricted() || self.0.iter().any(|p| p.matches(model))
+    }
+
+    /// The raw pattern strings, for `GET /config`.
+    pub fn patterns(&self) -> Vec<String> {
+        self.0.iter().map(|p| p.as_str().to_string()).collect()
+    }
 }
 
 /// The budgets per effort level. A run stops at whichever is reached first, and
@@ -907,6 +963,7 @@ impl Default for ResearchConfig {
                 .parse()
                 .expect("valid default ollama url"),
             default_model: String::new(),
+            allowed_models: Vec::new(),
             worker_threads: DEFAULT_RESEARCH_WORKER_THREADS,
             max_concurrent: DEFAULT_RESEARCH_MAX_CONCURRENT,
             max_num_ctx_tokens: DEFAULT_RESEARCH_MAX_NUM_CTX,
@@ -1517,6 +1574,27 @@ impl Config {
         }
         if self.research.max_concurrent < 1 {
             e.push("[research].max_concurrent = 0 rejects every research request. Fix: use at least 1 (default 2).".to_string());
+        }
+        match AllowedModels::compile(&self.research.allowed_models) {
+            Ok(allowed) => {
+                // Only cross-check against a list that compiled whole: a broken
+                // glob already has its own error, and a verdict from the partial
+                // list would be a cascading second complaint about the same key.
+                if !allowed.is_unrestricted()
+                    && !self.research.default_model.is_empty()
+                    && !allowed.allows(&self.research.default_model)
+                {
+                    e.push(format!(
+                        "[research].default_model = {:?} matches no pattern in \
+                         [research].allowed_models, so every request relying on the default \
+                         would be refused with 400 research.model_not_allowed. Fix: add a \
+                         matching pattern (note `\"name:*\"` does not match a bare `\"name\"`) \
+                         or change default_model.",
+                        self.research.default_model
+                    ));
+                }
+            }
+            Err(errors) => e.extend(errors),
         }
         for (level, b) in [
             ("low", &self.research.effort.low),
@@ -2255,6 +2333,64 @@ mod tests {
         assert!(errs.iter().any(|m| m.contains("max_chunk_tokens")));
         assert!(errs.iter().any(|m| m.contains("synchronous")));
         assert!(errs.iter().any(|m| m.contains("fusion_limit")));
+    }
+
+    /// Each broken glob gets its own collected error naming index and pattern —
+    /// the collect-all contract, not fail-fast at the first one.
+    #[test]
+    fn every_invalid_allowed_models_glob_is_named_with_its_index() {
+        let mut cfg = Config::default();
+        cfg.research.allowed_models = vec!["gemma4:*".into(), "a[".into(), "b[".into()];
+        let errs = cfg.validate().expect_err("should be invalid");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("allowed_models[1]") && m.contains("a[")),
+            "first broken glob must be named: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("allowed_models[2]") && m.contains("b[")),
+            "second broken glob must be named: {errs:?}"
+        );
+    }
+
+    /// A default model the whitelist does not cover would turn every defaulted
+    /// request into a 400 — startup is the only place that sees both keys together.
+    #[test]
+    fn a_default_model_outside_the_whitelist_is_rejected_at_startup() {
+        let mut cfg = Config::default();
+        cfg.research.default_model = "qwen3.6".into();
+        cfg.research.allowed_models = vec!["gemma4:*".into()];
+        let errs = cfg.validate().expect_err("should be invalid");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("default_model") && m.contains("allowed_models")),
+            "the error must name both keys: {errs:?}"
+        );
+
+        // A covered default passes; so does any default with the whitelist off.
+        cfg.research.allowed_models = vec!["gemma4:*".into(), "qwen3.6".into()];
+        cfg.validate().expect("a covered default_model must pass");
+        cfg.research.allowed_models = Vec::new();
+        cfg.validate()
+            .expect("an empty whitelist restricts nothing");
+    }
+
+    /// The matching semantics callers rely on: case-sensitive, tag included —
+    /// `"gemma4:*"` covers tagged variants but not the bare name — and an empty
+    /// list means unrestricted, not "nothing allowed".
+    #[test]
+    fn allowed_models_matches_case_sensitively_with_the_tag() {
+        let allowed = AllowedModels::compile(&["gemma4:*".to_string()]).expect("valid globs");
+        assert!(!allowed.is_unrestricted());
+        assert!(allowed.allows("gemma4:27b"));
+        assert!(!allowed.allows("gemma4"), "the tag separator is literal");
+        assert!(!allowed.allows("Gemma4:27b"), "matching is case-sensitive");
+        assert_eq!(allowed.patterns(), vec!["gemma4:*".to_string()]);
+
+        let unrestricted = AllowedModels::compile(&[]).expect("empty list compiles");
+        assert!(unrestricted.is_unrestricted());
+        assert!(unrestricted.allows("anything-at-all"));
     }
 
     #[test]

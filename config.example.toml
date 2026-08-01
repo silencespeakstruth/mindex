@@ -107,6 +107,14 @@ max_commit_message_bytes = 65536 # max subject+body of one commit, in bytes
 [research]
 ollama_url = "http://127.0.0.1:11434" # local Ollama server
 default_model = ""                    # model when a request omits one; "" = required per request
+allowed_models = []                   # glob whitelist of models /research may run; [] = any.
+                                      # Case-sensitive, matched against the resolved model WITH
+                                      # its tag: "gemma4:*" matches "gemma4:27b" but not bare
+                                      # "gemma4" — list both, or use "gemma4*". A request naming
+                                      # anything else gets 400 research.model_not_allowed, and
+                                      # GET /config's research.models is filtered to the allowed
+                                      # set. A non-empty list must cover default_model (startup
+                                      # refuses otherwise).
 worker_threads = 2                    # threads in the dedicated research runtime
 max_concurrent = 2                    # research jobs beyond this get 429 research.busy
 turn_timeout_ms = 3900000             # DEAD-SOCKET guard only, NOT the run's bound, and it must
