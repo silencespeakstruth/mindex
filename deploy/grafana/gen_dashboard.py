@@ -1092,6 +1092,81 @@ P += [
 ]
 y += 7
 
+# The report phase, which is where runs were measured to fail: retrieval found the
+# right files every time and the writing did not survive. These four families exist
+# to answer whether bounding and sectioning the output changed that.
+P += [
+    heat(
+        "Report length (words)",
+        gp(7, 8, 0, y),
+        "sum by (le) ("
+        + ev('mindex_research_report_words_bucket{model=~"$model"}')
+        + ")",
+        desc="Granted versus actual is the whole measurement: the per-effort "
+        "max_report_words is announced to the model as a ceiling, and nothing "
+        "makes it obey. If this sits wherever it likes regardless of the grant, "
+        "the prompt half of that knob is dead weight and only num_predict earns "
+        "its place.",
+    ),
+    ts(
+        "Report sections",
+        gp(7, 8, 8, y),
+        targets(
+            (
+                "sum by (outcome) ("
+                + ev("mindex_research_report_sections_total")
+                + ")",
+                "{{outcome}}",
+            ),
+        ),
+        unit="short",
+        desc="A report of 3+ plan items is written one section per turn, so one "
+        "failing costs a section rather than the document. This says how often "
+        "that trade is actually made. Rising `empty` means the per-section word "
+        "budget or the model is wrong; `timed_out`/`skipped` mean "
+        "report_timeout_ms is too tight for the plans being produced.",
+        custom=BARS_STACK_CUSTOM,
+        overrides=by_name_overrides(
+            {
+                "written": "green",
+                "empty": "red",
+                "timed_out": "orange",
+                "skipped": "yellow",
+            }
+        ),
+        legend=LEGEND_TABLE_SUM,
+    ),
+    ts(
+        "Report-phase faults",
+        gp(7, 8, 16, y),
+        targets(
+            (ev("mindex_research_report_length_caps_total"), "generation cut off"),
+            (ev("mindex_research_report_context_sheds_total"), "prompt shed to fit"),
+            (ev("mindex_research_forced_syntheses_total"), "server wrote the report"),
+        ),
+        unit="short",
+        desc="All three are expected to stay at zero. `generation cut off` means "
+        "num_predict fired, so REPORT_WORDS_TO_TOKENS or the model is wrong and "
+        "a cut landed mid-token — which can sever a fence and cost a rewrite. "
+        "`prompt shed` means the report turn's transcript was over the context "
+        "ceiling and the server dropped old tool output rather than letting "
+        "Ollama trim it in silence; on this hardware it may never fire, in which "
+        "case it is insurance. `server wrote the report` means the report window "
+        "expired first — those runs cite nothing, which is why the citation "
+        "panels beside this one must be read together with it.",
+        overrides=by_name_overrides(
+            {
+                "generation cut off": "red",
+                "prompt shed to fit": "orange",
+                "server wrote the report": "yellow",
+            }
+        ),
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
+    ),
+]
+y += 7
+
 P += [
     ts(
         "Stored research",

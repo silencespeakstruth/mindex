@@ -4639,6 +4639,353 @@
     },
     {
       "id": 56,
+      "type": "heatmap",
+      "title": "Report length (words)",
+      "description": "Granted versus actual is the whole measurement: the per-effort max_report_words is announced to the model as a ceiling, and nothing makes it obey. If this sits wherever it likes regardless of the grant, the prompt half of that knob is dead weight and only num_predict earns its place.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 136
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (le) (increase(mindex_research_report_words_bucket{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "format": "heatmap"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Blues",
+          "steps": 32,
+          "reverse": false,
+          "exponent": 0.5,
+          "fill": "dark-blue"
+        },
+        "yAxis": {
+          "unit": "short",
+          "axisPlacement": "left"
+        },
+        "legend": {
+          "show": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "yHistogram": true
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "filterValues": {
+          "le": 1e-09
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "hideFrom": {}
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Report sections",
+      "description": "A report of 3+ plan items is written one section per turn, so one failing costs a section rather than the document. This says how often that trade is actually made. Rising `empty` means the per-section word budget or the model is wrong; `timed_out`/`skipped` mean report_timeout_ms is too tight for the plans being produced.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 136
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mindex_research_report_sections_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "written"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "empty"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "timed_out"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "skipped"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Report-phase faults",
+      "description": "All three are expected to stay at zero. `generation cut off` means num_predict fired, so REPORT_WORDS_TO_TOKENS or the model is wrong and a cut landed mid-token \u2014 which can sever a fence and cost a rewrite. `prompt shed` means the report turn's transcript was over the context ceiling and the server dropped old tool output rather than letting Ollama trim it in silence; on this hardware it may never fire, in which case it is insurance. `server wrote the report` means the report window expired first \u2014 those runs cite nothing, which is why the citation panels beside this one must be read together with it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 136
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_report_length_caps_total[$__rate_interval])",
+          "legendFormat": "generation cut off",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_report_context_sheds_total[$__rate_interval])",
+          "legendFormat": "prompt shed to fit",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_forced_syntheses_total[$__rate_interval])",
+          "legendFormat": "server wrote the report",
+          "range": true,
+          "instant": false,
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "barAlignment": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generation cut off"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "prompt shed to fit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "server wrote the report"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 59,
       "type": "timeseries",
       "title": "Stored research",
       "description": "The corpus a new run can be given as context. `outdated` counts runs at least one of whose files has changed since \u2014 still useful for names, unreliable on specifics. `pinned` runs have no expiry and GC never reaps them, so a rising pinned count is the thing that stops retention from bounding this table.",
@@ -4650,7 +4997,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 136
+        "y": 143
       },
       "targets": [
         {
@@ -4776,7 +5123,7 @@
       }
     },
     {
-      "id": 57,
+      "id": 60,
       "type": "timeseries",
       "title": "Context reuse",
       "description": "Does prior research get reused, and does the character cap bite? Counted with increase() and drawn as bars: these are a handful of events a day, and a label set seeing one event in a process lifetime is flat at 1 under rate() forever.",
@@ -4788,7 +5135,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 136
+        "y": 143
       },
       "targets": [
         {
@@ -4945,7 +5292,7 @@
       }
     },
     {
-      "id": 58,
+      "id": 61,
       "type": "row",
       "title": "GC & retry",
       "collapsed": false,
@@ -4953,12 +5300,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 143
+        "y": 150
       },
       "panels": []
     },
     {
-      "id": 59,
+      "id": 62,
       "type": "timeseries",
       "title": "GC rows removed",
       "description": "Only chunks whose Qdrant delete was confirmed are hard-deleted; the rest keep their rows for the next sweep.",
@@ -4970,7 +5317,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 144
+        "y": 151
       },
       "targets": [
         {
@@ -5096,7 +5443,7 @@
       }
     },
     {
-      "id": 60,
+      "id": 63,
       "type": "timeseries",
       "title": "GC backlog",
       "description": "Soft-deleted chunks whose vectors still sit in Qdrant. Indexing is append-only, so this rises on every reindex and falls on the hourly sweep. A monotonic rise means the sweep is failing.",
@@ -5108,7 +5455,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 144
+        "y": 151
       },
       "targets": [
         {
@@ -5180,7 +5527,7 @@
       }
     },
     {
-      "id": 61,
+      "id": 64,
       "type": "timeseries",
       "title": "GC passes",
       "description": "",
@@ -5192,7 +5539,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 144
+        "y": 151
       },
       "targets": [
         {
@@ -5279,7 +5626,7 @@
       }
     },
     {
-      "id": 62,
+      "id": 65,
       "type": "timeseries",
       "title": "Retry outcomes",
       "description": "`skipped_claim` dominating means the worker is racing live /index traffic, which is different from it failing.",
@@ -5291,7 +5638,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 151
+        "y": 158
       },
       "targets": [
         {
@@ -5475,7 +5822,7 @@
       }
     },
     {
-      "id": 63,
+      "id": 66,
       "type": "timeseries",
       "title": "Permanently failed files",
       "description": "Files that exhausted `[workers].max_retries`. The retry worker will never touch them again \u2014 they need a re-push. Until now this existed only as an hourly WARN.",
@@ -5487,7 +5834,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 151
+        "y": 158
       },
       "targets": [
         {
@@ -5543,7 +5890,7 @@
       }
     },
     {
-      "id": 64,
+      "id": 67,
       "type": "row",
       "title": "Per-project state",
       "collapsed": false,
@@ -5551,12 +5898,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 158
+        "y": 165
       },
       "panels": []
     },
     {
-      "id": 65,
+      "id": 68,
       "type": "table",
       "title": "Projects",
       "description": "Recomputed by the metrics collector every `[metrics].refresh_interval_seconds`, and cleared and repopulated each tick \u2014 so a deleted project disappears here rather than reporting its last known state forever.",
@@ -5568,7 +5915,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 159
+        "y": 166
       },
       "targets": [
         {
@@ -5805,7 +6152,7 @@
       }
     },
     {
-      "id": 66,
+      "id": 69,
       "type": "bargauge",
       "title": "Files by language",
       "description": "A bar rather than a pie: there are more than a handful of languages and their values are close, which is exactly where a pie stops being readable.",
@@ -5817,7 +6164,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 168
+        "y": 175
       },
       "targets": [
         {
@@ -5866,7 +6213,7 @@
       }
     },
     {
-      "id": 67,
+      "id": 70,
       "type": "timeseries",
       "title": "Files by status",
       "description": "",
@@ -5878,7 +6225,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 168
+        "y": 175
       },
       "targets": [
         {
@@ -6032,7 +6379,7 @@
       }
     },
     {
-      "id": 68,
+      "id": 71,
       "type": "timeseries",
       "title": "Drift reported per check",
       "description": "A counter, not a gauge: /drift compares against a manifest only the client can produce, so there is no server-side drift level. This is what the checks that ran reported.",
@@ -6044,7 +6391,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 168
+        "y": 175
       },
       "targets": [
         {
