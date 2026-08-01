@@ -782,7 +782,9 @@ which is the same bug wearing a different hat. A banked checkpoint draft of the
 same section is included when there is one, which is what makes six turns cheap
 rather than six cold starts.
 
-**Bounds, because this is a new turn-producing path.** `MAX_REPORT_SECTIONS` 6;
+**Bounds, because this is a new turn-producing path.** `MAX_REPORT_SECTIONS` 6
+(since 2026-08-01 the run's `budget.max_report_sections` — see the
+request-tunable section below);
 `MAX_SECTION_ATTEMPTS` 2 — deliberately not `MAX_EMPTY_REPORT_RETRIES` (5),
 which was sized for the single turn a whole report used to take, and 5 × 6 is
 thirty report turns; `MAX_SECTION_REWRITES` 3. Two further checks **stub rather
@@ -916,3 +918,75 @@ record is the `research_runs` table (predates the 1.0.0 schema).
   at the old `turn_timeout_ms`, which is why that key must sit above every
   budget.
 
+## The report shape became request-tunable (2026-08-01)
+
+The section mechanism shipped with its numbers hardcoded, and the first field
+use found the wrong one first: six sections is not always the right plan
+shape, and nothing let the caller say so. Four knobs moved into the request —
+as new keys **inside `budget`**, deliberately: `ResearchBudgetOverride` is
+`deny_unknown_fields`, so an old server refuses them loudly with a 400 instead
+of silently running a different run than the caller recorded
+(`ResearchRequest` itself has no such guard — a top-level field would be
+dropped in silence). Scout needed no schema change: its `budget` dict passes
+through verbatim.
+
+| `budget` key | preset | request range | ceiling (TOML, default) |
+|---|---|---|---|
+| `max_report_sections` | 6/6/6 (`[research.effort.*]`) | 3..=cap | `max_request_report_sections` (12) |
+| `max_report_words` | 400/900/1800 (existing) | 0 (=off) or 150..=cap | `max_request_report_words` (4000) |
+| `checkpoint_every_steps` | `[research]` scalar, 6 | 0 (=off) or 2..=`max_request_steps` | reuses `max_request_steps` |
+| `evidence_width` | 1/1/1 (`[research.effort.*]`) | 1..=cap | `max_evidence_width` (3) |
+
+Decisions of record:
+
+- **`max_report_words` reversed its "never from the request" stance.** The
+  original objection was that every value a caller picks is "bigger". What
+  answers it is not trust in callers but the ceiling being held to the same
+  startup window check as the presets (`words × REPORT_WORDS_TO_TOKENS <
+  max_num_ctx_tokens / 2`), so no override can arm a `num_predict` the window
+  cannot hold — there is no per-request window check, and none is needed.
+- **The plan prompt is templated, not duplicated.** `PLAN_REQUEST` became
+  `plan_request(max_sections)` ("3-N sub-questions"), so the plan the model is
+  asked for and the sections the server will write can never disagree.
+  `PROMPT_VERSION` 2.0 → 2.1 (MINOR: byte-identical at the default 6). The
+  test fakes recognise the plan turn by `PLAN_REQUEST_PREFIX`, not equality.
+- **The floor of `max_report_sections` is the sectioning threshold.**
+  `MIN_SECTIONED_PLAN_ITEMS` (3) doubles as `config::MIN_REPORT_SECTIONS`; a
+  grant below it would name a shape the mechanism cannot produce. A caller
+  wanting a short report has `max_report_words`.
+- **`evidence_width` is one integer multiplier**, not per-tool fields. It
+  scales `READ_CHUNKS_LIMIT` 8, `GREP_LIMIT` 20, `CALLERS_LIMIT` 50,
+  `FILE_HISTORY_LIMIT` 20, `SYMBOLS_LIMIT` 10 — the per-call evidence widths —
+  and deliberately not `outline`/`list_files` (navigation; when 300 rows bind,
+  the fix is a narrower glob), not `search` (`search_top_k` stays TOML-only:
+  widening it was measured not to be the fix), not `MAX_EXCERPT_*` (response
+  caps). Threaded as a `limit` parameter into the research-only core fns and
+  stored on `StateResearchTools`; the `ResearchTools` trait is untouched.
+  Width is resent every turn, so it compounds into `max_tokens` — the scout
+  docstring says "width costs tokens" for that reason.
+- **Section mechanics stayed consts.** `MAX_SECTION_ATTEMPTS`,
+  `MAX_SECTION_REWRITES`, `MIN_SECTION_MS`, `REPORT_TOKEN_OVERDRAFT`,
+  `MAX_CHECKPOINTS` and every loop-termination counter are stability
+  guardrails, not tuning — "only genuine tuning knobs are configurable".
+- **Validation split by shape.** The spend axes and `evidence_width` keep
+  `validation.research_budget_out_of_range` (`1..=cap`); the three axes with
+  floors above 1 — two of which accept `0` as the off switch — got their own
+  code, `validation.research_shape_out_of_range`, whose detail says "or 0 to
+  disable it" only where that is true.
+- **Not journalled, no migration.** Shape grants were never journalled
+  (`max_report_words` set the precedent), and a `research_runs` rebuild is not
+  bought speculatively. The resolved values ride on the "Starting a research
+  job." log line — the only record of what a run was granted. Revisit with a
+  migration when a measurement harness needs them SQL-queryable.
+- **Ceiling risk, stated**: 12 sections × `MAX_SECTION_ATTEMPTS` 2 inside one
+  `report_timeout_ms` (300 s) means a caller asking for the ceiling should
+  expect `MIN_SECTION_MS` stubs, not a wider window. The 12 is deliberately
+  conservative for exactly that reason.
+
+Clients: VS Code adds four budget sliders (`bsections`/`bwords`/`bwidth`/
+`bcheckpoint`) on the existing `ConfigBound`/`PresetAxis` pattern — ceilings
+from `GET /config`, presets from the ladder (checkpoint's preset is the
+`[research]` scalar published beside it), empty = omitted. The one host-side
+subtlety: `readBudget`'s `num()` drops 0 (`n > 0`), so `bcheckpoint` has its
+own zero-preserving reader, and it rounds a slider's 1 up to 2 rather than
+letting the server's floor turn a slider position into a 400.

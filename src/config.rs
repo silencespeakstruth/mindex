@@ -129,6 +129,38 @@ const DEFAULT_RESEARCH_MAX_NUM_CTX: u64 = 131072;
 const DEFAULT_RESEARCH_MAX_REQUEST_SECONDS: u64 = 3600;
 const DEFAULT_RESEARCH_MAX_REQUEST_TOKENS: u64 = 8_000_000;
 const DEFAULT_RESEARCH_MAX_REQUEST_STEPS: usize = 200;
+/// Ceiling on a request's `budget.max_report_sections` override. Twelve is
+/// deliberately conservative: sections are report turns, each retried up to
+/// once, all inside `[research].report_timeout_ms` — a caller asking for the
+/// ceiling should expect stubs, not a wider window.
+const DEFAULT_RESEARCH_MAX_REQUEST_REPORT_SECTIONS: usize = 12;
+/// Ceiling on a request's `budget.max_report_words` override. Validated at
+/// startup against `max_num_ctx_tokens` exactly like the effort presets, which
+/// is what keeps the `num_predict` arming safe for any value a request may pass.
+const DEFAULT_RESEARCH_MAX_REQUEST_REPORT_WORDS: usize = 4000;
+/// Ceiling on a request's `budget.evidence_width` override. Three because the
+/// widened rows are resent on every later turn: width is paid in prompt tokens
+/// each turn, not once, so a small integer is the whole useful range.
+const DEFAULT_RESEARCH_MAX_EVIDENCE_WIDTH: u64 = 3;
+/// Report sections one run may write, at every effort level. Six matches what
+/// `PLAN_REQUEST` historically asked for ("3-6 sub-questions"); the plan turn's
+/// prompt is templated from the resolved value, so raising this genuinely asks
+/// the model for a longer plan rather than silently truncating one.
+const DEFAULT_RESEARCH_MAX_REPORT_SECTIONS: usize = 6;
+/// Multiplier on the per-call evidence widths (`read_chunks`, `grep`, `callers`,
+/// `file_history`, `symbols`), at every effort level. One — the historical
+/// widths — because width compounds into the token budget (every widened result
+/// is resent on every later turn); this exists for a caller who knows the
+/// question needs breadth, not as a default to raise.
+const DEFAULT_RESEARCH_EVIDENCE_WIDTH: u64 = 1;
+/// Floor on `max_report_sections`, preset and request alike.
+///
+/// This is `MIN_SECTIONED_PLAN_ITEMS` (research.rs derives its const from this
+/// one): below three plan items the sectioned path does not engage at all, so a
+/// smaller grant would name a report shape the mechanism cannot produce — and
+/// the templated plan request "3-N" would be malformed. A caller wanting a
+/// short report has `max_report_words`.
+pub const MIN_REPORT_SECTIONS: usize = 3;
 /// Chunks per `search` tool call, at every effort level. Same at all three
 /// because widening it was measured *not* to be the fix: the runs that missed an
 /// answer were already getting five hits per search and losing on query
@@ -200,7 +232,7 @@ const DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS: u64 = 120_000;
 /// which makes `max_seconds + report_timeout_ms` the true worst-case wait.
 ///
 /// Raised 120 s → 300 s when the report stopped being one turn: it now covers up to
-/// `MAX_REPORT_SECTIONS` generations plus a per-section repair pass. The window's
+/// `max_report_sections` generations plus a per-section repair pass. The window's
 /// *meaning* is unchanged — the tail a caller waits after the investigation — but
 /// what has to fit inside it is not. Anything reading the worst-case wait
 /// (scout's `RESEARCH_TOTAL_TIMEOUT`) moves with it.
@@ -211,11 +243,12 @@ const DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS: u64 = 2000;
 /// most in need of measurement in this file.
 const DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 6;
 /// Floor on a non-zero `checkpoint_every_steps`. At 1 the run writes as often as it
-/// looks, which is not an investigation.
-const MIN_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 2;
+/// looks, which is not an investigation. Shared with the request validator: the
+/// per-request override obeys the same floor and the same `0 = off` spelling.
+pub(crate) const MIN_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 2;
 /// Checkpoint turns one run may take, whatever the interval says. A backstop on a
 /// mis-set interval, not a tuning knob: eight banked drafts is already more than
-/// `MAX_REPORT_SECTIONS` can use.
+/// the default section grant (`max_report_sections`, 6) can use.
 pub const MAX_CHECKPOINTS: usize = 8;
 /// How often the local Ollama model registry is re-read for `GET /config`. Five
 /// minutes because the catalog changes only when a human runs `ollama pull`/`rm`,
@@ -530,8 +563,31 @@ pub struct ResearchConfig {
     pub max_request_seconds: u64,
     /// Ceiling on a request's `budget.max_tokens` override — the GPU-work cap.
     pub max_request_tokens: u64,
-    /// Ceiling on a request's `budget.max_steps` override.
+    /// Ceiling on a request's `budget.max_steps` override. Also caps the
+    /// `budget.checkpoint_every_steps` override: an interval above the step
+    /// budget is equivalent to `0` (off), so a dedicated ceiling would guard
+    /// nothing.
     pub max_request_steps: usize,
+    /// Ceiling on a request's `budget.max_report_sections` override.
+    ///
+    /// Sections are report turns inside one fixed `report_timeout_ms` window,
+    /// so this bounds wall-clock spent writing, not report quality: past the
+    /// window's capacity extra sections ship as stubs. The floor is
+    /// [`MIN_REPORT_SECTIONS`] — below it the sectioned path does not engage.
+    pub max_request_report_sections: usize,
+    /// Ceiling on a request's `budget.max_report_words` override.
+    ///
+    /// Held to the same startup check as the effort presets (`words ×`
+    /// [`REPORT_WORDS_TO_TOKENS`] must stay under half of `max_num_ctx_tokens`),
+    /// which is what makes any request-supplied value safe to arm `num_predict`
+    /// with — there is no per-request window check.
+    pub max_request_report_words: usize,
+    /// Ceiling on a request's `budget.evidence_width` override.
+    ///
+    /// Width is paid in prompt tokens on **every** later turn (the transcript is
+    /// resent), so the useful range is a small integer; past it a request is
+    /// buying context exhaustion, not evidence.
+    pub max_evidence_width: u64,
     /// Sampling temperature for every research turn. Absent = **the model's own
     /// Modelfile default**, which is the honest production default but makes model
     /// comparison meaningless: those defaults differ per model (measured here:
@@ -650,14 +706,36 @@ pub struct EffortBudget {
     /// sub-questions" multiplied by whatever the model felt like writing.
     ///
     /// A ceiling, not a target — the prompt says so — and it also drives
-    /// `num_predict` on the report turn as a runaway backstop. Deliberately **not**
-    /// overridable per request, for `context_fraction`'s reason: every value a
-    /// caller would pick is "bigger", and bigger is the failure.
+    /// `num_predict` on the report turn as a runaway backstop. Overridable per
+    /// request (`budget.max_report_words`, `0` = off), capped by
+    /// `[research].max_request_report_words`: the original "every value a caller
+    /// would pick is bigger" objection is answered by the cap being held to the
+    /// same window check as these presets.
     ///
     /// The numbers are unmeasured. `0` is what makes that honest: the whole
     /// mechanism reverts from config while a harness sweeps for where the cliff
     /// actually is, which is certainly per-model.
     pub max_report_words: usize,
+    /// Report sections one run may write (the sectioned report's `.take()` cap,
+    /// and the upper bound the plan turn's prompt asks for: "3-N sub-questions").
+    ///
+    /// Overridable per request (`budget.max_report_sections`), floor
+    /// [`MIN_REPORT_SECTIONS`], capped by
+    /// `[research].max_request_report_sections`. Sections trade depth per
+    /// section for coverage inside one fixed `report_timeout_ms` window — more
+    /// sections is not more report, past the window it is more stubs.
+    pub max_report_sections: usize,
+    /// Multiplier on the per-call evidence widths: `read_chunks`, `grep`,
+    /// `callers`, `file_history`, `symbols`. `1` = the historical widths.
+    ///
+    /// Overridable per request (`budget.evidence_width`), capped by
+    /// `[research].max_evidence_width`. Deliberately **not** applied to the
+    /// navigation tools (`outline`, `list_files` — when 300 rows bind, the fix
+    /// is a narrower glob), to `search` (its own axis, `search_top_k`), or to
+    /// the excerpt channel (a response cap, not an evidence width). Width
+    /// compounds into `max_tokens`: every widened result is resent on every
+    /// later turn.
+    pub evidence_width: u64,
 }
 
 /// Prometheus exposition and the state-gauge collector.
@@ -836,6 +914,9 @@ impl Default for ResearchConfig {
             max_request_seconds: DEFAULT_RESEARCH_MAX_REQUEST_SECONDS,
             max_request_tokens: DEFAULT_RESEARCH_MAX_REQUEST_TOKENS,
             max_request_steps: DEFAULT_RESEARCH_MAX_REQUEST_STEPS,
+            max_request_report_sections: DEFAULT_RESEARCH_MAX_REQUEST_REPORT_SECTIONS,
+            max_request_report_words: DEFAULT_RESEARCH_MAX_REQUEST_REPORT_WORDS,
+            max_evidence_width: DEFAULT_RESEARCH_MAX_EVIDENCE_WIDTH,
             turn_timeout_ms: DEFAULT_RESEARCH_TURN_TIMEOUT_MS,
             first_token_timeout_ms: DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS,
             max_turn_thinking_chars: DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS,
@@ -890,6 +971,8 @@ impl Default for EffortBudgets {
                 max_steps: 8,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
                 max_report_words: 400,
+                max_report_sections: DEFAULT_RESEARCH_MAX_REPORT_SECTIONS,
+                evidence_width: DEFAULT_RESEARCH_EVIDENCE_WIDTH,
             },
             medium: EffortBudget {
                 max_seconds: 900,
@@ -898,6 +981,8 @@ impl Default for EffortBudgets {
                 max_steps: 20,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
                 max_report_words: 900,
+                max_report_sections: DEFAULT_RESEARCH_MAX_REPORT_SECTIONS,
+                evidence_width: DEFAULT_RESEARCH_EVIDENCE_WIDTH,
             },
             high: EffortBudget {
                 max_seconds: 3600,
@@ -906,6 +991,8 @@ impl Default for EffortBudgets {
                 max_steps: 64,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
                 max_report_words: 1800,
+                max_report_sections: DEFAULT_RESEARCH_MAX_REPORT_SECTIONS,
+                evidence_width: DEFAULT_RESEARCH_EVIDENCE_WIDTH,
             },
         }
     }
@@ -1510,6 +1597,25 @@ impl Config {
                     b.max_report_words, report_tokens, self.research.max_num_ctx_tokens
                 ));
             }
+            // Below the sectioning threshold the grant names a report shape the
+            // mechanism cannot produce: the sectioned path never engages under
+            // MIN_REPORT_SECTIONS plan items, and the templated plan request
+            // "3-N" would be malformed.
+            if b.max_report_sections < MIN_REPORT_SECTIONS {
+                e.push(format!(
+                    "[research.effort.{level}].max_report_sections = {} is below the sectioning \
+                     threshold, so the sectioned report could never engage. Fix: use at least \
+                     {MIN_REPORT_SECTIONS} (default {DEFAULT_RESEARCH_MAX_REPORT_SECTIONS}).",
+                    b.max_report_sections
+                ));
+            }
+            if b.evidence_width < 1 {
+                e.push(format!(
+                    "[research.effort.{level}].evidence_width = 0 makes every evidence tool \
+                     return nothing. Fix: use at least 1 (default \
+                     {DEFAULT_RESEARCH_EVIDENCE_WIDTH}); it is a multiplier, not a row count."
+                ));
+            }
         }
         if self.research.retention_days < 1 {
             e.push(
@@ -1589,6 +1695,21 @@ impl Config {
                 self.research.max_request_steps as u64,
                 self.research.effort.high.max_steps as u64,
             ),
+            (
+                "max_request_report_sections",
+                self.research.max_request_report_sections as u64,
+                self.research.effort.high.max_report_sections as u64,
+            ),
+            (
+                "max_request_report_words",
+                self.research.max_request_report_words as u64,
+                self.research.effort.high.max_report_words as u64,
+            ),
+            (
+                "max_evidence_width",
+                self.research.max_evidence_width,
+                self.research.effort.high.evidence_width,
+            ),
         ] {
             if ceiling < highest {
                 e.push(format!(
@@ -1597,6 +1718,32 @@ impl Config {
                      Fix: raise it to at least {highest}."
                 ));
             }
+        }
+        // The same window check the effort presets get, applied to the request
+        // ceiling: it is what makes ANY value a request may pass safe to arm
+        // `num_predict` with — there is no per-request window check.
+        let ceiling_report_tokens =
+            self.research.max_request_report_words as u64 * REPORT_WORDS_TO_TOKENS;
+        if ceiling_report_tokens >= self.research.max_num_ctx_tokens / 2 {
+            e.push(format!(
+                "[research].max_request_report_words = {} would let a request reserve about \
+                 {ceiling_report_tokens} tokens for generation, at least half of \
+                 [research].max_num_ctx_tokens = {} — the evidence would not fit in the window \
+                 it has to share with the report. Fix: lower max_request_report_words, or raise \
+                 max_num_ctx_tokens.",
+                self.research.max_request_report_words, self.research.max_num_ctx_tokens
+            ));
+        }
+        // A ceiling below the floor would make every non-zero override invalid
+        // while the field still reads as offered.
+        if self.research.max_request_report_words < MIN_REPORT_WORDS {
+            e.push(format!(
+                "[research].max_request_report_words = {} is below the floor a non-zero \
+                 override must clear ({MIN_REPORT_WORDS}), so every override but 0 would be \
+                 rejected. Fix: use at least {MIN_REPORT_WORDS} (default \
+                 {DEFAULT_RESEARCH_MAX_REQUEST_REPORT_WORDS}).",
+                self.research.max_request_report_words
+            ));
         }
         if self.research.max_num_ctx_tokens < 1024 {
             e.push(format!(
@@ -1843,10 +1990,12 @@ mod tests {
         // The report budgets go with it, and that is the new rule working rather
         // than a fixture patched to be quiet: a 4096-token window genuinely cannot
         // hold the default 900-word report *and* the evidence it is written from, so
-        // an operator who shrinks the window for VRAM is told to shrink this too.
+        // an operator who shrinks the window for VRAM is told to shrink this too —
+        // including the request ceiling, which is held to the same window check so
+        // that no *override* can reserve what the presets may not.
         let off = parse(
             "[research]\nmax_num_ctx_tokens = 4096\nmax_context_runs = 0\n\
-             max_context_chars = 65536\n\
+             max_context_chars = 65536\nmax_request_report_words = 150\n\
              [research.effort.low]\nmax_report_words = 0\n\
              [research.effort.medium]\nmax_report_words = 0\n\
              [research.effort.high]\nmax_report_words = 0\n",
@@ -1854,6 +2003,57 @@ mod tests {
         .expect("parses");
         off.validate()
             .expect("an unused context cap must not fail startup");
+    }
+
+    /// The report-shape and evidence-width knobs get the same startup guardrails
+    /// as the budget axes: a ceiling below what `effort = "high"` already grants
+    /// is a contradiction, and so is a preset the mechanism cannot honour.
+    #[test]
+    fn report_shape_ceilings_and_floors_are_enforced_at_startup() {
+        // Ceiling below effort.high, for each new pair.
+        for (key, toml) in [
+            (
+                "max_request_report_sections",
+                // The default high preset (6) already exceeds a ceiling of 4.
+                "[research]\nmax_request_report_sections = 4\n".to_string(),
+            ),
+            (
+                "max_request_report_words",
+                // 150 clears the non-zero floor, so the only complaint left is
+                // the ceiling sitting under high's 1800.
+                "[research]\nmax_request_report_words = 150\n".to_string(),
+            ),
+            (
+                "max_evidence_width",
+                "[research]\nmax_evidence_width = 1\n[research.effort.high]\nevidence_width = 2\n"
+                    .to_string(),
+            ),
+        ] {
+            let cfg = parse(&toml).expect("parses");
+            let err = cfg.validate().expect_err("must be rejected");
+            assert!(
+                err.iter().any(|m| m.contains(key)),
+                "{key} below effort.high must be named: {err:?}"
+            );
+        }
+        // Preset floors: sections below the sectioning threshold, width of zero.
+        let cfg = parse("[research.effort.low]\nmax_report_sections = 2\nevidence_width = 0\n")
+            .expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter().any(|m| m.contains("max_report_sections")),
+            "{err:?}"
+        );
+        assert!(err.iter().any(|m| m.contains("evidence_width")), "{err:?}");
+        // A words ceiling below the non-zero floor would offer a field on which
+        // every override but 0 is rejected.
+        let cfg = parse("[research]\nmax_request_report_words = 100\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_request_report_words") && m.contains("150")),
+            "{err:?}"
+        );
     }
 
     /// A window this small cannot hold the report *and* what the report is written

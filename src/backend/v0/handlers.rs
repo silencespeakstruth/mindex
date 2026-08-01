@@ -2900,11 +2900,11 @@ pub(crate) async fn outline_core(
     })
 }
 
-/// Call sites per `callers` call. Between `outline`'s 300 and `read_chunks`'s 8:
-/// the rows are compact metadata and the point is to see the *shape* of a name's
-/// usage, but unlike an outline this is not bounded by one file — a common name
-/// can span the whole repo, and this text is resent every later turn. Truncation
-/// stays visible through `total_sites`.
+/// Call sites per `callers` call, at `evidence_width` 1. Between `outline`'s 300
+/// and `read_chunks`'s 8: the rows are compact metadata and the point is to see
+/// the *shape* of a name's usage, but unlike an outline this is not bounded by
+/// one file — a common name can span the whole repo, and this text is resent
+/// every later turn. Truncation stays visible through `total_sites`.
 const CALLERS_LIMIT: usize = 50;
 
 /// The grouped call-edge SQL for one direction. Binds are `?1` project, `?2`
@@ -2921,7 +2921,8 @@ const CALLERS_LIMIT: usize = 50;
 /// the interpolation carries no injection surface.
 /// `scope_clause` is an already-built `AND file_path IN (…)` fragment (empty when the
 /// run is unscoped), so a scoped run cannot read call sites it was not given.
-fn build_callers_query(direction: CallDirection, scope_clause: &str) -> String {
+/// `limit` is [`CALLERS_LIMIT`] scaled by the run's `evidence_width`.
+fn build_callers_query(direction: CallDirection, scope_clause: &str, limit: usize) -> String {
     let (filter_column, symbol_column, kind_column) = match direction {
         CallDirection::In => ("name", "parent_name", "parent_kind"),
         CallDirection::Out => ("parent_name", "name", "kind"),
@@ -2938,7 +2939,7 @@ fn build_callers_query(direction: CallDirection, scope_clause: &str) -> String {
            AND {filter_column} = ?3{scope_clause}
          GROUP BY file_path, {symbol_column}, {kind_column}
          ORDER BY file_path ASC, first_line ASC
-         LIMIT {CALLERS_LIMIT}"
+         LIMIT {limit}"
     )
 }
 
@@ -2963,6 +2964,7 @@ pub(crate) async fn callers_core(
     name: &str,
     direction: CallDirection,
     scope: &crate::research::ToolScope,
+    limit: usize,
     token: &CancellationToken,
 ) -> Result<CallersResponse, ApiError> {
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
@@ -2976,11 +2978,11 @@ pub(crate) async fn callers_core(
     } else {
         (String::new(), Vec::new())
     };
-    let sql = build_callers_query(direction, &scope_clause);
+    let sql = build_callers_query(direction, &scope_clause, limit);
     // Unscoped, for the difference only — see `symbols_core`.
     let unscoped_sql = scope
         .is_scoped()
-        .then(|| build_callers_query(direction, ""));
+        .then(|| build_callers_query(direction, "", limit));
     let mut binds: Vec<Bind> = vec![
         Bind::Guid(project_guid),
         Bind::Path(model_id.clone()),
@@ -3062,8 +3064,10 @@ pub(crate) async fn callers_core(
     })
 }
 
-/// Chunks per `read_chunks` call. Small: this returns *code*, which is resent on
-/// every later turn, so it is the one research lookup with a real context price.
+/// Chunks per `read_chunks` call, at `evidence_width` 1. Small: this returns
+/// *code*, which is resent on every later turn, so it is the one research lookup
+/// with a real context price — which is also why widening it is a per-request
+/// grant a caller pays for in tokens, never a default.
 const READ_CHUNKS_LIMIT: usize = 8;
 
 /// The indexed code covering a line range of one file.
@@ -3080,6 +3084,10 @@ const READ_CHUNKS_LIMIT: usize = 8;
 /// the same reason `outline` reports `indexed` separately from an empty symbol
 /// list. Persisting file text to close the gap properly is a project (a table, a
 /// storage cost, an invalidation surface), not a tool.
+// One over clippy's arity line, and honestly so: every parameter is a distinct
+// request axis (span, scope, width, cancellation) and a param struct would name
+// this one call site's arguments and nothing else.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_chunks_core(
     s: &RouterState,
     project_guid: UUIDv4,
@@ -3087,6 +3095,7 @@ pub(crate) async fn read_chunks_core(
     start_line: usize,
     end_line: usize,
     scope: &crate::research::ToolScope,
+    limit: usize,
     token: &CancellationToken,
 ) -> Result<ReadChunksResponse, ApiError> {
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
@@ -3125,7 +3134,7 @@ pub(crate) async fn read_chunks_core(
                    AND status = 'active'
                    AND start_line <= ?5 AND end_line >= ?4
                  ORDER BY start_line ASC
-                 LIMIT {READ_CHUNKS_LIMIT}"
+                 LIMIT {limit}"
             ))?;
             let rows = stmt
                 .query_map(
@@ -3166,14 +3175,16 @@ pub(crate) async fn read_chunks_core(
     })
 }
 
-/// Commits per `file_history` call.
+/// Commits per `file_history` call, at `evidence_width` 1.
 ///
 /// Small where `outline`'s is large, and for the opposite reason: an outline is a
 /// list of names and this is a list of prose. Twenty commit messages of this
 /// repository's median length is already ~5k tokens of transcript, and the recent
 /// ones are what answer "why is this the way it is" — a longer tail buys
 /// archaeology nobody asked for at the price of the budget that would have read
-/// the code. Transcript shape, not tuning, so it is a const like `GREP_LIMIT`.
+/// the code. Transcript shape, not tuning, so the base is a const like
+/// `GREP_LIMIT`; the per-request `evidence_width` grant is the one way to buy
+/// the archaeology knowingly.
 const FILE_HISTORY_LIMIT: usize = 20;
 
 /// The commits that touched one path, newest first — the git channel's only
@@ -3197,6 +3208,7 @@ pub(crate) async fn file_history_core(
     project_guid: UUIDv4,
     path: &str,
     scope: &crate::research::ToolScope,
+    limit: usize,
     token: &CancellationToken,
 ) -> Result<FileHistoryResponse, ApiError> {
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
@@ -3220,7 +3232,7 @@ pub(crate) async fn file_history_core(
     let (history_indexed, path_indexed, total, commits) = s
         .db_pool
         .transaction(token.child_token(), move |tx| {
-            read_file_history(tx, project_guid, &model_id, &owned_path)
+            read_file_history(tx, project_guid, &model_id, &owned_path, limit)
         })
         .with_cancellation_token(token)
         .await
@@ -3254,6 +3266,7 @@ fn read_file_history(
     project_guid: UUIDv4,
     model_id: &str,
     owned_path: &str,
+    limit: usize,
 ) -> Result<(bool, bool, usize, Vec<CommitSummary>), SQLite3PoolError> {
     // Does this project have a history channel at all? One indexed
     // existence check, and the single most load-bearing read here:
@@ -3305,12 +3318,7 @@ fn read_file_history(
     )?;
     let commits = stmt
         .query_map(
-            params![
-                project_guid,
-                model_id,
-                owned_path,
-                FILE_HISTORY_LIMIT as i64
-            ],
+            params![project_guid, model_id, owned_path, limit as i64],
             |r| {
                 let sha: String = r.get(0)?;
                 Ok(CommitSummary {
@@ -3393,8 +3401,9 @@ pub(crate) async fn list_files_core(
     })
 }
 
-/// Matches per `grep` call. Tighter than `list_files`'s 300 because each carries a
-/// line of source rather than a path, and every hit is resent on every later turn.
+/// Matches per `grep` call, at `evidence_width` 1. Tighter than `list_files`'s 300
+/// because each carries a line of source rather than a path, and every hit is
+/// resent on every later turn.
 const GREP_LIMIT: usize = 20;
 /// Shortest literal `grep` will look for.
 ///
@@ -3443,6 +3452,7 @@ pub(crate) async fn grep_core(
     pattern: &str,
     glob: Option<&str>,
     scope: &crate::research::ToolScope,
+    limit: usize,
     token: &CancellationToken,
 ) -> Result<GrepResponse, ApiError> {
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
@@ -3472,7 +3482,7 @@ pub(crate) async fn grep_core(
            AND c.code LIKE ?{p_pattern} ESCAPE '\\'
            AND c.file_path IN ({scope_sql}){glob_clause}
          ORDER BY c.file_path ASC, c.start_line ASC
-         LIMIT {GREP_LIMIT}"
+         LIMIT {limit}"
     );
 
     // How many matches the scope hid. One extra query, and only when the run is
@@ -3831,6 +3841,19 @@ pub(crate) async fn read_research_core(
 struct StateResearchTools {
     state: RouterState,
     project_guid: UUIDv4,
+    /// The run's `budget.evidence_width` grant. Constant per run, like
+    /// `project_guid`, which is why it lives here rather than travelling on
+    /// every call: the trait's surface stays untouched and no caller can pass
+    /// a different width than the one the request was granted.
+    evidence_width: u64,
+}
+
+/// One per-call evidence width, scaled by the run's `evidence_width` grant.
+///
+/// `max(1)` is defensive only — validation refuses 0 — so a malformed width can
+/// never zero a tool; `saturating_mul` for the same reason on the other end.
+fn scaled_width(base: usize, width: u64) -> usize {
+    base.saturating_mul(width.max(1) as usize)
 }
 
 /// Longest derived title, in characters. This is the *fallback* rendering, cut
@@ -4250,6 +4273,7 @@ impl crate::research::ResearchTools for StateResearchTools {
             &name,
             direction,
             scope,
+            scaled_width(CALLERS_LIMIT, self.evidence_width),
             token,
         )
         .await
@@ -4270,7 +4294,15 @@ impl crate::research::ResearchTools for StateResearchTools {
         scope: &crate::research::ToolScope,
         token: &CancellationToken,
     ) -> Result<FileHistoryResponse, ApiError> {
-        file_history_core(&self.state, self.project_guid, &path, scope, token).await
+        file_history_core(
+            &self.state,
+            self.project_guid,
+            &path,
+            scope,
+            scaled_width(FILE_HISTORY_LIMIT, self.evidence_width),
+            token,
+        )
+        .await
     }
 
     async fn grep(
@@ -4286,6 +4318,7 @@ impl crate::research::ResearchTools for StateResearchTools {
             &pattern,
             glob.as_deref(),
             scope,
+            scaled_width(GREP_LIMIT, self.evidence_width),
             token,
         )
         .await
@@ -4306,6 +4339,7 @@ impl crate::research::ResearchTools for StateResearchTools {
             start_line,
             end_line,
             scope,
+            scaled_width(READ_CHUNKS_LIMIT, self.evidence_width),
             token,
         )
         .await
@@ -4668,6 +4702,9 @@ pub async fn post_research(
             max_seconds: s.research_max_request_seconds,
             max_tokens: s.research_max_request_tokens,
             max_steps: s.research_max_request_steps,
+            max_report_sections: s.research_max_request_report_sections,
+            max_report_words: s.research_max_request_report_words,
+            max_evidence_width: s.research_max_evidence_width,
         },
     )?;
     let mut context_run_ids = req.context_run_ids.clone().unwrap_or_default();
@@ -4704,7 +4741,12 @@ pub async fn post_research(
         budget: s.research_budget(req.effort, req.budget),
         sampling: s.research_sampling_for(req.seed),
         report_timeout_ms: s.research_report_timeout_ms,
-        checkpoint_every_steps: s.research_checkpoint_every_steps,
+        // Not an effort axis, so not in `Budget::resolve`: the override lands
+        // straight from the request, `0` = no checkpoints for this run.
+        checkpoint_every_steps: req
+            .budget
+            .and_then(|b| b.checkpoint_every_steps)
+            .unwrap_or(s.research_checkpoint_every_steps),
         max_turn_thinking_chars: s.research_max_turn_thinking_chars,
         metrics: Some(s.metrics.clone()),
         prior_reports,
@@ -4717,10 +4759,16 @@ pub async fn post_research(
         effort = ?req.effort,
         seed = ?params.sampling.seed,
         // The resolved budget, not the requested effort: with `budget` overrides the
-        // level alone no longer says what the run was granted.
+        // level alone no longer says what the run was granted. The shape axes ride
+        // here too — they are not journalled (shape knobs never were), so this line
+        // is the only record of what a run was actually granted.
         max_seconds = params.budget.max_seconds,
         max_tokens = params.budget.max_tokens,
         max_steps = params.budget.max_steps,
+        max_report_sections = params.budget.max_report_sections,
+        max_report_words = params.budget.max_report_words,
+        evidence_width = params.budget.evidence_width,
+        checkpoint_every_steps = params.checkpoint_every_steps,
         "Starting a research job."
     );
 
@@ -4739,6 +4787,7 @@ pub async fn post_research(
             Arc::new(StateResearchTools {
                 state: s.clone(),
                 project_guid,
+                evidence_width: params.budget.evidence_width,
             }),
             s.metrics.clone(),
         ));
@@ -5678,6 +5727,9 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
             max_request_seconds: s.research_max_request_seconds,
             max_request_tokens: s.research_max_request_tokens,
             max_request_steps: s.research_max_request_steps,
+            max_request_report_sections: s.research_max_request_report_sections,
+            max_request_report_words: s.research_max_request_report_words,
+            max_evidence_width: s.research_max_evidence_width,
             report_timeout_ms: s.research_report_timeout_ms,
             checkpoint_every_steps: s.research_checkpoint_every_steps,
             sampling: ResearchSamplingInfo {
@@ -8193,7 +8245,7 @@ mod tests {
         i64,
         i64,
     ) {
-        let sql = build_callers_query(direction, "");
+        let sql = build_callers_query(direction, "", CALLERS_LIMIT);
         let rows: Vec<(String, Option<String>, Option<String>, i64, i64, i64, i64)> = pool
             .transaction(CancellationToken::new(), move |tx| {
                 tx.prepare(&sql)?
@@ -8744,7 +8796,7 @@ mod tests {
         path: &'static str,
     ) -> (bool, bool, usize, Vec<CommitSummary>) {
         p.transaction(CancellationToken::new(), move |tx| {
-            read_file_history(tx, guid(), HISTORY_MODEL, path)
+            read_file_history(tx, guid(), HISTORY_MODEL, path, FILE_HISTORY_LIMIT)
         })
         .await
         .unwrap()
@@ -8820,6 +8872,22 @@ mod tests {
             shas.last().unwrap().to_string().repeat(40),
             "newest first"
         );
+
+        // The limit is threaded, not baked into the SQL: a widened grant
+        // (`evidence_width` 2) actually reaches the read.
+        let widened = p
+            .transaction(CancellationToken::new(), move |tx| {
+                read_file_history(
+                    tx,
+                    guid(),
+                    HISTORY_MODEL,
+                    "src/a.rs",
+                    scaled_width(FILE_HISTORY_LIMIT, 2),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(widened.3.len(), FILE_HISTORY_LIMIT + 3, "width 2 uncaps it");
     }
 
     /// A file that was moved carries its earlier history under its old name.

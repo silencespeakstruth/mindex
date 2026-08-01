@@ -65,19 +65,32 @@ pub fn validate_query(query: &str, max_bytes: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Ceilings for a research `budget` override (`[research].max_request_*`).
+/// Ceilings for a research `budget` override (`[research].max_request_*` +
+/// `[research].max_evidence_width`).
 pub struct ResearchBudgetCaps {
     pub max_seconds: u64,
     pub max_tokens: u64,
     pub max_steps: usize,
+    pub max_report_sections: usize,
+    pub max_report_words: usize,
+    pub max_evidence_width: u64,
 }
 
-/// A research `budget` override: every present axis must be within `1..=cap`.
+/// A research `budget` override: every present axis must be within its range.
 ///
-/// Zero is rejected rather than clamped — `max_steps = 0` would let the model report
-/// on no evidence at all, and `max_seconds = 0` would end the run before its first
-/// turn. Both are far more likely to be a client bug than an intent, and a budget
-/// silently rounded up to 1 is worse than a 400 that says so.
+/// The spend axes (`max_seconds`/`max_tokens`/`max_steps`) and `evidence_width`
+/// are `1..=cap`: zero is rejected rather than clamped — `max_steps = 0` would
+/// let the model report on no evidence at all, and `max_seconds = 0` would end
+/// the run before its first turn. Both are far more likely to be a client bug
+/// than an intent, and a budget silently rounded up to 1 is worse than a 400
+/// that says so.
+///
+/// The shape axes carry floors instead, mirroring the config validation on
+/// their presets: `max_report_sections` is `MIN_REPORT_SECTIONS..=cap` (below
+/// the sectioning threshold the grant names a shape the mechanism cannot
+/// produce), while `max_report_words` and `checkpoint_every_steps` admit `0`
+/// as the sanctioned "off" spelling and reject the small non-zero values that
+/// only look like tight settings.
 pub fn research_budget(
     budget: &Option<crate::backend::v0::models::ResearchBudgetOverride>,
     caps: &ResearchBudgetCaps,
@@ -91,12 +104,56 @@ pub fn research_budget(
             b.max_steps.map(|v| v as u64),
             Some(caps.max_steps as u64),
         ),
+        (
+            "evidence_width",
+            b.evidence_width,
+            Some(caps.max_evidence_width),
+        ),
     ] {
         let (Some(got), Some(max)) = (got, max) else {
             continue;
         };
         if got < 1 || got > max {
             return Err(ApiError::ResearchBudgetOutOfRange { field, got, max });
+        }
+    }
+    for (field, got, min, max, zero_ok) in [
+        (
+            "max_report_sections",
+            b.max_report_sections,
+            crate::config::MIN_REPORT_SECTIONS as u64,
+            caps.max_report_sections as u64,
+            false,
+        ),
+        (
+            "max_report_words",
+            b.max_report_words,
+            crate::config::MIN_REPORT_WORDS as u64,
+            caps.max_report_words as u64,
+            true,
+        ),
+        (
+            "checkpoint_every_steps",
+            b.checkpoint_every_steps,
+            crate::config::MIN_RESEARCH_CHECKPOINT_EVERY_STEPS as u64,
+            caps.max_steps as u64,
+            true,
+        ),
+    ] {
+        let Some(got) = got.map(|v| v as u64) else {
+            continue;
+        };
+        if zero_ok && got == 0 {
+            continue;
+        }
+        if got < min || got > max {
+            return Err(ApiError::ResearchShapeOutOfRange {
+                field,
+                got,
+                min,
+                max,
+                zero_ok,
+            });
         }
     }
     Ok(())
@@ -409,6 +466,9 @@ mod tests {
             max_seconds: 1800,
             max_tokens: 4_000_000,
             max_steps: 200,
+            max_report_sections: 12,
+            max_report_words: 4000,
+            max_evidence_width: 3,
         };
         assert!(research_budget(&None, &caps).is_ok());
         // A partial override is normal: absent axes keep the effort preset.
@@ -439,6 +499,14 @@ mod tests {
                 max_steps: Some(201),
                 ..Default::default()
             },
+            ResearchBudgetOverride {
+                evidence_width: Some(0),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                evidence_width: Some(4),
+                ..Default::default()
+            },
         ] {
             assert_eq!(
                 err_code(research_budget(&Some(bad), &caps).unwrap_err()),
@@ -465,6 +533,134 @@ mod tests {
         assert!(
             problem.detail.contains("[research].max_request_steps"),
             "the fix-it hint must name a key that exists: {}",
+            problem.detail
+        );
+    }
+
+    #[test]
+    fn research_shape_bounds() {
+        use crate::backend::v0::models::ResearchBudgetOverride;
+        let caps = ResearchBudgetCaps {
+            max_seconds: 1800,
+            max_tokens: 4_000_000,
+            max_steps: 200,
+            max_report_sections: 12,
+            max_report_words: 4000,
+            max_evidence_width: 3,
+        };
+        // The whole legal surface: floors, ceilings, and 0 where 0 means "off".
+        for ok in [
+            ResearchBudgetOverride {
+                max_report_sections: Some(3),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_sections: Some(12),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_words: Some(0),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_words: Some(150),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_words: Some(4000),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                checkpoint_every_steps: Some(0),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                checkpoint_every_steps: Some(2),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                checkpoint_every_steps: Some(200),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                research_budget(&Some(ok), &caps).is_ok(),
+                "{ok:?} is within range and must pass"
+            );
+        }
+        for (bad, field) in [
+            (
+                ResearchBudgetOverride {
+                    max_report_sections: Some(0),
+                    ..Default::default()
+                },
+                "max_report_sections",
+            ),
+            (
+                ResearchBudgetOverride {
+                    max_report_sections: Some(2),
+                    ..Default::default()
+                },
+                "max_report_sections",
+            ),
+            (
+                ResearchBudgetOverride {
+                    max_report_sections: Some(13),
+                    ..Default::default()
+                },
+                "max_report_sections",
+            ),
+            // The trap the floor exists for: a small non-zero word count is a
+            // stub instruction, not a tight setting. 0 is the off switch.
+            (
+                ResearchBudgetOverride {
+                    max_report_words: Some(149),
+                    ..Default::default()
+                },
+                "max_report_words",
+            ),
+            (
+                ResearchBudgetOverride {
+                    max_report_words: Some(4001),
+                    ..Default::default()
+                },
+                "max_report_words",
+            ),
+            (
+                ResearchBudgetOverride {
+                    checkpoint_every_steps: Some(1),
+                    ..Default::default()
+                },
+                "checkpoint_every_steps",
+            ),
+            (
+                ResearchBudgetOverride {
+                    checkpoint_every_steps: Some(201),
+                    ..Default::default()
+                },
+                "checkpoint_every_steps",
+            ),
+        ] {
+            let e = research_budget(&Some(bad), &caps).unwrap_err();
+            assert!(
+                matches!(&e, ApiError::ResearchShapeOutOfRange { field: f, .. } if *f == field),
+                "{bad:?} must name {field}, got {e:?}"
+            );
+            assert_eq!(err_code(e), "validation.research_shape_out_of_range");
+        }
+        // The zero-accepting detail names the off switch; the sections one must not.
+        let words = research_budget(
+            &Some(ResearchBudgetOverride {
+                max_report_words: Some(10),
+                ..Default::default()
+            }),
+            &caps,
+        )
+        .unwrap_err();
+        let problem = crate::backend::error::ProblemDetails::from(&words);
+        assert!(
+            problem.detail.contains("0"),
+            "a zero-accepting axis must offer the off switch: {}",
             problem.detail
         );
     }

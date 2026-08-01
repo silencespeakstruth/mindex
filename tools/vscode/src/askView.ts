@@ -407,10 +407,30 @@ function readBudget(msg: Record<string, unknown>): ResearchBudget | undefined {
         const n = Number(s);
         return Number.isFinite(n) && n > 0 ? Math.floor(n) * scale : undefined;
     };
+    // The checkpoint axis is the one field where 0 is a value, not "unset": it
+    // means "no checkpoints for this run", so `num`'s `n > 0` would silently
+    // drop exactly the override the user reached for. And the slider cannot
+    // express the server's gap at 1 (floor 2, 0 = off), so 1 rounds up rather
+    // than failing the whole submit with a 400.
+    const checkpoint = (v: unknown): number | undefined => {
+        const s = asString(v).trim();
+        if (s === "") {
+            return undefined;
+        }
+        const n = Number(s);
+        if (!Number.isFinite(n) || n < 0) {
+            return undefined;
+        }
+        return n === 1 ? 2 : Math.floor(n);
+    };
     const budget: ResearchBudget = {
         max_seconds: num(msg.bseconds),
         max_tokens: num(msg.btokens, 1000),
         max_steps: num(msg.bsteps),
+        max_report_sections: num(msg.bsections),
+        max_report_words: num(msg.bwords),
+        evidence_width: num(msg.bwidth),
+        checkpoint_every_steps: checkpoint(msg.bcheckpoint),
     };
     const named = Object.fromEntries(
         Object.entries(budget).filter(([, v]) => v !== undefined)

@@ -66,6 +66,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.too_many_files`, `validation.selector_too_large`, \
 `validation.symbol_name_empty`, `validation.symbol_name_too_long`, \
 `validation.symbol_limit_out_of_range`, `validation.research_budget_out_of_range`, \
+`validation.research_shape_out_of_range`, \
 `validation.too_many_commits`, `validation.commit_message_too_large`, \
 `validation.commit_invalid`, `validation.history_bound_missing`, `research.busy`, \
 `research.model_missing`, `validation.research_context_too_many`, \

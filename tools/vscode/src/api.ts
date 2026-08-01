@@ -115,6 +115,12 @@ export interface ResearchEffortInfo {
     context_fraction: number;
     /** Chunks one `search` call returns to the model — the evidence width. */
     search_top_k?: number;
+    /** Word ceiling announced for the report (`0` = none). Absent on older servers. */
+    max_report_words?: number;
+    /** Report sections the run may write. Absent on older servers. */
+    max_report_sections?: number;
+    /** Multiplier on the per-call evidence tool widths. Absent on older servers. */
+    evidence_width?: number;
 }
 /** `[research].temperature`/`top_p`/`seed`; `null` means the model's own default. */
 export interface ResearchSamplingInfo {
@@ -137,6 +143,12 @@ export interface ResearchConfigInfo {
     max_request_seconds: number;
     max_request_tokens: number;
     max_request_steps: number;
+    /** Ceilings on the report-shape overrides. Absent on older servers. */
+    max_request_report_sections?: number;
+    max_request_report_words?: number;
+    max_evidence_width?: number;
+    /** Steps between draft-banking turns (`0` = off). Absent on older servers. */
+    checkpoint_every_steps?: number;
     /**
      * How long the report phase gets after the investigation deadline. The other
      * half of what a caller waits: `effort.*.max_seconds` bounds the investigation,
@@ -207,12 +219,24 @@ export type ResearchEffort = "low" | "medium" | "high";
 /**
  * Per-request budget overriding the `effort` preset, axis by axis. Absent fields
  * keep the preset. `context_fraction` is deliberately not overridable — it guards
- * against silent transcript truncation and is not a quality lever.
+ * against silent transcript truncation and is not a quality lever; `search_top_k`
+ * stays TOML-only for the same class of reason.
+ *
+ * An older server rejects the shape axes with a 400 (`deny_unknown_fields`) —
+ * loud, which is the point of them riding inside `budget`.
  */
 export interface ResearchBudget {
     max_seconds?: number;
     max_tokens?: number;
     max_steps?: number;
+    /** `0` = announce no length; otherwise 150..=max_request_report_words. */
+    max_report_words?: number;
+    /** 3..=max_request_report_sections. */
+    max_report_sections?: number;
+    /** `0` = no checkpoints this run; otherwise 2..=max_request_steps. */
+    checkpoint_every_steps?: number;
+    /** 1..=max_evidence_width. */
+    evidence_width?: number;
 }
 export interface ResearchRequest {
     question: string;

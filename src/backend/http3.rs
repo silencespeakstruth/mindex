@@ -122,10 +122,14 @@ pub struct RouterState {
     pub research_default_model: String,
     /// What each `effort` level buys (`[research].effort.*`).
     pub research_effort: crate::config::EffortBudgets,
-    /// Ceilings on a request's `budget` override (`[research].max_request_*`).
+    /// Ceilings on a request's `budget` override (`[research].max_request_*`;
+    /// `max_request_steps` also caps the `checkpoint_every_steps` override).
     pub research_max_request_seconds: u64,
     pub research_max_request_tokens: u64,
     pub research_max_request_steps: usize,
+    pub research_max_request_report_sections: usize,
+    pub research_max_request_report_words: usize,
+    pub research_max_evidence_width: u64,
     /// How long the report phase gets after the investigation deadline
     /// (`[research].report_timeout_ms`). Not a budget axis and not
     /// request-overridable — an operator's bound on the tail of a run.

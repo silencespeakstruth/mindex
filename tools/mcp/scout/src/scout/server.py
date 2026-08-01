@@ -401,7 +401,19 @@ async def research(
             alone is the wrong shape (a question that needs time but not depth, say).
             The server owns the ceilings and rejects an over-large value with a 400;
             they are deliberately not duplicated here, because three separate copies
-            of these numbers have drifted from the server before.
+            of these numbers have drifted from the server before (``GET /config``
+            publishes the live ladder and ceilings).
+
+            Four report-shape keys ride in the same dict:
+            ``max_report_sections`` (min 3 — how many sub-questions the plan asks
+            for and the report may write; sections share one fixed report window,
+            so past its capacity extras ship as stubs), ``max_report_words``
+            (0 = announce no length, else min 150), ``checkpoint_every_steps``
+            (0 = no draft-banking turns this run, else min 2 — each costs a step),
+            and ``evidence_width`` (min 1 — multiplies how many rows read_chunks/
+            grep/callers/file_history/symbols return; width is resent on every
+            later turn, so it is paid for in the token budget, not once). An older
+            server rejects the new keys with a 400 rather than ignoring them.
         context_run_ids: Optional ``run_id`` values of earlier runs on this project
             whose reports should be handed to this one as background — normally the
             ``run_id`` a previous call returned. They save the new run the work of

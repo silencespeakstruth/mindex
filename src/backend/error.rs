@@ -115,11 +115,24 @@ pub enum ApiError {
     /// A research request named no model and `[research].default_model` is unset. 400.
     ResearchModelMissing,
     /// A `budget` override axis was outside `1..=[research].max_request_*`. 400.
-    /// One code for all three axes; `field`/`meta.field` names the offender.
+    /// One code for the spend axes + `evidence_width`; `field`/`meta.field` names
+    /// the offender.
     ResearchBudgetOutOfRange {
         field: &'static str,
         got: u64,
         max: u64,
+    },
+    /// A `budget` shape axis (`max_report_sections` / `max_report_words` /
+    /// `checkpoint_every_steps`) was outside its range. 400. Unlike the spend
+    /// axes these carry a floor above 1, and two of them accept `0` as the
+    /// sanctioned "off" spelling — `zero_ok` is what lets one detail string say
+    /// so only where it is true.
+    ResearchShapeOutOfRange {
+        field: &'static str,
+        got: u64,
+        min: u64,
+        max: u64,
+        zero_ok: bool,
     },
     /// A request named more prior runs in `context_run_ids` than
     /// `[research].max_context_runs` allows. 400.
@@ -177,6 +190,7 @@ impl ApiError {
             ApiError::ResearchBusy => "research.busy",
             ApiError::ResearchModelMissing => "research.model_missing",
             ApiError::ResearchBudgetOutOfRange { .. } => "validation.research_budget_out_of_range",
+            ApiError::ResearchShapeOutOfRange { .. } => "validation.research_shape_out_of_range",
             ApiError::ResearchContextTooMany { .. } => "validation.research_context_too_many",
             ApiError::ResearchContextInvalid { .. } => "validation.research_context_invalid",
             ApiError::ResearchDeleteTooMany { .. } => "validation.research_delete_too_many",
@@ -239,6 +253,7 @@ impl ApiError {
             ApiError::ResearchBusy => "Research capacity exhausted",
             ApiError::ResearchModelMissing => "No research model",
             ApiError::ResearchBudgetOutOfRange { .. } => "Invalid research budget",
+            ApiError::ResearchShapeOutOfRange { .. } => "Invalid research report shape",
             ApiError::ResearchContextTooMany { .. } => "Too much prior research",
             ApiError::ResearchContextInvalid { .. } => "Research context run is invalid",
             ApiError::ResearchDeleteTooMany { .. } => "Too many runs in one delete",
@@ -265,7 +280,8 @@ impl ApiError {
             | ApiError::CommitInvalid { .. } => Some("commits"),
             ApiError::HistoryBoundMissing => Some("keep_last/older_than"),
             ApiError::ResearchModelMissing => Some("model"),
-            ApiError::ResearchBudgetOutOfRange { field, .. } => Some(field),
+            ApiError::ResearchBudgetOutOfRange { field, .. }
+            | ApiError::ResearchShapeOutOfRange { field, .. } => Some(field),
             ApiError::ResearchContextTooMany { .. } | ApiError::ResearchContextInvalid { .. } => {
                 Some("context_run_ids")
             }
@@ -364,11 +380,35 @@ impl ApiError {
             }
             ApiError::ResearchBudgetOutOfRange { field, got, max } => format!(
                 "budget.{field} must be between 1 and {max} (got {got}); the ceiling is \
-                 [research].max_request_{}.",
+                 [research].{}.",
                 // `max_seconds` is capped by `max_request_seconds` — the axis name
-                // without its own `max_` prefix.
-                field.trim_start_matches("max_")
+                // without its own `max_` prefix. `evidence_width` keeps its whole
+                // name and a different prefix: `[research].max_evidence_width`.
+                match *field {
+                    "evidence_width" => "max_evidence_width".to_string(),
+                    other => format!("max_request_{}", other.trim_start_matches("max_")),
+                }
             ),
+            ApiError::ResearchShapeOutOfRange {
+                field,
+                got,
+                min,
+                max,
+                zero_ok,
+            } => {
+                let off = if *zero_ok { ", or 0 to disable it" } else { "" };
+                format!(
+                    "budget.{field} must be between {min} and {max}{off} (got {got}); the \
+                     ceiling is [research].{}.",
+                    // `checkpoint_every_steps` shares the step budget's ceiling — an
+                    // interval above `max_steps` is `0` spelled differently.
+                    match *field {
+                        "checkpoint_every_steps" => "max_request_steps",
+                        "max_report_sections" => "max_request_report_sections",
+                        _ => "max_request_report_words",
+                    }
+                )
+            }
             ApiError::ResearchContextTooMany { got, max } => format!(
                 "context_run_ids names {got} earlier runs, but at most {max} may be given \
                  ([research].max_context_runs). Each one is resent on every turn, so the cap is \
@@ -423,6 +463,15 @@ impl ApiError {
             ApiError::ResearchBudgetOutOfRange { field, got, max } => {
                 Some(json!({ "field": field, "got": got, "min": 1, "max": max }))
             }
+            ApiError::ResearchShapeOutOfRange {
+                field,
+                got,
+                min,
+                max,
+                zero_ok,
+            } => Some(json!({
+                "field": field, "got": got, "min": min, "max": max, "zero_ok": zero_ok
+            })),
             ApiError::ResearchContextTooMany { got, max }
             | ApiError::ResearchDeleteTooMany { got, max } => {
                 Some(json!({ "got": got, "max": max }))
@@ -584,6 +633,13 @@ mod tests {
                 got: 0,
                 max: 0,
             },
+            ApiError::ResearchShapeOutOfRange {
+                field: "max_report_sections",
+                got: 0,
+                min: 0,
+                max: 0,
+                zero_ok: false,
+            },
             ApiError::ResearchContextTooMany { got: 0, max: 0 },
             ApiError::ResearchContextInvalid { runs: Vec::new() },
             ApiError::ResearchDeleteTooMany { got: 0, max: 0 },
@@ -623,6 +679,7 @@ mod tests {
             "validation.research_context_too_many",
             "validation.research_delete_too_many",
             "validation.research_list_limit_out_of_range",
+            "validation.research_shape_out_of_range",
             "validation.selector_too_large",
             "validation.sha256_invalid",
             "validation.symbol_limit_out_of_range",

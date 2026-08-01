@@ -37,7 +37,7 @@ use crate::models::ollama::{
 /// measurement corpus silently mixes generations and a regression looks like model
 /// variance. Cheap to carry, impossible to reconstruct after the fact.
 ///
-/// **Bump on any edit to** `system_prompt`, [`PLAN_REQUEST`],
+/// **Bump on any edit to** `system_prompt`, [`plan_request`],
 /// [`SUFFICIENCY_REQUEST`], the re-open nudge that follows it,
 /// [`REVALIDATION_SYSTEM_PROMPT`], [`format_citation_complaint`],
 /// [`format_ungrounded_complaint`], [`format_markdown_complaint`],
@@ -68,7 +68,13 @@ use crate::models::ollama::{
 /// sections it can already answer. No corpus comparison across this boundary is
 /// valid: a 1.4 report is one model turn's document, a 2.0 report is six turns'
 /// sections assembled by the server.
-pub const PROMPT_VERSION: &str = "2.0";
+///
+/// 2.0 → 2.1: the plan turn's upper bound is templated from the run's resolved
+/// `max_report_sections` ("3-6" became "3-N"). MINOR: the job is unchanged, and at
+/// the default grant of 6 the prompt is byte-for-byte the 2.0 text — but a
+/// non-default grant changes what the model is asked, and a 4-section corpus must
+/// not read as the same generation as a 12-section one.
+pub const PROMPT_VERSION: &str = "2.1";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -78,7 +84,9 @@ pub const PROMPT_VERSION: &str = "2.0";
 /// subdirectory usually still fills `search_top_k`, cheap because the extra cost
 /// is Qdrant's, not the embedder's — the query vector is computed once either way.
 const PREFIX_OVERFETCH: usize = 4;
-/// Rows per role per `symbols` tool call.
+/// Rows per role per `symbols` tool call, at `evidence_width` 1. Scaled by the
+/// run's grant at the call site — the one width applied loop-side, because the
+/// limit rides in `SymbolsRequest` rather than in a core function's SQL.
 const SYMBOLS_LIMIT: usize = 10;
 /// Re-asks allowed when a reply carries no parseable action; after that, finalize.
 ///
@@ -204,9 +212,20 @@ pub struct Budget {
     ///
     /// Not a budget axis either — nothing stops on it — but it is the only axis
     /// about **output**, and output is where runs were measured to fail: the loop
-    /// found the right files every time and then failed to write them up. Like
-    /// `context_fraction`, it never comes from the request.
+    /// found the right files every time and then failed to write them up.
+    /// Request-overridable (capped by `[research].max_request_report_words`,
+    /// which is held to the same window check as the presets).
     pub max_report_words: usize,
+    /// Report sections the run may write, and the upper bound the plan turn's
+    /// prompt asks for. Request-overridable, floor
+    /// [`crate::config::MIN_REPORT_SECTIONS`], capped by
+    /// `[research].max_request_report_sections`.
+    pub max_report_sections: usize,
+    /// Multiplier on the per-call evidence widths (`read_chunks`, `grep`,
+    /// `callers`, `file_history`, `symbols`). Request-overridable, capped by
+    /// `[research].max_evidence_width`. Like `search_top_k`, not a budget axis —
+    /// it rides along as per-run tool configuration.
+    pub evidence_width: u64,
 }
 
 impl Budget {
@@ -214,8 +233,10 @@ impl Budget {
     ///
     /// A partial override keeps the preset for every axis it does not name, so
     /// `{"max_seconds": 60}` shortens the run without silently deepening anything
-    /// else. `context_fraction` and `max_report_words` never come from the request
-    /// — see the struct docs.
+    /// else. `context_fraction` and `search_top_k` never come from the request —
+    /// see the struct docs. (`checkpoint_every_steps` is not here at all: it is a
+    /// `[research]` scalar, not an effort axis, and the handler resolves its
+    /// override into `ResearchParams` directly.)
     ///
     /// The overrides are range-checked at the edge (`validate::research_budget`),
     /// so by the time they get here they are within `[research].max_request_*`.
@@ -230,7 +251,11 @@ impl Budget {
             context_fraction: preset.context_fraction,
             max_steps: over.max_steps.unwrap_or(preset.max_steps),
             search_top_k: preset.search_top_k,
-            max_report_words: preset.max_report_words,
+            max_report_words: over.max_report_words.unwrap_or(preset.max_report_words),
+            max_report_sections: over
+                .max_report_sections
+                .unwrap_or(preset.max_report_sections),
+            evidence_width: over.evidence_width.unwrap_or(preset.evidence_width),
         }
     }
 }
@@ -1690,11 +1715,28 @@ Rules:
 /// "finalize when the evidence suffices" is unanchored, and the two failure modes
 /// it produces are both measured on this corpus: stopping at four steps with a
 /// third of the answer, or never stopping at all.
-const PLAN_REQUEST: &str = "Before you touch a tool: break this question into 3-6 \
-    sub-questions you must answer to write a correct report, and for each one name \
-    the artifact you expect to answer it — a file, a symbol, an invariant. Number \
-    them. Be concrete and brief: one line each, no preamble, no investigation yet. \
-    This list is your plan, and you will be held to it at the end.";
+/// Templated, not a `const`: the upper bound is the run's resolved
+/// `max_report_sections` (an effort preset or a request override), so the plan
+/// the model writes and the sections the server will actually write can never
+/// disagree about how many there may be. At the default (6) the text is
+/// byte-for-byte what the 2.0 const said. The lower bound stays the literal 3 —
+/// [`MIN_SECTIONED_PLAN_ITEMS`], the floor `validate::research_budget` enforces
+/// on the override, so the range is well-formed for every value that can reach
+/// here.
+fn plan_request(max_sections: usize) -> String {
+    format!(
+        "Before you touch a tool: break this question into 3-{max_sections} \
+         sub-questions you must answer to write a correct report, and for each one name \
+         the artifact you expect to answer it — a file, a symbol, an invariant. Number \
+         them. Be concrete and brief: one line each, no preamble, no investigation yet. \
+         This list is your plan, and you will be held to it at the end."
+    )
+}
+
+/// The stable prefix of [`plan_request`], for anything that must recognise the
+/// plan turn without knowing the run's section grant (the test fakes do).
+#[cfg(test)]
+const PLAN_REQUEST_PREFIX: &str = "Before you touch a tool:";
 
 /// Asked after the tool loop ends, before the report is written.
 ///
@@ -2115,7 +2157,7 @@ fn forced_synthesis(
 /// context.
 #[derive(Debug, Default)]
 struct RunState {
-    /// The model's own plan from the [`PLAN_REQUEST`] turn, repeated every turn
+    /// The model's own plan from the [`plan_request`] turn, repeated every turn
     /// because a plan the model cannot see is not a plan it can be held to.
     plan: Option<String>,
     /// Conclusions the model chose to keep, in the order it wrote them.
@@ -2161,19 +2203,20 @@ struct PlanItem {
     text: String,
 }
 
-/// Sections the report may be written in.
-///
-/// `PLAN_REQUEST` asks for 3-6, and this is the hard cap regardless of what came
-/// back — a plan of twenty items is not twenty report turns.
-const MAX_REPORT_SECTIONS: usize = 6;
+// Sections the report may be written in: no longer a const. The cap is the
+// run's `budget.max_report_sections` (effort preset, request override, ceiling
+// `[research].max_request_report_sections`), and `plan_request` announces the
+// same number — a plan of twenty items is still not twenty report turns.
 
 /// Plan items below which the report is written as one document.
 ///
-/// The same 3 `PLAN_REQUEST` asks for, and for its reason: three is the smallest
+/// The same 3 [`plan_request`] asks for, and for its reason: three is the smallest
 /// plan this feature was designed around. Splitting a two-item plan buys an extra
 /// turn and a seam for almost no reduction in what any one turn has to write, which
-/// is the only thing sectioning is for.
-const MIN_SECTIONED_PLAN_ITEMS: usize = 3;
+/// is the only thing sectioning is for. Also the floor of the
+/// `max_report_sections` grant — [`crate::config::MIN_REPORT_SECTIONS`] is this
+/// number, kept in `config` so the validators share it.
+const MIN_SECTIONED_PLAN_ITEMS: usize = crate::config::MIN_REPORT_SECTIONS;
 
 /// Attempts per section before it is stubbed.
 ///
@@ -2207,7 +2250,7 @@ const REPORT_TOKEN_OVERDRAFT: f64 = 1.5;
 
 /// Split a plan into its numbered sub-questions.
 ///
-/// `PLAN_REQUEST` asks for 3-6 numbered lines and models comply often enough for
+/// `plan_request` asks for 3-N numbered lines and models comply often enough for
 /// this to be worth reading — but not reliably enough to depend on, which is why
 /// every caller must handle a short result by falling back to the single-turn path.
 ///
@@ -4239,7 +4282,9 @@ async fn execute(
                 role: *role,
                 kind: kind.clone(),
                 anchor_path: anchor_path.clone(),
-                limit: Some(SYMBOLS_LIMIT),
+                limit: Some(
+                    SYMBOLS_LIMIT.saturating_mul(params.budget.evidence_width.max(1) as usize),
+                ),
                 include: params.scope.include.clone(),
                 exclude: params.scope.exclude.clone(),
             };
@@ -4941,7 +4986,9 @@ async fn research_inner(
     // Degrades to a plan-less run rather than failing: a plan is an aid, not a
     // contract, and a model that answers this badly can still answer the
     // question. `state.plan` staying `None` simply removes it from the note.
-    messages.push(ChatMessage::user(PLAN_REQUEST.to_string()));
+    messages.push(ChatMessage::user(plan_request(
+        params.budget.max_report_sections,
+    )));
     let planned = chat_turn(
         ollama,
         params,
@@ -5679,7 +5726,7 @@ async fn research_inner(
         .map(parse_plan_items)
         .unwrap_or_default()
         .into_iter()
-        .take(MAX_REPORT_SECTIONS)
+        .take(params.budget.max_report_sections)
         .collect();
     let mut sectioned: Option<SectionedReport> = None;
 
@@ -6528,8 +6575,8 @@ fn assemble_sections(
 /// represented to later turns by their **headings only**; feeding back their prose
 /// would grow the prompt to compensate for shrinking the output.
 ///
-/// Bounded three ways at once, because this is a new turn-producing path:
-/// `MAX_REPORT_SECTIONS` caps how many exist, `MAX_SECTION_ATTEMPTS` caps the retries
+/// Bounded three ways at once, because this is a new turn-producing path: the run's
+/// `budget.max_report_sections` caps how many exist, `MAX_SECTION_ATTEMPTS` caps the retries
 /// per section, and two soft checks — `MIN_SECTION_MS` of window and
 /// `REPORT_TOKEN_OVERDRAFT` of budget — stub the rest rather than starting a turn
 /// that cannot finish. None of them is a `break` in the tool loop, so no new
@@ -7850,10 +7897,35 @@ mod tests {
                 max_seconds: Some(30),
                 max_tokens: Some(1000),
                 max_steps: Some(2),
+                max_report_words: None,
+                max_report_sections: None,
+                checkpoint_every_steps: None,
+                evidence_width: None,
             }),
         );
         assert_eq!(b.context_fraction, preset.context_fraction);
         assert_eq!((b.max_seconds, b.max_tokens, b.max_steps), (30, 1000, 2));
+
+        // The shape axes: absent = the preset's values…
+        let b = Budget::resolve(&preset, Some(ResearchBudgetOverride::default()));
+        assert_eq!(b.max_report_words, preset.max_report_words);
+        assert_eq!(b.max_report_sections, preset.max_report_sections);
+        assert_eq!(b.evidence_width, preset.evidence_width);
+
+        // …and named = the override, each moving alone.
+        let b = Budget::resolve(
+            &preset,
+            Some(ResearchBudgetOverride {
+                max_report_words: Some(0),
+                max_report_sections: Some(9),
+                evidence_width: Some(3),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(b.max_report_words, 0);
+        assert_eq!(b.max_report_sections, 9);
+        assert_eq!(b.evidence_width, 3);
+        assert_eq!(b.max_seconds, preset.max_seconds);
     }
 
     // ── the loop against fakes ───────────────────────────────────────────────
@@ -7880,7 +7952,9 @@ mod tests {
             .find(|m| m.role == "user")
             .map(|m| m.content.as_str())
         {
-            Some(PLAN_REQUEST) => ToollessTurn::Plan,
+            // The plan request is templated by the run's section grant, so a fake
+            // recognises it by its stable prefix rather than by equality.
+            Some(m) if m.starts_with(PLAN_REQUEST_PREFIX) => ToollessTurn::Plan,
             Some(SUFFICIENCY_REQUEST) => ToollessTurn::Sufficiency,
             Some(CHECKPOINT_REQUEST) => ToollessTurn::Checkpoint,
             // Section turns and whole-report turns are both "the report" to a fake:
@@ -7898,7 +7972,7 @@ mod tests {
     const FAKE_VERDICT_COMPLETE: &str = "1. ANSWERED src/research.rs:10-20\n\
                                          2. ANSWERED src/worker/gc.rs:5-9";
     /// A plan long enough to be written in sections — `MIN_SECTIONED_PLAN_ITEMS`,
-    /// which is also the smallest `PLAN_REQUEST` asks for.
+    /// which is also the smallest `plan_request` asks for.
     const FAKE_PLAN_SECTIONED: &str = "1. What ends the loop? — src/research.rs\n\
                                        2. What does GC delete? — src/worker/gc.rs\n\
                                        3. What stops an orphan? — src/db/qdrant.rs";
@@ -8347,6 +8421,8 @@ mod tests {
                 // reshaped by a length clause. The tests that are about the budget
                 // set it.
                 max_report_words: 0,
+                max_report_sections: crate::config::EffortBudget::default().max_report_sections,
+                evidence_width: 1,
             },
             sampling: Sampling::default(),
             // Generous too: a test about the investigation must not be ended by the
@@ -9763,6 +9839,49 @@ mod tests {
         assert!(summary.contains("What does GC delete?"), "{summary}");
     }
 
+    /// The plan turn's upper bound is the run's own section grant, not a literal:
+    /// the model is asked for exactly as many sub-questions as the server will
+    /// write sections for. At the default the text is byte-for-byte the 2.0 const.
+    #[test]
+    fn the_plan_prompt_names_the_runs_section_grant() {
+        assert!(plan_request(8).contains("3-8"), "{}", plan_request(8));
+        assert!(plan_request(6).contains("3-6"), "{}", plan_request(6));
+        assert!(plan_request(6).starts_with(PLAN_REQUEST_PREFIX));
+    }
+
+    /// A request-lowered `max_report_sections` truncates an over-long plan: the
+    /// grant, not the plan's length, decides how many report turns exist.
+    #[tokio::test]
+    async fn a_lowered_section_grant_caps_the_plan() {
+        let mut fake = sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                "## 1. A\n\nsrc/worker/gc.rs:10-40",
+                "## 2. B\n\nsrc/worker/gc.rs:10-40",
+                "## 3. C\n\nsrc/worker/gc.rs:10-40",
+            ],
+        );
+        fake.plan = "1. What ends the loop? — src/research.rs\n\
+                     2. What does GC delete? — src/worker/gc.rs\n\
+                     3. What stops an orphan? — src/db/qdrant.rs\n\
+                     4. Who sweeps the log? — src/worker/gc.rs\n\
+                     5. What resurrects a file? — src/db/files.rs";
+        let ollama = Arc::new(fake);
+        let mut p = params(8);
+        p.budget.max_report_sections = 3;
+        let events = run_native_shared(ollama.clone(), p).await;
+        let summary = summary_of(&events);
+
+        // Three sections were written and the truncated items never became turns.
+        let report_turns = ollama.report_prompts.lock().unwrap().len();
+        assert_eq!(report_turns, 3, "{summary}");
+        assert!(!summary.contains("Who sweeps the log?"), "{summary}");
+        assert!(!summary.contains("What resurrects a file?"), "{summary}");
+    }
+
     /// The server writes the document's title, so a sectioned report can never fail
     /// the gate for a missing heading — and, as a consequence, `extract_report_title`
     /// finds no model-written heading, which is why every sectioned run stores a
@@ -9819,11 +9938,13 @@ mod tests {
             ],
             vec![""],
         ));
-        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let p = params(8);
+        let max_sections = p.budget.max_report_sections;
+        let events = run_native_shared(ollama.clone(), p).await;
 
         let report_turns = ollama.report_prompts.lock().unwrap().len();
         assert!(
-            report_turns <= MAX_REPORT_SECTIONS * MAX_SECTION_ATTEMPTS,
+            report_turns <= max_sections * MAX_SECTION_ATTEMPTS,
             "the writer must terminate on counters, took {report_turns} turns"
         );
         // Not one section survived, so the document is the server's own account —

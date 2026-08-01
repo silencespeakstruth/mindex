@@ -23,6 +23,10 @@ describe("ASK_FIELDS", () => {
             "bseconds",
             "btokens",
             "bsteps",
+            "bsections",
+            "bwords",
+            "bwidth",
+            "bcheckpoint",
             "sinclude",
             "sexclude",
             "slangs",
@@ -67,7 +71,7 @@ describe("ASK_FIELDS", () => {
     it("selects fields by group and mode", () => {
         deepStrictEqual(
             fieldsIn("budget", "research").map((f) => f.id),
-            ["bseconds", "btokens", "bsteps"]
+            ["bseconds", "btokens", "bsteps", "bsections", "bwords", "bwidth", "bcheckpoint"]
         );
         deepStrictEqual(fieldsIn("budget", "search"), []);
         ok(groupApplies("scope", "search"));

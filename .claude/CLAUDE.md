@@ -178,7 +178,7 @@ current consts; both nullable, and NULL never matches. `post_search` returns
 the *way* something is produced changed; MAJOR = its *shape* did. All compared
 by plain equality, never ordered — both halves trigger the identical rebuild.
 The set: `CHUNKS_DERIVATION_VERSION`, `SYMBOLS_DERIVATION_VERSION` (both
-`"1.0"`), `PROMPT_VERSION` (`"1.4"`). Deliberately outside it:
+`"1.0"`), `PROMPT_VERSION` (`"2.1"`). Deliberately outside it:
 `COLLECTION_SCHEMA_VERSION` (`"v1"`, a collection-*name* component) and the
 migration `i32` in `PRAGMA user_version`.
 
@@ -323,16 +323,18 @@ is the `research_runs` table.) The hard invariants:
   deliberately also rejecting a mild refinement, naming the earlier query.
   Only *executed* searches enter `seen_queries`.
 - **`read_chunks` reads the index, never the file** (pure SQL,
-  `status='active'`, span overlap, `READ_CHUNKS_LIMIT` 8); gaps reported
+  `status='active'`, span overlap, `READ_CHUNKS_LIMIT` 8 × the run's
+  `evidence_width`); gaps reported
   honestly ("indexed; lines N-M have no chunk"). **`path_prefix` on `search`
   is a post-filter** (`top_k * PREFIX_OVERFETCH`, then truncate), never
   appended to `include` (a union — the run could search out of its scope).
 - **Bump `PROMPT_VERSION`** (`research.rs`) on any edit to `system_prompt`,
-  `PLAN_REQUEST`, `SUFFICIENCY_REQUEST`, `REVALIDATION_SYSTEM_PROMPT`,
-  `format_citation_complaint`, `REPORT_ROLE`/`report_system_prompt`, either
-  report turn's user message, the budget nudges or `tool_specs`. Sampling
-  (`temperature/top_p/seed`) is `Option` — absent = model default; a request's
-  `seed` overrides config.
+  `plan_request` (templated by the run's `max_report_sections` — the test fakes
+  match it by prefix, `PLAN_REQUEST_PREFIX`), `SUFFICIENCY_REQUEST`,
+  `REVALIDATION_SYSTEM_PROMPT`, `format_citation_complaint`,
+  `REPORT_ROLE`/`report_system_prompt`, either report turn's user message, the
+  budget nudges or `tool_specs`. Sampling (`temperature/top_p/seed`) is
+  `Option` — absent = model default; a request's `seed` overrides config.
 - **A report of 3+ plan items is written one section at a time.** The report used
   to be a single turn, so a model that could not produce it produced *nothing* —
   a fifteen-minute run returning zero. Now each numbered sub-question gets its
@@ -341,10 +343,12 @@ is the `research_runs` table.) The hard invariants:
   document. Below `MIN_SECTIONED_PLAN_ITEMS` (3, what `PLAN_REQUEST` asks for) —
   or with no plan at all — the run takes the old single-turn path byte-for-byte,
   which is the safety valve *and* the revert switch. Bounded three ways because
-  it is a new turn-producing path: `MAX_REPORT_SECTIONS` 6, `MAX_SECTION_ATTEMPTS`
-  2 (not `MAX_EMPTY_REPORT_RETRIES` 5 — that was sized for one turn, and 5×6 is
-  thirty), plus `MIN_SECTION_MS` of window and `REPORT_TOKEN_OVERDRAFT` (1.5)
-  which **stub rather than stop**. No new `DoneReason`: a failed section is a
+  it is a new turn-producing path: the run's `budget.max_report_sections`
+  (effort default 6, request-overridable `3..=[research].
+  max_request_report_sections`, and what the templated plan prompt asks for —
+  "3-N"), `MAX_SECTION_ATTEMPTS` 2 (not `MAX_EMPTY_REPORT_RETRIES` 5 — that was
+  sized for one turn, and 5×6 is thirty), plus `MIN_SECTION_MS` of window and
+  `REPORT_TOKEN_OVERDRAFT` (1.5) which **stub rather than stop**. No new `DoneReason`: a failed section is a
   degradation, not a `break`. Each section turn sees its sub-question, the run's
   own sufficiency verdict on it, and the other sections' **headings only** —
   feeding back their prose would grow the prompt to compensate for shrinking the
@@ -362,7 +366,10 @@ is the `research_runs` table.) The hard invariants:
   `MAX_SECTION_REWRITES` (3). `rewrite_sections` is infallible: a report already
   exists, so a failure costs the repair, never the run.
 - **Checkpoints make a stopped run return findings.**
-  `[research].checkpoint_every_steps` (6, `0` = off) interrupts the tool loop to
+  `[research].checkpoint_every_steps` (6, `0` = off; a request overrides it via
+  `budget.checkpoint_every_steps`, `0` = off for that run, capped by
+  `max_request_steps` — an interval above the step budget is `0` spelled
+  differently) interrupts the tool loop to
   bank the sections already answerable into `RunState::draft_sections`, keyed by
   plan item and **replaced, never merged** (a later checkpoint saw more
   evidence). It **costs a step** *and* is capped by `MAX_CHECKPOINTS` (8):
@@ -382,9 +389,12 @@ is the `research_runs` table.) The hard invariants:
   as a **ceiling** — "at most", never "about" — and arms `num_predict` at
   `REPORT_WORDS_TO_TOKENS` (4) × the grant, ~3× the prose ratio so only a
   runaway meets it: a tight cut severs a fence, fails the markdown gate, and
-  buys a full-volume rewrite of what just failed. Not request-overridable, for
-  `context_fraction`'s reason. The numbers are **unmeasured**; `0` is what
-  keeps that honest.
+  buys a full-volume rewrite of what just failed. Request-overridable since the
+  shape knobs shipped (`budget.max_report_words`, `0` or
+  `150..=[research].max_request_report_words`) — safe because the *ceiling* is
+  held to the same startup window check as the presets (`words × 4 <
+  max_num_ctx_tokens / 2`), so no override can arm a `num_predict` the window
+  cannot hold. The numbers are **unmeasured**; `0` is what keeps that honest.
 - **The report turn's prompt is guarded too.** `context_fraction` only checks
   *between* turns against the *previous* turn's size, so the run's largest
   prompt (report turn + notes, or the rewrite with the whole draft) went
@@ -484,9 +494,12 @@ is the `research_runs` table.) The hard invariants:
   none and its readers fall back to the question the heading came from.
 - **Budgets**: `effort` selects `[research.effort.{low,medium,high}]`; a
   request overrides axis-by-axis (`Budget::resolve`), capped by
-  `[research].max_request_{seconds,tokens,steps}` (edge check
-  `validate::research_budget` → 400; config validation rejects a ceiling
-  below `effort.high`). `GET /config` publishes ladder + ceilings. The axes:
+  `[research].max_request_{seconds,tokens,steps,report_sections,report_words}`
+  + `max_evidence_width` (edge check `validate::research_budget` → 400; the
+  shape axes get their own code, `validation.research_shape_out_of_range`,
+  because they carry floors and two accept `0` = off; config validation
+  rejects any ceiling below `effort.high`). `GET /config` publishes ladder +
+  ceilings. The axes:
   - **`max_seconds`** (300/900/3600) is a HARD deadline — poll **and**
     `DeadlineToken` (child of the job token; `stopped_by` tells it from a
     disconnect, job token tested first). A deadline stop is not a failure.
@@ -516,11 +529,31 @@ is the `research_runs` table.) The hard invariants:
     transcript resent every turn → super-linear in turns).
   - **`context_fraction`** (0.5/0.7/0.85): a guard against Ollama's silent
     transcript trim, checked against `tally.peak_prompt_tokens` *before* the
-    next turn; **the one axis a request cannot override**.
+    next turn; not request-overridable, with `search_top_k` — the two axes a
+    request cannot touch.
   - **`max_steps`** (8/20/64): coarse backstop (a step is a poor unit).
   - **`search_top_k`** (5 at every level) is width, not budget; config
     validation refuses `> [search].max_top_k` at **startup** (`search_core`
-    leaves validation to callers).
+    leaves validation to callers). Deliberately still TOML-only: widening it
+    was measured not to fix the failures it looks like it would.
+  - **Shape axes** (request-overridable, resolved like the rest by
+    `Budget::resolve` except `checkpoint_every_steps`, which the handler
+    resolves into `ResearchParams` — it is a `[research]` scalar, not an
+    effort axis): `max_report_sections` (6 at every level, `3..=12`; floor =
+    `MIN_SECTIONED_PLAN_ITEMS`, kept as `config::MIN_REPORT_SECTIONS` so the
+    validators share it), `max_report_words` (see the output-volume bullet),
+    `checkpoint_every_steps` (see the checkpoints bullet) and
+    `evidence_width` (1 at every level, `1..=[research].max_evidence_width`) —
+    an integer multiplier on `READ_CHUNKS_LIMIT`/`GREP_LIMIT`/`CALLERS_LIMIT`/
+    `FILE_HISTORY_LIMIT`/`SYMBOLS_LIMIT`, threaded as a `limit` param into the
+    research-only core fns and stored on `StateResearchTools` (constant per
+    run, so the `ResearchTools` trait is untouched). It deliberately does
+    **not** scale `outline`/`list_files` (navigation — when 300 rows bind the
+    fix is a narrower glob), `search` (its own axis), or `MAX_EXCERPT_*`
+    (response caps). Width is resent every turn — it compounds into
+    `max_tokens`. None of the shape grants are journalled (shape knobs never
+    were); the resolved values ride on the "Starting a research job." log
+    line, the only record of what a run was actually granted.
 
   Each stop has a loop-level test; the time one uses **real** `Instant` in
   small increments (`tokio::test(start_paused)` does not move it).

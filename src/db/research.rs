@@ -329,6 +329,8 @@ mod tests {
                 max_steps: 20,
                 search_top_k: 5,
                 max_report_words: 900,
+                max_report_sections: 6,
+                evidence_width: 1,
             },
             reason: DoneReason::Finalized,
             steps: 3,

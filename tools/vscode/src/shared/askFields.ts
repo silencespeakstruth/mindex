@@ -18,10 +18,24 @@ export type ConfigBound =
     | "search.max_top_k"
     | "research.max_request_seconds"
     | "research.max_request_tokens_k"
-    | "research.max_request_steps";
+    | "research.max_request_steps"
+    | "research.max_request_report_sections"
+    | "research.max_request_report_words"
+    | "research.max_evidence_width";
 
-/** Which effort-preset axis an unset slider parks on. */
-export type PresetAxis = "max_seconds" | "max_tokens_k" | "max_steps";
+/**
+ * Which effort-preset axis an unset slider parks on. `checkpoint_every_steps` is
+ * not an effort axis — its preset is the `[research]` scalar the server publishes
+ * beside the ladder — but to the form it parks the same way.
+ */
+export type PresetAxis =
+    | "max_seconds"
+    | "max_tokens_k"
+    | "max_steps"
+    | "max_report_sections"
+    | "max_report_words"
+    | "evidence_width"
+    | "checkpoint_every_steps";
 
 export type FieldKind =
     | { k: "textarea"; rows: number }
@@ -176,6 +190,78 @@ export const ASK_FIELDS: readonly AskField[] = [
             max: "research.max_request_steps",
             fallbackMax: 200,
             preset: "max_steps",
+        },
+    },
+    {
+        id: "bsections",
+        label: "sections",
+        title:
+            "Report sections the run may write — also how many sub-questions the plan " +
+            "asks for. They share one report window: more sections past its capacity " +
+            "ship as stubs.",
+        group: "budget",
+        modes: ["research"],
+        kind: {
+            k: "slider",
+            unit: "count",
+            min: 3,
+            max: "research.max_request_report_sections",
+            fallbackMax: 12,
+            preset: "max_report_sections",
+        },
+    },
+    {
+        id: "bwords",
+        label: "words",
+        title:
+            "Word ceiling announced for the report (at least 150). The server refuses " +
+            "smaller non-zero values; leave unset for the effort preset.",
+        group: "budget",
+        modes: ["research"],
+        kind: {
+            k: "slider",
+            unit: "count",
+            min: 150,
+            max: "research.max_request_report_words",
+            fallbackMax: 4000,
+            preset: "max_report_words",
+        },
+    },
+    {
+        id: "bwidth",
+        label: "evidence",
+        title:
+            "Multiplier on how many rows each evidence tool returns (read_chunks, grep, " +
+            "callers, history, symbols). Width is resent every turn — it costs tokens.",
+        group: "budget",
+        modes: ["research"],
+        kind: {
+            k: "slider",
+            unit: "count",
+            min: 1,
+            max: "research.max_evidence_width",
+            fallbackMax: 3,
+            preset: "evidence_width",
+        },
+    },
+    {
+        id: "bcheckpoint",
+        label: "checkpoint",
+        title:
+            "Steps between the turns that bank a draft of what is already answerable. " +
+            "0 switches checkpoints off for this run; each one costs a step.",
+        group: "budget",
+        modes: ["research"],
+        kind: {
+            k: "slider",
+            unit: "steps",
+            // 0 is a legal, meaningful value here (off for this run); the server
+            // refuses 1 (floor 2), which the slider cannot express — the host-side
+            // reader maps 1 up to 2 rather than teaching the slider a gap.
+            min: 0,
+            max: "research.max_request_steps",
+            fallbackMax: 200,
+            preset: "checkpoint_every_steps",
         },
     },
     {

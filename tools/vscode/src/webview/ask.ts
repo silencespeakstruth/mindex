@@ -17,6 +17,7 @@ import {
     ConfigBound,
     FieldGroup,
     groupApplies,
+    PresetAxis,
 } from "../shared/askFields.js";
 import { formatValue } from "../shared/scale.js";
 import { el, pageData, vscodeApi, VsCodeApi } from "./host.js";
@@ -28,6 +29,10 @@ interface EffortBudget {
     max_seconds: number;
     max_tokens: number;
     max_steps: number;
+    /** Absent on servers older than the report-shape knobs. */
+    max_report_sections?: number;
+    max_report_words?: number;
+    evidence_width?: number;
 }
 interface ResearchConfig {
     default_model: string;
@@ -36,6 +41,11 @@ interface ResearchConfig {
     max_request_seconds: number;
     max_request_tokens: number;
     max_request_steps: number;
+    /** Absent on servers older than the report-shape knobs. */
+    max_request_report_sections?: number;
+    max_request_report_words?: number;
+    max_evidence_width?: number;
+    checkpoint_every_steps?: number;
 }
 interface SearchConfig {
     max_top_k: number;
@@ -250,14 +260,37 @@ function container(group: FieldGroup): HTMLElement {
 // ── server-published numbers ─────────────────────────────────────────────────
 
 /** The current effort's value for one preset axis, or a sane default before /config. */
-function presetValue(axis: "max_seconds" | "max_tokens_k" | "max_steps"): number {
-    const budget = researchConfig?.effort[effortValue()];
-    if (budget === undefined) {
-        return { max_seconds: 900, max_tokens_k: 1200, max_steps: 20 }[axis];
+function presetValue(axis: PresetAxis): number {
+    // Not an effort axis: the preset is the `[research]` scalar published beside
+    // the ladder, same for every effort level.
+    if (axis === "checkpoint_every_steps") {
+        return researchConfig?.checkpoint_every_steps ?? 6;
     }
-    return axis === "max_tokens_k"
-        ? Math.round(budget.max_tokens / 1000)
-        : budget[axis === "max_seconds" ? "max_seconds" : "max_steps"];
+    const budget = researchConfig?.effort[effortValue()];
+    const fallbacks = {
+        max_seconds: 900,
+        max_tokens_k: 1200,
+        max_steps: 20,
+        max_report_sections: 6,
+        max_report_words: 900,
+        evidence_width: 1,
+    };
+    if (budget === undefined) {
+        return fallbacks[axis];
+    }
+    switch (axis) {
+        case "max_tokens_k":
+            return Math.round(budget.max_tokens / 1000);
+        case "max_seconds":
+            return budget.max_seconds;
+        case "max_steps":
+            return budget.max_steps;
+        // Optional: an older server publishes a ladder without the shape axes.
+        case "max_report_sections":
+        case "max_report_words":
+        case "evidence_width":
+            return budget[axis] ?? fallbacks[axis];
+    }
 }
 
 function effortValue(): string {
@@ -277,6 +310,12 @@ function boundValue(bound: ConfigBound, fallback: number): number {
                 : Math.round(researchConfig.max_request_tokens / 1000);
         case "research.max_request_steps":
             return researchConfig?.max_request_steps ?? fallback;
+        case "research.max_request_report_sections":
+            return researchConfig?.max_request_report_sections ?? fallback;
+        case "research.max_request_report_words":
+            return researchConfig?.max_request_report_words ?? fallback;
+        case "research.max_evidence_width":
+            return researchConfig?.max_evidence_width ?? fallback;
     }
 }
 
@@ -387,10 +426,14 @@ function renderPanels(): void {
 
     // Each disclosure states its own contents in its header, so collapsing hides the
     // controls and never the decision.
-    const axes: [string, "seconds" | "ktokens" | "steps"][] = [
+    const axes: [string, "seconds" | "ktokens" | "steps" | "count"][] = [
         ["bseconds", "seconds"],
         ["btokens", "ktokens"],
         ["bsteps", "steps"],
+        ["bsections", "count"],
+        ["bwords", "count"],
+        ["bwidth", "count"],
+        ["bcheckpoint", "steps"],
     ];
     const overridden = axes
         .filter(([id]) => (controls.get(id)?.read() ?? "") !== "")

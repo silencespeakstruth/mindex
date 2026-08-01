@@ -817,9 +817,12 @@ pub struct ResearchRequest {
 
 /// Per-request overrides for the `effort` preset.
 ///
-/// `context_fraction` is deliberately absent: it is a guard against Ollama
-/// silently trimming the transcript on a small-window model, not a quality lever,
-/// so raising it per request buys nothing but truncation. It stays in config.
+/// Two axes are deliberately absent. `context_fraction` is a guard against
+/// Ollama silently trimming the transcript on a small-window model, not a
+/// quality lever, so raising it per request buys nothing but truncation.
+/// `search_top_k` was measured not to be the fix for the failure it looks like
+/// (runs lose on query formulation, not evidence width); it stays a config knob
+/// for a measurement harness. Both stay in config.
 #[derive(Deserialize, Serialize, Debug, ToSchema, Default, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchBudgetOverride {
@@ -830,6 +833,27 @@ pub struct ResearchBudgetOverride {
     /// Executed tool calls. A backstop, not a measure of work: `outline` is one
     /// indexed SELECT while `search` is a GPU embed plus a vector query.
     pub max_steps: Option<usize>,
+    /// Ceiling, in words, announced to the model for the final report. `0` = say
+    /// nothing about length; a non-zero value must be at least 150. Capped by
+    /// `[research].max_request_report_words` (400
+    /// `validation.research_shape_out_of_range` outside the range).
+    pub max_report_words: Option<usize>,
+    /// Report sections the run may write — also the upper bound the plan turn
+    /// asks for ("3-N sub-questions"). At least 3 (the sectioning threshold),
+    /// capped by `[research].max_request_report_sections`. Sections share one
+    /// fixed report window: past its capacity, extra sections ship as stubs.
+    pub max_report_sections: Option<usize>,
+    /// Investigate this many steps, then spend one turn banking what is already
+    /// answerable. `0` = no checkpoints for this run; a non-zero value must be
+    /// at least 2 and no more than `[research].max_request_steps` (an interval
+    /// above the step budget is `0` spelled differently). Overrides
+    /// `[research].checkpoint_every_steps`.
+    pub checkpoint_every_steps: Option<usize>,
+    /// Multiplier on the per-call evidence widths (`read_chunks`, `grep`,
+    /// `callers`, `file_history`, `symbols`). `1` = the historical widths;
+    /// capped by `[research].max_evidence_width`. Width is paid in prompt
+    /// tokens on every later turn — it compounds into `max_tokens`.
+    pub evidence_width: Option<u64>,
 }
 
 // ─── Management endpoints ───────────────────────────────────────────────────
@@ -1541,10 +1565,20 @@ pub struct ResearchConfigInfo {
     /// succeeded (so an empty `models` says nothing about what Ollama has).
     pub models_refreshed_at: Option<i64>,
     pub effort: ResearchEffortLadder,
-    /// Ceilings on a request's `budget` override.
+    /// Ceilings on a request's `budget` override. `max_request_steps` also caps
+    /// the `checkpoint_every_steps` override — an interval above the step budget
+    /// is `0` spelled differently, so it has no ceiling of its own.
     pub max_request_seconds: u64,
     pub max_request_tokens: u64,
     pub max_request_steps: usize,
+    /// Ceiling on `budget.max_report_sections` (floor: 3, the sectioning
+    /// threshold).
+    pub max_request_report_sections: usize,
+    /// Ceiling on `budget.max_report_words` (floor for non-zero values: 150;
+    /// `0` = announce no length).
+    pub max_request_report_words: usize,
+    /// Ceiling on `budget.evidence_width` (floor: 1).
+    pub max_evidence_width: u64,
     /// How long the report phase gets after the investigation deadline, in
     /// milliseconds. Published because it is the other half of what a caller waits:
     /// `effort.*.max_seconds` bounds the investigation, and the longest a request can
@@ -1597,11 +1631,17 @@ pub struct ResearchEffortInfo {
     /// and this is the one evidence-width knob that changes the answer.
     pub search_top_k: u64,
     /// Word ceiling announced to the model for the final report; `0` = no length
-    /// is announced. Published for the same reason as `search_top_k` and not
-    /// overridable for the same reason as `context_fraction`: every value a caller
-    /// would choose is "bigger", and an over-long report is the failure this
-    /// bounds.
+    /// is announced. Overridable per request (`budget.max_report_words`, capped
+    /// by `max_request_report_words`) — published so a client can render the
+    /// preset a run falls back to when it does not override.
     pub max_report_words: usize,
+    /// Report sections the run may write — the default a request's
+    /// `budget.max_report_sections` overrides, capped by
+    /// `max_request_report_sections`.
+    pub max_report_sections: usize,
+    /// Multiplier on the per-call evidence widths — the default a request's
+    /// `budget.evidence_width` overrides, capped by `max_evidence_width`.
+    pub evidence_width: u64,
 }
 
 impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
@@ -1613,6 +1653,8 @@ impl From<&crate::config::EffortBudget> for ResearchEffortInfo {
             context_fraction: b.context_fraction,
             search_top_k: b.search_top_k,
             max_report_words: b.max_report_words,
+            max_report_sections: b.max_report_sections,
+            evidence_width: b.evidence_width,
         }
     }
 }
