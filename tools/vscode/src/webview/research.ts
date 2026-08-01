@@ -18,6 +18,11 @@ interface PageData {
     scope: string;
     /** The stored reports handed to this run as background. */
     context: { id: string; seq: number; title: string }[];
+    /**
+     * This panel streams a challenge run. Suppresses the post-done Challenge
+     * button — a challenge of a challenge is refused server-side.
+     */
+    isChallenge?: boolean;
 }
 
 interface Progress {
@@ -520,6 +525,24 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
                         "reopened or reused as context later. Copy it now if you want to " +
                         "keep it."
                 );
+            } else if (data.isChallenge !== true) {
+                // The report just became a stored run, so it can be attacked. Not
+                // on challenge panels: the server refuses a challenge of a
+                // challenge, and offering one here would defer that refusal.
+                const runId = msg.info.run_id;
+                const challengeBtn = document.createElement("button");
+                challengeBtn.className = "secondary";
+                challengeBtn.append(
+                    icon("shield", true),
+                    document.createTextNode(" Challenge this report")
+                );
+                challengeBtn.title =
+                    "Launch a challenge run: it re-derives this report's claims " +
+                    "through the tools, on the report's own scope, and scores each claim.";
+                challengeBtn.addEventListener("click", () =>
+                    api.postMessage({ type: "challenge", id: runId })
+                );
+                toolbar.appendChild(challengeBtn);
             }
             toolbar.hidden = false;
             break;

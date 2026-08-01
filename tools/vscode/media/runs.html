@@ -28,6 +28,22 @@
                     <option value="valid">Valid</option>
                     <option value="invalid">Invalid</option>
                 </select>
+                <select
+                    id="runs-kind"
+                    class="runs-select"
+                    title="Kind — research runs answer a question; challenges attack another report's claims"
+                >
+                    <option value="all">All kinds</option>
+                    <option value="research">Research</option>
+                    <option value="challenge">Challenges</option>
+                </select>
+                <button
+                    id="runs-refresh"
+                    class="ghost"
+                    title="Re-run this query and refresh the open report"
+                >
+                    <span class="codicon codicon-refresh"></span>
+                </button>
                 <span class="runs-spinner dim" id="runs-loading" hidden>
                     <span class="codicon codicon-loading codicon-modifier-spin"></span>
                 </span>

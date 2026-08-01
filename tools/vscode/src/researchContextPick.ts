@@ -3,6 +3,7 @@ import type { MindexApi, ResearchRunSummary } from "./api";
 import { ICON } from "./icons";
 import { openResearchReport } from "./researchDocs";
 import { debounce } from "./shared/debounce";
+import { asTrust } from "./shared/runsFormat";
 
 /** How long the box waits after the last keystroke before it asks the server. */
 const SEARCH_DEBOUNCE_MS = 250;
@@ -256,7 +257,15 @@ interface RunItem extends vscode.QuickPickItem {
  */
 function toItem(run: ResearchRunSummary): RunItem {
     const age = describeAge(run.created_at);
+    // Kind and trust ride the description: a refuted report is still offered —
+    // offering is a hint, validating is a contract — but picking one as context
+    // for the next question is a decision worth making with the verdict in view.
+    const trust = asTrust(run.trust);
     const marks = [
+        run.kind === "challenge" ? `$(${ICON.challenge}) challenge` : null,
+        trust !== undefined && trust !== "unchallenged"
+            ? `${trust === "refuted" ? `$(${ICON.invalid}) ` : trust === "disputed" ? `$(${ICON.outOfDate}) ` : ""}trust: ${trust}`
+            : null,
         run.pinned ? `$(pinned)` : null,
         run.references_count > 0 ? `$(references)${run.references_count}` : null,
         run.referenced_by_count > 0 ? `$(link)${run.referenced_by_count}` : null,

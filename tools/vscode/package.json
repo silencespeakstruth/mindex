@@ -211,6 +211,18 @@
         "icon": "$(go-to-file)"
       },
       {
+        "command": "mindex.challengeResearchRun",
+        "title": "Challenge Research Report",
+        "category": "MINDex",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "mindex.activeResearchRuns",
+        "title": "Active Research Runs",
+        "category": "MINDex",
+        "icon": "$(record)"
+      },
+      {
         "command": "mindex.openSettings",
         "title": "Open Settings",
         "category": "MINDex",
@@ -303,6 +315,13 @@
         {
           "command": "mindex.openResearchReport",
           "when": "false"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "mindex.challengeResearchRun",
+          "when": "resourceScheme == mindex-research",
+          "group": "navigation@1"
         }
       ]
     },

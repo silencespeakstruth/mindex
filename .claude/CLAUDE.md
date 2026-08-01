@@ -1386,6 +1386,15 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   observable without `[mindex.statusPollSeconds]` (default 30, `0` = off).
   Language marks: generated `shared/langGlyphs.ts` (never hand-edit),
   two-toned colours derived and recomputed by `langIcons.test.ts`. A reindex
+  The challenge surfaces: history rows/preview carry kind/trust badges and a
+  challenge↔subject link; launching one is a QuickPick chain
+  (`challengeFlow.ts` — the server accepts only effort/model/budget/seed, the
+  subject supplies the rest), streamed into the ordinary `ResearchPanel`
+  under the same single-flight handles; `challengeGuard`/trust wording live
+  in `shared/runsFormat.ts`; offline re-verify (Verify button) renders
+  provenance and staleness as separate answers; `GET /research/active` +
+  cancel is a palette QuickPick (`activeRunsPick.ts`), which the 429 names.
+  The history list's `kind` filter is the server-side query param. A reindex
   reads the server's claims from `/status.indexing_claims` + the follow-up
   `/drift`'s `indexing` bucket — never from the `/index` response, which
   swallows claim conflicts and 200s (a refused reindex otherwise reads as

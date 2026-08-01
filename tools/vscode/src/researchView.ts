@@ -67,11 +67,18 @@ export class ResearchPanel {
          * link open — is what makes a chained run auditable instead of a fact with
          * no visible provenance.
          */
-        context: readonly { id: string; seq: number; title: string }[] = []
+        context: readonly { id: string; seq: number; title: string }[] = [],
+        /**
+         * Challenge runs reuse this panel verbatim (same stream, one extra
+         * `verdict` frame) — the tab title names the subject instead of slugging
+         * the synthesized question, and the webview suppresses its own
+         * post-done Challenge button (a challenge of a challenge is a server 400).
+         */
+        opts: { tabTitle?: string; isChallenge?: boolean } = {}
     ) {
         this.panel = vscode.window.createWebviewPanel(
             "mindexResearch",
-            titleFor(question),
+            opts.tabTitle ?? titleFor(question),
             { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
             {
                 enableScripts: true,
@@ -94,9 +101,17 @@ export class ResearchPanel {
                 question,
                 scope: describeScope(scope),
                 context: context.map((r) => ({ id: r.id, seq: r.seq, title: r.title })),
+                isChallenge: opts.isChallenge === true,
             },
         });
         this.panel.webview.onDidReceiveMessage((msg: Record<string, unknown>) => {
+            if (msg.type === "challenge") {
+                void vscode.commands.executeCommand(
+                    "mindex.challengeResearchRun",
+                    asString(msg.id)
+                );
+                return;
+            }
             if (msg.type === "openRun") {
                 void vscode.commands.executeCommand("mindex.openResearchReport", {
                     id: asString(msg.id),

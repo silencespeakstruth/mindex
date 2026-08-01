@@ -1256,6 +1256,9 @@ pub struct ResearchListQuery {
     /// the transitive verdict, not just the run's own staleness (that is
     /// `freshness`). Filtered before the page is cut, like `freshness`.
     pub valid: Option<bool>,
+    /// Restrict to ordinary `research` runs or to `challenge` runs. Filtered before
+    /// the page is cut, like the rest.
+    pub kind: Option<ResearchKind>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
@@ -1264,6 +1267,13 @@ pub enum ResearchFreshness {
     All,
     Fresh,
     Stale,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchKind {
+    Research,
+    Challenge,
 }
 
 /// One stored run, without its report. The list is a separate endpoint precisely so

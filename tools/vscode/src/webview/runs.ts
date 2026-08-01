@@ -8,6 +8,13 @@
  */
 
 import { marked } from "marked";
+import {
+    challengeBadge,
+    challengeGuard,
+    trustBadge,
+    verificationView,
+    VerificationLike,
+} from "../shared/runsFormat.js";
 import { el, icon, vscodeApi } from "./host.js";
 
 interface RunSummary {
@@ -62,12 +69,22 @@ interface RunDetail extends RunSummary {
     files: RunFile[];
 }
 
+/** One valid challenge aimed at the previewed run, as the host resolves them. */
+interface ChallengeAgainst {
+    id: string;
+    seq: number;
+    title: string;
+    verdict: string | null;
+    valid: boolean;
+}
+
 /** Survives a hidden tab; restored on reload so a half-built selection is not lost. */
 interface State {
     v: string;
     query: string;
     freshness: string;
     validity: string;
+    kind: string;
     selected: string[];
     /**
      * The report currently in the right pane. Persisted with the rest: the query
@@ -83,6 +100,8 @@ const api = vscodeApi<State>();
 const searchBox = el<HTMLInputElement>("runs-search");
 const freshnessBox = el<HTMLSelectElement>("runs-freshness");
 const validityBox = el<HTMLSelectElement>("runs-validity");
+const kindBox = el<HTMLSelectElement>("runs-kind");
+const refreshBtn = el<HTMLButtonElement>("runs-refresh");
 const list = el<HTMLUListElement>("runs-items");
 const empty = el("runs-empty");
 const errorBox = el("runs-error");
@@ -107,10 +126,11 @@ let activeId: string | undefined;
 const rows = new Map<string, RunSummary>();
 
 const restored = api.getState();
-if (restored?.v === "3") {
+if (restored?.v === "4") {
     searchBox.value = restored.query;
     freshnessBox.value = restored.freshness;
     validityBox.value = restored.validity;
+    kindBox.value = restored.kind;
     selected = new Set(restored.selected);
     activeId = restored.activeId;
     if (activeId !== undefined) {
@@ -120,10 +140,11 @@ if (restored?.v === "3") {
 
 function save(): void {
     api.setState({
-        v: "3",
+        v: "4",
         query: searchBox.value,
         freshness: freshnessBox.value,
         validity: validityBox.value,
+        kind: kindBox.value,
         selected: [...selected],
         activeId,
     });
@@ -136,6 +157,7 @@ function sendSearch(): void {
         q: searchBox.value,
         freshness: freshnessBox.value,
         validity: validityBox.value,
+        kind: kindBox.value,
     });
 }
 
@@ -144,6 +166,10 @@ function sendSearch(): void {
 searchBox.addEventListener("input", sendSearch);
 freshnessBox.addEventListener("change", sendSearch);
 validityBox.addEventListener("change", sendSearch);
+kindBox.addEventListener("change", sendSearch);
+// Not debounced — a button press is deliberate. `activeId` rides along because
+// the webview owns it and the host needs to know which preview to re-fetch.
+refreshBtn.addEventListener("click", () => api.postMessage({ type: "refresh", activeId }));
 moreBtn.addEventListener("click", () => api.postMessage({ type: "more" }));
 useBtn.addEventListener("click", () => api.postMessage({ type: "useAsContext" }));
 deleteBtn.addEventListener("click", () => api.postMessage({ type: "deleteSelected" }));
@@ -171,6 +197,29 @@ function badge(text: string, kind: string, title: string): HTMLSpanElement {
     span.textContent = text;
     span.title = title;
     return span;
+}
+
+/** Open a run in the right pane, from a row click or a subject link. */
+function selectRun(id: string): void {
+    activeId = id;
+    for (const other of list.querySelectorAll(".runs-item")) {
+        other.classList.toggle("selected-row", (other as HTMLElement).dataset.id === id);
+    }
+    save();
+    api.postMessage({ type: "select", id });
+}
+
+/** A meta-row link from a challenge to the report it attacked. */
+function subjectLink(label: string, subjectId: string): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.className = "runs-subject-link";
+    b.textContent = label;
+    b.title = "Open the challenged report";
+    b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        selectRun(subjectId);
+    });
+    return b;
 }
 
 function ghostButton(glyph: string, title: string, onClick: () => void): HTMLButtonElement {
@@ -234,6 +283,9 @@ function renderRow(run: RunSummary): HTMLLIElement {
     const when = document.createElement("span");
     when.textContent = relative(run.created_at);
     meta.appendChild(when);
+    const who = document.createElement("span");
+    who.textContent = `${run.model} · ${run.effort}`;
+    meta.appendChild(who);
     // Retention is otherwise invisible: `expires_at` has always been on the wire and
     // rendered nowhere, so a report simply vanished one day. Pinned is the loud
     // state; a countdown appears only once it is close enough to act on.
@@ -290,34 +342,26 @@ function renderRow(run: RunSummary): HTMLLIElement {
     // The refutation channel. A challenge row says what it concluded; every row
     // says what valid challenges concluded about IT. `unchallenged` is silent —
     // it merely means untested, and a badge on every row is a badge on none.
-    if (run.kind === "challenge") {
+    // (Wording lives in shared/runsFormat.ts so `node --test` reaches it.)
+    const chBadge = challengeBadge(run);
+    if (chBadge !== undefined) {
+        meta.appendChild(badge(chBadge.label, chBadge.kind, chBadge.title));
+    }
+    if (run.kind === "challenge" && run.challenged_run_id !== null) {
+        // The subject may not be on this page — its seq is then unknowable
+        // client-side, and the link says so. Selecting still works either way:
+        // the host fetches the detail by id.
+        const subject = rows.get(run.challenged_run_id);
         meta.appendChild(
-            badge(
-                run.challenge_verdict === null
-                    ? "challenge: inconclusive"
-                    : `challenge: ${run.challenge_verdict}`,
-                "deps",
-                "This run attacked another report's claims. Inconclusive means its " +
-                    "verdict turn produced nothing parseable — not an acquittal."
+            subjectLink(
+                subject === undefined ? "⚔ open subject" : `⚔ challenges #${subject.seq}`,
+                run.challenged_run_id
             )
         );
     }
-    if (run.trust === "refuted" || run.trust === "disputed" || run.trust === "confirmed") {
-        meta.appendChild(
-            badge(
-                run.trust,
-                run.trust === "refuted"
-                    ? "invalid"
-                    : run.trust === "disputed"
-                      ? "incomplete"
-                      : "pinned",
-                run.trust === "refuted"
-                    ? "A valid challenge run refuted this report's claims. Treat it as likely wrong."
-                    : run.trust === "disputed"
-                      ? "A valid challenge run disputed some of this report's claims."
-                      : "A valid challenge run confirmed this report's claims."
-            )
-        );
+    const tBadge = trustBadge(run);
+    if (tBadge !== undefined) {
+        meta.appendChild(badge(tBadge.label, tBadge.kind, tBadge.title));
     }
     if (run.references_count > 0) {
         meta.appendChild(
@@ -371,16 +415,7 @@ function renderRow(run: RunSummary): HTMLLIElement {
     );
 
     li.append(check, body, actions);
-    li.addEventListener("click", () => {
-        activeId = run.id;
-        for (const other of list.querySelectorAll(".runs-item")) {
-            other.classList.toggle(
-                "selected-row",
-                (other as HTMLElement).dataset.id === run.id
-            );
-        }
-        api.postMessage({ type: "select", id: run.id });
-    });
+    li.addEventListener("click", () => selectRun(run.id));
     return li;
 }
 
@@ -479,6 +514,8 @@ function renderDetail(run: RunDetail): void {
         head.appendChild(warn);
     }
 
+    head.appendChild(challengeSection(run));
+
     // The context ancestry: every report this one leaned on, so the reader knows
     // whose claims it inherited — and which of those have since gone bad.
     if (run.context.length > 0) {
@@ -560,6 +597,137 @@ function renderDetail(run: RunDetail): void {
     preview.appendChild(report);
 }
 
+/**
+ * The challenge half of the preview. For a challenge run: what it attacked and
+ * what it concluded. For a research run: what valid challenges concluded about
+ * it (filled asynchronously by the host's `challenges` message), plus the two
+ * actions — offline re-verification and launching a challenge.
+ */
+function challengeSection(run: RunDetail): HTMLElement {
+    const section = document.createElement("div");
+    section.className = "runs-section";
+
+    if (run.kind === "challenge") {
+        const p = document.createElement("p");
+        const subject = rows.get(run.challenged_run_id ?? "");
+        const link = subjectLink(
+            subject === undefined
+                ? "open the challenged report"
+                : `#${subject.seq} ${subject.title}`,
+            run.challenged_run_id ?? ""
+        );
+        const verdict =
+            run.challenge_verdict === null
+                ? "inconclusive — its verdict turn produced nothing parseable, which is not an acquittal"
+                : run.challenge_verdict;
+        p.append(
+            document.createTextNode("⚔ This run challenged "),
+            link,
+            document.createTextNode(`. Verdict: ${verdict}.`)
+        );
+        section.appendChild(p);
+    } else {
+        const tBadge = trustBadge(run);
+        if (tBadge !== undefined) {
+            const p = document.createElement("p");
+            p.textContent = tBadge.title;
+            section.appendChild(p);
+        }
+        // Filled by the host once it has resolved the challenges aimed at this
+        // run — a separate request, so the preview never waits on it.
+        const holder = document.createElement("div");
+        holder.id = "runs-challenges";
+        section.appendChild(holder);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "row";
+    const verify = document.createElement("button");
+    verify.className = "secondary";
+    verify.append(icon("verified", true), document.createTextNode(" Verify"));
+    verify.title =
+        "Re-check this report offline against the journalled evidence — provenance " +
+        "and staleness, no model involved. Staleness is measured against the index " +
+        "now, so re-running it after a reindex is the point.";
+    verify.addEventListener("click", () => api.postMessage({ type: "verify", id: run.id }));
+    actions.appendChild(verify);
+
+    const guard = challengeGuard(run);
+    const challenge = document.createElement("button");
+    challenge.className = "secondary";
+    challenge.append(icon("shield", true), document.createTextNode(" Challenge"));
+    if (guard.ok) {
+        challenge.title =
+            "Launch a challenge run: it re-derives this report's claims through the " +
+            "tools, on the report's own scope, and scores each claim.";
+    } else {
+        challenge.disabled = true;
+        challenge.title = guard.reason;
+    }
+    challenge.addEventListener("click", () =>
+        api.postMessage({ type: "challenge", id: run.id })
+    );
+    actions.appendChild(challenge);
+    section.appendChild(actions);
+
+    // Filled by the host's `verification` message after a Verify click.
+    const verifyOut = document.createElement("div");
+    verifyOut.id = "runs-verify-out";
+    section.appendChild(verifyOut);
+
+    return section;
+}
+
+/** Render the list of challenges aimed at the previewed run. */
+function renderChallenges(holder: HTMLElement, challenges: ChallengeAgainst[]): void {
+    holder.replaceChildren();
+    if (challenges.length === 0) {
+        return;
+    }
+    const p = document.createElement("p");
+    p.textContent = `Challenged ${challenges.length} time(s):`;
+    holder.appendChild(p);
+    const ul = document.createElement("ul");
+    ul.className = "runs-deps";
+    for (const c of challenges) {
+        const li = document.createElement("li");
+        li.className = "runs-dep";
+        const state = document.createElement("span");
+        const verdict = c.verdict ?? "inconclusive";
+        state.className = `dim verdict-${verdict}`;
+        state.textContent = c.valid ? verdict : `${verdict} (stale)`;
+        state.title = c.valid
+            ? "This challenge's own evidence still stands."
+            : "This challenge's own evidence has moved; it no longer counts toward trust.";
+        const link = document.createElement("button");
+        link.textContent = `#${c.seq} ${c.title}`;
+        link.title = "Open this challenge's report";
+        link.addEventListener("click", () => selectRun(c.id));
+        li.append(state, link);
+        ul.appendChild(li);
+    }
+    holder.appendChild(ul);
+}
+
+/** Render one offline re-verification result under the Verify button. */
+function renderVerification(holder: HTMLElement, v: VerificationLike): void {
+    holder.replaceChildren();
+    const view = verificationView(v);
+    for (const [text, cls] of [
+        [view.provenanceLine, "runs-verify-line"],
+        [view.spansNote, "runs-verify-line dim"],
+        [view.stalenessLine, "runs-verify-line"],
+        [view.warning, "runs-verify-warning"],
+    ] as const) {
+        if (text !== undefined) {
+            const p = document.createElement("p");
+            p.className = cls;
+            p.textContent = text;
+            holder.appendChild(p);
+        }
+    }
+}
+
 window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>) => {
     const msg = event.data;
     switch (msg.type) {
@@ -584,6 +752,28 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
         case "preview":
             renderDetail(msg.run as RunDetail);
             break;
+        case "challenges": {
+            // Async enrichment of the open preview. A stale answer (the user has
+            // already clicked another row) must not paint over the newer pane.
+            if (msg.runId !== activeId) {
+                break;
+            }
+            const holder = document.getElementById("runs-challenges");
+            if (holder !== null) {
+                renderChallenges(holder, (msg.list ?? []) as ChallengeAgainst[]);
+            }
+            break;
+        }
+        case "verification": {
+            if (msg.runId !== activeId) {
+                break;
+            }
+            const holder = document.getElementById("runs-verify-out");
+            if (holder !== null) {
+                renderVerification(holder, msg.v as VerificationLike);
+            }
+            break;
+        }
         case "updated": {
             // Replace the one row in place. Re-rendering the list would scroll it back
             // to the top for a change to a single button.

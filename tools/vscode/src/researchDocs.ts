@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { MindexApi, ResearchRunDetail, ResearchRunSummary } from "./api";
 import { ProblemError } from "./errors";
+import { provenanceExtras } from "./shared/runsFormat";
 
 /**
  * URI scheme for a stored report opened as a document.
@@ -45,7 +46,7 @@ export function researchUri(
 }
 
 /** The `runId` the URI names. */
-function runIdOf(uri: vscode.Uri): string {
+export function runIdOf(uri: vscode.Uri): string {
     // path is `/<runId>/<seq>-<slug>.md`.
     return decodeURIComponent(uri.path.split("/")[1] ?? "");
 }
@@ -67,12 +68,21 @@ function stamp(unixSeconds: number): string {
  * table in some previews and as literal text in others, and this must be readable
  * in the preview *and* in the source.
  */
-function header(detail: ResearchRunDetail): string {
+function header(detail: ResearchRunDetail, subjectLabel?: string): string {
     const lines: string[] = [];
-    lines.push(`> **Research #${detail.seq}** · ${stamp(detail.created_at)}`);
+    const what = detail.kind === "challenge" ? "Challenge" : "Research";
+    lines.push(`> **${what} #${detail.seq}** · ${stamp(detail.created_at)}`);
     lines.push(`> `);
     lines.push(`> ${detail.question.trim().replace(/\s+/g, " ")}`);
     lines.push(`> `);
+
+    // The challenge/trust lines, right under the identity: a refuted report must
+    // not read as settled for even a paragraph. Wording in shared/runsFormat.ts.
+    const extras = provenanceExtras(detail, subjectLabel);
+    if (extras.length > 0) {
+        lines.push(...extras);
+        lines.push(`> `);
+    }
 
     const facts = [
         `\`${detail.model}\``,
@@ -151,7 +161,18 @@ export class ResearchDocumentProvider implements vscode.TextDocumentContentProvi
         const runId = runIdOf(uri);
         try {
             const detail = await api.getResearchRun(guid, runId);
-            return header(detail) + detail.report;
+            // Best-effort: the subject may be gone, and naming that beats a bare
+            // uuid. `header` itself stays api-unaware.
+            let subjectLabel: string | undefined;
+            if (detail.kind === "challenge" && detail.challenged_run_id !== null) {
+                try {
+                    const subject = await api.getResearchRun(guid, detail.challenged_run_id);
+                    subjectLabel = `#${subject.seq} ${subject.title}`;
+                } catch {
+                    subjectLabel = "a report that has since been deleted";
+                }
+            }
+            return header(detail, subjectLabel) + detail.report;
         } catch (e) {
             // A deleted run is the common case here — the tab outlives the row,
             // and saying so is better than an empty document or a modal.

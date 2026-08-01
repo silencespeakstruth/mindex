@@ -2,7 +2,10 @@ import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
-import { MindexApi } from "./api";
+import { ConfigResponse, MindexApi, ResearchRunSummary } from "./api";
+import { pickChallengeOptions } from "./challengeFlow";
+import { showActiveResearchRuns } from "./activeRunsPick";
+import { challengeGuard } from "./shared/runsFormat";
 import { MindexFile, parseMindexFile } from "./mindexFile";
 import { buildManifest, scanWorkspace } from "./scanner";
 import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
@@ -10,7 +13,12 @@ import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
 import { StatusPanel } from "./statusPanel";
 import { ResearchRunsPanel } from "./researchRunsPanel";
 import { browseResearchRuns, pickContextRuns } from "./researchContextPick";
-import { openResearchReport, RESEARCH_SCHEME, ResearchDocumentProvider } from "./researchDocs";
+import {
+    openResearchReport,
+    RESEARCH_SCHEME,
+    ResearchDocumentProvider,
+    runIdOf,
+} from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
 import { IndexStatusBar } from "./indexStatusBar";
 import { IndexingPanel, IndexingPanelPlacement } from "./indexingPanel";
@@ -19,7 +27,7 @@ import { runSearch } from "./search";
 import { ResearchPanel, ResearchSubmission } from "./researchView";
 import { AskSubmission, AskViewProvider } from "./askView";
 import { createProjectFile } from "./createProject";
-import { isCancellation, reportError } from "./errors";
+import { isCancellation, ProblemError, reportError } from "./errors";
 import { BRAND, say } from "./brand";
 
 interface Project {
@@ -131,6 +139,11 @@ export function activate(context: vscode.ExtensionContext): void {
     driftView.onDidChangeCheckboxState((e) => driftProvider.applyCheckboxChanges(e.items));
     context.subscriptions.push(driftView);
 
+    // The last `GET /config` the monitor saw — what the challenge QuickPick reads
+    // its effort/model inventory from. Same offering-vs-validating stance as the
+    // Ask form: undefined degrades the pick to bare labels, never blocks it.
+    let serverConfig: ConfigResponse | undefined;
+
     const statusProvider = new StatusMonitor(
         () => api,
         () => project?.mindex.guid,
@@ -149,7 +162,10 @@ export function activate(context: vscode.ExtensionContext): void {
         // `GET /config` is read here on every refresh rather than once at
         // activation, because `research.models` is no longer static: a model pulled
         // after the window opened has to reach the picker without a reload.
-        (cfg) => askProvider.setServerConfig(cfg)
+        (cfg) => {
+            serverConfig = cfg;
+            askProvider.setServerConfig(cfg);
+        }
     );
     context.subscriptions.push(
         statusProvider,
@@ -245,6 +261,34 @@ export function activate(context: vscode.ExtensionContext): void {
         );
     };
 
+    /**
+     * The one callback block for both research and challenge streams — extracted
+     * so the two entrances cannot drift: a challenge is the same stream with one
+     * extra `verdict` frame, which `panel.verdict` already renders.
+     */
+    const researchCallbacks = (panel: ResearchPanel) => ({
+        onThinking: (text: string) => panel.thinking(text),
+        onStep: (step: Parameters<ResearchPanel["step"]>[0]) => panel.step(step),
+        onProgress: (progress: Parameters<ResearchPanel["progress"]>[0]) =>
+            panel.progress(progress),
+        onSummary: (text: string) => panel.summary(text),
+        onCitations: (citations: Parameters<ResearchPanel["citations"]>[0]) =>
+            panel.citations(citations),
+        onExcerpts: (excerpts: Parameters<ResearchPanel["excerpts"]>[0]) =>
+            panel.excerpts(excerpts),
+        onVerdict: (verdict: Parameters<ResearchPanel["verdict"]>[0]) =>
+            panel.verdict(verdict),
+        onDone: (info: Parameters<ResearchPanel["done"]>[0]) => panel.done(info),
+        onError: (code: string, detail: string) => {
+            panel.error(`${code}: ${detail}`, code);
+            // The run just proved Ollama is unreachable — re-read health
+            // so the status bar and the Ask notice say so too.
+            if (code === "ollama.unavailable") {
+                void statusProvider.refresh();
+            }
+        },
+    });
+
     const startResearch = async (s: ResearchSubmission): Promise<void> => {
         if (researchAbort !== undefined) {
             void vscode.window.showInformationMessage(
@@ -301,24 +345,7 @@ export function activate(context: vscode.ExtensionContext): void {
                             ? s.contextRunIds
                             : undefined,
                 },
-                {
-                    onThinking: (text) => panel.thinking(text),
-                    onStep: (step) => panel.step(step),
-                    onProgress: (progress) => panel.progress(progress),
-                    onSummary: (text) => panel.summary(text),
-                    onCitations: (citations) => panel.citations(citations),
-                    onExcerpts: (excerpts) => panel.excerpts(excerpts),
-                    onVerdict: (verdict) => panel.verdict(verdict),
-                    onDone: (info) => panel.done(info),
-                    onError: (code, detail) => {
-                        panel.error(`${code}: ${detail}`, code);
-                        // The run just proved Ollama is unreachable — re-read health
-                        // so the status bar and the Ask notice say so too.
-                        if (code === "ollama.unavailable") {
-                            void statusProvider.refresh();
-                        }
-                    },
-                },
+                researchCallbacks(panel),
                 abort.signal
             );
         } catch (e) {
@@ -345,6 +372,100 @@ export function activate(context: vscode.ExtensionContext): void {
         // later question) until the toast was clicked away.
         if (failure !== undefined) {
             await reportError("Research failed", failure);
+        }
+    };
+
+    /**
+     * Launch a challenge against a stored run's report. Shares everything with
+     * `startResearch` deliberately: the same single-flight handles (so
+     * degradation-abort and Cancel cover challenges for free), the same panel,
+     * the same callback block. What differs is the request — the server takes
+     * only effort/model/budget/seed; question, scope and context come from the
+     * subject.
+     */
+    const startChallenge = async (subject: ResearchRunSummary): Promise<void> => {
+        if (researchAbort !== undefined) {
+            void vscode.window.showInformationMessage(
+                say("a research run is already in progress — cancel it first.")
+            );
+            return;
+        }
+        // The server would refuse both of these with a 400; refusing here spares
+        // the QuickPick chain. The summary can be stale, so the server's answer
+        // still lands in the panel when it disagrees.
+        const guard = challengeGuard(subject);
+        if (!guard.ok) {
+            void vscode.window.showInformationMessage(say(guard.reason));
+            return;
+        }
+        let proj: Project;
+        try {
+            proj = await loadProject();
+        } catch (e) {
+            await reportError("Challenge failed", e);
+            return;
+        }
+        const req = await pickChallengeOptions(subject, serverConfig);
+        if (req === undefined) {
+            return;
+        }
+
+        const panel = new ResearchPanel(
+            context.extensionUri,
+            `Challenge research #${subject.seq}: ${subject.question}`,
+            () => {
+                if (researchPanel === panel) {
+                    cancelResearch();
+                }
+            },
+            undefined,
+            [],
+            {
+                tabTitle: `Challenge #${subject.seq}: ${subject.title}`,
+                isChallenge: true,
+            }
+        );
+        researchPanel = panel;
+
+        const abort = new AbortController();
+        researchAbort = abort;
+        askProvider.setRunning(true);
+        let failure: unknown;
+        try {
+            await api.challenge(
+                proj.mindex.guid,
+                subject.id,
+                req,
+                researchCallbacks(panel),
+                abort.signal
+            );
+        } catch (e) {
+            if (!isCancellation(e)) {
+                panel.error(e instanceof Error ? e.message : String(e));
+                failure = e;
+            }
+        } finally {
+            if (researchAbort === abort) {
+                researchAbort = undefined;
+                askProvider.setRunning(false);
+                if (researchPanel === panel) {
+                    researchPanel = undefined;
+                }
+            }
+        }
+        // After the handles are released, like `startResearch` — see the comment
+        // there for the un-clicked-toast trap.
+        if (failure !== undefined) {
+            if (failure instanceof ProblemError && failure.code === "research.busy") {
+                await vscode.window.showErrorMessage(
+                    say(
+                        "all research slots are busy — “MINDex: Active Research Runs” " +
+                            "lists them and can cancel one."
+                    )
+                );
+                return;
+            }
+            await reportError("Challenge failed", failure);
         }
     };
 
@@ -776,6 +897,9 @@ export function activate(context: vscode.ExtensionContext): void {
                             void openResearchReport(guid, run);
                         }
                     },
+                    challenge: (run) => {
+                        void startChallenge(run);
+                    },
                     reAsk: (run) => {
                         const effort =
                             run.effort === "low" || run.effort === "high"
@@ -850,6 +974,47 @@ export function activate(context: vscode.ExtensionContext): void {
                 title: typeof run.title === "string" ? run.title : "report",
             });
         }),
+
+        vscode.commands.registerCommand(
+            "mindex.challengeResearchRun",
+            async (arg: unknown) => {
+                const guid = project?.mindex.guid;
+                if (guid === undefined) {
+                    await vscode.window.showInformationMessage(
+                        say("no project here yet — create a .mindex file first.")
+                    );
+                    return;
+                }
+                // Three entry points, three argument shapes: the History panel passes a
+                // summary, the streaming panel a run id, the report tab's editor/title
+                // button nothing (the id is in the active editor's URI).
+                let runId: string | undefined;
+                if (typeof arg === "string" && arg !== "") {
+                    runId = arg;
+                } else if (typeof (arg as { id?: unknown } | undefined)?.id === "string") {
+                    runId = (arg as { id: string }).id;
+                } else {
+                    const uri = vscode.window.activeTextEditor?.document.uri;
+                    if (uri?.scheme === RESEARCH_SCHEME) {
+                        runId = runIdOf(uri);
+                    }
+                }
+                if (runId === undefined) {
+                    return;
+                }
+                try {
+                    // The detail refreshes kind/valid/trust — the pre-check must not
+                    // run on whatever stale shape the caller happened to hold.
+                    await startChallenge(await api.getResearchRun(guid, runId));
+                } catch (e) {
+                    await reportError("Challenge failed", e);
+                }
+            }
+        ),
+
+        vscode.commands.registerCommand("mindex.activeResearchRuns", () =>
+            showActiveResearchRuns(api)
+        ),
 
         vscode.commands.registerCommand("mindex.openSettings", () => openSettings()),
 

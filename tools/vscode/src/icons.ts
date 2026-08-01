@@ -52,6 +52,10 @@ export const ICON = {
     outOfDate: "warning",
     /** A report that can no longer be used as context. */
     invalid: "error",
+    /** Launch a challenge run against a stored report. */
+    challenge: "shield",
+    /** The live research runs holding a semaphore slot, and their cancel. */
+    activeRuns: "record",
     /** Jump to the extension's own settings. */
     settings: "gear",
     /** Refresh whatever the surface is showing. */

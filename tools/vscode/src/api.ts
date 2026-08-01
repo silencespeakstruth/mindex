@@ -506,6 +506,81 @@ export interface ResearchRunDetail extends ResearchRunSummary {
 }
 
 /**
+ * `POST /v0/{guid}/research/{run_id}/challenge` body. Deliberately minimal, and
+ * the server refuses unknown fields: the question comes from the stored run, the
+ * scope is the subject's own, and the context is the subject report itself —
+ * prior reports are hearsay and must not feed a refutation. The caller only
+ * chooses how hard the challenge tries.
+ */
+export interface ChallengeRequest {
+    model?: string;
+    effort: ResearchEffort;
+    budget?: ResearchBudget;
+    /** Pins sampling for a repeatable run; omit for the server's configured default. */
+    seed?: number;
+}
+
+/** One set of citation-provenance counts, as the offline re-verification reports them. */
+export interface CitationCounts {
+    total: number;
+    verified: number;
+    path_only: number;
+    unverified: number;
+    stale: number;
+}
+
+/**
+ * `GET /projects/{guid}/research/{run_id}/verification` — `check_citations`
+ * re-run offline over the journalled evidence. No model, no GPU. Two separate
+ * answers by design: **provenance** is immutable (`provenance_matches: false`
+ * means the journal is wrong, never the code), while **staleness** is computed
+ * against the index as it is now and is the number that moves between calls.
+ */
+export interface ResearchVerification {
+    run_id: string;
+    seq: number;
+    valid: boolean;
+    invalid_reason: string | null;
+    /**
+     * False for runs stored before evidence spans were journalled (pre-v1.3.0):
+     * provenance cannot be recomputed for those, only staleness.
+     */
+    spans_available: boolean;
+    /** The counters the run recorded when it finished. */
+    recorded: CitationCounts;
+    /** Recomputed from the journal; `null` when `spans_available` is false. */
+    recomputed: CitationCounts | null;
+    /** `null` when provenance could not be recomputed. */
+    provenance_matches: boolean | null;
+    stale_citations_now: number;
+    stale_paths_now: string[];
+    files_total: number;
+    files_moved: number;
+}
+
+/** One in-flight research run, as `GET /research/active` lists it. */
+export interface ActiveResearchRun {
+    run_id: string;
+    project_guid: string;
+    /** A challenge appears with the server-synthesized "Challenge research #N: …". */
+    question: string;
+    model: string;
+    effort: string;
+    started_at: number;
+    age_ms: number;
+    granted_seconds: number;
+    /** Past this, health calls the run wedged and the watchdog may cancel it. */
+    worst_case_ms: number;
+}
+
+export interface ActiveResearchResponse {
+    /** Oldest first. */
+    runs: ActiveResearchRun[];
+    slots_total: number;
+    slots_busy: number;
+}
+
+/**
  * The server's provenance check on the report's `path:start-end` references,
  * emitted once between the report and `done`. Not a spell-check: it says how much
  * of the report is anchored in locations the investigation actually retrieved.
@@ -903,6 +978,8 @@ export class MindexApi {
             pinned?: boolean;
             /** Restrict to fully-valid (`true`) or invalid (`false`) runs. */
             valid?: boolean;
+            /** Restrict to ordinary research runs or to challenges. */
+            kind?: "research" | "challenge";
         },
         signal?: AbortSignal
     ): Promise<ResearchRunListResponse> {
@@ -924,6 +1001,9 @@ export class MindexApi {
         }
         if (query?.valid !== undefined) {
             params.set("valid", String(query.valid));
+        }
+        if (query?.kind !== undefined) {
+            params.set("kind", query.kind);
         }
         const qs = params.size > 0 ? `?${params.toString()}` : "";
         return this.request(
@@ -1015,6 +1095,70 @@ export class MindexApi {
             // An abort is the user's cancel, not a failure.
             abortResolves: true,
         });
+    }
+
+    /**
+     * POST /research/{run_id}/challenge — the same one-way SSE stream as
+     * [`research`], pointed at a stored report. One extra frame arrives on this
+     * stream only: `verdict`, after `excerpts` and before `done`. Same abort
+     * semantics: aborting `signal` is the user's cancel and resolves.
+     */
+    challenge(
+        guid: string,
+        runId: string,
+        req: ChallengeRequest,
+        cb: ResearchCallbacks,
+        signal: AbortSignal
+    ): Promise<void> {
+        return this.streamRequest(
+            `/${this.protocol}/${guid}/research/${encodeURIComponent(runId)}/challenge`,
+            req,
+            signal,
+            {
+                onFrame: (frame) => dispatchSseFrame(frame, cb),
+                abortResolves: true,
+            }
+        );
+    }
+
+    /**
+     * The offline re-verification of one stored run. Cheap and side-effect-free;
+     * staleness is recomputed against the index *now*, so calling it again after a
+     * reindex is the point, not a waste.
+     */
+    getResearchVerification(
+        guid: string,
+        runId: string,
+        signal?: AbortSignal
+    ): Promise<ResearchVerification> {
+        return this.request(
+            "GET",
+            `/projects/${guid}/research/${encodeURIComponent(runId)}/verification`,
+            undefined,
+            signal
+        ) as Promise<ResearchVerification>;
+    }
+
+    /**
+     * The research runs holding a semaphore slot right now — global, not per
+     * project, because the semaphore is. What the 429 `research.busy` points at.
+     */
+    activeResearch(signal?: AbortSignal): Promise<ActiveResearchResponse> {
+        return this.request(
+            "GET",
+            "/research/active",
+            undefined,
+            signal
+        ) as Promise<ActiveResearchResponse>;
+    }
+
+    /**
+     * Cancel a live run by id — the hand that reaches a run whose caller
+     * abandoned it while its socket stayed open. 204 always, idempotent; the slot
+     * may take a moment to free as the job unwinds.
+     */
+    async cancelActiveResearch(runId: string): Promise<void> {
+        await this.request("DELETE", `/research/active/${encodeURIComponent(runId)}`);
     }
 
     /**

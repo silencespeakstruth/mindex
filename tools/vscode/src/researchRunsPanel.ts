@@ -25,6 +25,13 @@ export interface ResearchRunsActions {
      * the common next move, and retyping the question is how it gets skipped.
      */
     reAsk(run: ResearchRunDetail): void;
+    /**
+     * Launch a challenge against this run's report. The panel only pre-checks
+     * (webview-side, via `challengeGuard`) and forwards; the QuickPick chain,
+     * the stream and the error mapping live with `startResearch` in
+     * `extension.ts`, which owns the single-flight handles.
+     */
+    challenge(run: ResearchRunSummary): void;
 }
 
 /** How long the box waits after the last keystroke before it asks the server. */
@@ -62,6 +69,7 @@ export class ResearchRunsPanel {
     private query = "";
     private freshness: "all" | "fresh" | "stale" = "all";
     private validity: "all" | "valid" | "invalid" = "all";
+    private kind: "all" | "research" | "challenge" = "all";
 
     static showOrReveal(
         extensionUri: vscode.Uri,
@@ -116,6 +124,7 @@ export class ResearchRunsPanel {
                         this.query = asString(msg.q);
                         this.freshness = readFreshness(msg.freshness);
                         this.validity = readValidity(msg.validity);
+                        this.kind = readKind(msg.kind);
                         // Debounced: the first keystroke of an identifier is one
                         // letter, and its results would be wrong by the time they
                         // arrived.
@@ -125,6 +134,29 @@ export class ResearchRunsPanel {
                         // Not debounced — a button press is already deliberate.
                         void this.load(this.query, this.lastSeq());
                         break;
+                    case "refresh": {
+                        // Not debounced either, and it supersedes a pending
+                        // keystroke: the user asked for the current query, now.
+                        this.search.cancel();
+                        void this.load(this.query, undefined);
+                        // The open report is re-fetched too — its staleness and
+                        // trust are exactly the numbers that move under the panel.
+                        const active = asString(msg.activeId);
+                        if (active !== "") {
+                            void this.preview(active);
+                        }
+                        break;
+                    }
+                    case "verify":
+                        void this.verify(asString(msg.id));
+                        break;
+                    case "challenge": {
+                        const run = this.rows.get(asString(msg.id));
+                        if (run !== undefined) {
+                            actions.challenge(run);
+                        }
+                        break;
+                    }
                     case "select":
                         void this.preview(asString(msg.id));
                         break;
@@ -216,6 +248,7 @@ export class ResearchRunsPanel {
                     beforeSeq,
                     freshness: this.freshness,
                     valid: this.validity === "all" ? undefined : this.validity === "valid",
+                    kind: this.kind === "all" ? undefined : this.kind,
                 },
                 controller.signal
             );
@@ -274,6 +307,50 @@ export class ResearchRunsPanel {
             return;
         }
         this.post({ type: "preview", run: detail });
+        void this.loadChallenges(guid, detail);
+    }
+
+    /**
+     * The challenges aimed at the previewed run — one bounded request, filtered
+     * client-side. `trust === "unchallenged"` skips it: derived trust already
+     * proves no *valid* challenge exists (stale ones are then not listed, which is
+     * acceptable — they no longer count). A challenge past the first page is
+     * missed the same way; the trust line above the list stays authoritative.
+     * Best-effort enrichment: a failure costs the list, never the preview.
+     */
+    private async loadChallenges(guid: string, run: ResearchRunDetail): Promise<void> {
+        if (run.kind !== "research" || run.trust === "unchallenged") {
+            return;
+        }
+        try {
+            const page = await this.api().listResearchRuns(guid, { kind: "challenge" });
+            const list = page.runs
+                .filter((r) => r.challenged_run_id === run.id)
+                .map((r) => ({
+                    id: r.id,
+                    seq: r.seq,
+                    title: r.title,
+                    verdict: r.challenge_verdict,
+                    valid: r.valid,
+                }));
+            this.post({ type: "challenges", runId: run.id, list });
+        } catch {
+            // Best-effort — the trust badge already carries the verdict.
+        }
+    }
+
+    /** Offline re-verification of one run, rendered under the Verify button. */
+    private async verify(id: string): Promise<void> {
+        const guid = this.guid();
+        if (guid === undefined) {
+            return;
+        }
+        try {
+            const v = await this.api().getResearchVerification(guid, id);
+            this.post({ type: "verification", runId: id, v });
+        } catch (e) {
+            this.post({ type: "error", message: messageOf(e) });
+        }
     }
 
     private toggle(id: string, checked: boolean): void {
@@ -384,6 +461,10 @@ function readFreshness(v: unknown): "all" | "fresh" | "stale" {
 
 function readValidity(v: unknown): "all" | "valid" | "invalid" {
     return v === "valid" || v === "invalid" ? v : "all";
+}
+
+function readKind(v: unknown): "all" | "research" | "challenge" {
+    return v === "research" || v === "challenge" ? v : "all";
 }
 
 function isAbort(e: unknown): boolean {

@@ -149,6 +149,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::HistoryPruneResponse,
         crate::backend::v0::models::GcResponse,
         crate::backend::v0::models::ResearchFreshness,
+        crate::backend::v0::models::ResearchKind,
         crate::backend::v0::models::ResearchRunDependency,
         crate::backend::v0::models::ResearchRunSummary,
         crate::backend::v0::models::ResearchRunListResponse,

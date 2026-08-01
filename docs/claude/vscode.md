@@ -46,7 +46,62 @@ modifying `tools/vscode`.
   invalid badge shows the **reason**, not the verdict. `removed` carries an
   id *list* so one path serves both deletes, and it must clear the preview
   when the open report is the one going (it used to leave `activeId`
-  pointing at a dead id).
+  pointing at a dead id). The header's refresh button is in-panel, not a
+  `webview/title` menu — three contribution surfaces for one button that
+  would then sit in the tab bar, away from the filters it re-runs; it
+  supersedes any pending keystroke (`search.cancel()`) and re-fetches the
+  open preview, whose staleness and trust are exactly the numbers that move
+  under the panel. The `kind` filter select is backed by the server-side
+  `kind` query param — filtered inside the cursor-bounded subquery like the
+  rest, so a full page still means "there may be more".
+  **Challenge flow** (`challengeFlow.ts` + `startChallenge` in
+  `extension.ts`): launching a challenge is a **QuickPick chain** (effort →
+  optional model → optional max-seconds), not a form and not an Ask mode —
+  the server refuses a question, scope and context on the challenge body
+  (`deny_unknown_fields`; all three come from the subject), so there is
+  nothing to compose, and popup-first is the codified shape for that. Three
+  entry points, one command (`mindex.challengeResearchRun`, three argument
+  shapes): the history panel's preview button (passes the summary), the
+  streaming panel's post-done button (passes the new `run_id`; suppressed on
+  challenge panels — a challenge of a challenge is a server 400), and an
+  `editor/title` button on the report tab's *source* view
+  (`resourceScheme == mindex-research`; the Markdown preview tab is a webview
+  and offers no per-resource title menu — the palette covers it). The
+  command re-fetches the detail before the pre-check: kind/valid/trust must
+  not be judged on whatever stale shape the caller held. The client
+  pre-check (`challengeGuard` in `shared/runsFormat.ts`) mirrors the
+  server's two refusals so the button can explain itself; the server stays
+  the authority. The stream reuses `ResearchPanel` verbatim (`isChallenge`
+  page flag + a tab title naming the subject) and the same single-flight
+  handles as `startResearch` — which is what makes degradation-abort and
+  Cancel cover challenges for free; the callback block is built by one
+  shared `researchCallbacks()` so the two entrances cannot drift. A 429
+  names `MINDex: Active Research Runs`.
+  **Trust wording lives in `shared/runsFormat.ts`** (vscode-free, tested):
+  the wire types keep `kind`/`trust`/`challenge_verdict` as bare `string`
+  (`done_reason` precedent — an unknown future value must not become a type
+  lie); the unions and narrowing guards live behind that seam, and every
+  consumer of the *meaning* goes through them. Inconclusive is never an
+  acquittal; unchallenged is silent (a badge on every row is a badge on
+  none); a challenge row links its subject (resolved from the loaded page,
+  else a link the host resolves by id). The challenges-against list in the
+  preview is a client query (`kind=challenge` + filter on
+  `challenged_run_id`), fired only when `trust !== "unchallenged"` — derived
+  trust already proves the absence of valid challenges, and the stale ones
+  it then misses no longer count.
+  **Verification renders two halves separately** (`verificationView`):
+  provenance is immutable — `provenance_matches: false` impeaches the
+  journal, never the code — while staleness is computed against the index
+  now and is the number that moves; the Verify button re-fetches on every
+  click for exactly that reason. Pre-v1.3.0 rows get the staleness half
+  only, with the why spelled out.
+  **Active runs** (`activeRunsPick.ts`) are a palette command + QuickPick,
+  fetched on open — not a status-bar item and not a `StatusMonitor` hook: an
+  occupied slot is a rare state consulted deliberately (usually right after
+  a 429 named the command), and permanent chrome or a per-tick poll is the
+  wrong price. Cancel re-fetches rather than splicing (the 204 is idempotent
+  and says nothing; a run may linger while its job unwinds, which is the
+  honest state).
   **The form offers only what the server confirmed exists**: language
   pickers = the project's `chunks_active > 0` languages, model field = a
   `<select>` over `research.models`, both via `StatusMonitor.refresh()` —

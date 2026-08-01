@@ -52,6 +52,7 @@ use crate::backend::v0::models::ReadChunksResponse;
 use crate::backend::v0::models::ResearchEffortInfo;
 use crate::backend::v0::models::ResearchFreshness;
 use crate::backend::v0::models::ResearchHealth;
+use crate::backend::v0::models::ResearchKind;
 use crate::backend::v0::models::ResearchListQuery;
 use crate::backend::v0::models::ResearchObservedEffort;
 use crate::backend::v0::models::ResearchObservedInfo;
@@ -6400,6 +6401,9 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
 /// Every summary carries the run's derived `valid` verdict and its flat transitive
 /// `context` ancestry (see [`research_validity_ctes`]); `valid=true|false` filters
 /// on it, orthogonally to `freshness`, which stays the run's *own* staleness.
+/// `kind=research|challenge` restricts by the stored `kind` column — the browse
+/// half of the challenge feature; like every filter here it applies before the
+/// page is cut.
 ///
 /// `q` is a `LIKE` over the title, the question and the report body, with
 /// [`like_escape`], for the reason `grep` needs it: `_` is a
@@ -6478,6 +6482,15 @@ pub async fn get_research_runs(
                         "r.expires_at IS NULL"
                     } else {
                         "r.expires_at IS NOT NULL"
+                    }
+                    .to_string(),
+                );
+            }
+            if let Some(kind) = q.kind {
+                where_parts.push(
+                    match kind {
+                        ResearchKind::Research => "r.kind = 'research'",
+                        ResearchKind::Challenge => "r.kind = 'challenge'",
                     }
                     .to_string(),
                 );
@@ -7648,6 +7661,113 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The `kind` list filter selects on the stored column inside the
+    /// cursor-bounded subquery — the shape the handler builds — so a page of
+    /// challenges is cut from challenges only and the full-page ⇒ more inference
+    /// stays honest. The wire spellings are pinned alongside: an unknown value
+    /// must refuse to deserialize (→ 400 malformed query), never scan as "all".
+    #[tokio::test]
+    async fn kind_filter_selects_only_the_asked_kind() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            let insert_run = |id: &str, seq: i64, kind: &str| -> rusqlite::Result<()> {
+                tx.execute(
+                    "INSERT INTO research_runs (
+                         id, project_guid, seq, question, model, prompt_version, effort,
+                         kind, challenged_run_id, challenge_verdict,
+                         granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
+                         done_reason, steps, turns, elapsed_ms,
+                         prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx,
+                         citations_total, citations_verified, citations_path_only,
+                         citations_unverified, cited_paths_json, unverified_paths_json,
+                         changed_files, removed_files, stale_citations, stale_paths_json,
+                         notes_written, notes_rejected, plan_revisions, grep_calls, grep_hits,
+                         out_of_scope_refusals, out_of_scope_rows, scoped,
+                         forced_synthesis, report_window_ms, report_elapsed_ms, report
+                     ) VALUES (
+                         ?1, 'p1', ?2, 'q', 'm', '2.2', 'medium',
+                         ?3, NULL, NULL,
+                         1, 1, 1, 1,
+                         'finalized', 1, 1, 1,
+                         1, 1, 1, 1,
+                         0, 0, 0,
+                         0, '[]', '[]',
+                         0, 0, 0, '[]',
+                         0, 0, 0, 0, 0,
+                         0, 0, 0,
+                         0, 0, 0, 'report'
+                     )",
+                    params![id, seq, kind],
+                )?;
+                Ok(())
+            };
+            insert_run("r1", 1, "research")?;
+            insert_run("c1", 2, "challenge")?;
+            insert_run("r2", 3, "research")?;
+
+            let page = |tx: &rusqlite::Transaction,
+                        kind: Option<ResearchKind>|
+             -> rusqlite::Result<Vec<i64>> {
+                let mut where_parts = vec!["r.project_guid = ?1".to_string()];
+                if let Some(kind) = kind {
+                    where_parts.push(
+                        match kind {
+                            ResearchKind::Research => "r.kind = 'research'",
+                            ResearchKind::Challenge => "r.kind = 'challenge'",
+                        }
+                        .to_string(),
+                    );
+                }
+                let sql = format!(
+                    "{ctes}
+                     SELECT * FROM (
+                         SELECT {cols}
+                           FROM research_runs r
+                          WHERE {where_clause}
+                     )
+                     ORDER BY seq DESC
+                     LIMIT 10",
+                    ctes = research_validity_ctes("?1", "?2"),
+                    cols = research_summary_columns(),
+                    where_clause = where_parts.join(" AND "),
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let seqs = stmt
+                    .query_map(params!["p1", "BAAI/bge-m3"], |row| {
+                        research_summary_from_row(row).map(|r| r.seq)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(seqs)
+            };
+            assert_eq!(page(tx, None)?, vec![3, 2, 1]);
+            assert_eq!(page(tx, Some(ResearchKind::Research))?, vec![3, 1]);
+            assert_eq!(page(tx, Some(ResearchKind::Challenge))?, vec![2]);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The `kind` wire spellings are a contract with the extension's filter
+    /// select; an unknown value is a deserialization error, which `ApiQuery`
+    /// turns into 400 `request.malformed_body` — never a silent "all".
+    #[test]
+    fn research_kind_wire_spellings_are_stable() {
+        assert!(matches!(
+            serde_json::from_str::<ResearchKind>("\"research\""),
+            Ok(ResearchKind::Research)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ResearchKind>("\"challenge\""),
+            Ok(ResearchKind::Challenge)
+        ));
+        assert!(serde_json::from_str::<ResearchKind>("\"bogus\"").is_err());
+        assert!(serde_json::from_str::<ResearchKind>("\"Research\"").is_err());
     }
 
     /// `RESEARCH_SUMMARY_COLUMNS` is the boundary the detail query indexes its own
