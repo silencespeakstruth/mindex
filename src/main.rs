@@ -461,6 +461,7 @@ async fn main() -> Result<(), BoxError> {
                 research_max_request_tokens: cfg.research.max_request_tokens,
                 research_max_request_steps: cfg.research.max_request_steps,
                 research_report_timeout_ms: cfg.research.report_timeout_ms,
+                research_checkpoint_every_steps: cfg.research.checkpoint_every_steps,
                 research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
                 research_retention_days: cfg.research.retention_days,
                 research_max_context_runs: cfg.research.max_context_runs,

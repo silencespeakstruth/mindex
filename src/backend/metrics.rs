@@ -381,6 +381,16 @@ pub struct ResearchMetrics {
     /// knob is dead weight and only `num_predict` earns its place. Labelled by
     /// model because the answer is certainly per-model.
     pub report_words: HistFamily<ModelLabels>,
+    /// Sections of a sectioned report, by what became of each one:
+    /// `written` / `empty` / `timed_out` / `skipped` — a set the server defines, so
+    /// the cardinality rule holds.
+    ///
+    /// The point of writing in sections is that one failing costs a section rather
+    /// than the document; this is what says how often that trade is actually being
+    /// made. A rising `empty` share means the per-section word budget or the model
+    /// is wrong; `timed_out`/`skipped` mean `report_timeout_ms` is too tight for the
+    /// number of sections the plans are producing.
+    pub report_sections: Family<OutcomeLabels, Counter>,
 }
 
 #[derive(Clone)]
@@ -698,6 +708,7 @@ impl Metrics {
             // sits three buckets above the deepest grant: a report landing in +Inf
             // is itself the finding.
             report_words: hist_family(count_hist),
+            report_sections: Family::default(),
         };
         registry.register(
             "research_runs",
@@ -803,6 +814,11 @@ impl Metrics {
             "research_report_words",
             "Words in the report a research run shipped, by model",
             research.report_words.clone(),
+        );
+        registry.register(
+            "research_report_sections",
+            "Sections of a sectioned report, by what became of each one",
+            research.report_sections.clone(),
         );
 
         // ── GC ──

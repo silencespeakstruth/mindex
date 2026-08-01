@@ -4704,6 +4704,7 @@ pub async fn post_research(
         budget: s.research_budget(req.effort, req.budget),
         sampling: s.research_sampling_for(req.seed),
         report_timeout_ms: s.research_report_timeout_ms,
+        checkpoint_every_steps: s.research_checkpoint_every_steps,
         max_turn_thinking_chars: s.research_max_turn_thinking_chars,
         metrics: Some(s.metrics.clone()),
         prior_reports,
@@ -5678,6 +5679,7 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
             max_request_tokens: s.research_max_request_tokens,
             max_request_steps: s.research_max_request_steps,
             report_timeout_ms: s.research_report_timeout_ms,
+            checkpoint_every_steps: s.research_checkpoint_every_steps,
             sampling: ResearchSamplingInfo {
                 temperature: s.research_sampling.temperature,
                 top_p: s.research_sampling.top_p,

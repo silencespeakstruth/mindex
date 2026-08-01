@@ -60,7 +60,15 @@ use crate::models::ollama::{
 /// the anti-speculation rule that used to reach only truncated runs; `grep`'s spec
 /// gained a sentence about what an empty result means. MINOR: the job — read this
 /// evidence, write one cited report — is unchanged; only how it is asked for is.
-pub const PROMPT_VERSION: &str = "1.4";
+///
+/// 1.4 → 2.0: **MAJOR**, because the run is now asked to do a different job. A plan
+/// of three or more numbered items is written one section at a time — each turn sees
+/// its sub-question and the others' headings, never their prose — and the
+/// investigation is interrupted every `[research].checkpoint_every_steps` to bank the
+/// sections it can already answer. No corpus comparison across this boundary is
+/// valid: a 1.4 report is one model turn's document, a 2.0 report is six turns'
+/// sections assembled by the server.
+pub const PROMPT_VERSION: &str = "2.0";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -1059,6 +1067,14 @@ pub struct ResearchParams {
     /// *tail* of a run — which is why `budget.max_seconds + report_timeout_ms` is
     /// the longest a caller can wait.
     pub report_timeout_ms: u64,
+    /// Steps between checkpoint turns; `0` = off
+    /// (`[research].checkpoint_every_steps`).
+    ///
+    /// What makes a run that does not finish still return findings: the sections it
+    /// could already answer are banked mid-investigation, so a deadline,
+    /// `repeated_calls` or `unparseable` stop assembles them instead of shipping the
+    /// server's stub.
+    pub checkpoint_every_steps: usize,
     /// Where to record a pathology that happens *inside* one turn and leaves no trace
     /// in its return value — the runaway-thinking abandonment below. The same reason
     /// the embedder's 429 retries and Ollama's tool-call-parse retries are counted in
@@ -1875,6 +1891,117 @@ fn report_request(
     )
 }
 
+/// The writer role for a turn that produces **one section**, not a document.
+///
+/// [`REPORT_ROLE`]'s "begin with a single `# heading`" is dropped and replaced: a
+/// section owes a `##`, and telling it to open a document would have every section
+/// restate the finding.
+fn section_system_prompt(budget: Budget) -> String {
+    let mut s = String::from(
+        "You are a technical writer. Below is a research question about a codebase and \
+         the evidence a research agent gathered for it — code excerpts, symbol \
+         locations and file outlines. You are writing ONE SECTION of a longer report, \
+         not the report. You have NO tools: there is nothing left to call, and any JSON \
+         you emit would be discarded. Write Markdown prose, grounded in the evidence, \
+         citing locations as `path:start-end`.",
+    );
+    if budget.max_report_words > 0 {
+        // The per-section number, not the document's. A model given the document's
+        // ceiling writes the document.
+        s.push_str(
+            "\n\nLENGTH IS PART OF THE TASK. The word limit you are given below is a \
+             ceiling, not a target: a shorter section that answers its sub-question is a \
+             better section. Do NOT reproduce code you were shown — the server ships the \
+             verbatim text of every location you cite alongside the report, so quoting it \
+             buys the reader nothing. Cite the location and say what it does.",
+        );
+    }
+    s
+}
+
+/// The user message for one section turn.
+///
+/// Carries the sub-question, the run's own verdict on it from the sufficiency turn,
+/// the word allowance, the headings already written, and — when a checkpoint banked
+/// one — the model's earlier draft of this very section. That last part is what
+/// makes six section turns cheap and consistent rather than six cold starts.
+///
+/// Sections already written are represented by their **headings only**. Feeding back
+/// their prose would grow the prompt to compensate for shrinking the output, which
+/// is the same bug wearing a different hat.
+fn section_request(
+    index: usize,
+    total: usize,
+    item: &PlanItem,
+    verdict_line: Option<&str>,
+    words: usize,
+    written: &[String],
+    draft: Option<&str>,
+) -> String {
+    let mut s = format!(
+        "SECTION {index} of {total}. Write only this section of the report and nothing \
+         else.\n\nSub-question: {}\n",
+        item.text
+    );
+    if let Some(v) = verdict_line {
+        s.push_str(&format!("Your own verdict on it: {v}\n"));
+    }
+    if let Some(d) = draft {
+        s.push_str(&format!(
+            "\nHere is what you wrote about this item earlier in the run, when you had \
+             less evidence. Expand or correct it — do not simply repeat it:\n\n{d}\n"
+        ));
+    }
+    if !written.is_empty() {
+        s.push_str(&format!(
+            "\nSections already written, which you must not repeat: {}\n",
+            written.join("; ")
+        ));
+    }
+    if words > 0 {
+        s.push_str(&format!("\nWrite at most {words} words. "));
+    } else {
+        s.push('\n');
+    }
+    s.push_str(&format!(
+        "Begin with `## {}. ` and a short title. Do not write an introduction, do not \
+         summarise the other sections, and do not restate the question. Cite as \
+         `path:start-end`, only locations a tool returned this run. Where a claim rests \
+         on inference rather than on something a tool returned, say so in the sentence \
+         that makes it. If this sub-question was not answered, say so in two sentences \
+         and stop.",
+        item.number
+    ));
+    s
+}
+
+/// The turn that banks what the run has established so far.
+///
+/// Toolless, like the plan and sufficiency turns. Its output is parsed by the same
+/// `## N.` scanner the assembly uses and stored in `RunState::draft_sections`, so a
+/// run cut short has real content to ship instead of a stub — which is the entire
+/// reason it costs a step.
+const CHECKPOINT_REQUEST: &str = "CHECKPOINT. Pause the investigation for one turn and \
+    bank what you have. Go through your numbered plan and, for each sub-question you can \
+    ALREADY answer from evidence a tool returned in this run, write that part of the \
+    report now, under a `## N.` heading matching the item's number. Skip every item you \
+    cannot yet answer — do not guess at one to fill it. Cite as `path:start-end`. No \
+    preamble, no tool calls, no plan for what to do next: only the sections that are \
+    ready. What you write here is kept by the server and is what the report will be \
+    assembled from if this run is cut short.";
+
+/// The section the server writes when the model could not.
+///
+/// Named, so a reader can tell a sub-question that went unanswered from one that was
+/// never attempted — and so the assembled document keeps the plan's shape rather
+/// than silently losing an item.
+fn section_stub(item: &PlanItem, why: &str) -> String {
+    format!(
+        "## {}. {}\n\n*This section could not be written ({why}). The plan item was: {}*",
+        item.number, item.text, item.text
+    )
+}
+
 /// The report the *server* writes when the report window expired before the model
 /// produced anything.
 ///
@@ -1899,12 +2026,31 @@ fn forced_synthesis(
     reason: DoneReason,
     elapsed: Duration,
 ) -> String {
-    let mut out = String::from("# Research incomplete\n\n");
+    // The banked sections change what this notice *is*. With them it is a report —
+    // the run's own findings, written by the model at a checkpoint, assembled by the
+    // server — and only its framing is server-written. Without them it is what it
+    // always was: an account of a run that produced nothing.
+    let banked = &state.draft_sections;
+    let mut out = if banked.is_empty() {
+        String::from("# Research incomplete\n\n")
+    } else {
+        let derived = research_title(&params.question);
+        let title = if derived.trim().is_empty() {
+            "Research report"
+        } else {
+            derived.trim()
+        };
+        format!("# {title}\n\n")
+    };
     out.push_str(&format!(
-        "**No report was produced.** The investigation ran for {} seconds and stopped \
+        "**{}** The investigation ran for {} seconds and stopped \
          because {}; the model was then given {} seconds to write a report and did not \
-         finish one. What follows is an account of the run itself, written by the \
-         server — it contains no findings about the code.\n\n",
+         finish one.{}\n\n",
+        if banked.is_empty() {
+            "No report was produced."
+        } else {
+            "This report was assembled by the server."
+        },
         elapsed.as_secs(),
         match reason {
             DoneReason::Finalized => "the model judged the evidence sufficient",
@@ -1916,7 +2062,25 @@ fn forced_synthesis(
             DoneReason::Unparseable => "its replies could not be acted on",
         },
         params.report_timeout_ms / 1000,
+        if banked.is_empty() {
+            " What follows is an account of the run itself, written by the server — it \
+             contains no findings about the code."
+                .to_string()
+        } else {
+            format!(
+                " The {} section(s) below are the model's own, written and banked during \
+                 the investigation; the server only assembled them. Sub-questions with no \
+                 section are ones the run never got to.",
+                banked.len()
+            )
+        }
     ));
+    // The findings first, when there are any: a reader who stops after the first
+    // screen should get the answer, not the postmortem.
+    for body in banked.values() {
+        out.push_str(body.trim());
+        out.push_str("\n\n");
+    }
     out.push_str(&format!("## Question\n\n{}\n\n", params.question.trim()));
     if let Some(plan) = &state.plan {
         out.push_str(&format!(
@@ -1962,6 +2126,17 @@ struct RunState {
     /// else here answers "what have I already asked"; this answers "what have I already
     /// worked out".
     notes: Vec<String>,
+    /// Report sections the model banked at a checkpoint, keyed by plan-item number.
+    ///
+    /// **Replaced, never appended** for a given item — the "pinned, not appended"
+    /// rule applied to drafts: a later checkpoint saw more evidence, so its version
+    /// of section 3 supersedes the earlier one rather than joining it.
+    ///
+    /// Their reason for existing is what happens when a run does *not* finish. A
+    /// deadline, `repeated_calls` or `unparseable` stop used to reach
+    /// `forced_synthesis` with nothing but a file list, and the caller got a stub
+    /// after fifteen minutes. With these it gets findings.
+    draft_sections: std::collections::BTreeMap<usize, String>,
     searches: Vec<String>,
     symbols: Vec<String>,
     outlines: Vec<String>,
@@ -1975,28 +2150,154 @@ struct RunState {
     report_lookups: Vec<String>,
 }
 
+/// One numbered sub-question of the run's plan, and the section that answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanItem {
+    /// The number the model gave it. Not the index: a plan that jumps from 2 to 4
+    /// keeps the model's own numbering, because that is what the sufficiency verdict
+    /// and the checkpoint drafts key on.
+    number: usize,
+    /// The line, minus its number.
+    text: String,
+}
+
+/// Sections the report may be written in.
+///
+/// `PLAN_REQUEST` asks for 3-6, and this is the hard cap regardless of what came
+/// back — a plan of twenty items is not twenty report turns.
+const MAX_REPORT_SECTIONS: usize = 6;
+
+/// Plan items below which the report is written as one document.
+///
+/// The same 3 `PLAN_REQUEST` asks for, and for its reason: three is the smallest
+/// plan this feature was designed around. Splitting a two-item plan buys an extra
+/// turn and a seam for almost no reduction in what any one turn has to write, which
+/// is the only thing sectioning is for.
+const MIN_SECTIONED_PLAN_ITEMS: usize = 3;
+
+/// Attempts per section before it is stubbed.
+///
+/// Deliberately below `MAX_EMPTY_REPORT_RETRIES` (5), which was sized for the one
+/// turn a whole report used to take: five attempts across six sections is thirty
+/// report turns, and the report window would be gone long before that. One retry at
+/// a shifted seed covers the measured failure (a model that writes its report into
+/// the thinking channel); past that the section is stubbed and the others still
+/// ship, which is the whole point of writing in sections.
+const MAX_SECTION_ATTEMPTS: usize = 2;
+
+/// Sections the citation-repair phase will rewrite.
+///
+/// Bounds a loop that is otherwise driven by how many sections had a bad citation.
+const MAX_SECTION_REWRITES: usize = 3;
+
+/// Report window that must remain for a section to be *started*.
+///
+/// Starting one with less buys a cancelled turn and a stub; stubbing it directly
+/// spends nothing and says the same thing. This is what keeps "a deadline stop
+/// still ships something" true when the window runs out at section 4 of 6.
+const MIN_SECTION_MS: u64 = 10_000;
+
+/// How far past `max_tokens` the report phase may run before it stops starting
+/// sections.
+///
+/// The report phase is already outside the token budget's reach — that check lives
+/// inside the tool loop — which was immaterial when it was one turn and is not when
+/// it is six.
+const REPORT_TOKEN_OVERDRAFT: f64 = 1.5;
+
+/// Split a plan into its numbered sub-questions.
+///
+/// `PLAN_REQUEST` asks for 3-6 numbered lines and models comply often enough for
+/// this to be worth reading — but not reliably enough to depend on, which is why
+/// every caller must handle a short result by falling back to the single-turn path.
+///
+/// A line qualifies when its first non-space characters are ASCII digits followed
+/// by `.` or `)`. Scanned with `char_indices`/`chars`, never by byte offset: a plan
+/// is model output, hence arbitrary UTF-8, and slicing it by byte is the panic this
+/// codebase has already paid for once.
+fn parse_plan_items(plan: &str) -> Vec<PlanItem> {
+    let mut items = Vec::new();
+    for line in plan.lines() {
+        let t = line.trim();
+        let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || !matches!(t.chars().nth(digits.len()), Some('.') | Some(')')) {
+            continue;
+        }
+        let Ok(number) = digits.parse::<usize>() else {
+            continue;
+        };
+        // Skip the digits and the delimiter by *character* count, then trim the
+        // separator styles models actually use.
+        let text: String = t
+            .chars()
+            .skip(digits.len() + 1)
+            .collect::<String>()
+            .trim()
+            .trim_start_matches(['-', '—', ':'])
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+        items.push(PlanItem { number, text });
+    }
+    items
+}
+
+/// Split a reply into `## N.`-headed sections, keyed by the number in the heading.
+///
+/// One parser, two callers: a checkpoint turn's reply and a section turn's. Both
+/// are model output written to the same instruction, so reading them the same way
+/// is what keeps a checkpoint draft usable as the seed for the section that
+/// replaces it.
+///
+/// Text before the first recognised heading is discarded — it is the preamble the
+/// instruction asked for and did not get, not an answer to any plan item. Line
+/// scanning only: never a byte index into model output.
+fn parse_numbered_sections(text: &str) -> std::collections::BTreeMap<usize, String> {
+    let mut out: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    let mut current: Option<(usize, Vec<&str>)> = None;
+    for line in text.lines() {
+        if let Some(n) = section_heading_number(line) {
+            if let Some((num, body)) = current.take() {
+                out.insert(num, body.join("\n").trim().to_string());
+            }
+            current = Some((n, vec![line]));
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push(line);
+        }
+    }
+    if let Some((num, body)) = current {
+        out.insert(num, body.join("\n").trim().to_string());
+    }
+    out.retain(|_, body| !body.trim().is_empty());
+    out
+}
+
+/// The plan-item number of a `## N.` / `## N)` heading line, if it is one.
+fn section_heading_number(line: &str) -> Option<usize> {
+    let t = line.trim_start();
+    let hashes = t.chars().take_while(|&c| c == '#').count();
+    if !(2..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = t[hashes..].trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    // A bare `## 2024` is a heading about a year, not section two.
+    match rest.chars().nth(digits.len()) {
+        Some('.') | Some(')') => digits.parse().ok(),
+        _ => None,
+    }
+}
+
 impl RunState {
     /// How many numbered sub-questions the plan states, if it states any.
-    ///
-    /// `PLAN_REQUEST` asks for 3-6 numbered lines, and models comply often enough
-    /// for this to be worth reading — but not reliably enough to depend on, so
-    /// every caller must handle `None`. Counts a line whose first non-space
-    /// characters are digits followed by `.` or `)`; anything else is prose the run
-    /// wrapped its plan in.
-    ///
-    /// Scanned by `char_indices` rather than by byte offset: a plan is model output,
-    /// hence arbitrary UTF-8, and slicing it by byte is the panic this codebase has
-    /// already paid for once.
     fn plan_item_count(&self) -> Option<usize> {
         let plan = self.plan.as_deref()?;
-        let n = plan
-            .lines()
-            .filter(|line| {
-                let t = line.trim_start();
-                let digits = t.chars().take_while(char::is_ascii_digit).count();
-                digits > 0 && matches!(t.chars().nth(digits), Some('.') | Some(')'))
-            })
-            .count();
+        let n = parse_plan_items(plan).len();
         (n > 0).then_some(n)
     }
 
@@ -2961,6 +3262,19 @@ fn is_path_char(c: char) -> bool {
 /// backwards for the path, requiring a file extension (a trailing `.ext`) — which
 /// is what stops it matching prose like "step 3:10-20" or a bare `1-2`.
 fn parse_citations(report: &str) -> Vec<Citation> {
+    parse_citations_at(report)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// [`parse_citations`], keeping each citation's **byte** offset in the report.
+///
+/// Split out for the sectioned repair, which has to know *where* a bad citation is
+/// in order to rewrite only the section containing it. The offset is where the path
+/// begins. Byte here because that is the coordinate the scanner works in; the one
+/// caller converts to chars immediately, at the single place the two systems meet.
+fn parse_citations_at(report: &str) -> Vec<(usize, Citation)> {
     let b = report.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -3037,11 +3351,14 @@ fn parse_citations(report: &str) -> Vec<Citation> {
             });
         let looks_like_path = relative && has_extension;
         if looks_like_path && start <= end {
-            out.push(Citation {
-                path: path.to_string(),
-                start,
-                end,
-            });
+            out.push((
+                k,
+                Citation {
+                    path: path.to_string(),
+                    start,
+                    end,
+                },
+            ));
         }
         i = j;
     }
@@ -3209,8 +3526,29 @@ const MISSING_HEADING: &str = "The report must begin with a `# heading` naming t
 /// swallows the rest of the document in every renderer. Each entry is one concrete
 /// problem, worded for the model — the list is sent back verbatim as a complaint.
 pub fn validate_report_markdown(report: &str) -> Vec<String> {
+    let mut problems = validate_markdown_body(report);
+    // The heading check applies to a whole document only. A *section* legitimately
+    // opens with `## 2.` or with prose (the server supplies its heading when the
+    // model omits one), so demanding a top-level `#` of one would refuse every
+    // correctly written section.
+    if !report.trim().is_empty() {
+        let first_line = report.trim().lines().next().unwrap_or_default().trim();
+        let hashes = first_line.chars().take_while(|&c| c == '#').count();
+        if !(1..=6).contains(&hashes) || !first_line[hashes..].starts_with(char::is_whitespace) {
+            problems.push(MISSING_HEADING.to_string());
+        }
+    }
+    problems
+}
+
+/// The structural checks that hold for any Markdown fragment, heading aside.
+///
+/// Split out because a report and a *section* of one are checked differently: both
+/// must be non-empty, must not be JSON, and must close every fence they open, but
+/// only a whole document owes a `# heading`.
+fn validate_markdown_body(text: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    let trimmed = report.trim();
+    let trimmed = text.trim();
     if trimmed.is_empty() {
         problems.push("The report is empty.".to_string());
         return problems;
@@ -3221,12 +3559,7 @@ pub fn validate_report_markdown(report: &str) -> Vec<String> {
                 .to_string(),
         );
     }
-    let first_line = trimmed.lines().next().unwrap_or_default().trim();
-    let hashes = first_line.chars().take_while(|&c| c == '#').count();
-    if !(1..=6).contains(&hashes) || !first_line[hashes..].starts_with(char::is_whitespace) {
-        problems.push(MISSING_HEADING.to_string());
-    }
-    let fences = report
+    let fences = text
         .lines()
         .filter(|l| l.trim_start().starts_with("```"))
         .count();
@@ -4554,6 +4887,17 @@ async fn research_inner(
     // Tool-loop re-entries after the sufficiency check, capped by `MAX_REOPENS` —
     // the phase-level equivalent of the counters above.
     let mut reopens = 0usize;
+    // The sufficiency turn's per-item ANSWERED/UNANSWERED list, kept for the
+    // sectioned writer: each section is handed the run's own verdict on its
+    // sub-question instead of being asked to form one again. `None` when the turn
+    // was skipped (a budget-stopped run) or came back empty.
+    let mut sufficiency_verdict: Option<String> = None;
+    // Checkpoint turns taken, and the step one was last taken at. Two counters
+    // rather than one modulo test: `steps` advances in bursts inside a multi-call
+    // turn, so `steps % n == 0` would skip a checkpoint whenever a batch stepped
+    // straight past the multiple.
+    let mut checkpoints = 0usize;
+    let mut last_checkpoint_step = 0usize;
     // Overwritten by whichever `break` below fires; `Finalized` is the only one
     // the model chooses on purpose.
     let mut reason = DoneReason::Finalized;
@@ -5041,6 +5385,80 @@ async fn research_inner(
                 reply(&mut messages, result_text);
             }
 
+            // ── checkpoint ───────────────────────────────────────────────────
+            //
+            // Bank what is already answerable, so a run that never reaches a
+            // finished report still has findings to ship. Placed after the batch,
+            // never inside it: the transcript is well-formed here, with every
+            // announced call answered.
+            //
+            // It **costs a step** and is capped independently. Charging it is what
+            // makes it visible in the budget the operator set — the same reasoning
+            // that prices every refusal as a step — and the cap is what stops a
+            // mis-set interval from turning a run into a writing exercise.
+            if params.checkpoint_every_steps > 0
+                && checkpoints < crate::config::MAX_CHECKPOINTS
+                && steps > 0
+                && steps.saturating_sub(last_checkpoint_step) >= params.checkpoint_every_steps
+                && state.plan.is_some()
+                && !matches!(
+                    reason,
+                    DoneReason::BudgetExhausted | DoneReason::TimeExhausted
+                )
+            {
+                last_checkpoint_step = steps;
+                checkpoints += 1;
+                steps += 1;
+                messages.push(ChatMessage::user(CHECKPOINT_REQUEST.to_string()));
+                let banked = chat_turn(
+                    ollama,
+                    params,
+                    &messages,
+                    NO_TOOLS,
+                    tx,
+                    work,
+                    TurnOpts {
+                        stream_content: false,
+                        sampling: params.sampling,
+                    },
+                )
+                .await;
+                let text = match banked {
+                    Ok(o) => tally.record(o).content,
+                    // The deadline caught the checkpoint. Not a failure of the run:
+                    // the loop's own budget check picks it up on the next pass.
+                    Err(e) if is_deadline_stop(token, work, &e) => String::new(),
+                    Err(e) => return Err(e),
+                };
+                if text.trim().is_empty() {
+                    // Undo the request rather than leaving an unanswered instruction
+                    // in the transcript, exactly as the sufficiency turn does.
+                    messages.pop();
+                } else {
+                    messages.push(ChatMessage::assistant(text.clone()));
+                    let parsed = parse_numbered_sections(&text);
+                    let banked_now = parsed.len();
+                    // Replaced, not merged: a later checkpoint saw more evidence, so
+                    // its version of a section supersedes the earlier one.
+                    for (number, body) in parsed {
+                        state.draft_sections.insert(number, body);
+                    }
+                    info!(
+                        steps,
+                        checkpoints,
+                        banked_now,
+                        banked_total = state.draft_sections.len(),
+                        "Banked the sections the run can already answer."
+                    );
+                }
+                // No `step` event: there is no tool call, and a `step` frame with no
+                // argument key would break `each_action_names_its_argument_on_the_wire`.
+                // A step that is invisible on the wire is a real asymmetry, but a
+                // sanctioned one — a rejected duplicate is already exactly that. The
+                // `progress` event below carries the increment.
+                send(tx, token, emit_progress(steps, &tally))?;
+            }
+
             // A mid-batch exhaustion of either kind: the batch was answered in full,
             // so the transcript is well-formed and the run can stop.
             if matches!(
@@ -5068,6 +5486,9 @@ async fn research_inner(
         // and the list of open items is something the report turn is told to produce
         // from the plan anyway. It used to run unconditionally *and* unbudgeted,
         // which made it a full transcript resend charged to nobody.
+        //
+        // Its per-item verdict is kept: the sectioned writer hands each section the
+        // run's own judgement of its sub-question rather than asking for a fresh one.
         if state.plan.is_some() && reason == DoneReason::Finalized {
             messages.push(ChatMessage::user(SUFFICIENCY_REQUEST.to_string()));
             let checked = chat_turn(
@@ -5095,6 +5516,7 @@ async fn research_inner(
             if verdict.trim().is_empty() {
                 messages.pop();
             } else {
+                sufficiency_verdict = Some(verdict.clone());
                 messages.push(ChatMessage::assistant(verdict.clone()));
                 let elapsed = started.elapsed();
                 let spent = tally.prompt_tokens + tally.eval_tokens;
@@ -5235,58 +5657,122 @@ async fn research_inner(
             }
         }
     };
-    messages.push(ChatMessage::user(report_request(
-        reason,
-        &state,
-        params.budget,
-        started.elapsed(),
-        shed,
-    )));
     // Set (never cleared) by any report turn whose reply was cut at `num_predict`.
     // Its only use is the rewrite instruction below: a report that was cut is the
     // one case where "write it again" should also say "write it shorter".
     let mut length_capped = false;
-    let drafted = write_report(
-        ollama,
-        params,
-        &mut messages,
-        tx,
-        token,
-        writing,
-        &mut tally,
-        false,
-        &mut length_capped,
-    )
-    .await;
     // Whether the report the caller receives was written by the server rather than
     // by the model. Skips the citation-repair phase (there is neither time nor a
     // model left to ask) and is journalled, since "how often is the report window
     // too tight?" is not answerable from anything else.
     let mut forced = false;
-    let mut summary = match drafted {
-        Ok(ReportOutcome::Written(text)) => text,
-        // The window expired before any report existed. The run still owes the caller
-        // an answer, so the server writes an honest one from what the run actually
-        // saw — a 200 stream that simply ends without a `summary` is the worst of the
-        // available outcomes.
-        Err(e) if is_deadline_stop(token, writing, &e) => {
+
+    // Sectioned when the plan parsed into at least `MIN_SECTIONED_PLAN_ITEMS`
+    // numbered sub-questions, whole-document otherwise. The fallback is the safety
+    // valve, not an edge case: the plan turn degrades rather than fails, models do
+    // stop numbering, and a run without a plan has no denominator to divide a report
+    // into. It takes the path this file has always had, byte-for-byte — which is
+    // also what makes the whole feature revertible by one constant.
+    let plan_items: Vec<PlanItem> = state
+        .plan
+        .as_deref()
+        .map(parse_plan_items)
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_REPORT_SECTIONS)
+        .collect();
+    let mut sectioned: Option<SectionedReport> = None;
+
+    let mut summary = if plan_items.len() >= MIN_SECTIONED_PLAN_ITEMS {
+        info!(
+            sections = plan_items.len(),
+            "Writing the report one plan item at a time."
+        );
+        messages[0] = ChatMessage::system(section_system_prompt(params.budget));
+        let written = write_sectioned_report(
+            ollama,
+            params,
+            &mut messages,
+            tx,
+            writing,
+            &mut tally,
+            &plan_items,
+            sufficiency_verdict.as_deref(),
+            &state,
+            report_started,
+            &mut length_capped,
+        )
+        .await?;
+        if let Some(m) = &params.metrics {
+            for outcome in &written.outcomes {
+                m.research
+                    .report_sections
+                    .get_or_create(&crate::backend::metrics::OutcomeLabels { outcome })
+                    .inc();
+            }
+        }
+        // Not one section survived: the window or the model gave out before any real
+        // text existed. That is the same outcome `forced_synthesis` describes, and it
+        // must be labelled the same way — a document of stubs is server-written, and
+        // sending it back to be grounded would ask a model that just produced nothing
+        // to produce citations.
+        if !written.outcomes.contains(&"written") {
             warn!(
-                report_timeout_ms = params.report_timeout_ms,
-                "The report window expired before the model produced a report; \
-                 shipping a server-written account of the run instead."
+                sections = written.outcomes.len(),
+                "No section of the report could be written; the document is the \
+                 server's own account of the run."
             );
             forced = true;
             run_tools.forced_synthesis = true;
-            forced_synthesis(
-                params,
-                &state,
-                &evidence,
-                reason,
-                report_started.duration_since(started),
-            )
         }
-        Ok(failed) => return Err(failed.into_abort()),
-        Err(e) => return Err(e),
+        let text = written.text.clone();
+        sectioned = Some(written);
+        text
+    } else {
+        messages.push(ChatMessage::user(report_request(
+            reason,
+            &state,
+            params.budget,
+            started.elapsed(),
+            shed,
+        )));
+        let drafted = write_report(
+            ollama,
+            params,
+            &mut messages,
+            tx,
+            token,
+            writing,
+            &mut tally,
+            false,
+            &mut length_capped,
+        )
+        .await;
+        match drafted {
+            Ok(ReportOutcome::Written(text)) => text,
+            // The window expired before any report existed. The run still owes the
+            // caller an answer, so the server writes an honest one from what the run
+            // actually saw — a 200 stream that simply ends without a `summary` is the
+            // worst of the available outcomes.
+            Err(e) if is_deadline_stop(token, writing, &e) => {
+                warn!(
+                    report_timeout_ms = params.report_timeout_ms,
+                    "The report window expired before the model produced a report; \
+                     shipping a server-written account of the run instead."
+                );
+                forced = true;
+                run_tools.forced_synthesis = true;
+                forced_synthesis(
+                    params,
+                    &state,
+                    &evidence,
+                    reason,
+                    report_started.duration_since(started),
+                )
+            }
+            Ok(failed) => return Err(failed.into_abort()),
+            Err(e) => return Err(e),
+        }
     };
 
     // ── citation revalidation ────────────────────────────────────────────────
@@ -5533,76 +6019,122 @@ async fn research_inner(
         }
 
         // ── rewrite ──────────────────────────────────────────────────────────
-        messages[0] = ChatMessage::system(report_system_prompt(params.budget));
-        let mut rewrite_request = String::from(
-            "Now write the final report. It replaces the draft entirely, so repeat \
-             everything that should survive. Keep every claim the evidence supports, \
-             fix the citations that did not check out — point them at a location a \
-             tool actually returned — and drop any claim you could not ground. \
-             Markdown only, no preamble, no JSON.",
-        );
-        // Only when the draft was actually severed. Saying it unconditionally would
-        // teach every rewrite to shrink a report that was the right length.
-        if length_capped {
-            rewrite_request.push_str(
-                "\n\nYour previous reply was cut off at the generation limit before it \
-                 finished, which is why the draft ends where it does. Write a shorter \
-                 report — cover the same ground in fewer words.",
-            );
-        }
-        messages.push(ChatMessage::user(rewrite_request));
-        // A failed rewrite must not lose a draft that was merely mis-cited: the
-        // draft is still the better of the two answers, and its citation report
-        // already tells the caller which parts to distrust. That covers a rewrite
-        // that came back empty *and* one that could not be asked for at all.
-        let rewritten = match write_report(
-            ollama,
-            params,
-            &mut messages,
-            tx,
-            token,
-            writing,
-            &mut tally,
-            true,
-            &mut length_capped,
-        )
-        .await
-        {
-            Ok(ReportOutcome::Written(text)) => Some(text),
-            Ok(_) => {
-                warn!("The rewrite turn produced no report; shipping the draft as it stood.");
-                None
-            }
-            // The window expiring mid-rewrite is the case this whole arm was
-            // written for: a mis-cited report still beats none, and its
-            // `citations` event says which parts to distrust.
-            Err(e) if is_deadline_stop(token, writing, &e) => {
-                warn!("The report window expired during the rewrite; shipping the draft.");
-                None
-            }
-            Err(ResearchAbort::Cancelled) => return Err(ResearchAbort::Cancelled),
-            Err(e) => {
+        //
+        // A sectioned report is repaired section by section. The whole-document
+        // rewrite says "it replaces the draft entirely, so repeat everything that
+        // should survive" — a second full-volume generation of the document that
+        // just failed, which is the failure mode this generation exists to remove.
+        // Only the sections a defective citation actually landed in are regenerated;
+        // the rest are kept byte-for-byte.
+        if let Some(report) = &sectioned {
+            let defective = defective_sections(&summary, &evidence, report);
+            if defective.is_empty() {
                 warn!(
-                    reason = %e.reason(),
-                    "The rewrite turn failed; shipping the draft as it stood."
+                    "The report's citations did not check out, but none landed inside a \
+                     section; shipping it as it stands."
                 );
-                None
-            }
-        };
-        match rewritten {
-            Some(text) => {
-                summary = text;
+            } else {
+                info!(
+                    sections = ?defective,
+                    "Rewriting only the sections whose citations did not check out."
+                );
+                summary = rewrite_sections(
+                    ollama,
+                    params,
+                    &mut messages,
+                    tx,
+                    writing,
+                    &mut tally,
+                    report,
+                    &plan_items,
+                    &defective,
+                    &mut length_capped,
+                )
+                .await;
                 citations = check_citations(&summary, &evidence);
             }
-            None => send(
+            // Nothing streamed at any point on this path — every section turn kept
+            // the content gate closed — so the assembled document goes out whole.
+            send(
                 tx,
                 token,
                 ResearchEvent::Summary {
                     text: summary.clone(),
                 },
-            )?,
+            )?;
+            revalidation = Some(rv);
+        } else {
+            messages[0] = ChatMessage::system(report_system_prompt(params.budget));
+            let mut rewrite_request = String::from(
+                "Now write the final report. It replaces the draft entirely, so repeat \
+             everything that should survive. Keep every claim the evidence supports, \
+             fix the citations that did not check out — point them at a location a \
+             tool actually returned — and drop any claim you could not ground. \
+             Markdown only, no preamble, no JSON.",
+            );
+            // Only when the draft was actually severed. Saying it unconditionally would
+            // teach every rewrite to shrink a report that was the right length.
+            if length_capped {
+                rewrite_request.push_str(
+                    "\n\nYour previous reply was cut off at the generation limit before it \
+                 finished, which is why the draft ends where it does. Write a shorter \
+                 report — cover the same ground in fewer words.",
+                );
+            }
+            messages.push(ChatMessage::user(rewrite_request));
+            // A failed rewrite must not lose a draft that was merely mis-cited: the
+            // draft is still the better of the two answers, and its citation report
+            // already tells the caller which parts to distrust. That covers a rewrite
+            // that came back empty *and* one that could not be asked for at all.
+            let rewritten = match write_report(
+                ollama,
+                params,
+                &mut messages,
+                tx,
+                token,
+                writing,
+                &mut tally,
+                true,
+                &mut length_capped,
+            )
+            .await
+            {
+                Ok(ReportOutcome::Written(text)) => Some(text),
+                Ok(_) => {
+                    warn!("The rewrite turn produced no report; shipping the draft as it stood.");
+                    None
+                }
+                // The window expiring mid-rewrite is the case this whole arm was
+                // written for: a mis-cited report still beats none, and its
+                // `citations` event says which parts to distrust.
+                Err(e) if is_deadline_stop(token, writing, &e) => {
+                    warn!("The report window expired during the rewrite; shipping the draft.");
+                    None
+                }
+                Err(ResearchAbort::Cancelled) => return Err(ResearchAbort::Cancelled),
+                Err(e) => {
+                    warn!(
+                        reason = %e.reason(),
+                        "The rewrite turn failed; shipping the draft as it stood."
+                    );
+                    None
+                }
+            };
+            match rewritten {
+                Some(text) => {
+                    summary = text;
+                    citations = check_citations(&summary, &evidence);
+                }
+                None => send(
+                    tx,
+                    token,
+                    ResearchEvent::Summary {
+                        text: summary.clone(),
+                    },
+                )?,
+            }
+            revalidation = Some(rv);
         }
-        revalidation = Some(rv);
     } else {
         // Nothing streamed it — the gate was closed for the draft — so send it
         // whole.
@@ -5922,6 +6454,415 @@ impl ReportOutcome {
             detail: detail.into(),
         }
     }
+}
+
+/// A report written one plan item at a time, and where each part of it landed.
+struct SectionedReport {
+    text: String,
+    /// Each section's plan-item number and its **char** range in `text`. Char, not
+    /// byte: a report is arbitrary UTF-8 and indexing it by byte is the panic this
+    /// codebase has already paid for once. Used to map a defective citation back to
+    /// the one section that must be rewritten.
+    ranges: Vec<(usize, std::ops::Range<usize>)>,
+    /// Per-section outcome, for the metric. `written` plus one of the failure
+    /// labels, all from a set the server defines.
+    outcomes: Vec<&'static str>,
+}
+
+impl SectionedReport {
+    /// The plan-item number whose section contains this char offset.
+    fn section_at(&self, offset: usize) -> Option<usize> {
+        self.ranges
+            .iter()
+            .find(|(_, r)| r.contains(&offset))
+            .map(|(n, _)| *n)
+    }
+}
+
+/// Assemble sections into one document under a server-written title.
+///
+/// The heading comes from the question by the same derivation `repair_missing_heading`
+/// uses and readers already fall back to — which retires the missing-heading defect
+/// for sectioned reports entirely. One consequence worth stating: `extract_report_title`
+/// reads the model's first heading, and here there is none, so **every sectioned run
+/// stores `title = NULL`** and its readers fall back to the question. Exactly what a
+/// repaired-heading run already does.
+fn assemble_sections(
+    question: &str,
+    sections: &[(usize, String, &'static str)],
+) -> SectionedReport {
+    let derived = research_title(question);
+    let title = if derived.trim().is_empty() {
+        "Research report"
+    } else {
+        derived.trim()
+    };
+    let mut text = format!("# {title}\n");
+    let mut ranges = Vec::new();
+    let mut outcomes = Vec::new();
+    for (number, body, outcome) in sections {
+        text.push('\n');
+        let start = text.chars().count();
+        text.push_str(body.trim());
+        text.push('\n');
+        ranges.push((*number, start..text.chars().count()));
+        outcomes.push(*outcome);
+    }
+    SectionedReport {
+        text,
+        ranges,
+        outcomes,
+    }
+}
+
+/// Write the report one plan item at a time.
+///
+/// The change this exists for: a report used to be one turn, so a model that could
+/// not produce it produced *nothing* — a fifteen-minute run returning zero, which is
+/// what the field report measured. Six short turns fail one at a time, and a failed
+/// one costs its section rather than the document.
+///
+/// The shared prefix — system prompt, question, plan, notes, evidence digest,
+/// transcript — is built once by the caller and reused in place: each section pushes
+/// its request, takes its turn, and pops it again. Sections already written are
+/// represented to later turns by their **headings only**; feeding back their prose
+/// would grow the prompt to compensate for shrinking the output.
+///
+/// Bounded three ways at once, because this is a new turn-producing path:
+/// `MAX_REPORT_SECTIONS` caps how many exist, `MAX_SECTION_ATTEMPTS` caps the retries
+/// per section, and two soft checks — `MIN_SECTION_MS` of window and
+/// `REPORT_TOKEN_OVERDRAFT` of budget — stub the rest rather than starting a turn
+/// that cannot finish. None of them is a `break` in the tool loop, so no new
+/// `DoneReason` variant is needed: a failed section is a degradation, not a stop.
+#[allow(clippy::too_many_arguments)]
+async fn write_sectioned_report(
+    ollama: &dyn OllamaModel,
+    params: &ResearchParams,
+    messages: &mut Vec<ChatMessage>,
+    tx: &UnboundedSender<ResearchEvent>,
+    writing: &CancellationToken,
+    tally: &mut TokenTally,
+    items: &[PlanItem],
+    verdict: Option<&str>,
+    state: &RunState,
+    report_started: Instant,
+    length_capped: &mut bool,
+) -> Result<SectionedReport, ResearchAbort> {
+    let total = items.len();
+    let words = match params.budget.max_report_words {
+        0 => 0,
+        w => (w / total.max(1)).max(1),
+    };
+    let num_predict = match words {
+        0 => None,
+        w => Some(w as u64 * crate::config::REPORT_WORDS_TO_TOKENS),
+    };
+    let token_ceiling = (params.budget.max_tokens as f64 * REPORT_TOKEN_OVERDRAFT) as u64;
+    let window = Duration::from_millis(params.report_timeout_ms);
+
+    let mut written_headings: Vec<String> = Vec::new();
+    let mut sections: Vec<(usize, String, &'static str)> = Vec::new();
+
+    // A section the run cannot write now, but banked at a checkpoint, ships the
+    // banked version. It is strictly better than a stub in every way that matters:
+    // the model wrote it, its citations are real, and its only defect is that it saw
+    // less evidence than a fresh turn would have. Saying "could not be written" over
+    // text the run actually produced would be the worse lie.
+    let fallback = |item: &PlanItem, why: &'static str, label: &'static str| match state
+        .draft_sections
+        .get(&item.number)
+    {
+        Some(banked) => (
+            item.number,
+            format!(
+                "{}\n\n*Written at a checkpoint during the investigation, not at the \
+                     end: {why}.*",
+                banked.trim()
+            ),
+            "written",
+        ),
+        None => (item.number, section_stub(item, why), label),
+    };
+
+    for (i, item) in items.iter().enumerate() {
+        // Starting a section with nothing left to write it in buys a cancelled turn
+        // and a stub; stubbing directly spends nothing and says the same thing.
+        let left = window.saturating_sub(report_started.elapsed());
+        if writing.is_cancelled() || left < Duration::from_millis(MIN_SECTION_MS) {
+            warn!(
+                section = item.number,
+                "The report window ran out before this section could be started; \
+                 stubbing it and shipping the rest."
+            );
+            sections.push(fallback(item, "the report window expired", "timed_out"));
+            continue;
+        }
+        if tally.prompt_tokens + tally.eval_tokens >= token_ceiling {
+            warn!(
+                section = item.number,
+                "The report phase overran its token overdraft; stubbing the remaining \
+                 sections."
+            );
+            sections.push(fallback(item, "the token budget was spent", "skipped"));
+            continue;
+        }
+
+        let request = section_request(
+            i + 1,
+            total,
+            item,
+            verdict.and_then(|v| verdict_line_for(v, item.number)),
+            words,
+            &written_headings,
+            state.draft_sections.get(&item.number).map(String::as_str),
+        );
+        messages.push(ChatMessage::user(request));
+
+        let mut body: Option<String> = None;
+        for attempt in 0..MAX_SECTION_ATTEMPTS {
+            let sampling = Sampling {
+                seed: params.sampling.seed.map(|s| s.wrapping_add(attempt as i64)),
+                num_predict,
+                ..params.sampling
+            };
+            let outcome = match chat_turn(
+                ollama,
+                params,
+                messages,
+                NO_TOOLS,
+                tx,
+                writing,
+                TurnOpts {
+                    // Never streamed: the content gate stays closed until the
+                    // assembled document's citations have been checked, and a
+                    // half-written section arriving out of order would be worse
+                    // than a silence.
+                    stream_content: false,
+                    sampling,
+                },
+            )
+            .await
+            {
+                Ok(o) => tally.record(o),
+                // A cancelled turn here is the window or the client. Either way this
+                // section is not coming, and the caller decides which it was.
+                Err(ResearchAbort::Cancelled) => break,
+                Err(e) => {
+                    messages.pop();
+                    return Err(e);
+                }
+            };
+            if matches!((num_predict, outcome.eval_tokens), (Some(n), Some(e)) if e >= n) {
+                *length_capped = true;
+                if let Some(m) = &params.metrics {
+                    m.research.report_length_caps.inc();
+                }
+            }
+            let text = outcome.content;
+            if text.trim().is_empty() || looks_like_tool_call_attempt(&text) {
+                continue;
+            }
+            if !validate_markdown_body(&text).is_empty() {
+                continue;
+            }
+            body = Some(text);
+            break;
+        }
+        messages.pop();
+
+        match body {
+            Some(text) => {
+                // The model was told to open with `## N.`. When it did, take that
+                // section and drop whatever else came with it; when it did not, keep
+                // the prose and supply the heading — the text is the work, the
+                // heading is one line of syntax.
+                let parsed = parse_numbered_sections(&text);
+                let section = parsed.get(&item.number).cloned().unwrap_or_else(|| {
+                    format!("## {}. {}\n\n{}", item.number, item.text, text.trim())
+                });
+                written_headings.push(format!("#{}", item.number));
+                sections.push((item.number, section, "written"));
+            }
+            None => {
+                warn!(
+                    section = item.number,
+                    "The model produced no usable text for this section after \
+                     {MAX_SECTION_ATTEMPTS} attempts; stubbing it."
+                );
+                sections.push(fallback(item, "the model returned nothing usable", "empty"));
+            }
+        }
+    }
+    Ok(assemble_sections(&params.question, &sections))
+}
+
+/// Which sections a defective citation actually landed in.
+///
+/// This is what makes the repair proportionate. A whole-document rewrite regenerates
+/// everything to fix one bad line — a second full-volume generation of the document
+/// that just failed, at exactly the moment the run has least budget left. Mapping
+/// each failing citation back to its section means the repair costs one turn per
+/// broken section and leaves the rest byte-for-byte.
+///
+/// Char offsets throughout: a report is arbitrary UTF-8 and must never be indexed by
+/// byte. `parse_citations` reports byte offsets, so they are converted here — once,
+/// at the single place the two coordinate systems meet.
+fn defective_sections(
+    report: &str,
+    evidence: &Evidence,
+    sectioned: &SectionedReport,
+) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for (byte_offset, c) in parse_citations_at(report) {
+        let bad = !matches!(evidence.verdict(&c), Verdict::Verified) || evidence.is_stale(&c.path);
+        if !bad {
+            continue;
+        }
+        let char_offset = report[..byte_offset].chars().count();
+        if let Some(n) = sectioned.section_at(char_offset)
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    }
+    out.truncate(MAX_SECTION_REWRITES);
+    out
+}
+
+/// Regenerate the named sections and reassemble the document.
+///
+/// Infallible by design: this runs *after* a report exists, so every failure here
+/// costs the repair rather than the run — a mis-cited section is still the better of
+/// "that section" and "nothing", and the `citations` event says which parts to
+/// distrust. Cancellation is not special-cased for the same reason; the caller's
+/// next `send` reports a departed client.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_sections(
+    ollama: &dyn OllamaModel,
+    params: &ResearchParams,
+    messages: &mut Vec<ChatMessage>,
+    tx: &UnboundedSender<ResearchEvent>,
+    writing: &CancellationToken,
+    tally: &mut TokenTally,
+    report: &SectionedReport,
+    items: &[PlanItem],
+    defective: &[usize],
+    length_capped: &mut bool,
+) -> String {
+    let words = match params.budget.max_report_words {
+        0 => 0,
+        w => (w / items.len().max(1)).max(1),
+    };
+    let num_predict = match words {
+        0 => None,
+        w => Some(w as u64 * crate::config::REPORT_WORDS_TO_TOKENS),
+    };
+    let mut replaced: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    for number in defective {
+        let Some(item) = items.iter().find(|i| i.number == *number) else {
+            continue;
+        };
+        if writing.is_cancelled() {
+            break;
+        }
+        let mut request = format!(
+            "Rewrite section {number} — and only that section. Its citations did not \
+             check out. Keep every claim the evidence supports, point each `path:start-end` \
+             at a location a tool actually returned this run, and DROP any claim you \
+             cannot ground rather than re-citing it elsewhere. Begin with `## {number}. ` \
+             and a short title. Markdown only, no preamble, no JSON."
+        );
+        if words > 0 {
+            request.push_str(&format!(" At most {words} words."));
+        }
+        if *length_capped {
+            request.push_str(
+                " Your previous reply was cut off at the generation limit; write this \
+                 one shorter.",
+            );
+        }
+        messages.push(ChatMessage::user(request));
+        let turn = chat_turn(
+            ollama,
+            params,
+            messages,
+            NO_TOOLS,
+            tx,
+            writing,
+            TurnOpts {
+                stream_content: false,
+                sampling: Sampling {
+                    num_predict,
+                    ..params.sampling
+                },
+            },
+        )
+        .await;
+        messages.pop();
+        let text = match turn {
+            Ok(o) => tally.record(o).content,
+            Err(e) => {
+                warn!(
+                    section = number,
+                    reason = %e.reason(),
+                    "A section rewrite failed; keeping the section as it stood."
+                );
+                continue;
+            }
+        };
+        if text.trim().is_empty() || !validate_markdown_body(&text).is_empty() {
+            warn!(
+                section = number,
+                "A section rewrite came back unusable; keeping the section as it stood."
+            );
+            continue;
+        }
+        let parsed = parse_numbered_sections(&text);
+        let body = parsed
+            .get(number)
+            .cloned()
+            .unwrap_or_else(|| format!("## {}. {}\n\n{}", item.number, item.text, text.trim()));
+        replaced.insert(*number, body);
+    }
+    if replaced.is_empty() {
+        return report.text.clone();
+    }
+    // Rebuilt from the same pieces so the document keeps its shape and its ranges
+    // stay meaningful: only the named sections differ.
+    let sections: Vec<(usize, String, &'static str)> = report
+        .ranges
+        .iter()
+        .map(|(number, range)| {
+            let body = replaced.get(number).cloned().unwrap_or_else(|| {
+                report
+                    .text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.len())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            });
+            (*number, body, "written")
+        })
+        .collect();
+    assemble_sections(&params.question, &sections).text
+}
+
+/// The sufficiency verdict's line for one plan item, if it wrote one.
+///
+/// The verdict is already per-item (`SUFFICIENCY_REQUEST` asks for "the number, then
+/// ANSWERED … or UNANSWERED …"), so the section turn gets the run's own judgement of
+/// its sub-question rather than being asked to re-form one.
+fn verdict_line_for(verdict: &str, number: usize) -> Option<&str> {
+    verdict.lines().map(str::trim).find(|line| {
+        let digits: String = line.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<usize>() == Ok(number)
+            && matches!(
+                line.chars().nth(digits.len()),
+                Some('.') | Some(')') | Some(' ')
+            )
+    })
 }
 
 /// Ask for a report.
@@ -6928,6 +7869,7 @@ mod tests {
     enum ToollessTurn {
         Plan,
         Sufficiency,
+        Checkpoint,
         Report,
     }
 
@@ -6940,6 +7882,10 @@ mod tests {
         {
             Some(PLAN_REQUEST) => ToollessTurn::Plan,
             Some(SUFFICIENCY_REQUEST) => ToollessTurn::Sufficiency,
+            Some(CHECKPOINT_REQUEST) => ToollessTurn::Checkpoint,
+            // Section turns and whole-report turns are both "the report" to a fake:
+            // both consume the scripted `reports` list, in order, which is what lets
+            // one script drive either path.
             _ => ToollessTurn::Report,
         }
     }
@@ -6951,6 +7897,15 @@ mod tests {
     /// re-enter the tool loop.
     const FAKE_VERDICT_COMPLETE: &str = "1. ANSWERED src/research.rs:10-20\n\
                                          2. ANSWERED src/worker/gc.rs:5-9";
+    /// A plan long enough to be written in sections — `MIN_SECTIONED_PLAN_ITEMS`,
+    /// which is also the smallest `PLAN_REQUEST` asks for.
+    const FAKE_PLAN_SECTIONED: &str = "1. What ends the loop? — src/research.rs\n\
+                                       2. What does GC delete? — src/worker/gc.rs\n\
+                                       3. What stops an orphan? — src/db/qdrant.rs";
+    /// Its verdict, one line per item.
+    const FAKE_VERDICT_SECTIONED: &str = "1. ANSWERED src/research.rs:10-20\n\
+                                          2. ANSWERED src/worker/gc.rs:10-40\n\
+                                          3. UNANSWERED — never reached";
 
     /// Scripted Ollama: pops the next reply per call; each reply is a
     /// (thinking, content) pair.
@@ -6979,6 +7934,9 @@ mod tests {
                 let canned = match toolless_turn(messages) {
                     ToollessTurn::Plan => Some(FAKE_PLAN),
                     ToollessTurn::Sufficiency => Some(FAKE_VERDICT_COMPLETE),
+                    // Nothing banked: the loop undoes the request, so a test that
+                    // did not ask for checkpoints is unaffected if one fires.
+                    ToollessTurn::Checkpoint => Some(""),
                     ToollessTurn::Report => None,
                 };
                 if let Some(text) = canned {
@@ -7394,6 +8352,10 @@ mod tests {
             // Generous too: a test about the investigation must not be ended by the
             // report window, and the tests that *are* about the window set it.
             report_timeout_ms: 3_600_000,
+            // Off unless a test is about checkpoints: they cost a step and take a
+            // toolless turn, so leaving them on would move the step arithmetic of
+            // every unrelated loop test.
+            checkpoint_every_steps: 0,
             // Off unless a test is about the guard: the fakes emit a short thinking
             // delta every turn, and a guard armed by default would be a tripwire on
             // every one of these runs rather than a thing under test.
@@ -7788,6 +8750,16 @@ mod tests {
         /// The sufficiency verdict. Complete by default; a test that wants the
         /// tool loop re-opened sets one naming an UNANSWERED item.
         verdict: &'static str,
+        /// The checkpoint turn's reply. Empty by default, which the loop reads as
+        /// "nothing banked" and undoes — so a test that has not asked for
+        /// checkpoints is unaffected even if one fires.
+        checkpoint: &'static str,
+        /// The plan turn's reply. Two items by default, which is **below**
+        /// `MIN_SECTIONED_PLAN_ITEMS` — so the default fake takes the single-turn
+        /// report path, and a test about sectioning opts in by setting a longer one.
+        /// That split is deliberate: the two paths are different enough that a test
+        /// should say which it is about.
+        plan: &'static str,
         /// The transcript of every turn that was offered tools, so a test can
         /// assert what the model was actually shown — which is the only way to
         /// check that a plan survives and that the state note is pinned rather
@@ -7814,6 +8786,8 @@ mod tests {
                 turn_delay: Duration::ZERO,
                 report_delay: Duration::ZERO,
                 verdict: FAKE_VERDICT_COMPLETE,
+                checkpoint: "",
+                plan: FAKE_PLAN,
                 transcripts: Mutex::new(Vec::new()),
                 report_prompts: Mutex::new(Vec::new()),
                 samplings: Mutex::new(Vec::new()),
@@ -7850,8 +8824,9 @@ mod tests {
                     }
                 }
                 let text = match kind {
-                    ToollessTurn::Plan => FAKE_PLAN.to_string(),
+                    ToollessTurn::Plan => self.plan.to_string(),
                     ToollessTurn::Sufficiency => self.verdict.to_string(),
+                    ToollessTurn::Checkpoint => self.checkpoint.to_string(),
                     ToollessTurn::Report => {
                         self.report_prompts.lock().unwrap().push(
                             messages
@@ -8693,6 +9668,317 @@ mod tests {
             bounded,
             vec![900 * crate::config::REPORT_WORDS_TO_TOKENS],
             "exactly one turn — the report — is bounded: {samplings:?}"
+        );
+    }
+
+    // ── writing the report in sections ───────────────────────────────────────
+
+    #[test]
+    fn a_plan_with_numbered_items_is_split_into_sections() {
+        let items = parse_plan_items(FAKE_PLAN_SECTIONED);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].number, 1);
+        // The separator styles models actually use are stripped; the text is not.
+        assert_eq!(items[0].text, "What ends the loop? — src/research.rs");
+        // The model's own numbering is kept, not the index: the sufficiency verdict
+        // and the checkpoint drafts key on it.
+        assert_eq!(
+            parse_plan_items("4) first\n7. second")
+                .iter()
+                .map(|i| i.number)
+                .collect::<Vec<_>>(),
+            vec![4, 7]
+        );
+        // Prose the model wrapped its plan in is not a plan item.
+        assert!(parse_plan_items("Here is my plan:\n- a thing\n- another").is_empty());
+    }
+
+    /// A plan is model output and therefore arbitrary UTF-8. The parser must not
+    /// index into it by byte, which is the panic this codebase has already paid for.
+    #[test]
+    fn a_plan_is_arbitrary_utf8_and_must_never_panic_the_parser() {
+        for plan in [
+            "1. Как работает GC? — src/worker/gc.rs",
+            "1．全角のピリオド",
+            "1.",
+            "1.   ",
+            "999999999999999999999999. overflow",
+        ] {
+            let _ = parse_plan_items(plan);
+        }
+        assert_eq!(
+            parse_plan_items("1. Как работает GC? — src/worker/gc.rs")[0].text,
+            "Как работает GC? — src/worker/gc.rs"
+        );
+        // A number with no text is not a sub-question.
+        assert!(parse_plan_items("1.\n2.   ").is_empty());
+    }
+
+    fn sectioned_fake(turns: Vec<Vec<ToolCall>>, reports: Vec<&'static str>) -> NativeOllama {
+        let mut fake = NativeOllama::new(turns, reports);
+        fake.plan = FAKE_PLAN_SECTIONED;
+        fake.verdict = FAKE_VERDICT_SECTIONED;
+        fake
+    }
+
+    fn summary_of(events: &[ResearchEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ResearchEvent::Summary { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The point of the whole change: one section failing costs that section, not
+    /// the document. Before this, a report was one turn — so a model that could not
+    /// produce it produced *nothing*, which is the fifteen-minutes-for-zero outcome
+    /// the field report measured.
+    #[tokio::test]
+    async fn a_section_that_fails_does_not_lose_the_others() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                "## 1. The loop\n\nIt ends on counters — src/worker/gc.rs:10-40.",
+                // The middle section comes back empty on both of its attempts, so
+                // there are two entries: the fake serves one reply per turn, and a
+                // retry is a turn.
+                "",
+                "",
+                "## 3. Orphans\n\nGC reclaims them — src/worker/gc.rs:10-40.",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let summary = summary_of(&events);
+
+        assert!(summary.contains("It ends on counters"), "{summary}");
+        assert!(summary.contains("GC reclaims them"), "{summary}");
+        // The one that failed says so by name rather than vanishing, so the document
+        // keeps the plan's shape.
+        assert!(summary.contains("could not be written"), "{summary}");
+        assert!(summary.contains("What does GC delete?"), "{summary}");
+    }
+
+    /// The server writes the document's title, so a sectioned report can never fail
+    /// the gate for a missing heading — and, as a consequence, `extract_report_title`
+    /// finds no model-written heading, which is why every sectioned run stores a
+    /// null title and falls back to the question.
+    #[tokio::test]
+    async fn the_assembled_document_passes_the_markdown_gate() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec!["## 1. A\n\nsrc/worker/gc.rs:10-40"],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let summary = summary_of(&events);
+
+        assert!(
+            validate_report_markdown(&summary).is_empty(),
+            "the assembly must be well-formed: {summary}"
+        );
+        assert!(summary.starts_with("# "), "{summary}");
+        assert_eq!(
+            extract_report_title(&summary, "How does GC work?"),
+            None,
+            "the heading is the server's, derived from the question, so no title is stored"
+        );
+    }
+
+    /// A section legitimately opens with `##`, or with prose when the server supplies
+    /// its heading. Holding one to the whole-document heading rule would refuse every
+    /// correctly written section.
+    #[test]
+    fn a_section_is_not_refused_for_lacking_a_leading_h1() {
+        assert!(validate_markdown_body("## 2. Something\n\nprose").is_empty());
+        assert!(validate_markdown_body("just prose").is_empty());
+        // The body checks still apply.
+        assert!(!validate_markdown_body("").is_empty());
+        assert!(!validate_markdown_body("{\"a\": 1}").is_empty());
+        assert!(!validate_markdown_body("text\n```rust\nfn x() {}").is_empty());
+        // …and the whole-document check still wants a heading, which a section
+        // whose heading the server supplied does not have.
+        assert!(validate_report_markdown("just prose").contains(&MISSING_HEADING.into()));
+    }
+
+    /// The bound that matters most, because this is a new turn-producing path: a
+    /// model that never returns anything usable must not spin. Three sections at two
+    /// attempts each is the whole budget, and then the run ships stubs.
+    #[tokio::test]
+    async fn the_section_writer_terminates_on_counters() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![""],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+
+        let report_turns = ollama.report_prompts.lock().unwrap().len();
+        assert!(
+            report_turns <= MAX_REPORT_SECTIONS * MAX_SECTION_ATTEMPTS,
+            "the writer must terminate on counters, took {report_turns} turns"
+        );
+        // Not one section survived, so the document is the server's own account —
+        // and must say so on the wire rather than reading as a flawless report that
+        // happens to cite nothing.
+        let server_written = events.iter().find_map(|e| match e {
+            ResearchEvent::Citations { server_written, .. } => Some(*server_written),
+            _ => None,
+        });
+        assert_eq!(server_written, Some(true), "{events:?}");
+    }
+
+    /// Only the section a bad citation landed in is regenerated. The whole-document
+    /// rewrite asks for the entire report again — a second full-volume generation of
+    /// the document that just failed, at the moment the run has least budget left.
+    #[tokio::test]
+    async fn only_the_defective_section_is_rewritten() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                "## 1. Fine\n\nsrc/worker/gc.rs:10-40",
+                // Section 2 cites a path no tool returned.
+                "## 2. Broken\n\nsrc/invented.rs:1-9",
+                "## 3. Fine\n\nsrc/worker/gc.rs:10-40",
+                // The one rewrite turn, for section 2 alone.
+                "## 2. Fixed\n\nsrc/worker/gc.rs:10-40",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let summary = summary_of(&events);
+
+        assert!(summary.contains("## 2. Fixed"), "{summary}");
+        assert!(!summary.contains("src/invented.rs"), "{summary}");
+        // The sections that were right are kept byte-for-byte, not regenerated.
+        assert!(summary.contains("## 1. Fine"), "{summary}");
+        assert!(summary.contains("## 3. Fine"), "{summary}");
+        let last = ollama
+            .report_prompts
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        assert!(
+            last.contains("Rewrite section 2") && last.contains("only that section"),
+            "the rewrite must name the one section: {last}"
+        );
+    }
+
+    /// A citation's byte offset and its char offset diverge the moment the report
+    /// contains one non-ASCII character, and mapping a defect to the wrong section
+    /// would rewrite the wrong one. Cyrillic prose is the case that does it.
+    #[test]
+    fn a_section_range_is_measured_in_chars_not_bytes() {
+        let sections = vec![
+            (
+                1usize,
+                "## 1. Раздел\n\nПроза src/a.rs:1-2".to_string(),
+                "written",
+            ),
+            (
+                2usize,
+                "## 2. Второй\n\nПроза src/b.rs:3-4".to_string(),
+                "written",
+            ),
+        ];
+        let report = assemble_sections("How does GC work?", &sections);
+        // Every citation must land in its own section, which only holds if the
+        // ranges and the offsets are counted in the same unit.
+        for (byte_offset, c) in parse_citations_at(&report.text) {
+            let char_offset = report.text[..byte_offset].chars().count();
+            let expected = if c.path == "src/a.rs" { 1 } else { 2 };
+            assert_eq!(
+                report.section_at(char_offset),
+                Some(expected),
+                "citation {} landed in the wrong section",
+                c.path
+            );
+        }
+    }
+
+    // ── checkpoints ──────────────────────────────────────────────────────────
+
+    /// A checkpoint costs a step — charging it is what makes it visible in the
+    /// budget the operator set — but emits no `step` event, because there is no tool
+    /// call and a `step` frame with no argument key would break the wire contract.
+    /// A step invisible on the wire is a real asymmetry; a rejected duplicate is
+    /// already exactly that, so this pins it as a decision rather than an oversight.
+    #[tokio::test]
+    async fn a_checkpoint_costs_a_step_and_emits_no_step_event() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("search", json!({"query": "qdrant delete_batch"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec!["## 1. A\n\nsrc/worker/gc.rs:10-40"],
+        ));
+        let mut p = params(8);
+        p.checkpoint_every_steps = 2;
+        let events = run_native_shared(ollama.clone(), p).await;
+
+        let step_events = events
+            .iter()
+            .filter(|e| matches!(e, ResearchEvent::Step { .. }))
+            .count();
+        assert_eq!(step_events, 2, "two lookups, two step events: {events:?}");
+        // But three steps were spent: the checkpoint took one.
+        let spent = events
+            .iter()
+            .filter_map(|e| match e {
+                ResearchEvent::Done { progress, .. } => Some(progress.steps),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(
+            spent,
+            Some(3),
+            "the checkpoint must cost a step: {events:?}"
+        );
+    }
+
+    /// The payoff: a run cut short ships the model's own findings instead of the
+    /// server's stub. This is the fifteen-minutes-for-nothing case, and the whole
+    /// reason a checkpoint is worth a step.
+    #[tokio::test]
+    async fn a_stopped_run_ships_the_checkpointed_sections_not_a_stub() {
+        let mut fake = sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("search", json!({"query": "qdrant delete_batch"}))],
+            ],
+            vec!["## 1. A\n\nsrc/worker/gc.rs:10-40"],
+        );
+        // The checkpoint reply: one section banked mid-investigation.
+        fake.checkpoint = "## 2. Banked\n\nDeletes are soft — src/worker/gc.rs:10-40.";
+        let ollama = Arc::new(fake);
+        let mut p = params(2);
+        p.checkpoint_every_steps = 2;
+        // No report window at all, so the report phase cannot write anything and the
+        // banked section is the only content that exists.
+        p.report_timeout_ms = 1;
+        let events = run_native_shared(ollama.clone(), p).await;
+        let summary = summary_of(&events);
+
+        assert!(
+            summary.contains("Deletes are soft"),
+            "the banked section must survive the stop: {summary}"
+        );
+        assert!(
+            !summary.contains("No report was produced"),
+            "a run with banked findings is not a blank stub: {summary}"
         );
     }
 

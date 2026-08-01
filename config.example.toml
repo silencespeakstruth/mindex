@@ -150,13 +150,31 @@ max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking chann
                                       # degrades to a plan-less run, the tool loop charges a
                                       # bounded parse retry). Startup refuses a small non-zero
                                       # value, which would abandon healthy turns instead.
-report_timeout_ms = 120000            # how long the report phase gets AFTER the investigation
+report_timeout_ms = 300000            # how long the report phase gets AFTER the investigation
                                       # deadline. A window of its own, because the run that most
                                       # needs to synthesise what it found is the one that ran out
                                       # of time. So the longest a caller waits is
                                       # max_seconds + report_timeout_ms. If it expires with a draft
                                       # in hand the draft ships; with nothing, the server writes an
                                       # honest "cut short after N minutes" notice.
+                                      # Raised 120 s -> 300 s when the report stopped being one
+                                      # turn: a plan of 3+ numbered items is now written one
+                                      # section at a time, so this window covers up to six
+                                      # generations plus a per-section repair pass. Anything that
+                                      # reads the worst-case wait (scout's RESEARCH_TOTAL_TIMEOUT)
+                                      # has to move with it.
+checkpoint_every_steps = 6            # investigate this many steps, then spend ONE turn banking the
+                                      # report sections that are already answerable. 0 = off.
+                                      # The insurance policy on a run that does not finish: a
+                                      # deadline / repeated_calls / unparseable stop used to reach
+                                      # the report phase with nothing banked and ship a server-written
+                                      # stub; with this it ships the model's own findings.
+                                      # It COSTS A STEP, deliberately — the operator's step budget is
+                                      # where its cost should show. At 6 against medium's 20 that is
+                                      # ~15% of the run's lookups spent writing, which is a pure loss
+                                      # for a run that would have finished anyway. UNMEASURED: compare
+                                      # coverage on and off at the same seeds before trusting it, and
+                                      # be ready for the answer to be "0, except at low effort".
 health_timeout_ms = 2000              # /health liveness-ping timeout for Ollama (GET /api/tags)
 models_refresh_interval_seconds = 300 # how often the local Ollama model registry is re-read for
                                       # the research.models list GET /config publishes. A catalog

@@ -760,6 +760,98 @@ Whether announcing a budget changes anything at all is the open question
 uncorrelated, the prompt half of the knob is dead weight and only `num_predict`
 earns its place.
 
+## The report is written in sections (2026-08-01)
+
+Bounding the output is necessary and not sufficient: it makes each report
+smaller, but the report is still **one turn**, so a model that cannot produce
+it still produces nothing. That is the shape of every zero-return run in the
+field report. Sectioning removes the all-or-nothing property itself.
+
+A plan of `MIN_SECTIONED_PLAN_ITEMS` (3, what `PLAN_REQUEST` asks for) or more
+is written one sub-question per turn. Below that — or with no plan — the run
+takes the single-turn path this file has always had, byte-for-byte. That
+fallback is not an edge case; it is the safety valve *and* the revert switch,
+and it is why the plan turn's documented degradation (a plan-less run rather
+than a failed one) stays harmless.
+
+**What each section turn sees.** Its sub-question, the run's own sufficiency
+verdict on that item — machinery that already existed and was being thrown
+away — the word allowance, and the other sections' **headings only**. Feeding
+back their prose would grow the prompt to compensate for shrinking the output,
+which is the same bug wearing a different hat. A banked checkpoint draft of the
+same section is included when there is one, which is what makes six turns cheap
+rather than six cold starts.
+
+**Bounds, because this is a new turn-producing path.** `MAX_REPORT_SECTIONS` 6;
+`MAX_SECTION_ATTEMPTS` 2 — deliberately not `MAX_EMPTY_REPORT_RETRIES` (5),
+which was sized for the single turn a whole report used to take, and 5 × 6 is
+thirty report turns; `MAX_SECTION_REWRITES` 3. Two further checks **stub rather
+than stop**: `MIN_SECTION_MS` (10 s) of window left, and
+`REPORT_TOKEN_OVERDRAFT` (1.5) of the token budget — the report phase has
+always been outside that budget's reach, which was immaterial at one turn and
+is not at six. None of these is a `break` in the tool loop, so **no new
+`DoneReason` variant**: a failed section is a degradation, not a stop. That is
+the first thing to check when reviewing this.
+
+**The repair became proportionate.** The whole-document rewrite instruction
+says "it replaces the draft entirely, so repeat everything that should
+survive" — a second full-volume generation of the document that just failed, at
+the moment the run has least budget left. `defective_sections` maps each failing
+citation back to its section and only those are regenerated.
+`parse_citations_at` reports byte offsets, converted to char offsets at that one
+seam: a report is arbitrary UTF-8, section ranges are counted in chars, and
+mixing the two would rewrite the wrong section the moment a report contains one
+Cyrillic word.
+
+**Checkpoints are the other half.** `[research].checkpoint_every_steps` (6,
+`0` = off) interrupts the loop to bank the sections already answerable into
+`RunState::draft_sections` — keyed by plan item, **replaced never merged**,
+since a later checkpoint saw more evidence. A checkpoint **costs a step** *and*
+is capped by `MAX_CHECKPOINTS` (8), both on purpose: charging it puts its cost
+where the operator set the budget, and the cap stops a mis-set interval from
+turning a run into a writing exercise. It emits **no `step` event** — there is
+no tool call, and a `step` frame with no argument key would break
+`each_action_names_its_argument_on_the_wire`. A step invisible on the wire is a
+real asymmetry, but a sanctioned one: a rejected duplicate already is exactly
+that, and a test pins it so it reads as a decision.
+
+The payoff is the fifteen-minutes-for-nothing case. A section that cannot be
+written at the end ships its banked version — the model wrote it, its citations
+are real, and its only defect is that it saw less evidence — and
+`forced_synthesis` assembles banked findings under a derived title instead of
+"**No report was produced.**"
+
+**Consequences worth stating rather than discovering.** `report_timeout_ms`
+rises 120 s → 300 s: the window's meaning is unchanged (the tail a caller
+waits) but what has to fit inside it is not, and scout's `TOTAL_TIMEOUT` moves
+with it — that comment exists because this exact drift has bitten once already.
+`validate_report_markdown` splits into `validate_markdown_body` (empty / JSON /
+unclosed fence, which every fragment owes) plus the heading check (which only a
+whole document owes), because a section legitimately opens with `##`, or with
+prose when the server supplies its heading. And **every sectioned run stores
+`title = NULL`**: the document's heading is the server's, so
+`extract_report_title` finds no model-written one and readers fall back to the
+question — exactly what a repaired-heading run already does. Section headings
+themselves derive from the *plan*, which is model-authored, so a `path.rs:1-2`
+inside a plan item can reach the provenance report; that is the model's own
+text and is scored honestly, but the neighbouring `repair_missing_heading` rule
+points the other way and the difference is subtle.
+
+`PROMPT_VERSION` 1.4 → **2.0**, MAJOR: the run is asked to do a different job —
+write section *i* of *n* blind to the others' prose, and bank partial sections
+mid-investigation. No corpus comparison across this boundary is valid.
+
+**What must be measured.** Two things, and neither can be reasoned about.
+Sectioning may cost report *quality*: six independently written sections lose
+the cross-cutting synthesis a single pass produces and will repeat each other
+at the seams. Hand-score coverage as well as completion rate — a jump in the
+first paid for by a drop in the second is not a win, and
+`MIN_SECTIONED_PLAN_ITEMS` is the switch that turns it off. And checkpoints
+spend investigation budget on writing: at 6 against `medium`'s 20 steps, ~15%
+of the run's lookups become writing turns, a pure loss for a run that would
+have finished anyway. Measure coverage with them on and off at the same seeds,
+and be prepared for the answer to be "default 0, enable for `low` only".
+
 ### What was measured (2026-07-28)
 
 108 runs — 4 models × 12 questions about this repo × 3 seeds, effort medium,

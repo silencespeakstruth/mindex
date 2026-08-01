@@ -333,6 +333,48 @@ is the `research_runs` table.) The hard invariants:
   report turn's user message, the budget nudges or `tool_specs`. Sampling
   (`temperature/top_p/seed`) is `Option` — absent = model default; a request's
   `seed` overrides config.
+- **A report of 3+ plan items is written one section at a time.** The report used
+  to be a single turn, so a model that could not produce it produced *nothing* —
+  a fifteen-minute run returning zero. Now each numbered sub-question gets its
+  own turn (`write_sectioned_report`), the server assembles the document under a
+  derived `# heading`, and a section that fails costs that section, not the
+  document. Below `MIN_SECTIONED_PLAN_ITEMS` (3, what `PLAN_REQUEST` asks for) —
+  or with no plan at all — the run takes the old single-turn path byte-for-byte,
+  which is the safety valve *and* the revert switch. Bounded three ways because
+  it is a new turn-producing path: `MAX_REPORT_SECTIONS` 6, `MAX_SECTION_ATTEMPTS`
+  2 (not `MAX_EMPTY_REPORT_RETRIES` 5 — that was sized for one turn, and 5×6 is
+  thirty), plus `MIN_SECTION_MS` of window and `REPORT_TOKEN_OVERDRAFT` (1.5)
+  which **stub rather than stop**. No new `DoneReason`: a failed section is a
+  degradation, not a `break`. Each section turn sees its sub-question, the run's
+  own sufficiency verdict on it, and the other sections' **headings only** —
+  feeding back their prose would grow the prompt to compensate for shrinking the
+  output. Two consequences: `validate_report_markdown` splits into
+  `validate_markdown_body` (sections) + the heading check (documents), and
+  **every sectioned run stores `title = NULL`**, since the heading is the
+  server's and `extract_report_title` finds none — exactly what a
+  repaired-heading run already does.
+- **Citation repair regenerates one section, not the document.** The
+  whole-document rewrite says "repeat everything that should survive" — a second
+  full-volume generation of what just failed, when the run has least budget left.
+  `defective_sections` maps each failing citation's offset to its section
+  (`parse_citations_at` gives bytes, converted to **chars** at that one seam —
+  a report is arbitrary UTF-8), and only those are rewritten, capped by
+  `MAX_SECTION_REWRITES` (3). `rewrite_sections` is infallible: a report already
+  exists, so a failure costs the repair, never the run.
+- **Checkpoints make a stopped run return findings.**
+  `[research].checkpoint_every_steps` (6, `0` = off) interrupts the tool loop to
+  bank the sections already answerable into `RunState::draft_sections`, keyed by
+  plan item and **replaced, never merged** (a later checkpoint saw more
+  evidence). It **costs a step** *and* is capped by `MAX_CHECKPOINTS` (8):
+  charging it makes it visible in the operator's budget, the cap stops a mis-set
+  interval eating a run. It emits **no `step` event** — no tool call, and a
+  `step` frame with no argument key breaks
+  `each_action_names_its_argument_on_the_wire`; a step invisible on the wire is
+  sanctioned (a rejected duplicate already is one) and pinned by a test. Payoff:
+  a section that cannot be written now ships its banked version, and
+  `forced_synthesis` assembles real findings instead of "No report was
+  produced." Cost: ~15% of `medium`'s lookups become writing turns — **measure
+  coverage on and off at the same seeds** before trusting the default.
 - **Output volume, not retrieval, is where runs fail** (measured in the field;
   full record in `docs/claude/research.md`). Nothing had ever bounded the
   report: no length in any prompt, and `num_predict` sent on no turn ever.

@@ -130,6 +130,7 @@ pub struct RouterState {
     /// (`[research].report_timeout_ms`). Not a budget axis and not
     /// request-overridable — an operator's bound on the tail of a run.
     pub research_report_timeout_ms: u64,
+    pub research_checkpoint_every_steps: usize,
     /// Thinking characters after which one turn is abandoned
     /// (`[research].max_turn_thinking_chars`, `0` = off). Not published by
     /// `GET /config`: it changes nothing a caller renders, waits for or may set.

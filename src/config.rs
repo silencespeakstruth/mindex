@@ -198,8 +198,25 @@ const DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS: u64 = 120_000;
 /// point of a separate window is that a run which hits the wall still gets to
 /// synthesise what it found, so this cannot come out of the investigation's budget —
 /// which makes `max_seconds + report_timeout_ms` the true worst-case wait.
-const DEFAULT_RESEARCH_REPORT_TIMEOUT_MS: u64 = 120_000;
+///
+/// Raised 120 s → 300 s when the report stopped being one turn: it now covers up to
+/// `MAX_REPORT_SECTIONS` generations plus a per-section repair pass. The window's
+/// *meaning* is unchanged — the tail a caller waits after the investigation — but
+/// what has to fit inside it is not. Anything reading the worst-case wait
+/// (scout's `RESEARCH_TOTAL_TIMEOUT`) moves with it.
+const DEFAULT_RESEARCH_REPORT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS: u64 = 2000;
+/// Steps between checkpoint turns. Six against `medium`'s 20 gives three chances to
+/// bank before the budget binds, at a cost of ~15% of the run's lookups — the number
+/// most in need of measurement in this file.
+const DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 6;
+/// Floor on a non-zero `checkpoint_every_steps`. At 1 the run writes as often as it
+/// looks, which is not an investigation.
+const MIN_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 2;
+/// Checkpoint turns one run may take, whatever the interval says. A backstop on a
+/// mis-set interval, not a tuning knob: eight banked drafts is already more than
+/// `MAX_REPORT_SECTIONS` can use.
+pub const MAX_CHECKPOINTS: usize = 8;
 /// How often the local Ollama model registry is re-read for `GET /config`. Five
 /// minutes because the catalog changes only when a human runs `ollama pull`/`rm`,
 /// and one tick is a single GET bounded by [`DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS`].
@@ -473,6 +490,24 @@ pub struct ResearchConfig {
     /// nothing does, the server writes an honest notice saying the run was cut short.
     /// So the longest a caller can wait is `max_seconds + report_timeout_ms`.
     pub report_timeout_ms: u64,
+    /// Investigate this many steps, then spend one turn banking what is answerable.
+    /// `0` switches checkpoints off.
+    ///
+    /// The insurance policy on a run that does not finish. A deadline,
+    /// `repeated_calls` or `unparseable` stop used to reach the report phase with
+    /// nothing banked, and the caller got a server-written stub after fifteen
+    /// minutes — the failure a real field report measured. A checkpoint turn writes
+    /// the sections that are already answerable into the run's state, so that same
+    /// stop ships findings instead.
+    ///
+    /// It **costs a step**, deliberately: charging it is what makes it visible in
+    /// the budget the operator set, and "price the refusal as a step" is what every
+    /// other turn-consuming addition here does. That is also its cost — at 6 against
+    /// `medium`'s 20 steps, roughly 15% of the run's lookups become writing turns,
+    /// which is a pure loss for a run that would have finished anyway. Measure
+    /// coverage with it on and off at the same seeds before trusting this default;
+    /// the honest possible answer is "0, except at `low`".
+    pub checkpoint_every_steps: usize,
     /// Liveness-ping timeout for the Ollama check in `GET /health`. Ollama is an
     /// optional dependency, so the ping is short and never fails the health verdict.
     pub health_timeout_ms: u64,
@@ -805,6 +840,7 @@ impl Default for ResearchConfig {
             first_token_timeout_ms: DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS,
             max_turn_thinking_chars: DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS,
             report_timeout_ms: DEFAULT_RESEARCH_REPORT_TIMEOUT_MS,
+            checkpoint_every_steps: DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS,
             health_timeout_ms: DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS,
             models_refresh_interval_seconds: DEFAULT_RESEARCH_MODELS_REFRESH_SECONDS,
             // Unset = the model's own Modelfile defaults. Deliberately not pinned
@@ -1625,6 +1661,17 @@ impl Config {
         // start abandoning turns that were only thinking, which is the same class of
         // mistake as a tight `turn_timeout_ms` and would look identical from outside
         // (runs that end early having found nothing). Disabling is spelled `0`.
+        if self.research.checkpoint_every_steps > 0
+            && self.research.checkpoint_every_steps < MIN_RESEARCH_CHECKPOINT_EVERY_STEPS
+        {
+            e.push(format!(
+                "[research].checkpoint_every_steps = {} would spend most of the run writing \
+                 instead of looking. Fix: use at least {MIN_RESEARCH_CHECKPOINT_EVERY_STEPS} \
+                 (default {DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS}), or 0 to switch \
+                 checkpoints off.",
+                self.research.checkpoint_every_steps
+            ));
+        }
         if self.research.max_turn_thinking_chars > 0
             && self.research.max_turn_thinking_chars < MIN_RESEARCH_MAX_TURN_THINKING_CHARS
         {

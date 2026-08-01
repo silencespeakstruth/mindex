@@ -1550,6 +1550,11 @@ pub struct ResearchConfigInfo {
     /// `effort.*.max_seconds` bounds the investigation, and the longest a request can
     /// take is that plus this.
     pub report_timeout_ms: u64,
+    /// Steps between the turns that bank what the run can already answer; `0` = off.
+    /// Published because it comes out of the same step budget `effort.*.max_steps`
+    /// grants — a harness comparing coverage across runs has to know how many of
+    /// those steps went to writing rather than looking.
+    pub checkpoint_every_steps: usize,
     /// The sampling every research turn runs at.
     pub sampling: ResearchSamplingInfo,
 }

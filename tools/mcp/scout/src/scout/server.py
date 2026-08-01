@@ -42,12 +42,14 @@ PROTOCOL = os.environ.get("MINDEX_PROTOCOL", "v0")
 CONNECT_TIMEOUT = float(os.environ.get("RESEARCH_CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = float(os.environ.get("RESEARCH_READ_TIMEOUT", "120"))
 # Must outlast the server's own worst case, which is `effort.high.max_seconds` plus
-# `report_timeout_ms` — 3600 + 120 s at the shipped defaults. This is a CLIENT
+# `report_timeout_ms` — 3600 + 300 s at the shipped defaults. This is a CLIENT
 # ceiling and it has no idea what the server is configured for, so it is set above
 # the default ladder with room to spare: too low and every high-effort run dies in
 # flight, which is exactly what happened when the ladder was raised and this was
-# left at 1800.
-TOTAL_TIMEOUT = float(os.environ.get("RESEARCH_TOTAL_TIMEOUT", "3900"))
+# left at 1800. It moved again when the report window went 120 s -> 300 s to cover
+# a report written one section at a time; this comment is the thing that has to be
+# re-read whenever either server number changes.
+TOTAL_TIMEOUT = float(os.environ.get("RESEARCH_TOTAL_TIMEOUT", "4200"))
 
 # Effort used when the caller doesn't say. It selects a server-configured budget
 # (wall-clock, local tokens and tool calls), so it is also the main latency lever.
