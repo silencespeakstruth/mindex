@@ -162,6 +162,14 @@ _CITATION_KEYS = (
 # citation, verbatim, read from the index rather than written by the model.
 _EXCERPT_KEYS = ("path", "start_line", "end_line", "code")
 
+# Fields kept from the `verdict` event, which only a challenge stream carries:
+# the opponent's conclusion about the subject report. `overall` is null when the
+# verdict turn parsed to nothing — "challenged, inconclusive", which must never
+# be rendered as an acquittal. `grounded: false` means the challenge's own report
+# verified no citations, which the server already used to cap `overall` at
+# "disputed" — an unshown accusation can dispute a report but never refute it.
+_VERDICT_KEYS = ("challenged_run_id", "overall", "grounded", "claims")
+
 # mindex's `done` event says why the loop stopped. Anything but "finalized" means
 # the report was written on partial evidence, and the caller — who is told not to
 # re-verify reports — can only know that if we say so.
@@ -367,6 +375,18 @@ do not scope it. And a run scoped to the wrong place will say so rather than
 inventing an answer, so read the report's own caveats. Standing project-wide
 scope belongs in the repo-root `.mindex` file, not in every call.
 
+REPORTS CARRY A TRUST STATUS. Every stored run's listing shows `trust`:
+`unchallenged` (nobody has attacked it), `confirmed`, `disputed` or `refuted` —
+the aggregated verdict of *valid* challenge runs aimed at it. Weigh a `refuted`
+report as likely wrong and a `disputed` one with care; `unchallenged` merely
+means untested. When a report's correctness is load-bearing — you are about to
+build on it, hand it to a human, or chain serious work onto it — order a
+refutation pass with the `challenge` tool: a local model re-derives the report's
+claims against the index and files a verdict, for wall-clock only. An
+inconclusive challenge (null `overall`) is NOT an acquittal, and an ungrounded
+one is capped at `disputed` — the server enforces both, so read `verdict` as
+given.
+
 If a call returns a connection error, mindex or its local model is down: report
 that and stop. Don't retry blindly, and don't substitute your own investigation.
 """
@@ -532,6 +552,14 @@ async def research(
     # as an oversight-fix.
 
     url = f"{SERVER}/{PROTOCOL}/{project_guid}/research"
+    return await _run(url, body, include_excerpts)
+
+
+async def _run(url: str, body: dict[str, Any], include_excerpts: bool) -> dict:
+    """Drive one research/challenge SSE stream and shape the result.
+
+    One consumer for both tools, so the reader whitelists, the timeout story and
+    the warning wording cannot drift between them."""
     timeout = httpx.Timeout(TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT, read=READ_TIMEOUT)
 
     report_parts: list[str] = []
@@ -539,6 +567,7 @@ async def research(
     usage: dict[str, Any] = {}
     citations: dict[str, Any] = {}
     excerpts: list[dict[str, Any]] = []
+    verdict: dict[str, Any] = {}
     excerpts_truncated = False
     excerpts_total = 0
     elapsed_ms = 0
@@ -658,6 +687,9 @@ async def research(
                     # would quietly under-report how much evidence the report rests
                     # on.
                     excerpts_total = int(data.get("total", len(excerpts)))
+                elif event == "verdict":
+                    # Challenge streams only: the opponent's conclusion.
+                    verdict = {k: v for k, v in data.items() if k in _VERDICT_KEYS}
                 elif event == "error":
                     failure = f"{data.get('code', 'error')}: {data.get('detail', '')}"
                 # `thinking` deltas are deliberately dropped: they are the local
@@ -747,10 +779,16 @@ async def research(
             )
     # Echoed back so a report read later knows what it was allowed to see. A scoped
     # report and an unscoped one are otherwise the same document, and the scoped one
-    # can only speak about its scope.
-    if include or exclude:
+    # can only speak about its scope. (A challenge sends no scope of its own — it
+    # inherits the subject's on the server — so nothing is echoed for it.)
+    if body.get("include") or body.get("exclude"):
         out["scope"] = {
-            k: v for k, v in (("include", include), ("exclude", exclude)) if v
+            k: v
+            for k, v in (
+                ("include", body.get("include")),
+                ("exclude", body.get("exclude")),
+            )
+            if v
         }
     if truncated_by_client:
         out["truncated_by_client"] = True
@@ -770,6 +808,22 @@ async def research(
                 f"job, holding a research slot. Cancel it with "
                 f"DELETE /research/active/{live_run_id}, or check "
                 f"GET /research/active, before starting another research run."
+            )
+    if verdict:
+        out["verdict"] = verdict
+        overall = verdict.get("overall")
+        if overall is None:
+            out["verdict_warning"] = (
+                "The challenge ran but its verdict turn produced nothing parseable "
+                "— the subject is CHALLENGED, INCONCLUSIVE. Do not read this as the "
+                "report being confirmed; if the verdict matters, run the challenge "
+                "again."
+            )
+        elif not verdict.get("grounded", True):
+            out["verdict_warning"] = (
+                "The challenge's own report verified no citations, so its verdict "
+                f"was capped at '{overall}': an accusation that showed no code can "
+                "dispute a report but never refute it."
             )
     if citations:
         out["citations"] = citations
@@ -817,6 +871,74 @@ async def research(
             "The local model stopped before it was satisfied with the evidence.",
         )
     return out
+
+
+@mcp.tool()
+async def challenge(
+    project_guid: str,
+    run_id: str,
+    effort: str = DEFAULT_EFFORT,
+    model: str | None = None,
+    budget: dict[str, Any] | None = None,
+    include_excerpts: bool = False,
+) -> dict:
+    """Set an opponent on a stored research report — refutation as a service.
+
+    A local model receives the stored report as the SUBJECT UNDER EXAMINATION,
+    extracts its principal claims, and spends a whole research budget trying to
+    refute each one against the live index. Nothing from the subject counts as
+    evidence: every location must be re-derived through the opponent's own
+    tools, and that re-derivation IS the check. The result is a challenge report
+    (same shape as `research`) plus a `verdict`:
+
+        {"challenged_run_id", "overall", "grounded", "claims": [{claim, verdict}]}
+
+    `overall` is "confirmed" / "disputed" / "refuted" — or null, meaning the
+    verdict turn parsed to nothing: CHALLENGED, INCONCLUSIVE, never an
+    acquittal. `grounded: false` means the challenge itself verified no
+    citations, and the server capped its verdict at "disputed": an accusation
+    that showed no code can dispute but never refute.
+
+    The verdict also lands on the SUBJECT as a derived trust status
+    (`unchallenged`/`confirmed`/`disputed`/`refuted`) that every research
+    listing shows from now on — this is the durable half. A challenge whose own
+    evidence goes stale stops counting automatically.
+
+    WHEN TO USE IT: before building further work on a report whose correctness
+    matters — a report you are about to hand to a human, cite in a decision, or
+    chain many follow-ups onto. It costs a full research run of wall-clock, so
+    challenge reports that have earned the scrutiny, not every answer.
+
+    Refused (400) when the subject is no longer valid — its files moved, so
+    "the code changed" cannot be spent as "the report was wrong"; re-run the
+    research first. Also refused when the subject is itself a challenge:
+    contest a bad challenge by challenging the original again, or delete it.
+
+    Args:
+        project_guid: The project's mindex GUID (from the repo-root .mindex file).
+        run_id: The stored run to challenge — `run_id` from a `research` result
+            or from GET /projects/{guid}/research.
+        effort: Same ladder as `research`; "medium" is right for most reports.
+        model: Optional Ollama model override. Challenging with a DIFFERENT
+            model than wrote the subject is the interesting experiment.
+        budget: Same per-axis override dict as `research`.
+        include_excerpts: As on `research` — the challenge's own verified
+            citations come with verbatim code the same way.
+    """
+    run_id = run_id.strip()
+    if not run_id:
+        raise ValueError("run_id must not be empty")
+    if effort not in _EFFORTS:
+        raise ValueError(f"effort must be one of {sorted(_EFFORTS)}, got {effort!r}")
+
+    body: dict[str, Any] = {"effort": effort}
+    if model:
+        body["model"] = model
+    if budget:
+        body["budget"] = budget
+
+    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research/{run_id}/challenge"
+    return await _run(url, body, include_excerpts)
 
 
 def main() -> None:

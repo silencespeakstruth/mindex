@@ -30,9 +30,10 @@ use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
     delete_files, delete_history, delete_project, delete_research_active, delete_research_run,
     delete_research_runs, get_config, get_files, get_health, get_metrics, get_project_stats,
-    get_projects, get_research_active, get_research_run, get_research_runs, get_status,
-    get_version, post_cancel, post_drift, post_gc, post_history, post_index, post_research,
-    post_research_pin, post_retry, post_search, post_symbols,
+    get_projects, get_research_active, get_research_run, get_research_runs,
+    get_research_verification, get_status, get_version, post_cancel, post_drift, post_gc,
+    post_history, post_index, post_research, post_research_challenge, post_research_pin,
+    post_retry, post_search, post_symbols,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -453,6 +454,12 @@ fn build_router(
         .route("/v0/{project_guid}/search", post(post_search))
         .route("/v0/{project_guid}/symbols", post(post_symbols))
         .route("/v0/{project_guid}/research", post(post_research))
+        // The opponent: a research run whose subject is a stored report. Same
+        // loop, same semaphore — the data plane, like the run that produced it.
+        .route(
+            "/v0/{project_guid}/research/{run_id}/challenge",
+            post(post_research_challenge),
+        )
         .route(
             "/v0/{project_guid}/history",
             post(post_history).delete(delete_history),
@@ -483,6 +490,12 @@ fn build_router(
         .route(
             "/projects/{project_guid}/research/{run_id}/pin",
             post(post_research_pin),
+        )
+        // The offline re-check: pure SQLite over the journalled spans and
+        // baselines, so "does this report still hold" costs a read, not a rerun.
+        .route(
+            "/projects/{project_guid}/research/{run_id}/verification",
+            get(get_research_verification),
         )
         // Live runs, unlike the stored ones above, are not per project: the
         // semaphore they contend for is global, and a caller planning a queue needs

@@ -1115,3 +1115,128 @@ Decisions of record:
   A stale README is also, on inspection, the likeliest source of the "docs mention
   effort levels beyond low/medium/high" report: the repo has exactly three
   everywhere, and the budget shape-knob table reads like a fourth if skimmed.
+
+## The run became re-verifiable, and got an opponent (2026-08-01)
+
+Three workstreams shipped together (migration 5,
+`v1.3.0_research_verification.sql`), all serving one goal: reports a frontier
+model can *trust mechanically* — checked at write time, re-checkable later
+without a GPU, and attackable on demand.
+
+### Structured persistence (what the journal was missing)
+
+`check_citations(report, &Evidence)` is a pure function, and everything it
+needs except one input already survived journalling: the report is a column,
+staleness is a read-time join. The missing input was `PathEvidence.spans` —
+which lines the tools actually showed the model. Without them a stored run's
+`verified`/`path_only` split was unrecomputable forever; that is the whole
+reason `research_run_evidence (run_id, path, spans_json)` exists. It is NOT a
+column on `research_run_files`, although both are keyed `(run_id, path)`: the
+baselines drop paths that were never probed for a hash, while spans must keep
+them (a path shown without a baseline still verifies citations), and widening
+`sha256` to nullable would have forced a semantic edit onto the validity CTE.
+
+Beside it: `research_run_citations` (one row per citation *occurrence*, report
+order, duplicates kept — collapsing them would make the rows disagree with the
+counters), and `research_run_steps` (the tool-call trace: call + argument +
+landing spans + `at_ms`, **no result bodies** — the code is in the index, and a
+copy would outweigh the corpus while going stale against it). The trace rows
+are built at the same sites as the `step` SSE frames from the same locals, so
+wire and journal cannot drift. Checkpoints write no trace row, matching their
+wire invisibility.
+
+The rebuild also closed the metadata gaps: `model_digest`/`model_details_json`
+(from the model catalog's `/api/tags` snapshot at admission — no network call
+on the request path, NULL until the first tick rather than ever fabricated),
+`top_p`, the four unjournalled grants, `checkpoint_every_steps`/
+`checkpoints_taken`, the `revalidation_*` counters (previously dropped at
+`insert_run`'s door), `sufficiency_verdict`, `embedder_model_id`,
+`server_version`, `started_at` (admission wall-clock; `created_at` was always
+the *end*), and `scope_spec_json` — the scope as data, because `scope_json` is
+the rendered prose the model reads and cannot be parsed back. Failed/cancelled
+runs stay unjournalled (deliberate, deferred): five readers lean on "row =
+finished run".
+
+### Offline re-verification
+
+`GET /projects/{guid}/research/{run_id}/verification` reconstructs `Evidence`
+from the journal (`recheck_citations` in `research.rs`) and re-runs the same
+check — pure SQLite, no model. Two deliberately separated answers: provenance
+is immutable and must match the stored counters (`provenance_matches: false`
+means the journal or the reconstruction is broken, never the report); staleness
+is computed against the index NOW and is the number that moves. Nothing is
+stamped — derived like validity, so it can never disagree with a
+recomputation. Pre-migration rows: `spans_available: false`, staleness half
+only; recomputing provenance without spans would score everything `unverified`
+and the check would be lying. The discriminator is `started_at IS NOT NULL`
+(same migration as the spans), not "no evidence rows" — a run genuinely shown
+nothing also has none.
+
+### The challenge (the dissertation-defense pass)
+
+`POST /v0/{guid}/research/{run_id}/challenge` runs the ordinary loop against a
+stored report. Design decisions, in the order they were argued:
+
+- **Same semaphore, same runtime.** The GPU is the scarce resource; a second
+  pool would over-admit the one thing `max_concurrent` protects.
+- **The subject is hearsay, harder.** Injected before the plan turn with the
+  refutation framing; never seeds `Evidence`. This is not just invariant
+  preservation — re-deriving every location through the tools **is** the
+  refutation work, and it is why an opponent's confirmation means something.
+- **Claims are the plan.** `challenge_plan_request` asks for the report's
+  principal factual claims as numbered plan items, so the claim list the
+  verdict is scored against is the plan the model already produced and revised.
+  A server-side claim extractor was rejected (no NLP server-side; headings are
+  server-derived on forced syntheses); fenced JSON was rejected (the codebase
+  already built a content gate because these models mangle JSON).
+- **Verdicts are the sufficiency mechanism pointed at claims**: one toolless
+  turn, dictated vocabulary CONFIRMED/DISPUTED/REFUTED, parsed line-wise, last
+  keyword on a line wins. Runs under the report window's token so a challenge
+  can never stretch past what `/health` and the watchdog reason about. Every
+  failure shape → `verdict: NULL` = "challenged, inconclusive" (never a
+  `break`, never a failed run, never an acquittal). A forced-synthesis report
+  gets no verdict turn at all — scoring claims for a report the model never
+  wrote would invent a verdict.
+- **The grounding cap** is the rule that makes the feature safe with weak
+  models: `citations.verified == 0` on the challenge's own report caps the
+  verdict at `disputed`. An accusation that showed no code can dispute but
+  never refute.
+- **Trust is derived, never stored** (`research_trust_column`): over valid
+  challenges only — the same `invalid` CTE that governs context, so a
+  challenge whose evidence moved stops counting with no write anywhere.
+  Severity wins; inconclusive counts toward none (a garbage challenge must not
+  mark reports disputed). Single-level by construction: challenging a
+  challenge is a 400 — contest a bad challenge by challenging the original
+  again (a later valid challenge outweighs) or deleting it.
+- **Subject validity is an admission gate** (400
+  `research.challenge_subject_invalid`): a challenge scores claims against the
+  code as indexed now, and "the code changed" must not be spendable as "the
+  report was wrong".
+- **Scope is inherited**, from `scope_spec_json`: the opponent may read exactly
+  what its subject could. A scoped run journalled before the structured scope
+  existed is refused (`scope_unavailable`) rather than challenged with
+  different walls.
+- **Wire**: one new event, `verdict`, challenge streams only, between
+  `excerpts` and `done`. An ordinary stream is byte-for-byte unchanged —
+  pinned by `an_ordinary_run_emits_no_verdict_event` and
+  `verdict_wire_fields_are_stable`.
+- **Question spelling**: a challenge's `question` column is
+  `Challenge research #N: <subject question>` — self-describing in every list,
+  title fallback and `GET /research/active` without a registry change.
+
+Consumers: summaries carry `kind`/`challenged_run_id`/`challenge_verdict`/
+`trust` (`RESEARCH_SUMMARY_COLUMNS` 19 → 23); `list_research` labels
+challenges and non-default trust; `read_research` prepends a warning block on
+disputed/refuted subjects; scout gained the `challenge` tool and the trust
+paragraph in `_INSTRUCTIONS`; VS Code badges rows and renders the verdict
+above a challenge's report. `worker::research_stats` filters
+`kind = 'research'` — `observed` is a promise about `POST /research`, and a
+challenge's cost profile differs (the whole subject report rides in its
+prompt). `mindex_research_challenges_total{outcome}` counts verdicts
+(`inconclusive` is its own label); rare counter — `increase()`, never
+`rate()`.
+
+Not done, deliberately: journalling failed/cancelled runs; a challenge MCP
+tool on the `mindex` server (scout owns it); mock_ollama integration coverage
+of the verdict turn (unit-level fakes cover the loop; add a scripted
+integration case when the next mock_ollama change is in flight anyway).

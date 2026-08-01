@@ -815,6 +815,27 @@ pub struct ResearchRequest {
     pub context_run_ids: Option<Vec<String>>,
 }
 
+/// `POST /v0/{project_guid}/research/{run_id}/challenge` body — the same knobs
+/// as `ResearchRequest` minus what the subject supplies: the question comes from
+/// the stored run, the scope is the subject's own (a challenge may read exactly
+/// what its subject could, and nothing more), and prior context is the subject
+/// itself.
+#[derive(Deserialize, Serialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChallengeRequest {
+    /// Ollama model to drive the opponent. Falls back to
+    /// `[research].default_model`; 400 if both are absent. Challenging with a
+    /// *different* model than wrote the subject is the interesting experiment.
+    pub model: Option<String>,
+    /// Challenge depth — the same `[research.effort.*]` ladder.
+    #[schema(value_type = String, example = "medium")]
+    pub effort: crate::research::Effort,
+    /// Per-request budget override, identical semantics to `POST /research`.
+    pub budget: Option<ResearchBudgetOverride>,
+    /// RNG seed, as on `POST /research`.
+    pub seed: Option<i64>,
+}
+
 /// Per-request overrides for the `effort` preset.
 ///
 /// Two axes are deliberately absent. `context_fraction` is a guard against
@@ -1307,6 +1328,21 @@ pub struct ResearchRunSummary {
     /// ascending `seq`, deleted entries last. What lets a human pick context with
     /// confidence: every report this one leaned on, each with its own state.
     pub context: Vec<ResearchRunDependency>,
+    /// `research` or `challenge` — whether this run answered a question or
+    /// attacked another run's report.
+    pub kind: String,
+    /// For a challenge: the run it attacked. May name a run that no longer
+    /// exists (no FK by design); `null` on research runs.
+    pub challenged_run_id: Option<String>,
+    /// For a challenge: its overall verdict over the subject's claims
+    /// (`confirmed`/`disputed`/`refuted`), or `null` — inconclusive, which is
+    /// **not** an acquittal. `null` on research runs.
+    pub challenge_verdict: Option<String>,
+    /// The derived trust status of THIS run, from valid challenges aimed at it:
+    /// `refuted` > `disputed` > `confirmed` > `unchallenged` (severity wins; a
+    /// stale challenge stops counting automatically; an inconclusive one counts
+    /// toward none). Derived at read time like `valid` — nothing is stored.
+    pub trust: String,
 }
 
 /// One run in another run's context chain (direct or transitive).
@@ -1358,6 +1394,58 @@ pub struct ResearchRunDetail {
     pub scope: Option<String>,
     /// Per-file freshness — the honest form of `stale`.
     pub files: Vec<ResearchRunFile>,
+}
+
+/// One citation-verdict tally, for the verification endpoint: the same five
+/// counters the run journalled, in the same buckets.
+#[derive(Serialize, Debug, PartialEq, Eq, ToSchema)]
+pub struct CitationCounts {
+    pub total: i64,
+    pub verified: i64,
+    pub path_only: i64,
+    pub unverified: i64,
+    /// Orthogonal to the three verdicts, as everywhere else.
+    pub stale: i64,
+}
+
+/// `GET /projects/{guid}/research/{run_id}/verification` — the stored report's
+/// citations re-checked against the journal and today's index. Pure SQLite:
+/// no model, no GPU, safe to call as often as staleness matters.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchVerification {
+    pub run_id: String,
+    pub seq: i64,
+    /// Derived validity, the same predicate the list/detail endpoints compute.
+    pub valid: bool,
+    /// Why `valid` is false; `null` when valid.
+    pub invalid_reason: Option<&'static str>,
+    /// Whether the run was journalled with its evidence spans (v1.3.0+). Runs
+    /// stored before that can only be re-checked for staleness — recomputing
+    /// their provenance would score every citation `unverified` and read as a
+    /// degraded report, which would be the check lying.
+    pub spans_available: bool,
+    /// The counters the run itself journalled, verbatim.
+    pub recorded: CitationCounts,
+    /// The same check re-run today. Provenance must equal `recorded`'s (report
+    /// and spans are immutable); `stale` is computed against the index as it
+    /// stands **now** — the number that moves, and the reason to call this.
+    /// `null` when `spans_available` is false.
+    pub recomputed: Option<CitationCounts>,
+    /// `recomputed`'s provenance == `recorded`'s (total/verified/path_only/
+    /// unverified; `stale` deliberately excluded — it is *expected* to move).
+    /// `false` means the journal and the re-check disagree about immutable
+    /// facts: report a bug. `null` when `spans_available` is false.
+    pub provenance_matches: Option<bool>,
+    /// Citation staleness against today's index, computable for every run —
+    /// old rows included — from the baselines alone.
+    pub stale_citations_now: i64,
+    /// The cited paths behind that count, deduplicated and capped like the
+    /// run's own `stale_paths`.
+    pub stale_paths_now: Vec<String>,
+    /// Baseline currency, the same numbers the summary carries: how many files
+    /// the run read, and how many have changed or left the index since.
+    pub files_total: i64,
+    pub files_moved: i64,
 }
 
 /// `DELETE /projects/{guid}/research` body — the ids to drop.

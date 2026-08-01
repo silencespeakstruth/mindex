@@ -131,9 +131,13 @@ pub(crate) async fn refresh_once(
             // Every journalled run, whatever stopped it: a caller waiting does not
             // care *why* a run took what it took, and a cancelled run is never
             // journalled at all, so there is no abandonment to filter out.
+            // Ordinary research only: `observed` is the promise `GET /config`
+            // makes about `POST /research`, and a challenge's cost profile
+            // differs (the whole subject report rides in its prompt).
             tx.prepare(
                 "SELECT model, effort, elapsed_ms FROM research_runs \
-                 WHERE created_at >= ?1 ORDER BY model, effort, elapsed_ms",
+                 WHERE created_at >= ?1 AND kind = 'research' \
+                 ORDER BY model, effort, elapsed_ms",
             )?
             .query_map(rusqlite::params![cutoff], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))

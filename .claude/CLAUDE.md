@@ -80,22 +80,26 @@ container means mounting a `config.toml`.
   attention kernel**, which returns NaN for padded fp16 rows and still answers
   200 — `attention_backend()` in `__main__.py`; removing it silently corrupts
   every batch of more than one text.
-- Migrations in `src/db/migrations/`. **Four**: `v1.0.0_schema.sql` (version 1,
+- Migrations in `src/db/migrations/`. **Five**: `v1.0.0_schema.sql` (version 1,
   the whole 1.0.0 schema), `v1.1.0_git_history.sql` (2, adds `project_commits`
   + `project_commit_paths`), `v1.1.0_toml_yaml_languages.sql` (3, rebuilds
   `project_files` to widen its `programming_language` CHECK),
   `v1.2.0_research_context.sql` (4, rebuilds `research_runs` for
-  `seq`/`expires_at`/`context_run_ids_json`, adds `research_run_files`). The
+  `seq`/`expires_at`/`context_run_ids_json`, adds `research_run_files`),
+  `v1.3.0_research_verification.sql` (5, rebuilds `research_runs` for the
+  validation metadata + the challenge columns, adds `research_run_evidence` /
+  `research_run_citations` / `research_run_steps`). The
   applied set is the `MIGRATIONS` slice in `main.rs`, keyed by the integer in
   `PRAGMA user_version`; the filename version is documentation. **v1.0.0 is
   frozen** — the filter is `version > user_version`, so an in-place edit never
-  reaches a database stamped at 1 and is skipped in silence. Nine tables:
+  reaches a database stamped at 1 and is skipped in silence. Twelve tables:
   `projects`, `project_files`, `project_file_chunks`, `project_file_status_log`,
   `project_file_symbols`, `research_runs`, `research_run_files`,
+  `research_run_evidence`, `research_run_citations`, `research_run_steps`,
   `project_commits`, `project_commit_paths`. **No 1:1 side tables** — the three
   that existed (an `ADD COLUMN` workaround) were folded back into their parents;
   each cost a hot-path JOIN. A new *field* is a table rebuild (rule 8);
-  `research_run_files` is a genuine 1:N child. `.sqlfluff` raises
+  the four `research_run_*` tables are genuine 1:N children. `.sqlfluff` raises
   `large_file_skip_byte_limit` — sqlfluff skips files over 20 kB with only a
   warning, so without it the schema is silently unlinted.
 - `scripts/entrypoint.sh` generates a self-signed cert on first container start.
@@ -178,7 +182,7 @@ current consts; both nullable, and NULL never matches. `post_search` returns
 the *way* something is produced changed; MAJOR = its *shape* did. All compared
 by plain equality, never ordered — both halves trigger the identical rebuild.
 The set: `CHUNKS_DERIVATION_VERSION`, `SYMBOLS_DERIVATION_VERSION` (both
-`"1.0"`), `PROMPT_VERSION` (`"2.1"`). Deliberately outside it:
+`"1.0"`), `PROMPT_VERSION` (`"2.2"`). Deliberately outside it:
 `COLLECTION_SCHEMA_VERSION` (`"v1"`, a collection-*name* component) and the
 migration `i32` in `PRAGMA user_version`.
 
@@ -273,6 +277,18 @@ let GC clean up.
   the detail query indexes its four columns *from* that constant (a summary
   column added without moving it once handed the caller `invalid_flag` where
   `report` belonged).
+- **Offline re-verification** (`GET /projects/{guid}/research/{run_id}/
+  verification`): `check_citations` re-run as a pure function over journal rows
+  (`report` + `research_run_evidence` spans + `research_run_files` vs
+  `project_files`) — no model, no GPU. Two answers, deliberately separate:
+  **provenance** is immutable and must match the recorded counters
+  (`provenance_matches: false` = journal bug, never news about the code);
+  **staleness** is computed against the index *now* and is the number that
+  moves. Nothing is stamped — derived like validity, so it can never disagree
+  with a recomputation. Pre-v1.3.0 rows: `spans_available: false`, staleness
+  half only (recomputing provenance without spans would score everything
+  `unverified` — the check lying); the discriminator is `started_at IS NOT
+  NULL`, which arrived in the same migration as the spans.
 - **Live research runs** (`GET /research/active`, `DELETE
   /research/active/{run_id}`): global, not per project — the semaphore is. Kept
   off `/projects/{guid}/research` because that list is keyset-paged by `seq`,
@@ -480,10 +496,65 @@ is the `research_runs` table.) The hard invariants:
   orthogonal to provenance (`citations.stale`) and joins the revalidation
   gate. `apply_versions` takes the *asked* path list; a failed probe changes
   no verdicts.
-- **Every finished run is journalled** as one flat `research_runs` row via the
-  `ResearchJournal` seam (`db/research.rs`); best-effort (`warn!`, never a
-  failed run); **no FK to `project_files`** (must never surface in `/drift`);
-  unset sampling = NULL; `NoJournal` is `#[cfg(test)]`-gated.
+- **Every finished run is journalled** as one `research_runs` row **plus its
+  structured children, in one transaction** via the `ResearchJournal` seam
+  (`db/research.rs`): `research_run_files` (baselines),
+  `research_run_evidence` (the shown spans — the one `check_citations` input
+  that otherwise dies with the run, and what makes the offline re-verify
+  possible), `research_run_citations` (per-occurrence verdicts, report order,
+  duplicates kept) and `research_run_steps` (calls + arguments + landing spans,
+  **no result bodies** — the code is in the index). The trace rows are built at
+  the same sites as the `step` SSE frames from the same locals, so wire and
+  journal cannot drift; checkpoints write no trace row (they emit no `step`
+  frame either). Best-effort (`warn!`, never a failed run); **no FK to
+  `project_files`** (must never surface in `/drift`); unset sampling = NULL —
+  as is everything the environment did not provide: `model_digest`/
+  `model_details_json` come from the model-catalog snapshot at admission (NULL
+  until its first tick — never a fabricated identity), `top_p`, the four
+  previously-unjournalled grants, `checkpoint_every_steps`/`checkpoints_taken`,
+  the `revalidation_*` counters, `sufficiency_verdict`, `embedder_model_id`,
+  `server_version`, `started_at` (admission wall-clock; `created_at` is the
+  insert, i.e. the run's *end*). `kind` stays at its DEFAULT `'research'` —
+  the challenge endpoint writes its own rows. `NoJournal` is
+  `#[cfg(test)]`-gated.
+- **The opponent**: `POST /v0/{guid}/research/{run_id}/challenge` is a research
+  run whose subject is a stored report — same loop, same semaphore (a second
+  pool would over-admit the GPU), same budgets, same citation gate on its own
+  report. The subject is injected as hearsay-under-examination (**never seeds
+  Evidence** — re-deriving every location through the tools *is* the
+  refutation; `a_challenged_report_never_seeds_the_evidence`); the plan turn
+  asks for the report's claims (`challenge_plan_request`); a closing toolless
+  verdict turn scores each claim with the dictated vocabulary
+  CONFIRMED/DISPUTED/REFUTED (the sufficiency-turn mechanism — never JSON).
+  **The grounding cap is what makes this safe with weak models**: a challenge
+  whose own report verified zero citations has its verdict capped at
+  `disputed` — an unshown accusation can dispute but never refute. Zero
+  parseable verdict lines → NULL = "challenged, inconclusive", which **no
+  reader may render as an acquittal**. Every failure shape of the verdict turn
+  degrades to inconclusive, never a `break` (the counters-not-clock rule holds
+  with no new counter). The subject must be **valid** (400
+  `research.challenge_subject_invalid` — staleness must not be spendable as
+  refutation) and must not itself be a challenge (400
+  `research.challenge_subject_is_challenge`; trust aggregation is
+  single-level). The scope is the subject's own, re-inhabited from
+  `scope_spec_json` (the structured twin `scope_json` cannot provide — it is
+  rendered prose); a pre-v1.3.0 scoped run is refused (`scope_unavailable`).
+  **Trust is derived at read time, never stored** (`research_trust_column`,
+  the validity philosophy): over *valid* challenges only — a stale challenge
+  stops counting by itself — severity wins (`refuted` > `disputed` >
+  `confirmed` > `unchallenged`), inconclusive counts toward none. Surfaced as
+  `kind`/`challenged_run_id`/`challenge_verdict`/`trust` on every summary
+  (`RESEARCH_SUMMARY_COLUMNS` is 23 now), in `list_research` lines and as a
+  warning block in `read_research` (a refuted report must not read as settled),
+  in VS Code badges, and by scout (which also owns the `challenge` MCP tool).
+  Wire: **one** new event, `verdict`
+  (`{challenged_run_id, overall, grounded, claims}`), challenge streams only,
+  after `excerpts`/before `done`; an ordinary stream is byte-for-byte
+  unchanged (`an_ordinary_run_emits_no_verdict_event`,
+  `verdict_wire_fields_are_stable`). `worker::research_stats` filters
+  `kind='research'` (`observed` is a promise about `POST /research`);
+  `mindex_research_challenges_total{outcome}` counts verdicts
+  (rare counter — `increase()`, never `rate()`).
 - **Stored runs as context**: `context_run_ids` injects prior reports before
   the plan turn. **Prior reports are hearsay** — never seeded into `Evidence`
   (`a_prior_report_never_seeds_the_evidence`); truncated with a marker at
@@ -707,7 +778,7 @@ is the `research_runs` table.) The hard invariants:
   `run_id`/`seq` (null when the journal write failed; rendered as "not
   saved" in VS Code). `started` is always the **first** frame; event order after
   the report is fixed: `summary` → `citations` → `excerpts` (only with a verified
-  citation) → `done`.
+  citation) → `verdict` (challenge streams only) → `done`.
 - **A stream ending without a terminal event is a failure**:
   `SseEventStream` synthesises one `error` (`internal.error`) when the
   channel closes without `done`/`error` (a detached-job panic otherwise reads
@@ -1327,8 +1398,14 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   paths live in a `StatusBarItem` tooltip. Drift's `Sync all` is a synthetic
   row present only while there is actionable drift; its prose lives in
   `viewsWelcome`, not `TreeView.message`.
-- MCP `scout` (`tools/mcp/scout/`): token-economy layer, one tool —
-  `research`, a thin SSE client over `POST /v0/{guid}/research`. The whole
+- MCP `scout` (`tools/mcp/scout/`): token-economy layer, two tools —
+  `research`, a thin SSE client over `POST /v0/{guid}/research`, and
+  `challenge`, the same client pointed at
+  `POST /v0/{guid}/research/{run_id}/challenge` (one `_run` consumer for both,
+  so the reader whitelists cannot drift; `_VERDICT_KEYS` reads the challenge
+  stream's extra event, and `_INSTRUCTIONS` teach the caller the trust field
+  and the two rules a verdict must be read under — inconclusive ≠ acquittal,
+  ungrounded ≤ disputed). The whole
   investigation runs on the server's local model; scout holds no prompt, no
   chunk budget, no Ollama connection — it owns the *reader* (`_STEP_KEYS`,
   `_USAGE_KEYS`, `_CITATION_KEYS`, whitelists that silently drop unknown

@@ -9,7 +9,7 @@
 //! client is gone and the loop stops quietly.
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -74,7 +74,14 @@ use crate::models::ollama::{
 /// the default grant of 6 the prompt is byte-for-byte the 2.0 text — but a
 /// non-default grant changes what the model is asked, and a 4-section corpus must
 /// not read as the same generation as a 12-section one.
-pub const PROMPT_VERSION: &str = "2.1";
+///
+/// 2.1 → 2.2: the challenge generation. A *challenge* run gets its own plan turn
+/// ([`challenge_plan_request`] — claims instead of sub-questions), the subject
+/// injection ([`format_challenge_subject`]) and a closing verdict turn
+/// ([`CHALLENGE_VERDICT_REQUEST`]). MINOR rather than MAJOR because an ordinary
+/// research run's transcript is byte-for-byte 2.1 — the new text reaches only
+/// runs of the new kind, and `kind` on the row is what separates the corpora.
+pub const PROMPT_VERSION: &str = "2.2";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -532,6 +539,22 @@ pub enum ResearchEvent {
         total: usize,
         truncated: bool,
     },
+    /// A challenge run's conclusion about its subject, emitted only on
+    /// challenge streams, after `excerpts` (when any) and before `done`. An
+    /// ordinary research stream never carries this frame — byte-for-byte the
+    /// pre-challenge wire.
+    ///
+    /// `overall` is null when the verdict turn produced nothing parseable:
+    /// "challenged, inconclusive", which a reader must never render as an
+    /// acquittal. `grounded: false` says the challenge's own report verified no
+    /// citations, which caps `overall` at `disputed` — an unshown accusation
+    /// can dispute a report but never refute it.
+    Verdict {
+        challenged_run_id: String,
+        overall: Option<&'static str>,
+        grounded: bool,
+        claims: Vec<ClaimVerdict>,
+    },
     /// The run's final state and full cost. Carries every `progress` field, so a
     /// consumer that only reads `done` still gets the whole record.
     Done {
@@ -684,6 +707,7 @@ impl ResearchEvent {
             ResearchEvent::Summary { .. } => "summary",
             ResearchEvent::Citations { .. } => "citations",
             ResearchEvent::Excerpts { .. } => "excerpts",
+            ResearchEvent::Verdict { .. } => "verdict",
             ResearchEvent::Done { .. } => "done",
             ResearchEvent::Error { .. } => "error",
         }
@@ -769,6 +793,21 @@ impl ResearchEvent {
                         "end_line": e.end_line,
                         "code": e.code,
                     }))
+                    .collect::<Vec<Value>>(),
+            }),
+            ResearchEvent::Verdict {
+                challenged_run_id,
+                overall,
+                grounded,
+                claims,
+            } => json!({
+                "challenged_run_id": challenged_run_id,
+                // Null = inconclusive, deliberately distinct from any verdict.
+                "overall": overall,
+                "grounded": grounded,
+                "claims": claims
+                    .iter()
+                    .map(|c| json!({ "claim": c.claim, "verdict": c.verdict }))
                     .collect::<Vec<Value>>(),
             }),
             ResearchEvent::Done {
@@ -1128,7 +1167,11 @@ pub struct FileVersion {
 /// crate has no glob matcher of its own (`globset` lives in `tools/mindexfile`), so an
 /// in-process check would introduce a fifth glob dialect into a codebase that has
 /// already paid for having four.
-#[derive(Debug, Clone, Default)]
+// Serde derives so the journal can store the scope *structurally*
+// (`scope_spec_json`) beside the rendered `scope_json` — the rendered form is
+// for the model and cannot be parsed back, and the challenge endpoint needs to
+// re-inhabit the subject's exact scope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolScope {
     pub include: Option<SearchFilter>,
     pub exclude: Option<SearchFilter>,
@@ -1234,6 +1277,23 @@ pub struct ResearchParams {
     /// the caller holds no information the server lacks — the number depends on the
     /// model, and the model is already the server's to look up.
     pub max_turn_thinking_chars: usize,
+    /// `Some` makes this run a **challenge**: the subject's report is injected as
+    /// the thing under examination, the plan turn asks for its claims, and a
+    /// verdict turn closes the report phase. Everything else — budgets, scope
+    /// enforcement, the citation gate, revalidation — is byte-for-byte the
+    /// ordinary run: the opponent's own accusations go through the same
+    /// provenance check as any report.
+    pub challenge: Option<ChallengeSubject>,
+}
+
+/// The stored run a challenge attacks, loaded by the handler (the loop has no
+/// database access — the `prior_reports` rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeSubject {
+    pub run_id: String,
+    pub seq: i64,
+    pub question: String,
+    pub report: String,
 }
 
 /// One earlier run's report, as handed to a new run.
@@ -1268,6 +1328,12 @@ pub struct ResearchListing {
     pub title: Option<String>,
     pub question: String,
     pub created_at: i64,
+    /// `research` or `challenge` — a challenge's report is an attack on another
+    /// run, and reads differently.
+    pub kind: String,
+    /// The run's derived trust status (`unchallenged`/`confirmed`/`disputed`/
+    /// `refuted`) — what valid challenges concluded about it.
+    pub trust: String,
 }
 
 /// `read_research`'s three honest answers. `Invalid` is its own variant rather
@@ -1279,6 +1345,9 @@ pub enum StoredReport {
         seq: i64,
         question: String,
         report: String,
+        /// Derived trust status — rendered as a warning when a valid challenge
+        /// disputed or refuted this report.
+        trust: String,
     },
     /// Exists but is no longer valid — never handed to the model.
     Invalid {
@@ -1871,6 +1940,151 @@ const REVALIDATION_SYSTEM_PROMPT: &str = "You are checking your own draft report
     purpose only: read the locations you cited but never opened, so the claim is \
     either confirmed against real code or dropped. Do not start a new \
     investigation and do not write the report yet.";
+
+/// The plan request for a challenge run: the plan items are the subject's
+/// claims, so the claim list the verdict turn is later scored against is the
+/// plan the model already produced and revised.
+fn challenge_plan_request(max_sections: usize) -> String {
+    format!(
+        "Before you touch a tool: extract the 3-{max_sections} principal factual \
+         claims the report above makes about this codebase — the statements it \
+         would be worst to have wrong. Number them, one line each, no preamble, no \
+         investigation yet. This list is your plan: you will gather evidence that \
+         confirms or refutes each claim, and you will be held to it at the end."
+    )
+}
+
+/// How a challenge subject is framed in the transcript, before the plan turn.
+///
+/// The same hearsay contract as a prior report, stated harder: the subject is
+/// the thing under examination, so citing it back would be circular — every
+/// location must be re-derived through the tools, and that re-derivation *is*
+/// the refutation work. Truncated out loud at the same cap as prior context.
+fn format_challenge_subject(subject: &ChallengeSubject, max_chars: usize) -> String {
+    let mut out = format!(
+        "SUBJECT UNDER EXAMINATION — stored research report #{}.\n\
+         Your job is to try to REFUTE it: find where it is wrong, overstated, or \
+         no longer true, against the code as the index holds it now. Treat every \
+         claim as suspect until a tool of yours shows the code that supports it.\n\
+         (HEARSAY: nothing in the report below is evidence and none of its \
+         citations may be copied — a citation you did not re-derive with your own \
+         tools will be reported as invented.)\n\n\
+         Its question was:\n{}\n\nIts report:\n\n",
+        subject.seq, subject.question
+    );
+    let budget = max_chars.saturating_sub(out.len());
+    if subject.report.len() <= budget {
+        out.push_str(&subject.report);
+    } else {
+        let mut end = budget.min(subject.report.len());
+        while end > 0 && !subject.report.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&subject.report[..end]);
+        out.push_str("\n\n[the report was truncated here to fit the context budget]");
+    }
+    out
+}
+
+/// Asked after a challenge run's report is written: one dictated-vocabulary line
+/// per plan item, the sufficiency turn's mechanism pointed at claims. Not JSON,
+/// deliberately — the models this runs on mangle JSON reliably enough that the
+/// codebase already had to build a content gate against it.
+const CHALLENGE_VERDICT_REQUEST: &str = "The examination is over. Go through your \
+    numbered claim list and, for each claim, write one line: the number, the claim \
+    in a few words, then exactly one of CONFIRMED (your evidence supports it), \
+    DISPUTED (the evidence is mixed or you could not check it), or REFUTED (your \
+    evidence contradicts it). Judge only by evidence a tool returned in this run. \
+    No prose after the list, no tool calls.";
+
+/// One claim's verdict, parsed out of the challenge verdict turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimVerdict {
+    pub claim: String,
+    /// `"confirmed"` / `"disputed"` / `"refuted"` — a server-defined closed set.
+    pub verdict: &'static str,
+}
+
+/// Parse the verdict turn's reply: any line carrying exactly one of the dictated
+/// words is a claim verdict; everything else is ignored. When a line carries more
+/// than one, the *last* wins — "CONFIRMED? No: REFUTED" reads as refuted.
+fn parse_claim_verdicts(text: &str) -> Vec<ClaimVerdict> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let upper = line.to_ascii_uppercase();
+        let mut found: Option<&'static str> = None;
+        let mut found_at = 0usize;
+        for (word, verdict) in [
+            ("CONFIRMED", "confirmed"),
+            ("DISPUTED", "disputed"),
+            ("REFUTED", "refuted"),
+        ] {
+            if let Some(pos) = upper.rfind(word) {
+                // "REFUTED" is not a substring of "DISPUTED"/"CONFIRMED", and
+                // vice versa, so position alone decides.
+                if found.is_none() || pos >= found_at {
+                    found = Some(verdict);
+                    found_at = pos;
+                }
+            }
+        }
+        if let Some(verdict) = found {
+            let claim = line
+                .trim()
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')')
+                .trim()
+                .to_string();
+            out.push(ClaimVerdict { claim, verdict });
+        }
+    }
+    out
+}
+
+/// The overall verdict over a claim list, with the grounding cap applied.
+///
+/// Severity wins: any REFUTED → refuted, else any DISPUTED → disputed, else
+/// confirmed. Zero parseable claims → `None` — "challenged, inconclusive",
+/// which readers must never render as an acquittal.
+///
+/// **The grounding cap is the rule that makes this feature safe with weak
+/// models**: a challenge whose own report verified zero citations has shown no
+/// code, and an unshown accusation can dispute a report but never refute it.
+fn resolve_challenge_verdict(claims: &[ClaimVerdict], grounded: bool) -> Option<&'static str> {
+    if claims.is_empty() {
+        return None;
+    }
+    let worst = if claims.iter().any(|c| c.verdict == "refuted") {
+        "refuted"
+    } else if claims.iter().any(|c| c.verdict == "disputed") {
+        "disputed"
+    } else {
+        "confirmed"
+    };
+    Some(match (worst, grounded) {
+        ("refuted", false) => "disputed",
+        (v, _) => v,
+    })
+}
+
+/// What a challenge run concluded, carried on [`RunRecord`] and the `verdict`
+/// event. `None` on ordinary research runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeOutcome {
+    /// The overall verdict; `None` when the verdict turn produced nothing
+    /// parseable — inconclusive, never an acquittal.
+    pub verdict: Option<&'static str>,
+    /// Whether the challenge's own report had at least one verified citation.
+    /// `false` caps the verdict at `disputed` (already applied to `verdict`).
+    pub grounded: bool,
+    pub claims: Vec<ClaimVerdict>,
+}
+
+impl ChallengeOutcome {
+    /// Rows for the journal's per-verdict counters.
+    pub fn count_of(&self, verdict: &str) -> i64 {
+        self.claims.iter().filter(|c| c.verdict == verdict).count() as i64
+    }
+}
 
 /// Whether a sufficiency verdict still reports an open item.
 ///
@@ -2939,6 +3153,15 @@ struct ResearchOutcome {
     /// The finished report. Streamed already — carried back only so the run can
     /// be journalled; nothing re-sends it.
     report: String,
+    /// Per-path spans, lifted out of `Evidence` for the same reason as the
+    /// baselines: the journal runs one level up and cannot reach it.
+    evidence_spans: Vec<EvidenceSpans>,
+    /// The tool-call trace, accumulated beside the `step` events.
+    trace: Vec<StepTrace>,
+    /// The sufficiency turn's verdict text, if the turn ran and said anything.
+    sufficiency_verdict: Option<String>,
+    /// The challenge verdicts, when this run was one; `None` otherwise.
+    challenge: Option<ChallengeOutcome>,
 }
 
 /// What the citation-revalidation phase found and cost.
@@ -3029,6 +3252,75 @@ pub struct FileBaseline {
     pub sha256: String,
 }
 
+/// The line spans one path's tools showed the model — the persistent half of
+/// [`Evidence`]'s `spans`, for the journal (`research_run_evidence`).
+///
+/// This is the one input of `check_citations` that `FileBaseline` does not carry,
+/// which is exactly what made a stored report's verified/path_only verdicts
+/// unrecomputable offline. Kept apart from the baselines because their row sets
+/// differ: a path shown without ever being probed has no baseline but still has
+/// spans, and its citations still verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceSpans {
+    pub path: String,
+    /// `(start_line, end_line)` pairs, in the order they were shown. Empty for a
+    /// path the model only ever saw named (a `list_files` hit) — the `path_only`
+    /// verdict's input.
+    pub spans: Vec<(usize, usize)>,
+}
+
+/// One executed tool call, as journalled (`research_run_steps`) — the persistent
+/// form of the wire's `step` frame, built from the same locals at the same site
+/// so the two cannot drift.
+///
+/// Calls, arguments and landing spans only — **no result bodies**: the code a
+/// call returned is in the index, and a copy here would outweigh the corpus
+/// while going stale against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepTrace {
+    /// The wire's step number. Gaps are by construction: a checkpoint turn
+    /// consumes a number without emitting a step.
+    pub n: usize,
+    /// `"main"` or `"revalidation"` — the repair pass's numbers continue the
+    /// same sequence, so the phase is what tells them apart.
+    pub phase: &'static str,
+    pub action: &'static str,
+    pub argument: String,
+    pub hits: usize,
+    /// `path:start-end` strings, the step frame's own `spans` list — bounded by
+    /// the same [`MAX_STEP_SPANS`] cap as the wire.
+    pub spans: Vec<String>,
+    pub spans_truncated: bool,
+    /// Milliseconds since the investigation started.
+    pub at_ms: u64,
+}
+
+impl StepTrace {
+    /// Built beside the `step` event from the same `call`/`hits`/`shown` locals —
+    /// one construction site feeding both wire and journal is what keeps the
+    /// stored trace honest about what a client saw.
+    fn new(
+        n: usize,
+        phase: &'static str,
+        call: &StepCall,
+        hits: usize,
+        shown: &StepShown,
+        at_ms: u64,
+    ) -> Self {
+        let (_, argument) = call.argument();
+        Self {
+            n,
+            phase,
+            action: call.action(),
+            argument: argument.to_string(),
+            hits,
+            spans: shown.spans.clone(),
+            spans_truncated: shown.truncated,
+            at_ms,
+        }
+    }
+}
+
 /// A journal that keeps nothing, for the loop's own tests — they are about the
 /// loop, not about persistence, and the journal has its own tests in
 /// `db::research`. Test-only: in production a run that leaves no trace is the
@@ -3070,6 +3362,9 @@ pub struct RunTools {
     pub forced_synthesis: bool,
     pub report_window_ms: u64,
     pub report_elapsed_ms: u64,
+    /// Checkpoint turns that actually fired — paired with the granted interval on
+    /// the row, it says whether banked drafts were in play when the run stopped.
+    pub checkpoints_taken: usize,
 }
 
 pub struct RunRecord {
@@ -3112,6 +3407,16 @@ pub struct RunRecord {
     /// readers then fall back to a title derived from `question`.
     pub title: Option<String>,
     pub report: String,
+    /// The line spans every tool showed the model, per path — what makes the
+    /// citation check re-runnable offline against this row later.
+    pub evidence_spans: Vec<EvidenceSpans>,
+    /// The tool-call trace: calls + arguments + landing spans, no result bodies.
+    pub trace: Vec<StepTrace>,
+    /// The sufficiency turn's own ANSWERED/UNANSWERED list, verbatim. `None`
+    /// when the turn was skipped (a budget-stopped run) or came back empty.
+    pub sufficiency_verdict: Option<String>,
+    /// What a challenge run concluded; `None` on ordinary research runs.
+    pub challenge: Option<ChallengeOutcome>,
 }
 
 // ─── citation provenance ────────────────────────────────────────────────────
@@ -3250,6 +3555,24 @@ impl Evidence {
         out
     }
 
+    /// Every path's shown spans, for the journal — the other persistent half,
+    /// beside [`Self::baselines`]. Unlike the baselines, paths with no span and
+    /// no probe are **kept**: "the model saw this path named" is itself the fact
+    /// a later `path_only` verdict rests on. Sorted, like the baselines, so two
+    /// journal writes of the same run are comparable.
+    fn spans_snapshot(&self) -> Vec<EvidenceSpans> {
+        let mut out: Vec<EvidenceSpans> = self
+            .by_path
+            .iter()
+            .map(|(path, e)| EvidenceSpans {
+                path: path.clone(),
+                spans: e.spans.iter().map(|s| (s.start, s.end)).collect(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
     /// Whether a citation into this path describes code the index no longer holds.
     /// A reindex merely *in flight* is not staleness — nothing the run read has
     /// been contradicted yet.
@@ -3347,6 +3670,23 @@ pub struct Citation {
     pub end: usize,
 }
 
+/// One citation with its verdict — the journalled form (`research_run_citations`).
+///
+/// One entry per citation *occurrence*, in report order, duplicates kept: a
+/// report citing the same span three times made three claims, and collapsing
+/// them would make the stored rows disagree with the counts beside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitationDetail {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    /// `"verified"` / `"path_only"` / `"unverified"` — the same closed set the
+    /// counters are bucketed by.
+    pub verdict: &'static str,
+    /// Orthogonal to the verdict, exactly as on the counters.
+    pub stale: bool,
+}
+
 /// How many of a report's citations the run's own tool results support.
 ///
 /// `cited_paths` is not on the wire — it is what the per-run record stores, so
@@ -3379,6 +3719,11 @@ pub struct CitationReport {
     /// citation names no location worth reading, and shipping bytes for it would
     /// dress up a claim the check just refused.
     pub verified_locations: Vec<Citation>,
+    /// Every citation occurrence with its own verdict, in report order. Not on
+    /// the wire (the event carries the counters); journalled as
+    /// `research_run_citations`, so the corpus is queryable per citation without
+    /// re-parsing every report.
+    pub details: Vec<CitationDetail>,
 }
 
 /// Distinct `unverified_paths` (and `stale_paths`) reported. Enough to act on,
@@ -3514,6 +3859,45 @@ fn parse_citations_at(report: &str) -> Vec<(usize, Citation)> {
     out
 }
 
+/// One path's stored evidence, as read back from the journal for an offline
+/// re-check: the spans from `research_run_evidence`, the staleness verdict from
+/// joining `research_run_files` against today's `project_files`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvidence {
+    pub path: String,
+    pub spans: Vec<(usize, usize)>,
+    /// The index's hash for this path differs from the run's baseline **today**.
+    pub changed: bool,
+    /// The path has left the index since the run read it.
+    pub removed: bool,
+}
+
+/// [`check_citations`] over a *stored* run: rebuild the run's [`Evidence`] from
+/// journal rows and score its report again — a pure function over SQLite data,
+/// no model, no GPU.
+///
+/// Provenance (`verified`/`path_only`/`unverified`) is a fact about the run and
+/// must recompute byte-for-byte equal to the stored counters (the report and the
+/// spans are both immutable); a mismatch means the journal or this
+/// reconstruction is wrong, not the report. Staleness is deliberately the
+/// opposite: the `changed`/`removed` flags are computed against the index as it
+/// stands NOW, so `stale` here answers "does this report still describe the
+/// tree" — the number that moves over time and the reason to re-verify at all.
+pub fn recheck_citations(report: &str, stored: &[StoredEvidence]) -> CitationReport {
+    let mut evidence = Evidence::default();
+    for row in stored {
+        let e = evidence.by_path.entry(row.path.clone()).or_default();
+        e.spans = row
+            .spans
+            .iter()
+            .map(|&(start, end)| Span { start, end })
+            .collect();
+        e.changed = row.changed;
+        e.removed = row.removed;
+    }
+    check_citations(report, &evidence)
+}
+
 /// Score a finished report against what the run's tools actually returned.
 fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
     let citations = parse_citations(report);
@@ -3522,14 +3906,18 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
         ..Default::default()
     };
     for c in &citations {
-        match evidence.verdict(c) {
+        let verdict = match evidence.verdict(c) {
             Verdict::Verified => {
                 r.verified += 1;
                 if !r.verified_locations.contains(c) {
                     r.verified_locations.push(c.clone());
                 }
+                "verified"
             }
-            Verdict::PathOnly => r.path_only += 1,
+            Verdict::PathOnly => {
+                r.path_only += 1;
+                "path_only"
+            }
             Verdict::Unverified => {
                 r.unverified += 1;
                 if !r.unverified_paths.contains(&c.path)
@@ -3537,8 +3925,16 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
                 {
                     r.unverified_paths.push(c.path.clone());
                 }
+                "unverified"
             }
-        }
+        };
+        r.details.push(CitationDetail {
+            path: c.path.clone(),
+            start: c.start,
+            end: c.end,
+            verdict,
+            stale: evidence.is_stale(&c.path),
+        });
         // Independent of the verdict: a location the model really was shown can
         // still describe code that has since been reindexed away.
         if evidence.is_stale(&c.path) {
@@ -4639,9 +5035,10 @@ async fn execute(
                     seq,
                     question,
                     report,
+                    trust,
                 } => (
                     1,
-                    format_stored_report(seq, &question, &report, params.max_context_chars),
+                    format_stored_report(seq, &question, &report, &trust, params.max_context_chars),
                 ),
                 StoredReport::Invalid { seq } => (
                     0,
@@ -4687,6 +5084,10 @@ pub async fn run_research(
         tools: run_tools,
         file_baselines,
         mut report,
+        evidence_spans,
+        trace,
+        sufficiency_verdict,
+        challenge,
     } = match research_inner(&*ollama, &*tools, &params, &tx, &token).await {
         Ok(outcome) => outcome,
         Err(ResearchAbort::Cancelled) => {
@@ -4786,6 +5187,17 @@ pub async fn run_research(
             });
         }
     }
+    // The challenge's conclusion, after the evidence channels and before `done`
+    // — a reader that stops at `done` has already seen what the verdict rests
+    // on. Only challenge streams carry it; an ordinary run's wire is untouched.
+    if let (Some(subject), Some(outcome)) = (&params.challenge, &challenge) {
+        let _ = tx.send(ResearchEvent::Verdict {
+            challenged_run_id: subject.run_id.clone(),
+            overall: outcome.verdict,
+            grounded: outcome.grounded,
+            claims: outcome.claims.clone(),
+        });
+    }
     // Granted-versus-actual, the measurement the length ceiling exists to produce.
     // Counted in words rather than characters or tokens because words are what the
     // model was asked for; comparing the grant against a different unit answers
@@ -4854,6 +5266,10 @@ pub async fn run_research(
                 context_run_ids: params.prior_reports.iter().map(|p| p.id.clone()).collect(),
                 title,
                 report,
+                evidence_spans,
+                trace,
+                sufficiency_verdict,
+                challenge,
             })
             .await
     } else {
@@ -5031,6 +5447,16 @@ async fn research_inner(
         prior_reports_idx = Some(messages.len());
         messages.push(ChatMessage::user(block));
     }
+    // The challenge subject, after any prior context and before the plan turn:
+    // the plan a challenge writes IS its claim list, so the report under
+    // examination must already be on the table. Never sheddable, unlike prior
+    // reports — it is the question, not background.
+    if let Some(subject) = &params.challenge {
+        messages.push(ChatMessage::user(format_challenge_subject(
+            subject,
+            params.max_context_chars,
+        )));
+    }
 
     let mut steps = 0usize;
     let mut parse_retries = 0usize;
@@ -5062,6 +5488,9 @@ async fn research_inner(
     // Everything the tools show the model, so the report's citations can be
     // checked against what it was actually given rather than taken on trust.
     let mut evidence = Evidence::default();
+    // The journal's copy of the step frames: built beside each `step` event from
+    // the same locals, so the stored trace and the wire cannot drift.
+    let mut trace: Vec<StepTrace> = Vec::new();
     // The measurable half of this generation's three features; journalled per run.
     let mut run_tools = RunTools {
         report_window_ms: params.report_timeout_ms,
@@ -5092,9 +5521,11 @@ async fn research_inner(
     // Degrades to a plan-less run rather than failing: a plan is an aid, not a
     // contract, and a model that answers this badly can still answer the
     // question. `state.plan` staying `None` simply removes it from the note.
-    messages.push(ChatMessage::user(plan_request(
-        params.budget.max_report_sections,
-    )));
+    messages.push(ChatMessage::user(if params.challenge.is_some() {
+        challenge_plan_request(params.budget.max_report_sections)
+    } else {
+        plan_request(params.budget.max_report_sections)
+    }));
     let planned = chat_turn(
         ollama,
         params,
@@ -5479,6 +5910,15 @@ async fn research_inner(
                     } = apply_local(&mut state, action);
                     tally_tool_use(&mut run_tools, action, &result_text, hits);
                     steps += 1;
+                    let shown = StepShown::default();
+                    trace.push(StepTrace::new(
+                        steps,
+                        "main",
+                        &call,
+                        hits,
+                        &shown,
+                        started.elapsed().as_millis() as u64,
+                    ));
                     send(
                         tx,
                         token,
@@ -5488,7 +5928,7 @@ async fn research_inner(
                             hits,
                             // `note`/`revise_plan` read nothing: they write to the
                             // run's own state, so there is no location to report.
-                            shown: StepShown::default(),
+                            shown,
                         },
                     )?;
                     send(tx, token, emit_progress(steps, &tally))?;
@@ -5530,6 +5970,14 @@ async fn research_inner(
                 for (path, span) in shown {
                     evidence.record(&path, span);
                 }
+                trace.push(StepTrace::new(
+                    steps,
+                    "main",
+                    &call,
+                    hits,
+                    &step_shown,
+                    started.elapsed().as_millis() as u64,
+                ));
                 send(
                     tx,
                     token,
@@ -5569,6 +6017,7 @@ async fn research_inner(
             {
                 last_checkpoint_step = steps;
                 checkpoints += 1;
+                run_tools.checkpoints_taken += 1;
                 steps += 1;
                 messages.push(ChatMessage::user(CHECKPOINT_REQUEST.to_string()));
                 let banked = chat_turn(
@@ -6162,6 +6611,14 @@ async fn research_inner(
                     for (path, span) in shown {
                         evidence.record(&path, span);
                     }
+                    trace.push(StepTrace::new(
+                        steps + rv.steps,
+                        "revalidation",
+                        &step_call,
+                        hits,
+                        &step_shown,
+                        started.elapsed().as_millis() as u64,
+                    ));
                     // Numbered on from the investigation's steps so the client's
                     // step list stays monotonic, while the run's `steps` — the
                     // number the budget is measured against — stays within what it
@@ -6310,6 +6767,72 @@ async fn research_inner(
         )?;
     }
 
+    // ── challenge verdict ────────────────────────────────────────────────────
+    //
+    // One dictated-vocabulary turn (the sufficiency mechanism pointed at the
+    // claim list), under the report window's token so a challenge can never
+    // stretch past what `/health` and the watchdog reason about. Every failure
+    // shape degrades to "inconclusive" (`verdict: None`), never to a failed run
+    // and never to a `break` — the loop's counters are untouched. A
+    // server-written report gets no verdict turn at all: the model never wrote
+    // its accusations up, and scoring claims against a report that does not
+    // exist would invent a verdict.
+    let challenge = match &params.challenge {
+        None => None,
+        Some(_) if run_tools.forced_synthesis => Some(ChallengeOutcome {
+            verdict: None,
+            grounded: false,
+            claims: Vec::new(),
+        }),
+        Some(_) => {
+            messages.push(ChatMessage::user(CHALLENGE_VERDICT_REQUEST.to_string()));
+            let asked = chat_turn(
+                ollama,
+                params,
+                &messages,
+                NO_TOOLS,
+                tx,
+                writing,
+                TurnOpts {
+                    stream_content: false,
+                    sampling: params.sampling,
+                },
+            )
+            .await;
+            let text = match asked {
+                Ok(o) => tally.record(o).content,
+                // The window caught the turn: inconclusive, not a failure.
+                Err(e) if is_deadline_stop(token, writing, &e) => String::new(),
+                Err(e) => return Err(e),
+            };
+            if text.trim().is_empty() {
+                // Undo the request rather than leaving an unanswered instruction
+                // in the transcript, exactly as the sufficiency turn does.
+                messages.pop();
+            } else {
+                messages.push(ChatMessage::assistant(text.clone()));
+            }
+            let claims = parse_claim_verdicts(&text);
+            // The grounding cap: a challenge whose own report verified nothing
+            // has shown no code, and an unshown accusation can dispute but
+            // never refute.
+            let grounded = citations.verified > 0;
+            let verdict = resolve_challenge_verdict(&claims, grounded);
+            if verdict.is_none() {
+                warn!(
+                    "The challenge verdict turn produced nothing parseable; the \
+                     run is recorded as inconclusive — readers must not render \
+                     that as an acquittal."
+                );
+            }
+            Some(ChallengeOutcome {
+                verdict,
+                grounded,
+                claims,
+            })
+        }
+    };
+
     run_tools.report_elapsed_ms = report_started.elapsed().as_millis() as u64;
     Ok(ResearchOutcome {
         steps,
@@ -6321,6 +6844,10 @@ async fn research_inner(
         tools: run_tools,
         file_baselines: evidence.baselines(),
         report: summary,
+        evidence_spans: evidence.spans_snapshot(),
+        trace,
+        sufficiency_verdict,
+        challenge,
     })
 }
 
@@ -6336,7 +6863,15 @@ fn format_research_listing(listings: &[ResearchListing]) -> String {
     );
     for l in listings {
         let title = l.title.as_deref().unwrap_or(&l.question);
-        out.push_str(&format!("- #{}: {}\n", l.seq, title));
+        let mut line = format!("- #{}: {}", l.seq, title);
+        if l.kind == "challenge" {
+            line.push_str(" [challenge]");
+        }
+        if l.trust != "unchallenged" {
+            line.push_str(&format!(" (trust: {})", l.trust));
+        }
+        line.push('\n');
+        out.push_str(&line);
     }
     out
 }
@@ -6344,12 +6879,32 @@ fn format_research_listing(listings: &[ResearchListing]) -> String {
 /// Render one stored report for the model, truncated out loud at the same cap as
 /// an injected prior report — a stored body is unbounded, and an unbounded tool
 /// reply is prompt tokens on every later turn.
-fn format_stored_report(seq: i64, question: &str, report: &str, max_chars: usize) -> String {
+fn format_stored_report(
+    seq: i64,
+    question: &str,
+    report: &str,
+    trust: &str,
+    max_chars: usize,
+) -> String {
     let mut out = format!(
         "Stored report #{seq} — {question}\n(HEARSAY: another run's prose, not \
          evidence. Verify anything you intend to state; a citation copied from it \
-         will be reported as invented.)\n\n"
+         will be reported as invented.)\n"
     );
+    // The challenge channel's verdict, when it has one: a report a valid
+    // challenge disputed or refuted must not read as settled knowledge.
+    match trust {
+        "refuted" => out.push_str(
+            "(WARNING: a valid challenge run REFUTED this report's claims. \
+             Treat its statements as likely wrong unless your own tools confirm them.)\n",
+        ),
+        "disputed" => out.push_str(
+            "(CAUTION: a valid challenge run DISPUTED some of this report's \
+             claims. Weigh it accordingly.)\n",
+        ),
+        _ => {}
+    }
+    out.push('\n');
     let budget = max_chars.saturating_sub(out.len());
     if report.len() <= budget {
         out.push_str(report);
@@ -7494,6 +8049,142 @@ mod tests {
         );
     }
 
+    /// The hearsay rule holds for the challenge's own subject: the report under
+    /// examination is exactly what the opponent must NOT be able to cite back,
+    /// because re-deriving every location through the tools *is* the refutation
+    /// work. And an opponent that showed no code of its own (`verified: 0`) may
+    /// dispute but never refute — the grounding cap lands on the wire.
+    #[tokio::test]
+    async fn a_challenged_report_never_seeds_the_evidence() {
+        let mut params = params(8);
+        params.challenge = Some(ChallengeSubject {
+            run_id: "subject-1".into(),
+            seq: 3,
+            question: "How does GC work?".into(),
+            report: "# GC\n\nGC sweeps in src/worker/gc.rs:10-40.".into(),
+        });
+        // No tool calls at all: the opponent goes straight to a report citing
+        // exactly what the subject told it, then declares REFUTED. The unverified
+        // draft trips the citation gate, so the same text is scripted again as
+        // the rewrite; the verdict turn then consumes the third entry.
+        let events = run_native(
+            NativeOllama::new(
+                vec![],
+                vec![
+                    "# Challenge\n\nThe claim about src/worker/gc.rs:10-40 is wrong.",
+                    "# Challenge\n\nThe claim about src/worker/gc.rs:10-40 is wrong.",
+                    "1. GC sweeps in gc.rs — REFUTED",
+                ],
+            ),
+            params,
+        )
+        .await;
+
+        let citations = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Citations { report, .. } => Some(report.clone()),
+                _ => None,
+            })
+            .expect("the run must emit a citation verdict");
+        assert_eq!(
+            citations.verified, 0,
+            "a citation copied from the subject must never count as verified"
+        );
+        assert!(
+            citations
+                .unverified_paths
+                .iter()
+                .any(|p| p == "src/worker/gc.rs"),
+            "the copied path must be named as unverified: {:?}",
+            citations.unverified_paths
+        );
+
+        let (challenged, overall, grounded, claims) = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Verdict {
+                    challenged_run_id,
+                    overall,
+                    grounded,
+                    claims,
+                } => Some((
+                    challenged_run_id.clone(),
+                    *overall,
+                    *grounded,
+                    claims.clone(),
+                )),
+                _ => None,
+            })
+            .expect("a challenge stream must carry a verdict event");
+        assert_eq!(challenged, "subject-1");
+        assert!(!grounded, "no citation verified — the challenge is unshown");
+        assert_eq!(
+            overall,
+            Some("disputed"),
+            "an ungrounded REFUTED must be capped at disputed"
+        );
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].verdict, "refuted");
+    }
+
+    /// The mirror: an opponent whose own report verified a citation has shown
+    /// code, and its REFUTED stands.
+    #[tokio::test]
+    async fn a_grounded_challenge_may_refute() {
+        let mut params = params(8);
+        params.challenge = Some(ChallengeSubject {
+            run_id: "subject-2".into(),
+            seq: 4,
+            question: "Where does GC sweep?".into(),
+            report: "# GC\n\nThe sweep is nowhere near src/worker/gc.rs.".into(),
+        });
+        let events = run_native(
+            NativeOllama::new(
+                vec![
+                    vec![call("search", json!({"query": "gc sweep"}))],
+                    vec![call("finalize", json!({}))],
+                ],
+                vec![
+                    // 12-18 overlaps the 10-20 the fake search returns: verified.
+                    "# Challenge\n\nThe sweep IS in src/worker/gc.rs:12-18.",
+                    "1. \"nowhere near gc.rs\" — REFUTED",
+                ],
+            ),
+            params,
+        )
+        .await;
+        let (overall, grounded) = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Verdict {
+                    overall, grounded, ..
+                } => Some((*overall, *grounded)),
+                _ => None,
+            })
+            .expect("verdict event");
+        assert!(grounded);
+        assert_eq!(overall, Some("refuted"));
+    }
+
+    /// An ordinary research stream must stay byte-for-byte pre-challenge: no
+    /// `verdict` frame, ever.
+    #[tokio::test]
+    async fn an_ordinary_run_emits_no_verdict_event() {
+        let events = drive_native_with(
+            vec![vec![call("finalize", json!({}))]],
+            vec!["# Report\n\nNothing to say."],
+            8,
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ResearchEvent::Verdict { .. })),
+            "an ordinary run leaked a verdict frame"
+        );
+    }
+
     /// The reports already injected as context are in the transcript in full;
     /// `list_research` repeating them would invite re-reading what is already
     /// there.
@@ -8456,6 +9147,8 @@ mod tests {
                     title: Some("GC sweep ordering".into()),
                     question: "How does GC sweep?".into(),
                     created_at: 1,
+                    kind: "research".into(),
+                    trust: "unchallenged".into(),
                 },
                 ResearchListing {
                     id: "stored-2".into(),
@@ -8463,6 +9156,8 @@ mod tests {
                     title: None,
                     question: "Where is the connection pool returned?".into(),
                     created_at: 2,
+                    kind: "research".into(),
+                    trust: "unchallenged".into(),
                 },
             ])
         }
@@ -8479,6 +9174,7 @@ mod tests {
                     seq,
                     question: "Where is the connection pool returned?".into(),
                     report: "# Pool return\n\nSee src/slicing/traits.rs:100-140.".into(),
+                    trust: "unchallenged".into(),
                 }),
                 3 => Ok(StoredReport::Invalid { seq }),
                 _ => Ok(StoredReport::Missing { seq }),
@@ -8555,6 +9251,8 @@ mod tests {
             prior_reports: Vec::new(),
             max_context_chars: 24_000,
             metrics: None,
+            // Ordinary run: the challenge tests set it themselves.
+            challenge: None,
         }
     }
 
@@ -11697,6 +12395,142 @@ mod tests {
         assert_eq!(r.cited_paths, vec!["src/invented.rs".to_string()]);
     }
 
+    /// The offline re-check is the same pure function over journal rows: fed the
+    /// spans the run stored, it must reproduce the live check's provenance
+    /// verdicts byte-for-byte — that equality is what `provenance_matches` means.
+    #[test]
+    fn recheck_from_stored_spans_reproduces_the_live_verdicts() {
+        let report = "see src/gc.rs:110-140 and src/nope.rs:1-5, plus src/list.rs:40-60";
+        let ev = evidence_of(&[("src/gc.rs", Some((100, 120))), ("src/list.rs", None)]);
+        let live = check_citations(report, &ev);
+
+        let stored = vec![
+            StoredEvidence {
+                path: "src/gc.rs".into(),
+                spans: vec![(100, 120)],
+                changed: false,
+                removed: false,
+            },
+            StoredEvidence {
+                path: "src/list.rs".into(),
+                spans: Vec::new(),
+                changed: false,
+                removed: false,
+            },
+        ];
+        let re = recheck_citations(report, &stored);
+        assert_eq!(
+            (re.total, re.verified, re.path_only, re.unverified),
+            (live.total, live.verified, live.path_only, live.unverified),
+        );
+        assert_eq!(re.details, live.details);
+    }
+
+    /// Staleness in a re-check is *today's*, not the run's: the flags come from
+    /// joining the baselines against the current index, so a file edited since
+    /// the run flips its citations stale without touching provenance.
+    #[test]
+    fn recheck_staleness_reflects_the_flags_it_is_given() {
+        let report = "see src/gc.rs:110-140";
+        let stored = vec![StoredEvidence {
+            path: "src/gc.rs".into(),
+            spans: vec![(100, 120)],
+            changed: true,
+            removed: false,
+        }];
+        let re = recheck_citations(report, &stored);
+        assert_eq!((re.verified, re.stale), (1, 1), "{re:?}");
+        assert_eq!(re.stale_paths, vec!["src/gc.rs".to_string()]);
+    }
+
+    /// An old run journalled without spans collapses `verified` to `path_only` —
+    /// which is exactly why the endpoint refuses to recompute provenance for it
+    /// (`spans_available: false`) instead of shipping this as a verdict.
+    #[test]
+    fn recheck_without_spans_cannot_reproduce_verified() {
+        let report = "see src/gc.rs:110-140";
+        let stored = vec![StoredEvidence {
+            path: "src/gc.rs".into(),
+            spans: Vec::new(),
+            changed: false,
+            removed: false,
+        }];
+        let re = recheck_citations(report, &stored);
+        assert_eq!((re.verified, re.path_only), (0, 1), "{re:?}");
+    }
+
+    /// Every citation occurrence lands in `details` with its own verdict, in
+    /// report order, duplicates kept — the journalled rows must agree with the
+    /// counters beside them.
+    #[test]
+    fn citation_details_carry_one_row_per_occurrence_in_order() {
+        let ev = evidence_of(&[("src/gc.rs", Some((100, 120)))]);
+        let r = check_citations("src/gc.rs:110-140 then src/gc.rs:110-140 and x.rs:1-2", &ev);
+        assert_eq!(r.details.len(), 3);
+        assert_eq!(r.details[0].verdict, "verified");
+        assert_eq!(r.details[1].verdict, "verified");
+        assert_eq!(
+            (r.details[2].path.as_str(), r.details[2].verdict),
+            ("x.rs", "unverified")
+        );
+        assert_eq!((r.total, r.verified, r.unverified), (3, 2, 1));
+    }
+
+    /// The dictated-vocabulary parser: any line carrying a verdict word is a
+    /// claim; the last word on a line wins; everything else is ignored.
+    #[test]
+    fn claim_verdicts_parse_the_dictated_vocabulary() {
+        let claims = parse_claim_verdicts(
+            "Here is my list:\n\
+             1. GC sweeps in gc.rs — CONFIRMED\n\
+             just prose, no verdict\n\
+             2) The pool leaks - REFUTED\n\
+             3. The window claim — CONFIRMED? No: DISPUTED",
+        );
+        let verdicts: Vec<&str> = claims.iter().map(|c| c.verdict).collect();
+        assert_eq!(verdicts, vec!["confirmed", "refuted", "disputed"]);
+
+        // Severity wins; the grounding cap turns refuted into disputed; an empty
+        // list is inconclusive, never an acquittal.
+        assert_eq!(resolve_challenge_verdict(&claims, true), Some("refuted"));
+        assert_eq!(resolve_challenge_verdict(&claims, false), Some("disputed"));
+        assert_eq!(resolve_challenge_verdict(&[], true), None);
+        let all_ok = parse_claim_verdicts("1. a — CONFIRMED\n2. b — CONFIRMED");
+        assert_eq!(resolve_challenge_verdict(&all_ok, false), Some("confirmed"));
+    }
+
+    #[test]
+    fn verdict_wire_fields_are_stable() {
+        // scout's reader and the VS Code view key on these exact names; a rename
+        // here is a silent drop there, not an error.
+        let ev = ResearchEvent::Verdict {
+            challenged_run_id: "r1".into(),
+            overall: Some("refuted"),
+            grounded: true,
+            claims: vec![ClaimVerdict {
+                claim: "GC sweeps".into(),
+                verdict: "refuted",
+            }],
+        };
+        assert_eq!(ev.name(), "verdict");
+        let d = ev.data();
+        assert_eq!(d["challenged_run_id"], "r1");
+        assert_eq!(d["overall"], "refuted");
+        assert_eq!(d["grounded"], true);
+        assert_eq!(d["claims"][0]["claim"], "GC sweeps");
+        assert_eq!(d["claims"][0]["verdict"], "refuted");
+
+        // Inconclusive is null on the wire — a value a reader must not render as
+        // an acquittal, and must be able to tell from any verdict string.
+        let ev = ResearchEvent::Verdict {
+            challenged_run_id: "r1".into(),
+            overall: None,
+            grounded: false,
+            claims: Vec::new(),
+        };
+        assert!(ev.data()["overall"].is_null());
+    }
+
     #[test]
     fn citations_wire_fields_are_stable() {
         // scout's reader and the VS Code view key on these exact names; a rename
@@ -11712,6 +12546,7 @@ mod tests {
                 stale_paths: vec!["src/moved.rs".into()],
                 cited_paths: vec!["src/nope.rs".into()],
                 verified_locations: Vec::new(),
+                details: Vec::new(),
             },
             revalidation: Some(Revalidation {
                 draft_unverified: 4,

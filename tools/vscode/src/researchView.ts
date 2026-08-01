@@ -8,6 +8,7 @@ import {
     ResearchProgress,
     ResearchStep,
     SearchFilter,
+    ResearchVerdict,
 } from "./api";
 import { say } from "./brand";
 import { describeScope, Scope } from "./scope";
@@ -139,6 +140,9 @@ export class ResearchPanel {
     }
     excerpts(excerpts: ResearchExcerpts): void {
         this.post({ type: "excerpts", excerpts });
+    }
+    verdict(verdict: ResearchVerdict): void {
+        this.post({ type: "verdict", verdict });
     }
     done(info: ResearchDone): void {
         this.post({ type: "done", info });

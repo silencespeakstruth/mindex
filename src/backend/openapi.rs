@@ -72,7 +72,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `research.model_missing`, `research.model_not_allowed`, \
 `validation.research_context_too_many`, \
 `validation.research_context_invalid`, `validation.research_delete_too_many`, \
-`validation.research_list_limit_out_of_range`, `research.run_not_found`.",
+`validation.research_list_limit_out_of_range`, `research.run_not_found`, \
+`research.challenge_subject_invalid`, `research.challenge_subject_is_challenge`.",
     ),
     paths(
         // Indexing
@@ -87,8 +88,10 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::post_search,
         handlers::post_symbols,
         handlers::post_research,
+        handlers::post_research_challenge,
         handlers::get_research_runs,
         handlers::get_research_run,
+        handlers::get_research_verification,
         handlers::post_research_pin,
         handlers::delete_research_run,
         handlers::delete_research_runs,
@@ -124,6 +127,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::SymbolInfo,
         crate::backend::v0::models::SymbolsResponse,
         crate::backend::v0::models::ResearchRequest,
+        crate::backend::v0::models::ChallengeRequest,
         crate::backend::v0::models::ResearchBudgetOverride,
         crate::research::Effort,
         crate::backend::v0::models::DeleteFilesRequest,
@@ -150,6 +154,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ResearchRunListResponse,
         crate::backend::v0::models::ResearchRunFile,
         crate::backend::v0::models::ResearchRunDetail,
+        crate::backend::v0::models::CitationCounts,
+        crate::backend::v0::models::ResearchVerification,
         crate::backend::v0::models::ResearchPinRequest,
         crate::backend::v0::models::DeleteResearchRunsRequest,
         crate::backend::v0::models::DeleteResearchRunsResponse,
@@ -224,6 +230,8 @@ mod tests {
             "/projects/{project_guid}/research",
             "/projects/{project_guid}/research/{run_id}",
             "/projects/{project_guid}/research/{run_id}/pin",
+            "/projects/{project_guid}/research/{run_id}/verification",
+            "/v0/{project_guid}/research/{run_id}/challenge",
             "/research/active",
             "/research/active/{run_id}",
             "/gc",
@@ -234,7 +242,7 @@ mod tests {
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 21, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 23, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak

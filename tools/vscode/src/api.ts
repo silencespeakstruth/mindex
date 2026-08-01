@@ -450,6 +450,21 @@ export interface ResearchRunSummary {
     referenced_by_count: number;
     /** Flat transitive context ancestry — every report this one leaned on. */
     context: ResearchRunDependency[];
+    /** `research` or `challenge` — whether this run answered a question or attacked another run's report. */
+    kind: string;
+    /** For a challenge: the run it attacked; `null` on research runs. */
+    challenged_run_id: string | null;
+    /**
+     * For a challenge: its overall verdict (`confirmed`/`disputed`/`refuted`),
+     * or `null` — inconclusive, which is NOT an acquittal. `null` on research runs.
+     */
+    challenge_verdict: string | null;
+    /**
+     * Derived trust status of THIS run from valid challenges aimed at it:
+     * `refuted` > `disputed` > `confirmed` > `unchallenged`. A stale challenge
+     * stops counting automatically; an inconclusive one counts toward none.
+     */
+    trust: string;
 }
 
 /** One run in another run's context chain (direct or transitive). */
@@ -552,6 +567,25 @@ export interface ResearchExcerpt {
  * model tokens. That is the point: asking a report to reproduce a file is the most
  * reliable way to make a run fail, so the report cites and the server quotes.
  */
+/** One claim's verdict inside a challenge's `verdict` event. */
+export interface ResearchClaimVerdict {
+    claim: string;
+    verdict: "confirmed" | "disputed" | "refuted";
+}
+
+/**
+ * A challenge run's conclusion about the stored report it attacked. `overall`
+ * is `null` when the verdict turn parsed to nothing — challenged, inconclusive,
+ * never an acquittal. `grounded: false` means the challenge's own report
+ * verified no citations, which capped `overall` at `disputed`.
+ */
+export interface ResearchVerdict {
+    challenged_run_id: string;
+    overall: "confirmed" | "disputed" | "refuted" | null;
+    grounded: boolean;
+    claims: ResearchClaimVerdict[];
+}
+
 export interface ResearchExcerpts {
     excerpts: ResearchExcerpt[];
     /** Verified citations found, before the server's caps. */
@@ -590,6 +624,12 @@ export interface ResearchCallbacks {
     onCitations(citations: ResearchCitations): void;
     /** Optional: a server older than the excerpt channel never fires it. */
     onExcerpts?(excerpts: ResearchExcerpts): void;
+    /**
+     * A challenge stream's conclusion about its subject, after `excerpts` and
+     * before `done`. Ordinary research streams never emit it. Optional on both
+     * ends, like `excerpts`.
+     */
+    onVerdict?(verdict: ResearchVerdict): void;
     onDone(info: ResearchDone): void;
     /** A server-side failure after the stream started (HTTP status was already 200). */
     onError(code: string, detail: string): void;
@@ -678,6 +718,10 @@ function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
             // Optional on both ends: an older server never sends it, and a view
             // that does not render it need not implement it.
             cb.onExcerpts?.(d as unknown as ResearchExcerpts);
+            break;
+        case "verdict":
+            // Challenge streams only — see ResearchVerdict.
+            cb.onVerdict?.(d as unknown as ResearchVerdict);
             break;
         case "done":
             cb.onDone(d as unknown as ResearchDone);

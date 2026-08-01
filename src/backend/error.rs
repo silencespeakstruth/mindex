@@ -157,6 +157,19 @@ pub enum ApiError {
     ResearchRunNotFound { run_id: String },
     /// The `limit` on the stored-research list was outside `1..=[research].list_page_limit`. 400.
     ResearchListLimitOutOfRange { got: usize, max: usize },
+    /// The run a challenge was aimed at is no longer valid — its files moved, or
+    /// its context chain broke — or its scope cannot be reconstructed. 400 rather
+    /// than a run: staleness already has its own verdict channel, and letting an
+    /// opponent "refute" a report whose code has changed would conflate "the code
+    /// moved" with "the report was wrong", poisoning the trust status.
+    ChallengeSubjectInvalid {
+        run_id: String,
+        reason: &'static str,
+    },
+    /// The run a challenge was aimed at is itself a challenge. 400: trust-status
+    /// aggregation is single-level in v1 — to contest a bad challenge, challenge
+    /// the original report again (a later valid challenge outweighs) or delete it.
+    ChallengeSubjectIsChallenge { run_id: String },
 }
 
 impl ApiError {
@@ -202,6 +215,10 @@ impl ApiError {
             ApiError::ResearchRunNotFound { .. } => "research.run_not_found",
             ApiError::ResearchListLimitOutOfRange { .. } => {
                 "validation.research_list_limit_out_of_range"
+            }
+            ApiError::ChallengeSubjectInvalid { .. } => "research.challenge_subject_invalid",
+            ApiError::ChallengeSubjectIsChallenge { .. } => {
+                "research.challenge_subject_is_challenge"
             }
         }
     }
@@ -265,6 +282,8 @@ impl ApiError {
             ApiError::ResearchDeleteTooMany { .. } => "Too many runs in one delete",
             ApiError::ResearchRunNotFound { .. } => "No such research run",
             ApiError::ResearchListLimitOutOfRange { .. } => "Invalid page size",
+            ApiError::ChallengeSubjectInvalid { .. } => "Challenge subject is not valid",
+            ApiError::ChallengeSubjectIsChallenge { .. } => "Cannot challenge a challenge",
         }
     }
 
@@ -450,6 +469,17 @@ impl ApiError {
                 "limit must be between 1 and {max} (got {got}); the ceiling is \
                  [research].list_page_limit."
             ),
+            ApiError::ChallengeSubjectInvalid { run_id, reason } => format!(
+                "Research run {run_id} cannot be challenged ({reason}). A challenge scores \
+                 claims against the code as indexed now, so a subject whose evidence has \
+                 already moved would conflate \"the code changed\" with \"the report was \
+                 wrong\". Re-run the research first, then challenge the fresh run."
+            ),
+            ApiError::ChallengeSubjectIsChallenge { run_id } => format!(
+                "Research run {run_id} is itself a challenge, and challenges cannot be \
+                 challenged. To contest it, challenge the original report again — a later \
+                 valid challenge outweighs — or delete it."
+            ),
         }
     }
 
@@ -506,6 +536,10 @@ impl ApiError {
             ApiError::ResearchListLimitOutOfRange { got, max } => {
                 Some(json!({ "got": got, "min": 1, "max": max }))
             }
+            ApiError::ChallengeSubjectInvalid { run_id, reason } => {
+                Some(json!({ "run_id": run_id, "reason": reason }))
+            }
+            ApiError::ChallengeSubjectIsChallenge { run_id } => Some(json!({ "run_id": run_id })),
             _ => None,
         }
     }
@@ -670,6 +704,13 @@ mod tests {
                 run_id: String::new(),
             },
             ApiError::ResearchListLimitOutOfRange { got: 0, max: 0 },
+            ApiError::ChallengeSubjectInvalid {
+                run_id: String::new(),
+                reason: "",
+            },
+            ApiError::ChallengeSubjectIsChallenge {
+                run_id: String::new(),
+            },
         ];
         let mut codes: Vec<&str> = all.iter().map(ApiError::code).collect();
         codes.sort_unstable();
@@ -686,6 +727,8 @@ mod tests {
             "request.malformed_body",
             "request.malformed_path",
             "research.busy",
+            "research.challenge_subject_invalid",
+            "research.challenge_subject_is_challenge",
             "research.model_missing",
             "research.model_not_allowed",
             "research.run_not_found",

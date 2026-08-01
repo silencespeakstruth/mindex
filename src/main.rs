@@ -39,6 +39,10 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("db/migrations/v1.1.0_toml_yaml_languages.sql"),
     ),
     (4, include_str!("db/migrations/v1.2.0_research_context.sql")),
+    (
+        5,
+        include_str!("db/migrations/v1.3.0_research_verification.sql"),
+    ),
 ];
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
@@ -768,7 +772,16 @@ mod tests {
                  );
                  INSERT INTO research_run_files (run_id, path, sha256) VALUES
                      ('run-1', 'src/a.rs', '\
-                      0000000000000000000000000000000000000000000000000000000000000001');",
+                      0000000000000000000000000000000000000000000000000000000000000001');
+                 INSERT INTO research_run_evidence (run_id, path, spans_json) VALUES
+                     ('run-1', 'src/a.rs', '[[1,2]]');
+                 INSERT INTO research_run_citations
+                     (run_id, ord, path, start_line, end_line, verdict, stale)
+                 VALUES ('run-1', 0, 'src/a.rs', 1, 2, 'verified', 0);
+                 INSERT INTO research_run_steps
+                     (run_id, n, phase, action, argument, hits, spans_json,
+                      spans_truncated, at_ms)
+                 VALUES ('run-1', 1, 'main', 'grep', 'x', 1, '[]', 0, 5);",
             )?;
 
             // The whole batch again, as a cold re-run would apply it.
@@ -782,6 +795,17 @@ mod tests {
                 tx.query_row("SELECT COUNT(*) FROM research_run_files", [], |r| r.get(0))?;
             assert_eq!(runs, 1, "the rebuild lost the run");
             assert_eq!(files, 1, "the rebuild orphaned or dropped the baselines");
+            // Migration 5's own children survive its rebuild the same way the
+            // baselines survive migration 4's — via the FK suspension.
+            for child in [
+                "research_run_evidence",
+                "research_run_citations",
+                "research_run_steps",
+            ] {
+                let n: i64 =
+                    tx.query_row(&format!("SELECT COUNT(*) FROM {child}"), [], |r| r.get(0))?;
+                assert_eq!(n, 1, "the rebuild dropped {child} rows");
+            }
 
             // And they still join: `id` survives the copy, so the child still resolves.
             let joined: i64 = tx.query_row(

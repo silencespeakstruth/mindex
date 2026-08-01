@@ -38,9 +38,42 @@ pub struct RunContext {
     pub effort: &'static str,
     pub seed: Option<i64>,
     pub temperature: Option<f64>,
+    /// The third sampling axis; NULL = the model's own default, like the two above.
+    pub top_p: Option<f64>,
+    /// The Ollama blob digest of the resolved model, from the model catalog at
+    /// admission; `None` when the catalog had not seen it yet (e.g. within the
+    /// first refresh interval after startup). The name in `model` is mutable —
+    /// a re-pulled tag is a different artifact — so this is what makes two runs
+    /// actually comparable.
+    pub model_digest: Option<String>,
+    /// The catalog's details object for the model (parameter size, quantization,
+    /// family), stored whole as JSON; read by humans and notebooks, never joined.
+    pub model_details_json: Option<String>,
+    /// Which embedding model the run's file baselines were read under
+    /// (`RouterState.model_id`). The staleness join has always bound this from
+    /// state; stamping it keeps stored runs interpretable across an embedder swap.
+    pub embedder_model_id: String,
+    /// `CARGO_PKG_VERSION` of the server that produced the row.
+    pub server_version: &'static str,
+    /// Wall-clock admission time (unix seconds). `created_at` is the INSERT's
+    /// time — the run's end — so without this the corpus never recorded when a
+    /// run began.
+    pub started_at: i64,
+    /// The resolved checkpoint interval for this run (`0` = off) — request
+    /// override over `[research].checkpoint_every_steps`, resolved by the
+    /// handler like the rest of this struct.
+    pub checkpoint_every_steps: usize,
     /// The run's file scope, rendered once by the caller. `None` for an unscoped run —
     /// stored as SQL NULL, so "no scope" and "an empty scope" stay apart.
     pub scope_json: Option<String>,
+    /// The same scope as data (serialized `ToolScope`), for the challenge
+    /// endpoint to re-inhabit. `None` on unscoped runs.
+    pub scope_spec_json: Option<String>,
+    /// `"research"` or `"challenge"` — the row's `kind` column.
+    pub kind: &'static str,
+    /// The run this challenge attacked; `None` on ordinary research runs. No FK
+    /// (see the migration): a dangling id means the subject is gone, nothing more.
+    pub challenged_run_id: Option<String>,
     /// `[research].retention_days`, threaded rather than read from a global. Stamped
     /// onto the row as an absolute `expires_at` at insert, so a run's deadline is a
     /// property of the run and a later config change moves only future runs.
@@ -103,7 +136,18 @@ pub async fn insert_run(
                      out_of_scope_refusals, out_of_scope_rows,
                      scoped, scope_json,
                      forced_synthesis, report_window_ms, report_elapsed_ms,
-                     title, report
+                     title, report,
+                     top_p, model_digest, model_details_json,
+                     granted_context_fraction, granted_report_words,
+                     granted_report_sections, granted_evidence_width,
+                     checkpoint_every_steps, checkpoints_taken,
+                     revalidation_draft_unverified, revalidation_draft_path_only,
+                     revalidation_draft_stale, revalidation_steps,
+                     sufficiency_verdict,
+                     embedder_model_id, server_version, started_at,
+                     scope_spec_json, kind, challenged_run_id,
+                     challenge_verdict, claims_total, claims_confirmed,
+                     claims_disputed, claims_refuted
                  ) VALUES (
                      ?1, ?2, ?44, unixepoch() + ?45, ?46,
                      ?3, ?4, ?5, ?6, ?7, ?8,
@@ -118,7 +162,18 @@ pub async fn insert_run(
                      ?36, ?37,
                      ?38, ?39,
                      ?40, ?41, ?42,
-                     ?47, ?43
+                     ?47, ?43,
+                     ?48, ?49, ?50,
+                     ?51, ?52,
+                     ?53, ?54,
+                     ?55, ?56,
+                     ?57, ?58,
+                     ?59, ?60,
+                     ?61,
+                     ?62, ?63, ?64,
+                     ?65, ?66, ?67,
+                     ?68, ?69, ?70,
+                     ?71, ?72
                  )",
                 rusqlite::params![
                     id,
@@ -168,6 +223,31 @@ pub async fn insert_run(
                     retention_secs,
                     context_run_ids,
                     record.title,
+                    ctx.top_p,
+                    ctx.model_digest,
+                    ctx.model_details_json,
+                    record.budget.context_fraction,
+                    record.budget.max_report_words as i64,
+                    record.budget.max_report_sections as i64,
+                    record.budget.evidence_width as i64,
+                    ctx.checkpoint_every_steps as i64,
+                    record.tools.checkpoints_taken as i64,
+                    record.revalidation.map(|r| r.draft_unverified as i64),
+                    record.revalidation.map(|r| r.draft_path_only as i64),
+                    record.revalidation.map(|r| r.draft_stale as i64),
+                    record.revalidation.map(|r| r.steps as i64),
+                    record.sufficiency_verdict,
+                    ctx.embedder_model_id,
+                    ctx.server_version,
+                    ctx.started_at,
+                    ctx.scope_spec_json,
+                    ctx.kind,
+                    ctx.challenged_run_id,
+                    record.challenge.as_ref().and_then(|c| c.verdict),
+                    record.challenge.as_ref().map(|c| c.claims.len() as i64),
+                    record.challenge.as_ref().map(|c| c.count_of("confirmed")),
+                    record.challenge.as_ref().map(|c| c.count_of("disputed")),
+                    record.challenge.as_ref().map(|c| c.count_of("refuted")),
                 ],
             )?;
 
@@ -180,6 +260,62 @@ pub async fn insert_run(
                 )?;
                 for b in &record.file_baselines {
                     stmt.execute(rusqlite::params![id, b.path, b.sha256])?;
+                }
+            }
+            // The shown spans — what makes the citation check re-runnable against
+            // this row later without a model or a GPU.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_evidence (run_id, path, spans_json) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for e in &record.evidence_spans {
+                    let spans =
+                        serde_json::to_string(&e.spans).unwrap_or_else(|_| "[]".to_string());
+                    stmt.execute(rusqlite::params![id, e.path, spans])?;
+                }
+            }
+            // Every citation occurrence with its own verdict, in report order.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_citations \
+                     (run_id, ord, path, start_line, end_line, verdict, stale) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                for (ord, c) in record.citations.details.iter().enumerate() {
+                    stmt.execute(rusqlite::params![
+                        id,
+                        ord as i64,
+                        c.path,
+                        c.start as i64,
+                        c.end as i64,
+                        c.verdict,
+                        i64::from(c.stale),
+                    ])?;
+                }
+            }
+            // The tool-call trace: calls + arguments + landing spans, no bodies.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_steps \
+                     (run_id, n, phase, action, argument, hits, spans_json, \
+                      spans_truncated, at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )?;
+                for s in &record.trace {
+                    let spans =
+                        serde_json::to_string(&s.spans).unwrap_or_else(|_| "[]".to_string());
+                    stmt.execute(rusqlite::params![
+                        id,
+                        s.n as i64,
+                        s.phase,
+                        s.action,
+                        s.argument,
+                        s.hits as i64,
+                        spans,
+                        i64::from(s.spans_truncated),
+                        s.at_ms as i64,
+                    ])?;
                 }
             }
             Ok(RecordedRun { id, seq })
@@ -309,6 +445,17 @@ impl ResearchJournal for MeteredJournal {
         if record.revalidation.is_some() {
             r.revalidations.inc();
         }
+        // A challenge's verdict is a server-defined closed set; `None` — a
+        // verdict turn that parsed to nothing — is its own label rather than a
+        // dropped event, because "inconclusive" is the value that must not be
+        // mistaken for an acquittal.
+        if let Some(challenge) = &record.challenge {
+            r.challenges
+                .get_or_create(&crate::backend::metrics::OutcomeLabels {
+                    outcome: challenge.verdict.unwrap_or("inconclusive"),
+                })
+                .inc();
+        }
         if record.tools.forced_synthesis {
             r.forced_syntheses.inc();
         }
@@ -359,6 +506,22 @@ mod tests {
                 cited_paths: vec!["src/gc.rs".into(), "src/nope.rs".into()],
                 // Not journalled — the excerpt channel's input, not the record's.
                 verified_locations: Vec::new(),
+                details: vec![
+                    crate::research::CitationDetail {
+                        path: "src/gc.rs".into(),
+                        start: 10,
+                        end: 20,
+                        verdict: "verified",
+                        stale: true,
+                    },
+                    crate::research::CitationDetail {
+                        path: "src/nope.rs".into(),
+                        start: 1,
+                        end: 2,
+                        verdict: "unverified",
+                        stale: false,
+                    },
+                ],
             },
             staleness: RunStaleness {
                 changed_files: 1,
@@ -367,6 +530,22 @@ mod tests {
             revalidation: None,
             title: Some("Report".into()),
             report: "# Report\n\nIt sweeps.".into(),
+            evidence_spans: vec![crate::research::EvidenceSpans {
+                path: "src/gc.rs".into(),
+                spans: vec![(10, 30)],
+            }],
+            trace: vec![crate::research::StepTrace {
+                n: 1,
+                phase: "main",
+                action: "grep",
+                argument: "sweep".into(),
+                hits: 2,
+                spans: vec!["src/gc.rs:10-30".into()],
+                spans_truncated: false,
+                at_ms: 42,
+            }],
+            sufficiency_verdict: Some("1. ANSWERED".into()),
+            challenge: None,
         }
     }
 
@@ -438,6 +617,16 @@ mod tests {
             effort: "medium",
             seed: Some(7),
             temperature: Some(0.2),
+            top_p: Some(0.9),
+            model_digest: Some("sha256:abc".into()),
+            model_details_json: Some(r#"{"parameter_size":"32B"}"#.into()),
+            embedder_model_id: "BAAI/bge-m3".into(),
+            server_version: "0.0.0-test",
+            started_at: 1_700_000_000,
+            checkpoint_every_steps: 6,
+            scope_spec_json: None,
+            kind: "research",
+            challenged_run_id: None,
         }
     }
 
@@ -564,6 +753,162 @@ mod tests {
             .await
             .expect("two rows");
         assert_eq!(titles, vec![Some("Report".to_string()), None]);
+    }
+
+    /// The three structured children land in the same transaction as the row —
+    /// spans (what re-verification reconstructs `Evidence` from), per-citation
+    /// verdicts, and the tool-call trace.
+    #[tokio::test]
+    async fn the_structured_children_land_with_the_run() {
+        let pool = pool().await;
+        let c = ctx();
+        let run_id = c.id.clone();
+        insert_run(&pool, c, record(), CancellationToken::new()).await;
+
+        type EvidenceRow = (String, String);
+        type CitationRow = (i64, String, String, i64);
+        type StepRow = (String, String, String, i64);
+        let (spans, citation, step): (EvidenceRow, CitationRow, StepRow) = pool
+            .transaction(CancellationToken::new(), move |tx| {
+                let spans = tx.query_row(
+                    "SELECT path, spans_json FROM research_run_evidence WHERE run_id = ?1",
+                    rusqlite::params![run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let citation = tx.query_row(
+                    "SELECT ord, path, verdict, stale FROM research_run_citations \
+                     WHERE run_id = ?1 AND ord = 0",
+                    rusqlite::params![run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                let step = tx.query_row(
+                    "SELECT phase, action, argument, hits FROM research_run_steps \
+                     WHERE run_id = ?1 AND n = 1",
+                    rusqlite::params![run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                Ok((spans, citation, step))
+            })
+            .await
+            .expect("children present");
+        assert_eq!(spans, ("src/gc.rs".to_string(), "[[10,30]]".to_string()));
+        assert_eq!(
+            citation,
+            (0, "src/gc.rs".to_string(), "verified".to_string(), 1)
+        );
+        assert_eq!(
+            step,
+            (
+                "main".to_string(),
+                "grep".to_string(),
+                "sweep".to_string(),
+                2
+            )
+        );
+    }
+
+    /// The metadata that used to be measured and then dropped at the journal's
+    /// door — plus the request-decided fields that never had columns. NULL means
+    /// "not recorded", so the None case must land as NULL, not zero.
+    #[tokio::test]
+    async fn the_new_metadata_lands_on_the_row_and_absent_reads_as_null() {
+        let pool = pool().await;
+        let mut with_reval = record();
+        with_reval.revalidation = Some(crate::research::Revalidation {
+            draft_unverified: 3,
+            draft_path_only: 2,
+            draft_stale: 1,
+            steps: 4,
+        });
+        insert_run(&pool, ctx(), with_reval, CancellationToken::new()).await;
+        let mut bare = record();
+        bare.sufficiency_verdict = None;
+        let mut c2 = ctx();
+        c2.top_p = None;
+        c2.model_digest = None;
+        insert_run(&pool, c2, bare, CancellationToken::new()).await;
+
+        type Row = (
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<f64>,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = pool
+            .transaction(CancellationToken::new(), |tx| {
+                let mut stmt = tx.prepare(
+                    "SELECT revalidation_draft_unverified, revalidation_steps, \
+                     sufficiency_verdict, top_p, model_digest, embedder_model_id, \
+                     server_version, started_at, granted_context_fraction, \
+                     checkpoint_every_steps \
+                     FROM research_runs ORDER BY seq",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("two rows");
+
+        let first = &rows[0];
+        assert_eq!((first.0, first.1), (Some(3), Some(4)));
+        assert_eq!(first.2.as_deref(), Some("1. ANSWERED"));
+        assert_eq!(first.3, Some(0.9));
+        assert_eq!(first.4.as_deref(), Some("sha256:abc"));
+        assert_eq!(first.5.as_deref(), Some("BAAI/bge-m3"));
+        assert_eq!(first.6.as_deref(), Some("0.0.0-test"));
+        assert_eq!(first.7, Some(1_700_000_000));
+        assert_eq!(first.8, Some(0.7));
+        assert_eq!(first.9, Some(6));
+
+        let second = &rows[1];
+        // No repair happened, nothing was said, nothing was configured: NULL.
+        assert_eq!((second.0, second.1), (None, None));
+        assert_eq!(second.2, None);
+        assert_eq!(second.3, None);
+        assert_eq!(second.4, None);
+    }
+
+    /// Every journalled row is an ordinary research run: `kind` takes its
+    /// DEFAULT and the challenge columns stay NULL — the challenge endpoint
+    /// writes its own rows.
+    #[tokio::test]
+    async fn an_ordinary_run_is_stored_as_kind_research() {
+        let pool = pool().await;
+        insert_run(&pool, ctx(), record(), CancellationToken::new()).await;
+
+        let (kind, challenged, verdict): (String, Option<String>, Option<String>) = pool
+            .transaction(CancellationToken::new(), |tx| {
+                Ok(tx.query_row(
+                    "SELECT kind, challenged_run_id, challenge_verdict FROM research_runs",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .expect("one row");
+        assert_eq!(kind, "research");
+        assert_eq!((challenged, verdict), (None, None));
     }
 
     /// The write is on the "report already delivered" side of the run, so a

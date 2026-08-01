@@ -292,6 +292,25 @@ pub trait OllamaModel: Send + Sync {
     /// exactly the set a `/research` request may legally name.
     async fn list_models(&self) -> Result<Vec<String>, OllamaError>;
 
+    /// [`Self::list_models`] with each model's identity attached: blob digest and
+    /// the details object (parameter size, quantization, family), for the run
+    /// journal. A provided method deriving from `list_models` so every fake keeps
+    /// compiling; the HTTP client overrides it to read the fields `/api/tags`
+    /// already carries. A default-derived descriptor has no digest — which reads
+    /// as "not recorded", never as a wrong one.
+    async fn list_model_descriptors(&self) -> Result<Vec<ModelDescriptor>, OllamaError> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|name| ModelDescriptor {
+                name,
+                digest: None,
+                details_json: None,
+            })
+            .collect())
+    }
+
     /// Liveness ping of the Ollama server (used by `GET /health`). Ollama is an
     /// *optional* dependency — a failure here is reported, never fatal.
     ///
@@ -319,6 +338,24 @@ struct TagsResponse {
 struct TagEntry {
     #[serde(default)]
     name: String,
+    /// The model's blob digest — what makes a mutable tag name comparable across
+    /// re-pulls. Missing on old Ollamas: degrade to None, never to an error.
+    #[serde(default)]
+    digest: Option<String>,
+    /// Ollama's details object (parameter size, quantization, family), kept as
+    /// raw JSON: the journal stores it whole, nothing in this crate reads inside.
+    #[serde(default)]
+    details: Option<serde_json::Value>,
+}
+
+/// One locally-available model with its identity, for the run journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDescriptor {
+    pub name: String,
+    pub digest: Option<String>,
+    /// The details object serialized back to a JSON string, or `None` when
+    /// Ollama sent none.
+    pub details_json: Option<String>,
 }
 
 /// The slice of `POST /api/show` this client needs.
@@ -782,6 +819,34 @@ impl OllamaModel for OllamaHttpClient {
             .into_iter()
             .map(|m| m.name)
             .filter(|n| !n.is_empty())
+            .collect())
+    }
+
+    async fn list_model_descriptors(&self) -> Result<Vec<ModelDescriptor>, OllamaError> {
+        // The same `/api/tags` read as `list_models`, keeping the fields that
+        // identify the artifact behind the name.
+        let url = self.base_url.join("api/tags").unwrap(); // join of a literal cannot fail
+        let tags: TagsResponse = self
+            .client
+            .get(url)
+            .timeout(Duration::from_millis(self.tuning.health_timeout_ms))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(tags
+            .models
+            .into_iter()
+            .filter(|m| !m.name.is_empty())
+            .map(|m| ModelDescriptor {
+                name: m.name,
+                digest: m.digest.filter(|d| !d.is_empty()),
+                details_json: m
+                    .details
+                    .as_ref()
+                    .and_then(|d| serde_json::to_string(d).ok()),
+            })
             .collect())
     }
 }

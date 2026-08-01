@@ -34,6 +34,10 @@ interface RunSummary {
     references_count: number;
     referenced_by_count: number;
     context: RunDependency[];
+    kind: string;
+    challenged_run_id: string | null;
+    challenge_verdict: string | null;
+    trust: string;
 }
 
 interface RunDependency {
@@ -280,6 +284,38 @@ function renderRow(run: RunSummary): HTMLLIElement {
                     : run.invalid_reason === "context_deleted"
                       ? "A report in this one's context chain was deleted."
                       : "A report in this one's context chain is no longer valid."
+            )
+        );
+    }
+    // The refutation channel. A challenge row says what it concluded; every row
+    // says what valid challenges concluded about IT. `unchallenged` is silent —
+    // it merely means untested, and a badge on every row is a badge on none.
+    if (run.kind === "challenge") {
+        meta.appendChild(
+            badge(
+                run.challenge_verdict === null
+                    ? "challenge: inconclusive"
+                    : `challenge: ${run.challenge_verdict}`,
+                "deps",
+                "This run attacked another report's claims. Inconclusive means its " +
+                    "verdict turn produced nothing parseable — not an acquittal."
+            )
+        );
+    }
+    if (run.trust === "refuted" || run.trust === "disputed" || run.trust === "confirmed") {
+        meta.appendChild(
+            badge(
+                run.trust,
+                run.trust === "refuted"
+                    ? "invalid"
+                    : run.trust === "disputed"
+                      ? "incomplete"
+                      : "pinned",
+                run.trust === "refuted"
+                    ? "A valid challenge run refuted this report's claims. Treat it as likely wrong."
+                    : run.trust === "disputed"
+                      ? "A valid challenge run disputed some of this report's claims."
+                      : "A valid challenge run confirmed this report's claims."
             )
         );
     }

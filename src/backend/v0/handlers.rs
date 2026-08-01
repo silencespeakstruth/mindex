@@ -17,7 +17,9 @@ use crate::backend::v0::models::CallSite;
 use crate::backend::v0::models::CallersResponse;
 use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
+use crate::backend::v0::models::ChallengeRequest;
 use crate::backend::v0::models::ChunkExcerpt;
+use crate::backend::v0::models::CitationCounts;
 use crate::backend::v0::models::Code;
 use crate::backend::v0::models::CommitSummary;
 use crate::backend::v0::models::ConfigResponse;
@@ -60,6 +62,7 @@ use crate::backend::v0::models::ResearchRunDetail;
 use crate::backend::v0::models::ResearchRunFile;
 use crate::backend::v0::models::ResearchRunListResponse;
 use crate::backend::v0::models::ResearchRunSummary;
+use crate::backend::v0::models::ResearchVerification;
 use crate::backend::v0::models::RetryRequest;
 use crate::backend::v0::models::RetryResponse;
 use crate::backend::v0::models::SearchFilter;
@@ -3740,7 +3743,8 @@ pub(crate) async fn list_research_core(
                 .map(|q| format!("%{}%", like_escape(q)));
             let sql = format!(
                 "{ctes}
-                 SELECT r.id, r.seq, r.title, r.question, r.created_at
+                 SELECT r.id, r.seq, r.title, r.question, r.created_at, r.kind,
+                        {trust}
                    FROM research_runs r
                   WHERE r.project_guid = ?1
                     AND NOT EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id)
@@ -3754,6 +3758,7 @@ pub(crate) async fn list_research_core(
                     ""
                 },
                 limit = LIST_RESEARCH_LIMIT,
+                trust = research_trust_column(),
             );
             let mut stmt = tx.prepare(&sql)?;
             let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
@@ -3768,6 +3773,8 @@ pub(crate) async fn list_research_core(
                         title: row.get(2)?,
                         question: row.get(3)?,
                         created_at: row.get(4)?,
+                        kind: row.get(5)?,
+                        trust: row.get(6)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3804,10 +3811,12 @@ pub(crate) async fn read_research_core(
             let sql = format!(
                 "{ctes}
                  SELECT r.question, r.report,
-                        EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id)
+                        EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id),
+                        {trust}
                    FROM research_runs r
                   WHERE r.project_guid = ?1 AND r.seq = ?3",
                 ctes = research_validity_ctes("?1", "?2"),
+                trust = research_trust_column(),
             );
             let row = tx
                 .query_row(&sql, rusqlite::params![pg, model_id, seq], |row| {
@@ -3815,6 +3824,7 @@ pub(crate) async fn read_research_core(
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .optional()?;
@@ -3833,11 +3843,12 @@ pub(crate) async fn read_research_core(
         })?;
     Ok(match found {
         None => crate::research::StoredReport::Missing { seq },
-        Some((_, _, true)) => crate::research::StoredReport::Invalid { seq },
-        Some((question, report, false)) => crate::research::StoredReport::Found {
+        Some((_, _, true, _)) => crate::research::StoredReport::Invalid { seq },
+        Some((question, report, false, trust)) => crate::research::StoredReport::Found {
             seq,
             question,
             report,
+            trust,
         },
     })
 }
@@ -4765,22 +4776,6 @@ pub async fn post_research(
     let prior_reports =
         load_prior_reports(&s, &project_guid, &context_run_ids, &load_guard.0).await?;
 
-    let permit = s
-        .research_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::ResearchBusy)?;
-
-    let token = CancellationToken::new();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Minted here rather than at the journal insert, which is where it used to be
-    // born. A run that has no id until it ends cannot be listed, cancelled or named
-    // in a bug report while it runs — and a cancelled run, which is never
-    // journalled, had no id at all. Same uuid on the wire, in the registry and in
-    // the row.
-    let run_id = uuid::Uuid::new_v4().to_string();
-
     let params = crate::research::ResearchParams {
         question: req.question,
         model,
@@ -4801,12 +4796,231 @@ pub async fn post_research(
         metrics: Some(s.metrics.clone()),
         prior_reports,
         max_context_chars: s.research_max_context_chars,
+        challenge: None,
     };
+    launch_research_job(s, project_guid, req.effort, params, "research", None).await
+}
+
+/// `POST /v0/{project_guid}/research/{run_id}/challenge` — set an opponent on a
+/// stored report.
+///
+/// The challenge **is** a research run through the same loop: same admission
+/// semaphore (the GPU is the scarce resource — a second pool would over-admit
+/// the one thing `max_concurrent` protects), same budgets, same scope
+/// enforcement, same citation-provenance gate on its own report. What differs
+/// is the framing: the subject's report is injected as the thing under
+/// examination (hearsay — the opponent may cite nothing from it and must
+/// re-derive every location through its own tools, which *is* the refutation
+/// work), the plan turn asks for the report's principal claims, and a closing
+/// verdict turn scores each claim CONFIRMED / DISPUTED / REFUTED in a
+/// server-dictated vocabulary.
+///
+/// The stream is the ordinary research stream plus **one** extra event,
+/// `verdict` `{challenged_run_id, overall, grounded, claims: [{claim,
+/// verdict}]}`, emitted after `excerpts` (when any) and before `done`.
+/// `overall` is `confirmed`/`disputed`/`refuted`, or null when the verdict turn
+/// produced nothing parseable — "challenged, inconclusive", never an acquittal.
+/// `grounded: false` says the challenge's own report verified no citations,
+/// which caps `overall` at `disputed`: an unshown accusation can dispute a
+/// report but never refute it.
+///
+/// The subject must be **valid** (its files unmoved, its context chain alive):
+/// a challenge scores claims against the code as indexed now, and "the code
+/// changed" must not be spendable as "the report was wrong" — 400
+/// `research.challenge_subject_invalid`. Challenging a challenge is refused
+/// (400 `research.challenge_subject_is_challenge`): trust aggregation is
+/// single-level; contest a bad challenge by challenging the original again, or
+/// delete it. The verdict lands on the *subject* as a derived trust status in
+/// the list/detail endpoints — nothing on the subject's row is written.
+///
+/// **Concurrency:** read-only against the index, like `POST /research`; shares
+/// its semaphore, so a busy slot answers 429 `research.busy`.
+#[utoipa::path(
+    post,
+    path = "/v0/{project_guid}/research/{run_id}/challenge",
+    tag = "Search",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ("run_id" = String, Path, description = "The stored run to challenge."),
+    ),
+    request_body = ChallengeRequest,
+    responses(
+        (status = 200, description = "SSE stream of research events, exactly as `POST /v0/{project_guid}/research` emits them, plus one `verdict` event on this stream only — `{challenged_run_id, overall, grounded, claims}` after `excerpts` and before `done`. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`.", content_type = "text/event-stream"),
+        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`) or a subject that is itself a challenge (`research.challenge_subject_is_challenge`).", body = ProblemDetails),
+        (status = 404, description = "This project has no such run.", body = ProblemDetails),
+        (status = 429, description = "All research slots are busy.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn post_research_challenge(
+    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    State(s): State<RouterState>,
+    ApiJson(req): ApiJson<ChallengeRequest>,
+) -> Result<Response, ApiError> {
+    validate::research_budget(
+        &req.budget,
+        &validate::ResearchBudgetCaps {
+            max_seconds: s.research_max_request_seconds,
+            max_tokens: s.research_max_request_tokens,
+            max_steps: s.research_max_request_steps,
+            max_report_sections: s.research_max_request_report_sections,
+            max_report_words: s.research_max_request_report_words,
+            max_evidence_width: s.research_max_evidence_width,
+        },
+    )?;
+    let model = match req.model.as_deref().map(str::trim) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ if !s.research_default_model.is_empty() => s.research_default_model.clone(),
+        _ => return Err(ApiError::ResearchModelMissing),
+    };
+    if !s.research_allowed_models.allows(&model) {
+        return Err(ApiError::ResearchModelNotAllowed { model });
+    }
+
+    // The subject, loaded before any slot is taken (the prior-reports rule).
+    let load_guard = http3::CancellationGuard(CancellationToken::new());
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid;
+    let rid = run_id.clone();
+    let subject_row = s
+        .db_pool
+        .transaction(load_guard.0.child_token(), move |tx| {
+            let sql = format!(
+                "{ctes}
+                 SELECT r.seq, r.question, r.report, r.kind, r.scoped, r.scope_spec_json,
+                        EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS invalid_flag
+                   FROM research_runs r
+                  WHERE r.project_guid = ?1 AND r.id = ?3",
+                ctes = research_validity_ctes("?1", "?2"),
+            );
+            tx.query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            })
+            .optional()
+            .map_err(SQLite3PoolError::from)
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to load a research run for challenging. Check the database is readable."
+            );
+            ApiError::from(e)
+        })?;
+    let Some((seq, question, report, kind, scoped, scope_spec_json, invalid)) = subject_row else {
+        return Err(ApiError::ResearchRunNotFound { run_id });
+    };
+    if kind == "challenge" {
+        return Err(ApiError::ChallengeSubjectIsChallenge { run_id });
+    }
+    if invalid {
+        return Err(ApiError::ChallengeSubjectInvalid {
+            run_id,
+            reason: "stale_or_broken_context",
+        });
+    }
+    // The challenge re-inhabits the subject's exact scope. A scoped run
+    // journalled before the structured scope existed cannot be faithfully
+    // re-scoped — refuse honestly rather than challenge with different walls.
+    let scope: crate::research::ToolScope = match &scope_spec_json {
+        Some(json) => serde_json::from_str(json).map_err(|e| {
+            warn!(error = %e, "A stored scope_spec_json failed to parse; refusing the challenge.");
+            ApiError::ChallengeSubjectInvalid {
+                run_id: run_id.clone(),
+                reason: "scope_unavailable",
+            }
+        })?,
+        None if scoped != 0 => {
+            return Err(ApiError::ChallengeSubjectInvalid {
+                run_id,
+                reason: "scope_unavailable",
+            });
+        }
+        None => crate::research::ToolScope::default(),
+    };
+
+    let params = crate::research::ResearchParams {
+        // Self-describing everywhere the question surfaces: the list, the title
+        // fallback, `GET /research/active`.
+        question: format!("Challenge research #{seq}: {question}"),
+        model,
+        scope,
+        budget: s.research_budget(req.effort, req.budget),
+        sampling: s.research_sampling_for(req.seed),
+        report_timeout_ms: s.research_report_timeout_ms,
+        checkpoint_every_steps: req
+            .budget
+            .and_then(|b| b.checkpoint_every_steps)
+            .unwrap_or(s.research_checkpoint_every_steps),
+        max_turn_thinking_chars: s.research_max_turn_thinking_chars,
+        metrics: Some(s.metrics.clone()),
+        // The subject is injected by the challenge machinery itself, not as a
+        // prior report: it is the question, not background.
+        prior_reports: Vec::new(),
+        max_context_chars: s.research_max_context_chars,
+        challenge: Some(crate::research::ChallengeSubject {
+            run_id: run_id.clone(),
+            seq,
+            question,
+            report,
+        }),
+    };
+    launch_research_job(
+        s,
+        project_guid,
+        req.effort,
+        params,
+        "challenge",
+        Some(run_id),
+    )
+    .await
+}
+
+/// The shared tail of `POST /research` and `POST /research/{run_id}/challenge`:
+/// admission, run identity, journal context, registry entry, job spawn and the
+/// SSE response. One function so the two entrances cannot drift on any of the
+/// invariants that live here (permit-in-the-job, registry-in-the-job, the
+/// `started`-first frame).
+async fn launch_research_job(
+    s: RouterState,
+    project_guid: UUIDv4,
+    effort_level: crate::research::Effort,
+    params: crate::research::ResearchParams,
+    kind: &'static str,
+    challenged_run_id: Option<String>,
+) -> Result<Response, ApiError> {
+    let permit = s
+        .research_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::ResearchBusy)?;
+
+    let token = CancellationToken::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Minted here rather than at the journal insert, which is where it used to be
+    // born. A run that has no id until it ends cannot be listed, cancelled or named
+    // in a bug report while it runs — and a cancelled run, which is never
+    // journalled, had no id at all. Same uuid on the wire, in the registry and in
+    // the row.
+    let run_id = uuid::Uuid::new_v4().to_string();
+
     info!(
         project_guid = %project_guid.0,
         model = %params.model,
         prompt_version = crate::research::PROMPT_VERSION,
-        effort = ?req.effort,
+        effort = ?effort_level,
+        kind,
         seed = ?params.sampling.seed,
         // The resolved budget, not the requested effort: with `budget` overrides the
         // level alone no longer says what the run was granted. The shape axes ride
@@ -4823,7 +5037,13 @@ pub async fn post_research(
     );
 
     let ollama = s.research_ollama.clone();
-    let effort = match req.effort {
+    // The model's identity at admission, from the catalog worker's snapshot — no
+    // network call on the request path. `(None, None)` when the catalog has not
+    // seen the model (e.g. before its first tick): "not recorded", journalled as
+    // NULL, never a fabricated digest.
+    let (model_digest, model_details_json) =
+        s.research_models.read().await.identity_of(&params.model);
+    let effort = match effort_level {
         crate::research::Effort::Low => "low",
         crate::research::Effort::Medium => "medium",
         crate::research::Effort::High => "high",
@@ -4855,9 +5075,27 @@ pub async fn post_research(
                     effort,
                     seed: params.sampling.seed,
                     temperature: params.sampling.temperature,
+                    top_p: params.sampling.top_p,
+                    model_digest,
+                    model_details_json,
+                    embedder_model_id: {
+                        let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+                        model_id.clone()
+                    },
+                    server_version: env!("CARGO_PKG_VERSION"),
+                    started_at: crate::unix_now(),
+                    checkpoint_every_steps: params.checkpoint_every_steps,
                     // Rendered by the same one renderer the model reads, so the
                     // journal and the prompt can never describe the scope differently.
                     scope_json: params.scope.is_scoped().then(|| params.scope.describe()),
+                    // The same scope as data, for a later challenge to re-inhabit.
+                    scope_spec_json: params
+                        .scope
+                        .is_scoped()
+                        .then(|| serde_json::to_string(&params.scope).ok())
+                        .flatten(),
+                    kind,
+                    challenged_run_id: challenged_run_id.clone(),
                     retention_days: s.research_retention_days,
                 },
             }),
@@ -5881,7 +6119,30 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
 /// shifted `report` into `invalid_flag`'s place and the run's own report became
 /// whatever the next column held. Naming the boundary is what stops the two from
 /// drifting; `research_summary_columns_are_counted_correctly` pins it.
-const RESEARCH_SUMMARY_COLUMNS: usize = 19;
+const RESEARCH_SUMMARY_COLUMNS: usize = 23;
+
+/// The derived trust status of run `r` — the challenge channel's verdict,
+/// aggregated at read time exactly as validity is (nothing is ever written to
+/// the subject's row). Only **valid** challenges count: a challenge whose own
+/// evidence has moved, or whose subject-project chain broke, stops counting the
+/// moment it goes stale — the same `invalid` CTE decides both. Severity wins
+/// across challenges; an inconclusive challenge (NULL verdict — its verdict
+/// turn parsed to nothing) counts toward none of the three, so a run whose only
+/// challenge was inconclusive reads `unchallenged` here and the challenge
+/// itself stays visible in the corpus.
+///
+/// Requires [`research_validity_ctes`] prepended, like `invalid_flag`.
+fn research_trust_column() -> &'static str {
+    "COALESCE((SELECT CASE
+         WHEN SUM(c.challenge_verdict = 'refuted') > 0 THEN 'refuted'
+         WHEN SUM(c.challenge_verdict = 'disputed') > 0 THEN 'disputed'
+         WHEN SUM(c.challenge_verdict = 'confirmed') > 0 THEN 'confirmed'
+       END
+       FROM research_runs c
+      WHERE c.kind = 'challenge'
+        AND c.challenged_run_id = r.id
+        AND NOT EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = c.id)), 'unchallenged') AS trust"
+}
 
 fn research_summary_columns() -> String {
     format!(
@@ -5890,8 +6151,11 @@ fn research_summary_columns() -> String {
          r.steps, r.elapsed_ms, {}, r.title,
          EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS invalid_flag,
          COALESCE((SELECT n FROM refs WHERE refs.run_id = r.id), 0) AS references_count,
-         COALESCE((SELECT n FROM refd WHERE refd.run_id = r.id), 0) AS referenced_by_count",
-        research_staleness_columns("?2")
+         COALESCE((SELECT n FROM refd WHERE refd.run_id = r.id), 0) AS referenced_by_count,
+         r.kind, r.challenged_run_id, r.challenge_verdict,
+         {trust}",
+        research_staleness_columns("?2"),
+        trust = research_trust_column(),
     )
 }
 
@@ -5933,6 +6197,10 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
         references_count: row.get(17)?,
         referenced_by_count: row.get(18)?,
         context: Vec::new(),
+        kind: row.get(19)?,
+        challenged_run_id: row.get(20)?,
+        challenge_verdict: row.get(21)?,
+        trust: row.get(22)?,
     })
 }
 
@@ -6230,6 +6498,229 @@ pub async fn get_research_run(
     found
         .map(Json)
         .ok_or(ApiError::ResearchRunNotFound { run_id })
+}
+
+/// `GET /projects/{project_guid}/research/{run_id}/verification` — re-check a
+/// stored report's citations against the journal and today's index.
+///
+/// The whole point of journalling the evidence spans: `check_citations` is a pure
+/// function of `(report, spans, staleness)`, all three now in SQLite, so the check
+/// re-runs **offline** — no model, no GPU, cheap enough to call whenever currency
+/// matters. Two different questions come back:
+///
+/// - **Provenance** (`recomputed` vs `recorded`, `provenance_matches`): immutable
+///   facts about the run. A mismatch means the journal or the reconstruction is
+///   wrong — a bug, never news about the code.
+/// - **Staleness** (`stale_citations_now`, `files_moved`): computed against the
+///   index as it stands *now*. This is the number that moves, and the reason to
+///   call this endpoint at all.
+///
+/// Runs journalled before v1.3.0 have no stored spans; for them
+/// `spans_available` is `false` and only the staleness half is computed —
+/// recomputing provenance without spans would score every citation `unverified`
+/// and read as a degraded report, which would be the check lying. Nothing is
+/// stamped: like validity, the verdict is derived at read time, so it can never
+/// disagree with a recomputation.
+///
+/// **Concurrency:** read-only — safe concurrently with anything, including a
+/// live research run.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_guid}/research/{run_id}/verification",
+    tag = "Research",
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ("run_id" = String, Path, description = "The run's stable id."),
+    ),
+    responses(
+        (status = 200, description = "The re-checked citation report: recorded vs recomputed provenance, plus citation staleness against today's index.", body = ResearchVerification),
+        (status = 404, description = "This project has no such run.", body = ProblemDetails),
+        (status = 500, description = "SQLite read failure.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn get_research_verification(
+    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    State(s): State<RouterState>,
+) -> Result<Json<ResearchVerification>, ApiError> {
+    let guard = http3::CancellationGuard(CancellationToken::new());
+    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
+    let model_id = model_id.to_string();
+    let pg = project_guid;
+    let pg_simple = project_guid.0.simple().to_string();
+    let rid = run_id.clone();
+
+    type FileStates = std::collections::HashMap<String, (bool, bool)>;
+    let found = s
+        .db_pool
+        .transaction(guard.0.child_token(), move |tx| {
+            let sql = format!(
+                "{ctes}
+                 SELECT {cols}, r.report, r.citations_path_only, r.stale_citations,
+                        r.started_at
+                   FROM research_runs r
+                  WHERE r.project_guid = ?1 AND r.id = ?3",
+                ctes = research_validity_ctes("?1", "?2"),
+                cols = research_summary_columns(),
+            );
+            let row = tx
+                .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                    let summary = research_summary_from_row(row)?;
+                    // Indexed from the summary boundary, like the detail query —
+                    // a new summary column must not quietly redirect these.
+                    let n = RESEARCH_SUMMARY_COLUMNS;
+                    Ok((
+                        summary,
+                        row.get::<_, String>(n)?,
+                        row.get::<_, i64>(n + 1)?,
+                        row.get::<_, i64>(n + 2)?,
+                        row.get::<_, Option<i64>>(n + 3)?,
+                    ))
+                })
+                .optional()?;
+            let Some((mut summary, report, recorded_path_only, recorded_stale, started_at)) = row
+            else {
+                return Ok(None);
+            };
+            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &[summary.id.clone()])?;
+            let own_deps = deps.remove(&summary.id).unwrap_or_default();
+            fill_validity(&mut summary, own_deps);
+
+            // Per-path staleness NOW: the same LEFT JOIN as the detail endpoint,
+            // reduced to the two flags `Evidence` keeps. A missing project_files
+            // row is `removed` — a result, not an absence (the run_files comment).
+            let mut stmt = tx.prepare(
+                "SELECT rf.path, rf.sha256, pf.sha256
+                   FROM research_run_files rf
+                   LEFT JOIN project_files pf
+                          ON pf.project_guid = ?1
+                         AND pf.model_id     = ?2
+                         AND pf.path         = rf.path
+                         AND pf.status      != 'deleted'
+                  WHERE rf.run_id = ?3",
+            )?;
+            let states: FileStates = stmt
+                .query_map(rusqlite::params![pg, &model_id, &summary.id], |row| {
+                    let path: String = row.get(0)?;
+                    let baseline: String = row.get(1)?;
+                    let current: Option<String> = row.get(2)?;
+                    let (changed, removed) = match &current {
+                        None => (false, true),
+                        Some(now) if now.eq_ignore_ascii_case(&baseline) => (false, false),
+                        Some(_) => (true, false),
+                    };
+                    Ok((path, (changed, removed)))
+                })?
+                .collect::<Result<_, _>>()?;
+
+            let mut stmt =
+                tx.prepare("SELECT path, spans_json FROM research_run_evidence WHERE run_id = ?1")?;
+            let spans_rows: Vec<(String, String)> = stmt
+                .query_map(rusqlite::params![&summary.id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<Result<_, _>>()?;
+
+            Ok(Some((
+                summary,
+                report,
+                recorded_path_only,
+                recorded_stale,
+                started_at,
+                states,
+                spans_rows,
+            )))
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                error = ?e,
+                project_guid = %project_guid.0,
+                "Failed to read a stored research run for verification. Check the \
+                 database is readable."
+            );
+            ApiError::from(e)
+        })?;
+
+    let Some((summary, report, recorded_path_only, recorded_stale, started_at, states, spans_rows)) =
+        found
+    else {
+        return Err(ApiError::ResearchRunNotFound { run_id });
+    };
+
+    // Spans were journalled atomically with the row from v1.3.0 on, and
+    // `started_at` arrived in the same migration — so it is the discriminator
+    // between "this run recorded no spans" (old row) and "this run was shown
+    // nothing" (legitimately empty evidence).
+    let spans_available = started_at.is_some();
+
+    // The stored evidence, staleness flags merged in. Baseline-only paths (probed
+    // for a hash but journalled before spans existed) still enter with no spans,
+    // so the staleness half covers every run either way.
+    let mut stored: Vec<crate::research::StoredEvidence> = spans_rows
+        .into_iter()
+        .map(|(path, json)| {
+            let (changed, removed) = states.get(&path).copied().unwrap_or((false, false));
+            crate::research::StoredEvidence {
+                spans: serde_json::from_str(&json).unwrap_or_default(),
+                changed,
+                removed,
+                path,
+            }
+        })
+        .collect();
+    for (path, (changed, removed)) in &states {
+        if !stored.iter().any(|e| &e.path == path) {
+            stored.push(crate::research::StoredEvidence {
+                path: path.clone(),
+                spans: Vec::new(),
+                changed: *changed,
+                removed: *removed,
+            });
+        }
+    }
+
+    let rechecked = crate::research::recheck_citations(&report, &stored);
+    let recorded = CitationCounts {
+        total: summary.citations_total,
+        verified: summary.citations_verified,
+        path_only: recorded_path_only,
+        unverified: summary.citations_unverified,
+        stale: recorded_stale,
+    };
+    let recomputed = spans_available.then_some(CitationCounts {
+        total: rechecked.total as i64,
+        verified: rechecked.verified as i64,
+        path_only: rechecked.path_only as i64,
+        unverified: rechecked.unverified as i64,
+        stale: rechecked.stale as i64,
+    });
+    // Provenance only: `stale` is expected to move, and folding it in would make
+    // every honest re-check after an edit read as a journal bug.
+    let provenance_matches = recomputed.as_ref().map(|r| {
+        (r.total, r.verified, r.path_only, r.unverified)
+            == (
+                recorded.total,
+                recorded.verified,
+                recorded.path_only,
+                recorded.unverified,
+            )
+    });
+
+    Ok(Json(ResearchVerification {
+        run_id: summary.id.clone(),
+        seq: summary.seq,
+        valid: summary.valid,
+        invalid_reason: summary.invalid_reason,
+        spans_available,
+        recorded,
+        recomputed,
+        provenance_matches,
+        stale_citations_now: rechecked.stale as i64,
+        stale_paths_now: rechecked.stale_paths,
+        files_total: summary.files_total,
+        files_moved: summary.files_moved,
+    }))
 }
 
 /// `POST /projects/{project_guid}/research/{run_id}/pin` — exempt a run from the
@@ -6886,6 +7377,94 @@ mod tests {
         assert_eq!(drain_frames(&mut stream), 1);
         assert!(stream.saw_terminal);
         assert!(!stream.ended, "nothing should have been synthesised");
+    }
+
+    /// The trust status is derived, like validity: severity wins across valid
+    /// challenges, an inconclusive challenge counts toward nothing, and a
+    /// challenge whose own evidence has moved stops counting the moment it goes
+    /// stale — with no write anywhere.
+    #[tokio::test]
+    async fn trust_aggregates_valid_challenges_and_drops_stale_ones() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        let trust_sql = format!(
+            "{ctes} SELECT {trust} FROM research_runs r WHERE r.id = ?3",
+            ctes = research_validity_ctes("?1", "?2"),
+            trust = research_trust_column(),
+        );
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            let insert_run = |id: &str,
+                              seq: i64,
+                              kind: &str,
+                              subject: Option<&str>,
+                              verdict: Option<&str>|
+             -> rusqlite::Result<()> {
+                tx.execute(
+                    "INSERT INTO research_runs (
+                         id, project_guid, seq, question, model, prompt_version, effort,
+                         kind, challenged_run_id, challenge_verdict,
+                         granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
+                         done_reason, steps, turns, elapsed_ms,
+                         prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx,
+                         citations_total, citations_verified, citations_path_only,
+                         citations_unverified, cited_paths_json, unverified_paths_json,
+                         changed_files, removed_files, stale_citations, stale_paths_json,
+                         notes_written, notes_rejected, plan_revisions, grep_calls, grep_hits,
+                         out_of_scope_refusals, out_of_scope_rows, scoped,
+                         forced_synthesis, report_window_ms, report_elapsed_ms, report
+                     ) VALUES (
+                         ?1, 'p1', ?2, 'q', 'm', '2.2', 'medium',
+                         ?3, ?4, ?5,
+                         1, 1, 1, 1,
+                         'finalized', 1, 1, 1,
+                         1, 1, 1, 1,
+                         0, 0, 0,
+                         0, '[]', '[]',
+                         0, 0, 0, '[]',
+                         0, 0, 0, 0, 0,
+                         0, 0, 0,
+                         0, 0, 0, 'report'
+                     )",
+                    params![id, seq, kind, subject, verdict],
+                )?;
+                Ok(())
+            };
+            insert_run("subj", 1, "research", None, None)?;
+            let trust = |tx: &rusqlite::Transaction| -> rusqlite::Result<String> {
+                tx.query_row(&trust_sql, params!["p1", "BAAI/bge-m3", "subj"], |r| {
+                    r.get(0)
+                })
+            };
+            assert_eq!(trust(tx)?, "unchallenged");
+
+            // An inconclusive challenge (NULL verdict) counts toward nothing.
+            insert_run("ch-null", 2, "challenge", Some("subj"), None)?;
+            assert_eq!(trust(tx)?, "unchallenged");
+
+            insert_run("ch-ok", 3, "challenge", Some("subj"), Some("confirmed"))?;
+            assert_eq!(trust(tx)?, "confirmed");
+
+            insert_run("ch-disp", 4, "challenge", Some("subj"), Some("disputed"))?;
+            assert_eq!(trust(tx)?, "disputed");
+
+            insert_run("ch-ref", 5, "challenge", Some("subj"), Some("refuted"))?;
+            assert_eq!(trust(tx)?, "refuted");
+
+            // The refuting challenge goes stale: its baseline names a file the
+            // index does not hold, so the validity CTE reads it `removed` and the
+            // refutation stops counting — no write anywhere.
+            tx.execute(
+                "INSERT INTO research_run_files (run_id, path, sha256)
+                 VALUES ('ch-ref', 'src/gone.rs', ?1)",
+                params!["0".repeat(64)],
+            )?;
+            assert_eq!(trust(tx)?, "disputed");
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     /// `RESEARCH_SUMMARY_COLUMNS` is the boundary the detail query indexes its own

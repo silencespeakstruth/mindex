@@ -76,6 +76,14 @@ interface Citations {
     draft_path_only?: number | null;
 }
 
+/** A challenge stream's conclusion about the report it attacked. */
+interface Verdict {
+    challenged_run_id: string;
+    overall: string | null;
+    grounded: boolean;
+    claims: { claim: string; verdict: string }[];
+}
+
 interface Excerpt {
     path: string;
     start_line: number;
@@ -96,6 +104,7 @@ type Incoming =
     | { type: "summary"; text: string }
     | { type: "citations"; citations: Citations }
     | { type: "excerpts"; excerpts: Excerpts }
+    | { type: "verdict"; verdict: Verdict }
     | { type: "done"; info: Done }
     | { type: "error"; detail: string; code?: string }
     | { type: "cancelled" };
@@ -167,6 +176,8 @@ let currentThinking: HTMLDetailsElement | null = null;
 let markdown = "";
 /** The server's citation verdict, held until `done` builds the report markup. */
 let citations: Citations | null = null;
+/** A challenge run's verdict, held like `citations` until `done` renders. */
+let verdict: Verdict | null = null;
 /** Verbatim code for the report's verified citations, appended after it renders. */
 let excerpts: Excerpts | null = null;
 let renderQueued = false;
@@ -383,6 +394,11 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
             excerpts = msg.excerpts;
             break;
         }
+        case "verdict": {
+            // Held like `citations`; only challenge streams send it.
+            verdict = msg.verdict;
+            break;
+        }
         case "done": {
             closeThinking();
             // "done" repeats every progress field, so the meter freezes on the run's
@@ -466,6 +482,31 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
                         citations.draft_unverified + (citations.draft_path_only ?? 0)
                     } locations it had not looked at; it was sent back and rewritten.`
                 );
+            }
+            // A challenge stream's conclusion, above everything else: it is what
+            // the run was for. Inconclusive is stated as such — it must not read
+            // as the subject being confirmed.
+            if (verdict !== null) {
+                const claims = verdict.claims
+                    .map((c) => `${c.verdict.toUpperCase()}: ${c.claim}`)
+                    .join("\n");
+                if (verdict.overall === null) {
+                    prependNote(
+                        "warning",
+                        "Challenge verdict: INCONCLUSIVE — the verdict turn produced " +
+                            "nothing parseable. The subject report is challenged, not " +
+                            "acquitted."
+                    );
+                } else {
+                    prependNote(
+                        verdict.overall === "confirmed" ? "discard" : "warning",
+                        `Challenge verdict: ${verdict.overall.toUpperCase()}` +
+                            (verdict.grounded
+                                ? ""
+                                : " (capped — this challenge verified no citations of its own)") +
+                            (claims ? `\n${claims}` : "")
+                    );
+                }
             }
             // The journal is best-effort by contract, so `run_id` is null when the
             // write failed or the markdown gate rejected the draft. That is the

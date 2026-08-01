@@ -324,6 +324,11 @@ pub struct ResearchMetrics {
     pub tool_calls: Family<ToolOutcomeLabels, Counter>,
     pub tool_duration: HistFamily<ToolOutcomeLabels>,
     pub citations: Family<ClassLabels, Counter>,
+    /// Challenge runs by their overall verdict (`confirmed`/`disputed`/
+    /// `refuted`/`inconclusive`) — a server-defined closed set, so the
+    /// cardinality rule holds. Rare by nature: chart with `increase()`, never
+    /// `rate()` (the rare-counter rule in CLAUDE.md).
+    pub challenges: Family<OutcomeLabels, Counter>,
     pub revalidations: Counter,
     /// Reports the *server* wrote because the report window expired before the model
     /// produced one. The operational symptom of `[research].report_timeout_ms` set too
@@ -710,6 +715,7 @@ impl Metrics {
             tool_calls: Family::default(),
             tool_duration: hist_family(request_hist),
             citations: Family::default(),
+            challenges: Family::default(),
             revalidations: Counter::default(),
             forced_syntheses: Counter::default(),
             parse_retries: Counter::default(),
@@ -776,6 +782,11 @@ impl Metrics {
             "research_citations",
             "Citations in a finished report, by provenance verdict",
             research.citations.clone(),
+        );
+        registry.register(
+            "research_challenges",
+            "Challenge runs recorded, by overall verdict.",
+            research.challenges.clone(),
         );
         registry.register(
             "research_revalidations",
@@ -1268,6 +1279,10 @@ mod tests {
             .citations
             .get_or_create(&ClassLabels { class: "verified" })
             .inc();
+        m.research
+            .challenges
+            .get_or_create(&OutcomeLabels { outcome: "refuted" })
+            .inc();
         m.research.revalidations.inc();
         m.research.parse_retries.inc();
         m.gc.research_pruned.inc();
@@ -1461,6 +1476,7 @@ mod tests {
             ("mindex_qdrant_points_total", "counter"),
             ("mindex_research_active", "gauge"),
             ("mindex_research_citations_total", "counter"),
+            ("mindex_research_challenges_total", "counter"),
             ("mindex_research_context_used_ratio", "histogram"),
             ("mindex_research_duration_seconds", "histogram"),
             ("mindex_research_inflight_oldest_age_seconds", "gauge"),
