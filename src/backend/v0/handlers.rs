@@ -2602,11 +2602,51 @@ async fn search_core_inner(
         return Err(ApiError::NoMatch);
     }
 
-    // Guarantee the response is sorted by score (descending), independent of the
-    // order Qdrant's fusion/rerank happens to return.
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let unscorable = rank_by_score(&mut results);
+    if unscorable > 0 {
+        state.metrics.search.unscorable_winners.inc_by(unscorable);
+        warn!(
+            unscorable,
+            winners = results.len(),
+            "The reranker scored chunks NaN; ranking them last rather than first. \
+             Sysadmin: this is what a mismatched embedder produces — check both \
+             instances are the same model at the same precision, and that the XPU \
+             backend is off its default attention kernel (it returns NaN for padded \
+             fp16 rows and still answers 200)."
+        );
+    }
 
     Ok(results)
+}
+
+/// Sort search results by score, best first, and report how many could not be
+/// ordered at all.
+///
+/// **NaN must sort last, and this is not a theoretical concern.** `total_cmp` orders
+/// `+NaN` above every finite value, so a plain descending sort by it hands the
+/// *first* result slot to a chunk the reranker could not score — the top hit, the one
+/// an agent reads and a human trusts. And NaN scores have a documented producer on
+/// this hardware: the XPU backend's default attention kernel returns NaN for padded
+/// fp16 rows and still answers 200 (`attention_backend()` in the embedder), as does
+/// any split deployment whose two instances disagree about precision. The symptom
+/// would be "search sometimes puts something irrelevant first", which reads as a
+/// ranking-quality complaint rather than a broken embedder.
+///
+/// They are ranked last rather than dropped: the chunk matched the filters and the
+/// candidate set, so it is a real answer with an unusable score, and silently
+/// shortening the response is the failure mode the orphaned-winner counter exists to
+/// stop repeating.
+fn rank_by_score(results: &mut [SearchResult]) -> u64 {
+    let unscorable = results.iter().filter(|r| r.score.is_nan()).count() as u64;
+    results.sort_by(|a, b| match (a.score.is_nan(), b.score.is_nan()) {
+        (false, false) => b.score.total_cmp(&a.score),
+        // Ties among NaNs keep their relative order (`sort_by` is stable), so the
+        // reranker's own sequence survives where nothing else can order them.
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+    });
+    unscorable
 }
 
 /// `limit` used when a `/symbols` request omits it. Not configurable: it is a
@@ -8067,6 +8107,123 @@ mod tests {
                 std::task::Poll::Pending => panic!("a closed channel must not park"),
             }
         }
+    }
+
+    fn result_at(score: f32, path: &str) -> SearchResult {
+        SearchResult {
+            score,
+            path: path.to_string(),
+            code: String::new(),
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 1,
+        }
+    }
+
+    fn ranked_paths(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.path.as_str()).collect()
+    }
+
+    /// The ordinary case: best first, whatever order Qdrant's fusion and rerank
+    /// happened to return them in.
+    #[test]
+    fn results_come_back_best_first() {
+        let mut results = vec![
+            result_at(0.1, "c.rs"),
+            result_at(0.9, "a.rs"),
+            result_at(0.5, "b.rs"),
+        ];
+        assert_eq!(rank_by_score(&mut results), 0);
+        assert_eq!(ranked_paths(&results), vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    /// `total_cmp` orders `+NaN` above every finite value, so a plain descending sort
+    /// by it hands the **first** result slot to a chunk the reranker could not score —
+    /// the top hit, the one an agent reads and a human trusts.
+    ///
+    /// This is not hypothetical on this hardware: the embedder's XPU backend returns
+    /// NaN for padded fp16 rows on its default attention kernel and still answers 200,
+    /// and so does a split deployment whose two instances differ in precision. The
+    /// symptom is "search sometimes puts something irrelevant first" — a ranking
+    /// -quality complaint, not the broken embedder it actually is.
+    #[test]
+    fn an_unscorable_result_is_ranked_last_not_first() {
+        let mut results = vec![
+            result_at(0.4, "middle.rs"),
+            result_at(f32::NAN, "broken.rs"),
+            result_at(0.9, "best.rs"),
+        ];
+
+        let unscorable = rank_by_score(&mut results);
+
+        assert_eq!(unscorable, 1, "the NaN score was not counted");
+        assert_eq!(
+            ranked_paths(&results),
+            vec!["best.rs", "middle.rs", "broken.rs"],
+            "a chunk the reranker could not score took the top result slot"
+        );
+        assert!(
+            results.last().expect("three results").score.is_nan(),
+            "the unscorable result must survive, just not lead"
+        );
+    }
+
+    /// Every score NaN is the whole-batch version of the same fault. Nothing is
+    /// dropped — the chunks matched the filters and the candidate set, so they are
+    /// real answers with unusable scores — and the count is what says so.
+    #[test]
+    fn a_wholly_unscorable_result_set_is_reported_not_discarded() {
+        let mut results = vec![
+            result_at(f32::NAN, "a.rs"),
+            result_at(f32::NAN, "b.rs"),
+            result_at(f32::NAN, "c.rs"),
+        ];
+
+        assert_eq!(rank_by_score(&mut results), 3);
+        assert_eq!(
+            results.len(),
+            3,
+            "an unscorable batch was silently shortened"
+        );
+        // Stable sort: with nothing to order them by, the reranker's own sequence is
+        // the only information left, and it is kept.
+        assert_eq!(ranked_paths(&results), vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    /// Negative and zero scores are ordinary values, not failures — a fusion score can
+    /// legitimately be either, and treating them as unscorable would bury real hits.
+    #[test]
+    fn negative_and_zero_scores_are_ordinary_values() {
+        let mut results = vec![
+            result_at(-0.5, "neg.rs"),
+            result_at(0.0, "zero.rs"),
+            result_at(f32::NAN, "nan.rs"),
+            result_at(0.2, "pos.rs"),
+        ];
+
+        assert_eq!(rank_by_score(&mut results), 1);
+        assert_eq!(
+            ranked_paths(&results),
+            vec!["pos.rs", "zero.rs", "neg.rs", "nan.rs"]
+        );
+    }
+
+    /// Infinities are orderable and must stay orderable — only NaN is the thing that
+    /// cannot be compared at all.
+    #[test]
+    fn infinities_are_ranked_rather_than_counted_as_unscorable() {
+        let mut results = vec![
+            result_at(f32::NEG_INFINITY, "worst.rs"),
+            result_at(0.5, "mid.rs"),
+            result_at(f32::INFINITY, "best.rs"),
+        ];
+
+        assert_eq!(rank_by_score(&mut results), 0);
+        assert_eq!(
+            ranked_paths(&results),
+            vec!["best.rs", "mid.rs", "worst.rs"]
+        );
     }
 
     /// A probe that never answers must become a *failure*, not an unbounded wait.

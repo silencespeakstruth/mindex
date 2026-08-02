@@ -337,6 +337,15 @@ pub struct SearchMetrics {
     /// soft-deleted the chunk between this request's two queries); a sustained rate is
     /// divergence.
     pub orphaned_winners: Counter,
+    /// Winners the reranker scored `NaN`. `total_cmp` orders `+NaN` above every
+    /// finite value, so before they were ranked *last* these took the top result
+    /// slot — the one an agent reads and a human trusts. The producer is not
+    /// hypothetical: the embedder's XPU backend returns NaN for padded fp16 rows on
+    /// its default attention kernel and still answers 200, and so does a split
+    /// deployment whose two instances differ in precision. Expected to stay at zero;
+    /// any value at all means the embedding path is misconfigured, and the symptom
+    /// without this counter reads as a ranking-quality complaint.
+    pub unscorable_winners: Counter,
 }
 
 #[derive(Clone)]
@@ -798,6 +807,7 @@ impl Metrics {
             candidates: count_hist(),
             results: count_hist(),
             orphaned_winners: Counter::default(),
+            unscorable_winners: Counter::default(),
         };
         registry.register(
             "search_requests",
@@ -823,6 +833,11 @@ impl Metrics {
             "search_orphaned_winners",
             "Qdrant winners dropped because their SQLite chunk row was gone",
             search.orphaned_winners.clone(),
+        );
+        registry.register(
+            "search_unscorable_winners",
+            "Winners the reranker scored NaN, ranked last instead of first",
+            search.unscorable_winners.clone(),
         );
 
         // ── Research ──
@@ -1522,6 +1537,7 @@ mod tests {
             })
             .inc();
         m.search.orphaned_winners.inc();
+        m.search.unscorable_winners.inc();
         m.state
             .project_vectors
             .get_or_create(&ProjectLabels {
@@ -1734,6 +1750,7 @@ mod tests {
             ("mindex_search_candidates", "histogram"),
             ("mindex_search_orphaned_winners_total", "counter"),
             ("mindex_search_requests_total", "counter"),
+            ("mindex_search_unscorable_winners_total", "counter"),
             ("mindex_search_results", "histogram"),
             ("mindex_search_stage_duration_seconds", "histogram"),
             ("mindex_start_time_seconds", "gauge"),

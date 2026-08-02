@@ -1560,6 +1560,24 @@ snapshot: a failed read deliberately keeps the previous gauges, which was
 indistinguishable from a healthy tick, so every `StateMetrics` value could sit
 frozen with nothing saying so.
 
+**A score that cannot be compared must rank last, not first**
+(`rank_by_score`, `search_unscorable_winners`). `total_cmp` orders `+NaN` above
+every finite value, so the plain descending sort by it handed the **top result
+slot** — the one an agent reads and a human trusts — to a chunk the reranker
+could not score. The producer is documented and local: the embedder's XPU
+backend returns NaN for padded fp16 rows on its default attention kernel and
+still answers 200 (see **Layout**), as does a split deployment whose two
+instances differ in precision (see **Retrieval pipeline**). Without the counter
+the symptom is "search sometimes puts something irrelevant first", which reads
+as a ranking-quality complaint rather than the misconfigured embedder it is —
+the third spelling of the same defect those two sections already describe, and
+the only one visible from `/metrics`. NaN results are ranked last rather than
+dropped: the chunk matched the filters and the candidate set, so it is a real
+answer with an unusable score, and silently shortening the response is what
+`search_orphaned_winners` exists to stop repeating. The sort is stable, so a
+wholly unscorable batch keeps the reranker's own order — the only information
+left. Expected to stay at zero.
+
 **GC reports per phase whether it finished** (`gc::Phase`/`GcOutcome`). Each phase
 used to return a bare `usize` with every error mapped to `0`, and `collect`
 incremented `gc_runs{outcome="ok"}` whenever the token was live — so a GC failing

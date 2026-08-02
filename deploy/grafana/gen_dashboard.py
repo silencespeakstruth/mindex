@@ -580,17 +580,29 @@ P += [
                 "orphaned winners",
             ),
             (
+                ("increase(mindex_search_unscorable_winners_total[$__rate_interval])"),
+                "unscorable winners",
+            ),
+            (
                 "time() - mindex_state_refreshed_timestamp_seconds",
                 "state age (s)",
             ),
         ),
         desc="An orphaned winner is a chunk Qdrant scored and SQLite no longer "
         "has; a few mean a reindex raced a search, a steady rate means "
-        "divergence. `state age` climbing means the collector's snapshot is "
+        "divergence. An unscorable winner is one the reranker scored NaN — it "
+        "is ranked last instead of first, and any value at all means the "
+        "embedding path is misconfigured (mismatched precision between a split "
+        "pair, or the XPU attention kernel that returns NaN for padded fp16 "
+        "rows). `state age` climbing means the collector's snapshot is "
         "failing and every gauge on this dashboard is frozen at its last good "
         "value.",
         overrides=by_name_overrides(
-            {"orphaned winners": "orange", "state age (s)": "yellow"}
+            {
+                "orphaned winners": "orange",
+                "unscorable winners": "red",
+                "state age (s)": "yellow",
+            }
         ),
     ),
 ]
