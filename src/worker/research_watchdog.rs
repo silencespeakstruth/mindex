@@ -151,6 +151,127 @@ mod tests {
         assert_eq!(metrics.research.watchdog_cancels.get(), 1);
     }
 
+    /// `GET /health` and this worker must never disagree about the word "wedged":
+    /// health degrades the verdict on `registry.wedged()`, the watchdog acts on
+    /// `cancel_overdue(WEDGE_GRACE)`, and they share one const precisely so a run
+    /// cannot be healthy to one and killable by the other. Two separate numbers
+    /// would give the worst of both — health green while the watchdog cancels a
+    /// client's run, or health red while nothing ever frees the slot.
+    #[test]
+    fn health_and_the_watchdog_select_the_same_runs() {
+        // Just inside: past its own worst case, but still within the grace.
+        let inside = CancellationToken::new();
+        let reg = registry_with(
+            300_000,
+            Duration::from_millis(300_000) + WEDGE_GRACE - Duration::from_secs(5),
+            inside.clone(),
+        );
+        assert!(
+            reg.wedged().is_empty(),
+            "health calls this run wedged while it is still inside the shared grace"
+        );
+        sweep_once(&reg, &Metrics::new(), WEDGE_GRACE);
+        assert!(
+            !inside.is_cancelled(),
+            "the watchdog cancelled a run health considers healthy"
+        );
+
+        // Just outside: past worst case *and* past the grace.
+        let outside = CancellationToken::new();
+        let reg = registry_with(
+            300_000,
+            Duration::from_millis(300_000) + WEDGE_GRACE + Duration::from_secs(5),
+            outside.clone(),
+        );
+        assert_eq!(
+            reg.wedged().len(),
+            1,
+            "health does not consider wedged a run the watchdog is about to cancel"
+        );
+        sweep_once(&reg, &Metrics::new(), WEDGE_GRACE);
+        assert!(
+            outside.is_cancelled(),
+            "the watchdog left a run health is reporting as unhealthy"
+        );
+    }
+
+    /// `research_watchdog_cancels_total` is documented to stay at zero, so any value
+    /// it holds is read as a count of *events*. A run parked in an await its token
+    /// cannot reach stays registered after being cancelled, so every 30-second sweep
+    /// found it again: one event became an unbounded number, and the log filled with
+    /// the same line. The run stays visible through the gauge and `wedged()` instead.
+    #[test]
+    fn a_wedged_run_is_counted_once_however_many_sweeps_find_it() {
+        let metrics = Metrics::new();
+        let token = CancellationToken::new();
+        let reg = registry_with(300_000, Duration::from_secs(600), token.clone());
+
+        for _ in 0..10 {
+            sweep_once(&reg, &metrics, Duration::ZERO);
+        }
+
+        assert_eq!(
+            metrics.research.watchdog_cancels.get(),
+            1,
+            "ten sweeps over one wedged run counted it ten times"
+        );
+        assert_eq!(
+            reg.wedged().len(),
+            1,
+            "and the run must stay visible — it is still holding the slot"
+        );
+        assert!(
+            metrics.state.research_inflight_oldest_age_seconds.get() >= 600,
+            "the age gauge is what keeps a cancelled-but-stuck run visible"
+        );
+    }
+
+    /// The age gauge lives in `StateMetrics`, which the metrics worker clears and
+    /// repopulates wholesale — but it is written *here*, by a different worker. A
+    /// tick that erased it would make a wedged slot look free every refresh interval,
+    /// which is the exact reading this gauge exists to prevent.
+    #[tokio::test]
+    async fn a_state_metrics_tick_does_not_erase_the_wedged_age() {
+        let metrics = Metrics::new();
+        let token = CancellationToken::new();
+        let reg = registry_with(300_000, Duration::from_secs(900), token);
+        sweep_once(&reg, &metrics, Duration::ZERO);
+        let aged = metrics.state.research_inflight_oldest_age_seconds.get();
+        assert!(aged >= 900, "sanity: the gauge was set");
+
+        let pool = crate::db::sqlite3::SQLite3Pool::new(
+            std::path::Path::new(":memory:"),
+            1,
+            16384,
+            "NORMAL",
+        );
+        pool.transaction(CancellationToken::new(), |tx| {
+            crate::apply_pending_migrations(tx).map(|_| ())
+        })
+        .await
+        .expect("migrations apply");
+
+        crate::worker::metrics::collect_once(
+            &pool,
+            &metrics,
+            &crate::worker::metrics::MetricsTuning {
+                refresh_interval_seconds: 60,
+                probe_dependencies: false,
+                max_retries: 3,
+                model_id: "BAAI/bge-m3".to_string(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            metrics.state.research_inflight_oldest_age_seconds.get(),
+            aged,
+            "a state-metrics tick zeroed the age of a wedged research run, so the \
+             next scrape reports the stuck slot as free"
+        );
+    }
+
     /// The gauge is the difference between "a slot is busy" and "a slot has been
     /// busy for an hour", so it must be written on every sweep — including the
     /// sweep that finds nothing, which is what resets it to zero.

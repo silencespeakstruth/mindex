@@ -9139,6 +9139,188 @@ mod tests {
         );
     }
 
+    /// How many times `research_unjournalled_runs{model,outcome}` fired.
+    fn unjournalled_count(
+        metrics: &crate::backend::metrics::Metrics,
+        outcome: &'static str,
+    ) -> u64 {
+        metrics
+            .research
+            .unjournalled
+            .get_or_create(&crate::backend::metrics::ModelOutcomeLabels {
+                model: params(1).model.clone(),
+                outcome,
+            })
+            .get()
+    }
+
+    /// Three endings write no `research_runs` row — `cancelled`, `failed` and a report
+    /// the markdown gate rejected — and **every** per-run research metric lives in the
+    /// `MeteredJournal` decorator. So all three were absent from `research_runs`,
+    /// `_duration`, `_steps`, `_tokens` and `_citations` simultaneously: the GPU hour
+    /// was spent and the dashboard said the run never happened. This counter is the
+    /// denominator that makes the rest of them mean something, and the journal seam
+    /// physically cannot see these cases.
+    #[tokio::test]
+    async fn a_run_that_stored_nothing_is_counted_under_why() {
+        // (a) The report failed the markdown gate.
+        let metrics = Arc::new(crate::backend::metrics::Metrics::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_research(
+            Arc::new(NativeOllama::new(
+                vec![vec![call("finalize", json!({}))]],
+                vec![r#"{"a": 1}"#, r#"{"a": 2}"#],
+            )),
+            Arc::new(FakeTools::default()),
+            Arc::new(NoJournal),
+            params(8),
+            tx,
+            CancellationToken::new(),
+            Some(Arc::clone(&metrics)),
+        )
+        .await;
+        assert_eq!(
+            unjournalled_count(&metrics, "report_rejected"),
+            1,
+            "a run whose report was refused left no trace in any research metric"
+        );
+
+        // (b) The run failed outright — here, an Ollama that answers nothing at all.
+        let metrics = Arc::new(crate::backend::metrics::Metrics::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_research(
+            Arc::new(FakeOllama {
+                replies: Mutex::new(vec![]),
+            }),
+            Arc::new(FakeTools::default()),
+            Arc::new(NoJournal),
+            params(8),
+            tx,
+            CancellationToken::new(),
+            Some(Arc::clone(&metrics)),
+        )
+        .await;
+        assert_eq!(
+            unjournalled_count(&metrics, "failed"),
+            1,
+            "a failed run was invisible to /metrics"
+        );
+
+        // (c) The client went away — the receiver is gone, so the first `send` fails
+        // and the run aborts as cancelled. This is the shape that matters most: a
+        // cancelled run emits no terminal event and writes no journal row, so this
+        // counter is the *only* record anywhere that the slot and the GPU were spent.
+        let metrics = Arc::new(crate::backend::metrics::Metrics::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        run_research(
+            Arc::new(NativeOllama::new(
+                vec![vec![call("finalize", json!({}))]],
+                vec!["# Report\n\nBody."],
+            )),
+            Arc::new(FakeTools::default()),
+            Arc::new(NoJournal),
+            params(8),
+            tx,
+            CancellationToken::new(),
+            Some(Arc::clone(&metrics)),
+        )
+        .await;
+        assert_eq!(
+            unjournalled_count(&metrics, "cancelled"),
+            1,
+            "a disconnected run was invisible to /metrics"
+        );
+    }
+
+    /// The counter must stay at zero for a run that *did* store something — otherwise
+    /// it is not a denominator, it is noise, and the ratio a dashboard builds from it
+    /// against `research_runs_total` is meaningless.
+    #[tokio::test]
+    async fn a_run_that_stored_its_report_is_not_counted_as_unjournalled() {
+        struct OkJournal;
+        #[async_trait]
+        impl ResearchJournal for OkJournal {
+            async fn record(&self, _: RunRecord) -> Option<RecordedRun> {
+                Some(RecordedRun {
+                    id: "run-uuid".into(),
+                    seq: 1,
+                    replaced: 0,
+                })
+            }
+        }
+
+        let metrics = Arc::new(crate::backend::metrics::Metrics::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_research(
+            Arc::new(NativeOllama::new(
+                vec![vec![call("finalize", json!({}))]],
+                vec!["# Report\n\nThe sweep confirms Qdrant before deleting the row."],
+            )),
+            Arc::new(FakeTools::default()),
+            Arc::new(OkJournal),
+            params(8),
+            tx,
+            CancellationToken::new(),
+            Some(Arc::clone(&metrics)),
+        )
+        .await;
+
+        for outcome in ["cancelled", "failed", "report_rejected"] {
+            assert_eq!(
+                unjournalled_count(&metrics, outcome),
+                0,
+                "a journalled run was also counted as {outcome}"
+            );
+        }
+    }
+
+    /// A journal write that *fails* is the fourth shape, and it is deliberately not
+    /// counted here: the run reached the end, so `MeteredJournal` recorded every
+    /// per-run metric on the way through, and `done` already says `run_id: null`.
+    /// Counting it again would double-count the one ending that is already visible.
+    #[tokio::test]
+    async fn a_failed_journal_write_is_reported_on_the_wire_not_as_an_unjournalled_run() {
+        struct FailingJournal;
+        #[async_trait]
+        impl ResearchJournal for FailingJournal {
+            async fn record(&self, _: RunRecord) -> Option<RecordedRun> {
+                None // the insert failed; best-effort, so the run still completes
+            }
+        }
+
+        let metrics = Arc::new(crate::backend::metrics::Metrics::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_research(
+            Arc::new(NativeOllama::new(
+                vec![vec![call("finalize", json!({}))]],
+                vec!["# Report\n\nThe sweep confirms Qdrant before deleting the row."],
+            )),
+            Arc::new(FakeTools::default()),
+            Arc::new(FailingJournal),
+            params(8),
+            tx,
+            CancellationToken::new(),
+            Some(Arc::clone(&metrics)),
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        match events.last() {
+            Some(ResearchEvent::Done { recorded, .. }) => assert!(
+                recorded.is_none(),
+                "a failed journal write must say so on the wire"
+            ),
+            other => panic!("expected a done event, got {other:?}"),
+        }
+        for outcome in ["cancelled", "failed", "report_rejected"] {
+            assert_eq!(unjournalled_count(&metrics, outcome), 0, "{outcome}");
+        }
+    }
+
     /// The other half of the gate: a report that is STILL broken after the repair
     /// pass is streamed (a watched broken report beats a vanished one) but never
     /// journalled — the corpus is what later runs are fed as context.
