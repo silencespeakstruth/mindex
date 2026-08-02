@@ -514,10 +514,20 @@ pub enum ResearchEvent {
     /// what a clean report emits, in the exact field a caller is told to trust.
     /// Field reports of "verified: 0 / unverified: 0 even though it read the files"
     /// are this, and nothing else.
+    ///
+    /// `shown_paths` is how many files any tool actually returned during the run —
+    /// the denominator `total` never had. It exists so a caller can *machine-check*
+    /// admissibility instead of relying on a reader's discipline: a report with
+    /// `verified: 0` over `shown_paths: 12` read a dozen files and cited none of
+    /// them, while the same `verified: 0` over `shown_paths: 0` is the honest "no
+    /// tool showed me anything in this scope" answer — the one case the ungrounded
+    /// gate deliberately exempts, and therefore the one case that reaches a caller
+    /// looking exactly like a clean run.
     Citations {
         report: CitationReport,
         revalidation: Option<Revalidation>,
         server_written: bool,
+        shown_paths: usize,
     },
     /// The indexed code at every **verified** citation, verbatim. Emitted once,
     /// after `citations` and before `done`.
@@ -757,8 +767,12 @@ impl ResearchEvent {
                 report,
                 revalidation,
                 server_written,
+                shown_paths,
             } => json!({
                 "server_written": server_written,
+                // What the run was shown, beside what it cited: the two together are
+                // what make "cited nothing" readable without the report.
+                "shown_paths": shown_paths,
                 "total": report.total,
                 "verified": report.verified,
                 "path_only": report.path_only,
@@ -1770,8 +1784,27 @@ fn is_near_duplicate(previous: &str, candidate: &str) -> bool {
     union > 0.0 && intersection / union >= NEAR_DUPLICATE_JACCARD
 }
 
+/// The markup a model reaches for when it wants a tool on a turn that passed none:
+/// the Hermes/Qwen `<tool_call>` block, its bare `<function=…>` inner form, and
+/// Llama's `<|python_tag|>`.
+///
+/// All ASCII, so a `find` over them returns a byte offset that is also a char
+/// boundary — the one property the callers slice on.
+const MARKUP_TOOL_CALL_OPENINGS: [&str; 3] = ["<tool_call", "<function=", "<|python_tag|>"];
+
+/// Where the first tool call written as markup begins, as a byte offset.
+///
+/// Separate from [`looks_like_tool_call_attempt`] because the report path wants the
+/// *position*, not the verdict: everything before it is prose the model did write.
+fn markup_tool_call_at(content: &str) -> Option<usize> {
+    MARKUP_TOOL_CALL_OPENINGS
+        .iter()
+        .filter_map(|m| content.find(m))
+        .min()
+}
+
 /// Whether a reply *looks like* an attempt to call a tool in prose — a JSON object
-/// carrying a `name` or `action` key.
+/// carrying a `name` or `action` key, or one of [`MARKUP_TOOL_CALL_OPENINGS`].
 ///
 /// This is a diagnostic, not a parser. mindex speaks Ollama's native tool-calling
 /// API; a model whose template has no tool support emits its call as text instead,
@@ -1781,7 +1814,19 @@ fn is_near_duplicate(previous: &str, candidate: &str) -> bool {
 /// it produced was mangled (`"search Semantic code search over…"`), so
 /// accommodating it meant guessing — turning a model error into a successful call
 /// with unpredictable arguments.
+///
+/// The markup half was added after a model that *does* call tools natively
+/// (`Ornith-vision:35b`) turned out to emit `<tool_call><function=read_file>…` on
+/// the **report** turn, where no tools are passed. JSON-only detection let that
+/// through every gate it should have tripped — the section-retry filter, the
+/// content gate, `validate_report_markdown` — and one run shipped, journalled and
+/// streamed a "report" whose entire body was three fake tool calls. Widening the
+/// diagnostic is what closes that path; it is still not a parser, and a markup call
+/// is still an operator-visible failure rather than a call.
 fn looks_like_tool_call_attempt(content: &str) -> bool {
+    if markup_tool_call_at(content).is_some() {
+        return true;
+    }
     for (i, ch) in content.char_indices() {
         if ch != '{' {
             continue;
@@ -2047,8 +2092,16 @@ fn parse_claim_verdicts(text: &str) -> Vec<ClaimVerdict> {
 /// which readers must never render as an acquittal.
 ///
 /// **The grounding cap is the rule that makes this feature safe with weak
-/// models**: a challenge whose own report verified zero citations has shown no
-/// code, and an unshown accusation can dispute a report but never refute it.
+/// models**: a challenge whose own report showed no code cannot spend what it
+/// never had. An unshown accusation can dispute a report but never refute it —
+/// and, symmetrically, an unshown *acquittal* is not a confirmation. It resolves
+/// to `None`, "challenged, inconclusive", which is the one verdict readers are
+/// already forbidden to render as an acquittal; `disputed` passes through
+/// unchanged, being the verdict an ungrounded run is entitled to either way.
+///
+/// The symmetric half arrived with the majority rule in `grounded` (2026-08-02):
+/// capping only the accusation left the cheaper error — laundering a report the
+/// challenge never checked into `trust: confirmed` — uncapped.
 fn resolve_challenge_verdict(claims: &[ClaimVerdict], grounded: bool) -> Option<&'static str> {
     if claims.is_empty() {
         return None;
@@ -2060,10 +2113,11 @@ fn resolve_challenge_verdict(claims: &[ClaimVerdict], grounded: bool) -> Option<
     } else {
         "confirmed"
     };
-    Some(match (worst, grounded) {
-        ("refuted", false) => "disputed",
-        (v, _) => v,
-    })
+    match (worst, grounded) {
+        ("refuted", false) => Some("disputed"),
+        ("confirmed", false) => None,
+        (v, _) => Some(v),
+    }
 }
 
 /// What a challenge run concluded, carried on [`RunRecord`] and the `verdict`
@@ -2547,6 +2601,15 @@ const MIN_SECTIONED_PLAN_ITEMS: usize = crate::config::MIN_REPORT_SECTIONS;
 /// the thinking channel); past that the section is stubbed and the others still
 /// ship, which is the whole point of writing in sections.
 const MAX_SECTION_ATTEMPTS: usize = 2;
+
+/// How much prose a section reply must have written *before* a markup tool call for
+/// the truncated remainder to be kept instead of retried.
+///
+/// A floor, not a target: it applies only to text this server cut, and only to
+/// decide "answer or stub". The observed failure writes one restated-question line
+/// and then the fake call, which clears any smaller number and clears none of this
+/// one — roughly two sentences.
+const MIN_TRUNCATED_SECTION_CHARS: usize = 200;
 
 /// Sections the citation-repair phase will rewrite.
 ///
@@ -4202,6 +4265,27 @@ fn out_of_scope_reply(path: &str, scope: &ToolScope) -> String {
 }
 
 /// Literal matches, with the line each one is on.
+/// A sentence appended to a `grep` miss when the pattern reads like a regex.
+///
+/// The tool spec already says the match is literal, and models still write `\.bwp`,
+/// `foo|bar` and `.*` — three false negatives in one measured session, one of them
+/// inside a challenge, each reported to the reader as proof of absence. The spec is
+/// read once at the start of a run; this is read at the moment the mistake costs
+/// something, which is the only moment it changes what happens next. Empty when the
+/// pattern has no metacharacter, so an ordinary miss keeps its ordinary wording.
+fn regex_metacharacter_hint(pattern: &str) -> String {
+    const META: [char; 8] = ['\\', '|', '*', '[', ']', '(', ')', '?'];
+    if !pattern.contains(META) {
+        return String::new();
+    }
+    format!(
+        " NOTE: this pattern contains regex punctuation and the match is LITERAL — \
+         \"{pattern}\" was looked for character by character, backslashes and all. If \
+         you meant a regex, search for a plain substring of it instead (one \
+         alternative at a time), and do not report the text as absent on this result."
+    )
+}
+
 fn format_grep(pattern: &str, resp: &GrepResponse, scope: &ToolScope) -> String {
     // An empty result has three meanings and used to have one sentence — the
     // `file_history` three-flag problem, in counter form. The middle branch is the
@@ -4227,17 +4311,18 @@ fn format_grep(pattern: &str, resp: &GrepResponse, scope: &ToolScope) -> String 
                  text is not reachable from this index."
             );
         }
+        let regexish = regex_metacharacter_hint(pattern);
         return match (resp.searched_chunks, resp.searched_files) {
             (Some(chunks), Some(files)) => format!(
                 "No occurrence of \"{pattern}\" in the {chunks} indexed chunk(s) across \
                  {files} file(s) this search could reach. The match is literal and \
                  case-insensitive, so check the spelling — or the text may live in a \
-                 part of a file the slicer left out of every chunk."
+                 part of a file the slicer left out of every chunk.{regexish}"
             ),
             _ => format!(
                 "No indexed chunk contains \"{pattern}\". The match is literal and \
                  case-insensitive, so check the spelling — or the text may live in a \
-                 part of a file the slicer left out of every chunk."
+                 part of a file the slicer left out of every chunk.{regexish}"
             ),
         };
     }
@@ -5171,6 +5256,10 @@ pub async fn run_research(
         // `total: 0` the model chose. Sourced from the same flag the journal has
         // always recorded — the fact existed, it just never reached the wire.
         server_written: run_tools.forced_synthesis,
+        // The baselines are one row per path any tool returned — the same set the
+        // journal stores and `probe_freshness` asks about, so the wire and the
+        // record cannot disagree about what the run was shown.
+        shown_paths: file_baselines.len(),
     });
     // The code behind the citations, verbatim. Under the **job** token, not the
     // report window: that window bounds what the *model* is given to write in, and
@@ -5712,11 +5801,12 @@ async fn research_inner(
                     return Err(ResearchAbort::Failed {
                         code: "research.model_lacks_tools".into(),
                         detail: format!(
-                            "The model \"{}\" wrote a tool call as text instead of using the \
-                         tool-calling API, which means its Ollama template does not \
-                         support tools. Pick a model whose template does (check \
-                         `ollama show <model>`); a `tools` capability alone is not \
-                         proof, it is the template that matters.",
+                            "The model \"{}\" wrote a tool call as text (JSON, or \
+                         `<tool_call>`-style markup) instead of using the tool-calling \
+                         API. Its Ollama template is not driving tools on this turn. \
+                         Pick a model whose template does (check `ollama show \
+                         <model>`); a `tools` capability alone is not proof, it is the \
+                         template that matters.",
                             params.model
                         ),
                     });
@@ -6816,7 +6906,15 @@ async fn research_inner(
             // The grounding cap: a challenge whose own report verified nothing
             // has shown no code, and an unshown accusation can dispute but
             // never refute.
-            let grounded = citations.verified > 0;
+            //
+            // `verified > 0` alone was too weak a bar, measured 2026-08-02: one
+            // challenge cited nine locations, wrote eight of them without their
+            // directory (`handlers.rs:625-642`) so only one checked out, and
+            // returned `confirmed` over a subject that had itself declined to
+            // answer. A report whose citations are mostly fabricated is not a
+            // grounded one because a single survivor happened to parse, so the
+            // majority has to hold up too.
+            let grounded = citations.verified > 0 && citations.unverified <= citations.verified;
             let verdict = resolve_challenge_verdict(&claims, grounded);
             if verdict.is_none() {
                 warn!(
@@ -7376,7 +7474,23 @@ async fn write_sectioned_report(
                     m.research.report_length_caps.inc();
                 }
             }
-            let text = outcome.content;
+            // A section that ran into a prose tool call is not automatically lost:
+            // everything before the markup is prose the model did write, and keeping
+            // it is the difference between an answer and a stub. Only a *substantial*
+            // remainder is worth keeping — the observed shape is a heading line
+            // followed straight by the fake call, and half a sentence under a
+            // server-supplied heading reads as an answer while saying nothing, which
+            // is worse than the stub's honest "could not be written".
+            let text = match markup_tool_call_at(&outcome.content) {
+                Some(at)
+                    if outcome.content[..at].trim().chars().count()
+                        >= MIN_TRUNCATED_SECTION_CHARS =>
+                {
+                    outcome.content[..at].to_string()
+                }
+                Some(_) => String::new(),
+                None => outcome.content,
+            };
             if text.trim().is_empty() || looks_like_tool_call_attempt(&text) {
                 continue;
             }
@@ -7835,12 +7949,15 @@ async fn chat_turn(
                             None => {
                                 pending.push_str(&text);
                                 let head = pending.trim_start();
-                                if head.is_empty() {
-                                    return; // whitespace so far, undecided
-                                }
-                                decided = Some(!head.starts_with('{'));
-                                if decided == Some(false) {
-                                    return;
+                                match withhold_decision(head) {
+                                    // Whitespace, or a strict prefix of an opening:
+                                    // keep buffering rather than guess.
+                                    None => return,
+                                    Some(true) => {
+                                        decided = Some(false);
+                                        return;
+                                    }
+                                    Some(false) => decided = Some(true),
                                 }
                                 ResearchEvent::Summary {
                                     text: std::mem::take(&mut pending),
@@ -7896,11 +8013,38 @@ async fn chat_turn(
     Ok(outcome)
 }
 
-/// Whether `chat_turn`'s content gate held this reply back instead of streaming
-/// it — true exactly when the reply opens with `{`. The caller uses it to know a
-/// re-ask is still safe: no `summary` delta of this text has left the server.
+/// The openings `chat_turn`'s content gate holds back: a JSON object, or any of the
+/// markup tool-call shapes. One list so the gate and [`is_withheld`] cannot disagree
+/// about what was streamed — the property a re-ask rests on.
+const WITHHELD_OPENINGS: [&str; 4] = ["{", "<tool_call", "<function=", "<|python_tag|>"];
+
+/// Whether a reply opening with `head` must be withheld. `None` = `head` is still a
+/// strict prefix of some opening, so the answer is not knowable yet.
+///
+/// The tri-state exists because the gate decides on the first delta, and a delta can
+/// be a single `<`: with a one-character opening (`{`) "starts with" sufficed, with
+/// `<tool_call` it would stream the first chunk of exactly what it is meant to hold.
+fn withhold_decision(head: &str) -> Option<bool> {
+    if head.is_empty() {
+        return None;
+    }
+    if WITHHELD_OPENINGS.iter().any(|m| head.starts_with(m)) {
+        return Some(true);
+    }
+    if WITHHELD_OPENINGS.iter().any(|m| m.starts_with(head)) {
+        return None;
+    }
+    Some(false)
+}
+
+/// Whether `chat_turn`'s content gate held this reply back instead of streaming it.
+/// The caller uses it to know a re-ask is still safe: no `summary` delta of this text
+/// has left the server.
+///
+/// Undecided counts as withheld — an undecided gate streamed nothing, which is
+/// exactly what this asks.
 fn is_withheld(content: &str) -> bool {
-    content.trim_start().starts_with('{')
+    !matches!(withhold_decision(content.trim_start()), Some(false))
 }
 
 #[cfg(test)]
@@ -8126,6 +8270,47 @@ mod tests {
         );
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].verdict, "refuted");
+    }
+
+    /// Both halves of the grounding cap, on the resolver itself.
+    ///
+    /// The symmetric half is the one measured in the field (2026-08-02): a challenge
+    /// that verified one citation out of nine returned `confirmed` over a subject it
+    /// had not checked, and `trust` promoted it. An unshown acquittal is not an
+    /// acquittal — it is inconclusive, the one verdict readers are already told never
+    /// to render as one.
+    #[test]
+    fn an_ungrounded_challenge_can_neither_refute_nor_confirm() {
+        let claim = |v: &'static str| ClaimVerdict {
+            claim: "c".into(),
+            verdict: v,
+        };
+        // Grounded: every verdict stands as scored.
+        assert_eq!(
+            resolve_challenge_verdict(&[claim("refuted")], true),
+            Some("refuted")
+        );
+        assert_eq!(
+            resolve_challenge_verdict(&[claim("confirmed")], true),
+            Some("confirmed")
+        );
+        // Ungrounded: the accusation is capped, the acquittal withdrawn.
+        assert_eq!(
+            resolve_challenge_verdict(&[claim("refuted")], false),
+            Some("disputed")
+        );
+        assert_eq!(
+            resolve_challenge_verdict(&[claim("confirmed")], false),
+            None
+        );
+        // `disputed` is what an ungrounded run is entitled to either way, so it
+        // passes through untouched rather than being withdrawn too.
+        assert_eq!(
+            resolve_challenge_verdict(&[claim("disputed")], false),
+            Some("disputed")
+        );
+        // No parseable claim is inconclusive regardless of grounding.
+        assert_eq!(resolve_challenge_verdict(&[], true), None);
     }
 
     /// The mirror: an opponent whose own report verified a citation has shown
@@ -8629,6 +8814,62 @@ mod tests {
         assert!(!looks_like_tool_call_attempt(
             r#"Config example: {"num_ctx": 65536, "stream": true}"#
         ));
+    }
+
+    /// The shape that got past every gate: a model that *does* call tools natively
+    /// still writes markup when a turn passes none, and JSON-only detection let a
+    /// report whose entire body was three fake calls ship, stream and journal.
+    #[test]
+    fn a_markup_call_written_as_text_is_detected() {
+        assert!(looks_like_tool_call_attempt(
+            "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/config.rs\n\
+             </parameter>\n</function>\n</tool_call>"
+        ));
+        // The bare inner form, and Llama's tag.
+        assert!(looks_like_tool_call_attempt("<function=search>"));
+        assert!(looks_like_tool_call_attempt("<|python_tag|>search(\"gc\")"));
+        // Mid-text, which is how a section leaks one after real prose.
+        assert!(looks_like_tool_call_attempt(
+            "The sweep deletes from Qdrant first.\n\n<tool_call><function=outline>"
+        ));
+        // Angle brackets alone are ordinary prose and must stay ordinary.
+        assert!(!looks_like_tool_call_attempt(
+            "The generic is `Vec<String>` and the comparison is `a < b`."
+        ));
+        assert!(!looks_like_tool_call_attempt(
+            "<div>markup, but not a call</div>"
+        ));
+    }
+
+    /// The offset half: everything before the markup is prose the model did write,
+    /// and the section writer keeps it rather than losing the section.
+    #[test]
+    fn the_markup_offset_is_where_the_prose_ends() {
+        let text = "Prose first.\n<tool_call><function=x>";
+        assert_eq!(markup_tool_call_at(text), Some(13));
+        assert_eq!(&text[..13], "Prose first.\n");
+        // The earliest opening wins, whichever spelling it is.
+        assert_eq!(markup_tool_call_at("a<function=x>b<tool_call>"), Some(1));
+        assert_eq!(markup_tool_call_at("no call here"), None);
+    }
+
+    /// The content gate and `is_withheld` must agree about what was streamed — a
+    /// re-ask is only safe because nothing left the server. The tri-state exists
+    /// because the gate decides on the first delta, which can be a single `<`.
+    #[test]
+    fn the_content_gate_withholds_every_call_shape_and_streams_prose() {
+        assert_eq!(withhold_decision("{\"action\""), Some(true));
+        assert_eq!(withhold_decision("<tool_call>"), Some(true));
+        assert_eq!(withhold_decision("# Report"), Some(false));
+        // Undecided: a strict prefix of an opening, and the empty head.
+        assert_eq!(withhold_decision("<"), None);
+        assert_eq!(withhold_decision("<tool"), None);
+        assert_eq!(withhold_decision(""), None);
+        // A report that opens with `<` but is not a call still streams once the
+        // next delta settles it.
+        assert_eq!(withhold_decision("<div>"), Some(false));
+        assert!(is_withheld("  <tool_call><function=read_file>"));
+        assert!(!is_withheld("# A perfectly ordinary report"));
     }
 
     // ── effort mapping ───────────────────────────────────────────────────────
@@ -12219,6 +12460,39 @@ mod tests {
         assert!(text.contains("No indexed chunk contains"), "{text}");
     }
 
+    /// A regex-shaped pattern that misses is the third way to read absence into a
+    /// non-answer: `\.bwp` finds nothing, `.bwp` finds seven, and the report says
+    /// the extension does not appear. The tool spec already says the match is
+    /// literal — it is read once, at the start of a run; this is read at the moment
+    /// the mistake costs something.
+    #[test]
+    fn a_regex_shaped_grep_miss_says_the_match_was_literal() {
+        let text = format_grep(
+            r"\.bwp",
+            &empty_grep(Some(1421), Some(88)),
+            &ToolScope::default(),
+        );
+        assert!(text.contains("regex punctuation"), "{text}");
+        assert!(text.contains("LITERAL"), "{text}");
+        assert!(
+            text.contains("do not report the text as absent"),
+            "the hint has to say what not to conclude: {text}"
+        );
+        // Alternation and wildcards count too.
+        assert!(
+            format_grep("foo|bar", &empty_grep(None, None), &ToolScope::default())
+                .contains("regex punctuation")
+        );
+        // An ordinary miss keeps its ordinary wording — the hint is not noise on
+        // every negative result.
+        let plain = format_grep(
+            "GcGuard",
+            &empty_grep(Some(1421), Some(88)),
+            &ToolScope::default(),
+        );
+        assert!(!plain.contains("regex punctuation"), "{plain}");
+    }
+
     // ── the report turn's size guard ─────────────────────────────────────────
 
     /// The digest is what makes shedding safe: it states the full set of citable
@@ -12495,8 +12769,12 @@ mod tests {
         assert_eq!(resolve_challenge_verdict(&claims, true), Some("refuted"));
         assert_eq!(resolve_challenge_verdict(&claims, false), Some("disputed"));
         assert_eq!(resolve_challenge_verdict(&[], true), None);
+        // ...and an ungrounded acquittal is withdrawn to inconclusive, the other
+        // half of the same cap — see `an_ungrounded_challenge_can_neither_refute_
+        // nor_confirm`.
         let all_ok = parse_claim_verdicts("1. a — CONFIRMED\n2. b — CONFIRMED");
-        assert_eq!(resolve_challenge_verdict(&all_ok, false), Some("confirmed"));
+        assert_eq!(resolve_challenge_verdict(&all_ok, true), Some("confirmed"));
+        assert_eq!(resolve_challenge_verdict(&all_ok, false), None);
     }
 
     #[test]
@@ -12555,10 +12833,14 @@ mod tests {
                 steps: 3,
             }),
             server_written: false,
+            shown_paths: 12,
         };
         assert_eq!(ev.name(), "citations");
         let d = ev.data();
         assert_eq!(d["server_written"], false);
+        // The denominator the counts never had: 7 verified out of 9 citations, over
+        // the 12 files the run was actually shown.
+        assert_eq!(d["shown_paths"], 12);
         assert_eq!(d["total"], 9);
         assert_eq!(d["verified"], 7);
         assert_eq!(d["path_only"], 1);
@@ -12587,6 +12869,7 @@ mod tests {
             report: CitationReport::default(),
             revalidation: None,
             server_written: false,
+            shown_paths: 0,
         };
         let d = ev.data();
         assert_eq!(d["draft_unverified"], Value::Null);
@@ -12607,13 +12890,16 @@ mod tests {
             report: CitationReport::default(),
             revalidation: None,
             server_written: false,
+            shown_paths: 0,
         };
         let server_written = ResearchEvent::Citations {
             report: CitationReport::default(),
             revalidation: None,
             server_written: true,
+            shown_paths: 0,
         };
         // Same counts, opposite meanings.
+        assert_eq!(model_written.data()["shown_paths"], 0);
         assert_eq!(model_written.data()["total"], 0);
         assert_eq!(server_written.data()["total"], 0);
         assert_eq!(model_written.data()["server_written"], false);

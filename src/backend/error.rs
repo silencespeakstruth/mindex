@@ -170,6 +170,13 @@ pub enum ApiError {
     /// aggregation is single-level in v1 — to contest a bad challenge, challenge
     /// the original report again (a later valid challenge outweighs) or delete it.
     ChallengeSubjectIsChallenge { run_id: String },
+    /// The run's `include`/`exclude` scope admits no indexed file at all. 400 before
+    /// the semaphore: every tool is scoped by the same subquery, so such a run can
+    /// only refuse every lookup and then report the question unanswerable — which
+    /// reads as a finding about the code rather than about the request. Measured
+    /// cost of the commonest spelling of it (`"src/"`, where the glob wanted
+    /// `"src/**"`): one 302-second run, zero citations, no error anywhere.
+    ResearchScopeEmpty { scope: String },
 }
 
 impl ApiError {
@@ -220,6 +227,7 @@ impl ApiError {
             ApiError::ChallengeSubjectIsChallenge { .. } => {
                 "research.challenge_subject_is_challenge"
             }
+            ApiError::ResearchScopeEmpty { .. } => "research.scope_matches_nothing",
         }
     }
 
@@ -284,6 +292,7 @@ impl ApiError {
             ApiError::ResearchListLimitOutOfRange { .. } => "Invalid page size",
             ApiError::ChallengeSubjectInvalid { .. } => "Challenge subject is not valid",
             ApiError::ChallengeSubjectIsChallenge { .. } => "Cannot challenge a challenge",
+            ApiError::ResearchScopeEmpty { .. } => "Research scope matches no indexed file",
         }
     }
 
@@ -480,6 +489,13 @@ impl ApiError {
                  challenged. To contest it, challenge the original report again — a later \
                  valid challenge outweighs — or delete it."
             ),
+            ApiError::ResearchScopeEmpty { scope } => format!(
+                "The requested scope ({scope}) matches no indexed file in this project, so \
+                 every tool the run could call would refuse. Globs are root-relative with \
+                 forward slashes and `*` stops at `/`, so a directory needs `src/**` — \
+                 neither `src/` nor `src` matches anything. GET /projects/{{guid}}/files \
+                 lists what is indexed."
+            ),
         }
     }
 
@@ -540,6 +556,7 @@ impl ApiError {
                 Some(json!({ "run_id": run_id, "reason": reason }))
             }
             ApiError::ChallengeSubjectIsChallenge { run_id } => Some(json!({ "run_id": run_id })),
+            ApiError::ResearchScopeEmpty { scope } => Some(json!({ "scope": scope })),
             _ => None,
         }
     }
@@ -711,6 +728,9 @@ mod tests {
             ApiError::ChallengeSubjectIsChallenge {
                 run_id: String::new(),
             },
+            ApiError::ResearchScopeEmpty {
+                scope: String::new(),
+            },
         ];
         let mut codes: Vec<&str> = all.iter().map(ApiError::code).collect();
         codes.sort_unstable();
@@ -732,6 +752,7 @@ mod tests {
             "research.model_missing",
             "research.model_not_allowed",
             "research.run_not_found",
+            "research.scope_matches_nothing",
             "search.no_match",
             "selector.empty",
             "validation.code_too_large",

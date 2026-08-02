@@ -597,6 +597,16 @@ export interface ResearchCitations {
      * missing value as false, which is what it was before.
      */
     server_written?: boolean;
+    /**
+     * How many files this run's tools actually returned — the denominator the
+     * counts never had. `verified: 0` over a non-zero `shown_paths` is a report
+     * that cited none of what it read; over zero it is the honest "nothing in this
+     * scope was shown to me", which the server's own grounding gate exempts and
+     * which therefore arrives looking exactly like a clean run.
+     *
+     * Optional for the same reason as `server_written`: an older server omits it.
+     */
+    shown_paths?: number;
     total: number;
     /** Path and an overlapping line range were both shown to the model. */
     verified: number;

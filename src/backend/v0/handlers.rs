@@ -4594,9 +4594,9 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 /// - `summary` `{text}` — the final Markdown report. Streamed as deltas when the
 ///   report was rewritten after its citation check; sent as one event otherwise,
 ///   because the first draft is withheld until that check has run;
-/// - `citations` `{server_written, total, verified, path_only, unverified,
-///   unverified_paths, stale, stale_paths, draft_unverified, draft_path_only,
-///   draft_stale, revalidation_steps}` —
+/// - `citations` `{server_written, shown_paths, total, verified, path_only,
+///   unverified, unverified_paths, stale, stale_paths, draft_unverified,
+///   draft_path_only, draft_stale, revalidation_steps}` —
 ///   emitted once, after the report and before `done`: the server's provenance
 ///   check on the report's `path:start-end` references, scored against the
 ///   locations this run's own tool calls actually returned. `verified` = the path
@@ -4623,7 +4623,14 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   server-written report contains no `path:start-end`, so it always scores
 ///   `total: 0, verified: 0, unverified: 0`, which is byte-for-byte what a clean
 ///   report scores. Without this flag those two are indistinguishable, and "verified
-///   0 even though it read the files" is exactly that confusion;
+///   0 even though it read the files" is exactly that confusion. `shown_paths` is
+///   how many files this run's tools actually returned — the denominator the counts
+///   never had, and what makes admissibility machine-checkable rather than a matter
+///   of the reader's discipline: `verified: 0` over `shown_paths: 12` means the
+///   report cited none of the dozen files it read, while `verified: 0` over
+///   `shown_paths: 0` is the honest "nothing in this scope was shown to me", which
+///   is the one case the server's own grounding gate exempts and therefore the one
+///   case that reaches a caller looking exactly like a clean run;
 /// - `excerpts` `{excerpts: [{path, start_line, end_line, code}], total, truncated}`
 ///   — emitted once between `citations` and `done`, and only when the report has at
 ///   least one **verified** citation: the indexed code at those locations,
@@ -4708,7 +4715,9 @@ unless the first draft failed those checks and was sent back for correction. Rea
 `server_written` before any of the counts: it says the report window expired and the server \
 assembled the report, which therefore cites nothing and scores `total: 0, verified: 0, \
 unverified: 0` — byte-for-byte what a clean report scores, and indistinguishable from it \
-without the flag. `excerpts` follows `citations` when the report has at least one verified \
+without the flag. `shown_paths` counts the files this run's tools actually returned, so a \
+caller can machine-check admissibility (`verified: 0` over `shown_paths: 12` cited none of \
+what it read; over `shown_paths: 0` it was shown nothing at all). `excerpts` follows `citations` when the report has at least one verified \
 citation and carries the indexed code at those locations verbatim \
 (`{path, start_line, end_line, code}`), so a caller needing a file's literal text gets it \
 from the index rather than by asking the model to retype it into the report; scope is \
@@ -4733,7 +4742,7 @@ out-of-scope path is refused by name rather than answered empty; the stored-repo
 tools (`list_research`/`read_research`) are the one unscoped exception, offer only valid \
 runs, and their content is hearsay that cannot be cited. A run whose `context_run_ids` name \
 an invalid run is refused up front with 400 `validation.research_context_invalid`.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
+        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, an include/exclude scope matching no indexed file — `research.scope_matches_nothing`, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
     ),
 )]
@@ -4847,7 +4856,7 @@ pub async fn post_research(
     request_body = ChallengeRequest,
     responses(
         (status = 200, description = "SSE stream of research events, exactly as `POST /v0/{project_guid}/research` emits them, plus one `verdict` event on this stream only — `{challenged_run_id, overall, grounded, claims}` after `excerpts` and before `done`. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`) or a subject that is itself a challenge (`research.challenge_subject_is_challenge`).", body = ProblemDetails),
+        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), or a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`).", body = ProblemDetails),
         (status = 404, description = "This project has no such run.", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
     ),
@@ -5000,6 +5009,40 @@ async fn launch_research_job(
     kind: &'static str,
     challenged_run_id: Option<String>,
 ) -> Result<Response, ApiError> {
+    // Before the permit, like the model-policy gate above it: a scope that admits no
+    // file cannot produce a run worth a slot. Every model-facing tool is bounded by
+    // the same subquery this counts, so such a run refuses every lookup and then
+    // reports the question unanswerable — a finding-shaped non-answer that costs a
+    // full budget and raises no error. One indexed COUNT is the whole cost, and only
+    // for a scoped run: an unscoped one is unchanged by construction.
+    if params.scope.is_scoped() {
+        let (scope_sql, binds) = scope_subquery(project_guid, &params.scope, 1);
+        let sql = format!("SELECT COUNT(*) FROM ({scope_sql})");
+        let guard = http3::CancellationGuard(CancellationToken::new());
+        let in_scope: i64 = s
+            .db_pool
+            .transaction(guard.0.clone(), move |tx| {
+                let mut st = tx.prepare(&sql)?;
+                let n: i64 =
+                    st.query_row(rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?;
+                Ok(n)
+            })
+            .await
+            .map_err(|e| {
+                error!(
+                    error = ?e,
+                    "Failed to count the files a research scope admits; refusing the run. \
+                     Check that the SQLite database is readable."
+                );
+                ApiError::from(e)
+            })?;
+        if in_scope == 0 {
+            return Err(ApiError::ResearchScopeEmpty {
+                scope: params.scope.describe(),
+            });
+        }
+    }
+
     let permit = s
         .research_semaphore
         .clone()

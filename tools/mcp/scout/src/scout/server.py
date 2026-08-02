@@ -143,8 +143,15 @@ _USAGE_KEYS = (
 # what a perfectly clean report scores, in the one field this layer tells the caller
 # to trust. Field reports of "verified: 0 even though it read the files" are that
 # collision and nothing else.
+# `shown_paths` is the denominator the counts never had: how many files the run's
+# tools actually returned. It is what makes admissibility machine-checkable —
+# `verified: 0` over `shown_paths: 12` is a report that cited none of the dozen files
+# it read, while over `shown_paths: 0` it is the honest "nothing in this scope was
+# shown to me". The server exempts the second from its own grounding gate, so that
+# one arrives looking exactly like a clean run.
 _CITATION_KEYS = (
     "server_written",
+    "shown_paths",
     "total",
     "verified",
     "path_only",
@@ -343,6 +350,16 @@ assembled one from what the run had. Such a report cites nothing, so it scores
 scores. Read the flag, not the counts: "verified 0" with `server_written` false
 means the model wrote ungrounded prose; with it true it means there was no model
 report at all, and the right move is to ask again.
+
+THE ADMISSION CHECK, AND IT IS ARITHMETIC, NOT JUDGEMENT: before you act on a
+report, require `steps > 0` and `citations.verified > 0`. A report that passes
+neither was written without the index being consulted, however confident it reads.
+The one legitimate exception is `citations.shown_paths == 0` — no tool returned a
+single file, so there was nothing to cite and the report can only be saying the
+question is unanswerable in this scope; treat that as a scoping problem and re-ask
+with a wider one, never as a finding about the code. `verified: 0` with
+`shown_paths` above zero is the case to refuse outright: the run read files and
+grounded nothing in them.
 
 How to call it: pass the project GUID from the repo-root `.mindex` file and ONE
 clear question in `question` (a full question, not keywords — the local model

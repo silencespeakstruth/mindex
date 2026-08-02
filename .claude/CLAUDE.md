@@ -353,6 +353,23 @@ is the `research_runs` table.) The hard invariants:
   `ResearchTools` (`research.rs`). Mocks: `tests/mock_ollama` (scripted via
   `POST /script`; `force_text_calls` covers `research.model_lacks_tools`),
   fakes in `research.rs` tests.
+- **A prose tool call is detected in two notations, and it is a diagnostic,
+  never a parser.** `looks_like_tool_call_attempt` scores JSON (a `name`/
+  `action` object) **and** markup (`<tool_call`, `<function=`, `<|python_tag|>`
+  — `MARKUP_TOOL_CALL_OPENINGS`). The markup half is not hypothetical: a model
+  that calls tools natively all run long still writes markup on the **report**
+  turn, where no tools are passed, and JSON-only detection let that through
+  every gate meant to catch it — the section-retry filter, the content gate and
+  `validate_report_markdown` — so a run shipped, streamed and journalled a
+  "report" whose whole body was three fake calls. The content gate withholds
+  the same set (`WITHHELD_OPENINGS`, one list so the gate and `is_withheld`
+  cannot disagree about what was streamed — the property a re-ask rests on);
+  its decision is **tri-state**, because a delta can be a bare `<`. In a
+  section, the prose **before** the markup is kept when it clears
+  `MIN_TRUNCATED_SECTION_CHARS` (200) and the section is retried otherwise: the
+  observed shape is one restated-question line and then the fake call, and half
+  a sentence under a server-supplied heading reads as an answer while saying
+  nothing.
 - **Native tool calling only; no text fallback.** Twelve tools
   (search/grep/symbols/outline/callers/list_files/read_chunks/file_history/
   list_research/read_research/note/revise_plan, plus `finalize`) as `tools`
@@ -476,7 +493,15 @@ is the `research_runs` table.) The hard invariants:
   scores, in the field scout tells callers to trust. Every "verified 0 even
   though it read the files" is that collision. The flag comes from the same
   `RunTools.forced_synthesis` the journal already recorded; the fact existed
-  and never reached the wire.
+  and never reached the wire. Its sibling **`citations.shown_paths`** is the
+  denominator the counts never had — how many files any tool actually returned
+  (`file_baselines.len()`, the same set the journal stores). It is what makes
+  the admission rule `steps > 0 && verified > 0` a *machine* check rather than
+  a reader's discipline: `verified: 0` over `shown_paths: 12` cited none of what
+  it read, while over `shown_paths: 0` it is the honest "nothing in this scope
+  was shown to me" — the one case the ungrounded gate exempts, and therefore
+  the one that reaches a caller looking exactly like a clean run. scout owns
+  the rule in `_INSTRUCTIONS`.
 - **The `excerpts` event ships code, so the model never has to.** Between
   `citations` and `done`: the indexed code at every **verified** citation,
   verbatim, via `read_chunks_core` (pure SQL, **scope-enforced** — this must
@@ -526,9 +551,13 @@ is the `research_runs` table.) The hard invariants:
   asks for the report's claims (`challenge_plan_request`); a closing toolless
   verdict turn scores each claim with the dictated vocabulary
   CONFIRMED/DISPUTED/REFUTED (the sufficiency-turn mechanism — never JSON).
-  **The grounding cap is what makes this safe with weak models**: a challenge
-  whose own report verified zero citations has its verdict capped at
-  `disputed` — an unshown accusation can dispute but never refute. Zero
+  **The grounding cap is what makes this safe with weak models**, and it is
+  symmetric: `grounded` = `verified > 0 AND unverified <= verified` (majority,
+  because one surviving citation out of nine was enough to launder a challenge
+  that had checked nothing — measured); an ungrounded `refuted` caps at
+  `disputed` (an unshown accusation can dispute but never refute) and an
+  ungrounded `confirmed` resolves to NULL (an unshown *acquittal* is not one).
+  `disputed` passes through either way. Zero
   parseable verdict lines → NULL = "challenged, inconclusive", which **no
   reader may render as an acquittal**. Every failure shape of the verdict turn
   degrades to inconclusive, never a `break` (the counters-not-clock rule holds
@@ -595,6 +624,15 @@ is the `research_runs` table.) The hard invariants:
   so there — and only there — the stored report carries a line the live view
   did not show. `title` is read **before** the repair, so a repaired run stores
   none and its readers fall back to the question the heading came from.
+- **A scope that admits no file is refused at admission** (400
+  `research.scope_matches_nothing`, in `launch_research_job`, before the
+  permit — so it covers the challenge entrance too). One indexed `COUNT` over
+  `scope_subquery`, and only for `is_scoped()` runs, so an unscoped one is
+  unchanged by construction. Without it such a run refuses every lookup and
+  then reports the question unanswerable, which reads as a finding about the
+  code: the commonest spelling (`"src/"`, where SQLite `GLOB` wanted
+  `"src/**"`) cost a measured 302-second run with zero citations and no error
+  anywhere.
 - **Budgets**: `effort` selects `[research.effort.{low,medium,high}]`; a
   request overrides axis-by-axis (`Budget::resolve`), capped by
   `[research].max_request_{seconds,tokens,steps,report_sections,report_words}`
@@ -715,7 +753,12 @@ is the `research_runs` table.) The hard invariants:
   subquery, read **only on a miss**, the `out_of_scope` probe's rule) and
   `format_grep`'s empty branch is three-way. A glob matching no file used to
   read as proof of absence, which is how one run honestly reports 0 hits for a
-  literal the next finds 5 times.
+  literal the next finds 5 times. A miss whose pattern carries regex
+  punctuation additionally says the match was literal
+  (`regex_metacharacter_hint`): `tool_specs` says so too, but that is read once
+  at the start of a run, while this is read at the moment the mistake costs
+  something — `\.bwp` → 0 and `.bwp` → 7 is a false negative the reader is
+  handed as proof of absence.
 - **`callers` is deliberately approximate** (no target column;
   `parent_name` by byte-span containment; `direction: "out"` via
   `idx_project_file_symbols_parent`); the collision/alias caveat is repeated
@@ -773,7 +816,7 @@ is the `research_runs` table.) The hard invariants:
   `done_event_carries_the_reason_and_the_run_cost_on_the_wire`,
   `done_names_no_run_when_the_journal_write_failed`,
   `each_action_names_its_argument_on_the_wire`,
-  `citations_wire_fields_are_stable`,
+  `citations_wire_fields_are_stable` (which pins `shown_paths`),
   `a_server_written_report_says_so_on_the_wire`. `done` carries nullable
   `run_id`/`seq` (null when the journal write failed; rendered as "not
   saved" in VS Code). `started` is always the **first** frame; event order after
