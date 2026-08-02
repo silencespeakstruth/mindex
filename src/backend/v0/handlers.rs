@@ -12384,4 +12384,260 @@ mod tests {
         assert!(out.definitions.is_empty());
         assert!(out.references.is_empty());
     }
+
+    fn filter_of(paths: &[&str], langs: &[ProgrammingLanguage]) -> Option<SearchFilter> {
+        Some(SearchFilter {
+            paths: (!paths.is_empty()).then(|| paths.iter().map(|p| glob(p)).collect()),
+            programming_languages: (!langs.is_empty()).then(|| langs.to_vec()),
+        })
+    }
+
+    fn scope(
+        include: Option<SearchFilter>,
+        exclude: Option<SearchFilter>,
+    ) -> crate::research::ToolScope {
+        crate::research::ToolScope { include, exclude }
+    }
+
+    /// Paths admitted by a scope, sorted — read through the real SQL rather than by
+    /// inspecting the generated string, since the string is not the contract.
+    async fn admitted(s: &RouterState, sc: &crate::research::ToolScope) -> Vec<String> {
+        let mut out: Vec<String> = list_files_core(s, guid(), "*", sc, &CancellationToken::new())
+            .await
+            .expect("list runs")
+            .files
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        out.sort();
+        out
+    }
+
+    async fn mixed_project() -> RouterState {
+        router_state(
+            pool_with_chunks(&[
+                ("src/a.rs", "a"),
+                ("src/b.rs", "b"),
+                ("src/gen/c.rs", "c"),
+                ("tests/d.rs", "d"),
+                ("docs/e.md", "e"),
+            ])
+            .await,
+        )
+    }
+
+    /// `build_file_filter` is one expression with three callers that could not be
+    /// more different in consequence: it is the walls of a scoped research run, the
+    /// selector of `DELETE /files`, and the selector of `POST /cancel`. It had no
+    /// test of its own. These read it through the real SQL, because the generated
+    /// string is not the contract — what the database admits is.
+    #[tokio::test]
+    async fn an_absent_or_empty_selector_admits_the_whole_project() {
+        let s = mixed_project().await;
+
+        assert_eq!(admitted(&s, &scope(None, None)).await.len(), 5);
+        // `Some` with empty lists is the same statement as `None`, and must not be
+        // read as "admit nothing" — that would silently empty a scoped run and, on
+        // the destructive endpoints, would be the more dangerous mistake.
+        let empty = Some(SearchFilter {
+            paths: Some(vec![]),
+            programming_languages: Some(vec![]),
+        });
+        assert_eq!(admitted(&s, &scope(empty.clone(), empty)).await.len(), 5);
+    }
+
+    /// Several include globs are OR'd — a caller naming two directories wants both,
+    /// not their (empty) intersection.
+    #[tokio::test]
+    async fn include_globs_are_alternatives_not_conjunctions() {
+        let s = mixed_project().await;
+        assert_eq!(
+            admitted(&s, &scope(filter_of(&["src/**", "docs/**"], &[]), None)).await,
+            vec!["docs/e.md", "src/a.rs", "src/b.rs", "src/gen/c.rs"]
+        );
+    }
+
+    /// A language and a path in the same include are ANDed: they are two different
+    /// axes of the same question, and OR-ing them would widen a scope past both.
+    #[tokio::test]
+    async fn a_language_and_a_path_narrow_together() {
+        let s = mixed_project().await;
+        assert_eq!(
+            admitted(
+                &s,
+                &scope(filter_of(&["src/**"], &[ProgrammingLanguage::Rust]), None)
+            )
+            .await,
+            vec!["src/a.rs", "src/b.rs", "src/gen/c.rs"]
+        );
+        // The same language with a path that admits only markdown yields nothing —
+        // proving the two are combined rather than either standing alone.
+        assert!(
+            admitted(
+                &s,
+                &scope(filter_of(&["docs/**"], &[ProgrammingLanguage::Rust]), None)
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    /// **Exclude wins.** A file matching both is out, which is the rule `.mindex`
+    /// states for the client walk and which the SQL must agree with — a blanket
+    /// exclude that a later include could carve back open would mean the two halves
+    /// of the same project describe different file sets, and that surfaces as
+    /// permanent drift rather than as an error.
+    #[tokio::test]
+    async fn an_exclude_beats_an_include_that_also_matches() {
+        let s = mixed_project().await;
+
+        assert_eq!(
+            admitted(
+                &s,
+                &scope(filter_of(&["src/**"], &[]), filter_of(&["src/gen/**"], &[]))
+            )
+            .await,
+            vec!["src/a.rs", "src/b.rs"],
+            "a file matched by both the include and the exclude was admitted"
+        );
+
+        // The same, by language.
+        assert_eq!(
+            admitted(
+                &s,
+                &scope(None, filter_of(&[], &[ProgrammingLanguage::Markdown]))
+            )
+            .await,
+            vec!["src/a.rs", "src/b.rs", "src/gen/c.rs", "tests/d.rs"]
+        );
+    }
+
+    /// An exclude alone is a legitimate scope — "everything but this" — and must not
+    /// require an include to mean anything.
+    #[tokio::test]
+    async fn an_exclude_alone_still_narrows() {
+        let s = mixed_project().await;
+        assert_eq!(
+            admitted(&s, &scope(None, filter_of(&["tests/**", "docs/**"], &[]))).await,
+            vec!["src/a.rs", "src/b.rs", "src/gen/c.rs"]
+        );
+    }
+
+    /// `status != 'deleted'` is part of the filter itself, not of its callers, so a
+    /// soft-deleted file is outside *every* scope — including the selector of a
+    /// second `DELETE /files`, which must not re-delete what is already gone, and
+    /// the walls of a research run, which must not be shown a file that no longer
+    /// exists.
+    #[tokio::test]
+    async fn a_soft_deleted_file_is_outside_every_selector() {
+        let s = mixed_project().await;
+        s.db_pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.execute(
+                    "UPDATE project_files SET status = 'deleted'
+                      WHERE project_guid = ?1 AND path = 'src/a.rs'",
+                    params![guid()],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("soft delete");
+
+        for sc in [
+            scope(None, None),
+            scope(filter_of(&["src/**"], &[]), None),
+            scope(filter_of(&[], &[ProgrammingLanguage::Rust]), None),
+        ] {
+            assert!(
+                !admitted(&s, &sc).await.contains(&"src/a.rs".to_string()),
+                "a soft-deleted file was admitted by a selector"
+            );
+        }
+    }
+
+    /// The scope fragment can be appended to a query that already has binds, and
+    /// `first_bind` is what keeps the numbering straight. Get it wrong and the
+    /// placeholders silently take each other's values — a scope bound to a pattern,
+    /// a pattern bound to a guid — which SQLite reports as no rows rather than as an
+    /// error. `grep_core` puts three binds before the scope; `callers_core` puts
+    /// three before it too but rewrites one by index.
+    #[tokio::test]
+    async fn a_scope_appended_after_other_binds_still_binds_correctly() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "fn needle() {}"),
+            ("tests/b.rs", "fn needle() {}"),
+        ])
+        .await;
+        add_symbols(
+            &pool,
+            "src/a.rs",
+            &[("needle", "function", "definition", 1, None)],
+        )
+        .await;
+        add_symbols(
+            &pool,
+            "tests/b.rs",
+            &[("needle", "call", "reference", 2, Some("t"))],
+        )
+        .await;
+        let s = router_state(pool);
+        let sc = scope(filter_of(&["src/**"], &[]), None);
+
+        // grep: the pattern bind sits before the scope's.
+        let g = grep_core(
+            &s,
+            guid(),
+            "needle",
+            None,
+            &sc,
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(g.total, 1, "the scope and the pattern binds crossed over");
+        assert_eq!(g.matches[0].path, "src/a.rs");
+
+        // callers: the name bind sits before the scope's, and one bind is rewritten
+        // by index afterwards.
+        let c = callers_core(
+            &s,
+            guid(),
+            "needle",
+            CallDirection::In,
+            &sc,
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("callers runs");
+        assert!(c.defined, "the name bind did not survive the scope append");
+        assert_eq!(c.out_of_scope_sites, 1);
+
+        // symbols: the role bind is rewritten by index per executed query, which is
+        // only valid while the scope's binds are numbered last.
+        let req = SymbolsRequest {
+            name: "needle".to_string(),
+            role: None,
+            kind: None,
+            anchor_path: None,
+            limit: None,
+            include: Some(SearchFilter {
+                paths: Some(vec![glob("src/**")]),
+                programming_languages: None,
+            }),
+            exclude: None,
+        };
+        let sym = symbols_core(&s, guid(), &req, &CancellationToken::new())
+            .await
+            .expect("symbols runs");
+        assert_eq!(
+            sym.total_definitions, 1,
+            "the role bind and the scope binds crossed over"
+        );
+        assert_eq!(
+            sym.total_references, 0,
+            "the reference lives outside the scope"
+        );
+    }
 }
