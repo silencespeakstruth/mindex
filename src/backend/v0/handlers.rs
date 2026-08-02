@@ -9891,6 +9891,125 @@ mod tests {
         .unwrap()
     }
 
+    /// An `OllamaModel` that refuses every call — the SQL-only cores never chat.
+    struct NoOllama;
+    #[async_trait]
+    impl crate::models::ollama::OllamaModel for NoOllama {
+        async fn chat_stream(
+            &self,
+            _model: &str,
+            _messages: &[crate::models::ollama::ChatMessage],
+            _tools: &[crate::models::ollama::ToolSpec],
+            _sampling: crate::models::ollama::Sampling,
+            _on_delta: &mut (dyn FnMut(crate::models::ollama::ChatDelta) + Send),
+            _token: &CancellationToken,
+        ) -> Result<crate::models::ollama::ChatOutcome, crate::models::ollama::OllamaError>
+        {
+            unreachable!("a SQL-only core must not reach Ollama")
+        }
+        async fn list_models(&self) -> Result<Vec<String>, crate::models::ollama::OllamaError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A `RouterState` wired to the given pool and to fakes that refuse every
+    /// network call.
+    ///
+    /// The `*_core` functions — `grep`, `read_chunks`, `outline`, `list_files`,
+    /// `callers`, `symbols` — are pure SQL and are what both the research tool loop
+    /// and several public endpoints run. They took a `&RouterState`, which is only
+    /// obtainable from a fully wired server, so their real queries were reachable in
+    /// tests **only through the research fakes that replace them**: the scope
+    /// subquery, the `status = 'active'` filter, the two-read "no such file" vs "no
+    /// rows in range" distinction and the out-of-scope counters were all exercised
+    /// by nothing.
+    ///
+    /// Every scalar comes from `Config::default()` rather than a number chosen here,
+    /// so a default that changes is seen by these tests instead of being shadowed.
+    fn router_state(pool: SQLite3Pool) -> RouterState {
+        let cfg = crate::config::Config::default();
+        // The trivial tokenizer from `fixture()`: nothing here tokenizes, but the
+        // field is not optional.
+        let word_level = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".to_string(), 0u32)].into_iter().collect())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("static vocab");
+        let embedder: Arc<dyn crate::models::bge_m3::BGEm3Model> = Arc::new(NoEmbedder);
+
+        RouterState {
+            tokenizer: Arc::new(Tokenizer::new(word_level)),
+            db_pool: Arc::new(pool),
+            qdrant: Arc::new(NoStore),
+            model: EmbeddingModel::BGEm3 {
+                model_id: MODEL.to_string(),
+                client: Arc::clone(&embedder),
+            },
+            query_model: embedder,
+            embed_tuning: crate::embed::EmbedTuning {
+                embed_batch: cfg.indexing.embed_batch_chunks,
+                upsert_batch: cfg.qdrant.upsert_batch_points,
+                sparse_min_weight: cfg.indexing.sparse_min_weight,
+            },
+            min_chunk_tokens: cfg.slicer.min_chunk_tokens,
+            max_chunk_tokens: cfg.slicer.max_chunk_tokens,
+            fill_gaps: cfg.slicer.fill_gaps,
+            max_doc_chunk_tokens: cfg.slicer.max_doc_chunk_tokens,
+            doc_semantic_weight: cfg.slicer.doc_semantic_weight,
+            default_top_k: cfg.search.default_top_k,
+            max_top_k: cfg.search.max_top_k,
+            max_query_bytes: cfg.search.max_query_bytes,
+            max_code_bytes: cfg.limits.max_code_bytes,
+            max_files_per_request: cfg.limits.max_files_per_request,
+            max_drift_files: cfg.limits.max_drift_files,
+            max_selector_patterns: cfg.limits.max_selector_patterns,
+            max_symbol_name_bytes: cfg.limits.max_symbol_name_bytes,
+            max_symbol_results: cfg.limits.max_symbol_results,
+            max_history_commits: cfg.limits.max_history_commits,
+            max_commit_message_bytes: cfg.limits.max_commit_message_bytes,
+            max_research_delete_ids: cfg.limits.max_research_delete_ids,
+            path_batch_size: cfg.indexing.path_batch_size,
+            status_log_retention_days: cfg.workers.status_log_retention_days,
+            max_retries: cfg.workers.max_retries,
+            indexing_locks: Arc::new(Mutex::new(HashSet::new())),
+            gc_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stuck_grace_mins: cfg.indexing.stuck_grace_minutes,
+            db_pool_size: cfg.database.pool_size,
+            db_schema_version: 0,
+            research_handle: tokio::runtime::Handle::current(),
+            research_semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.research.max_concurrent)),
+            research_max_concurrent: cfg.research.max_concurrent,
+            research_registry: crate::backend::inflight::ResearchRegistry::new(),
+            research_stats: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            research_ollama: Arc::new(NoOllama),
+            research_default_model: cfg.research.default_model.clone(),
+            research_allowed_models: crate::config::AllowedModels::compile(&[])
+                .expect("an empty whitelist compiles"),
+            research_effort: cfg.research.effort.clone(),
+            research_max_request_seconds: cfg.research.max_request_seconds,
+            research_max_request_tokens: cfg.research.max_request_tokens,
+            research_max_request_steps: cfg.research.max_request_steps,
+            research_max_request_report_sections: cfg.research.max_request_report_sections,
+            research_max_request_report_words: cfg.research.max_request_report_words,
+            research_max_evidence_width: cfg.research.max_evidence_width,
+            research_report_timeout_ms: cfg.research.report_timeout_ms,
+            research_checkpoint_every_steps: cfg.research.checkpoint_every_steps,
+            research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
+            research_retention_days: cfg.research.retention_days,
+            research_max_context_runs: cfg.research.max_context_runs,
+            research_max_context_chars: cfg.research.max_context_chars,
+            research_list_page_limit: cfg.research.list_page_limit,
+            research_sampling: crate::models::ollama::Sampling {
+                temperature: cfg.research.temperature,
+                top_p: cfg.research.top_p,
+                seed: cfg.research.seed,
+                num_predict: None,
+            },
+            research_models: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            metrics: Arc::new(crate::backend::metrics::Metrics::new()),
+        }
+    }
+
     /// The owned pieces a test-local `FileIndexer` borrows (kept alive by the caller).
     struct IndexerFixture {
         tokenizer: Arc<Tokenizer>,
@@ -11463,5 +11582,440 @@ mod tests {
         ));
         assert!(populated.contains("- `glm-4:9b`"));
         assert!(populated.contains("| glm-4:9b | medium | 12 | 180 | 420 |"));
+    }
+
+    // ── the SQL-only cores ───────────────────────────────────────────────────
+
+    /// A project with the given `(path, code)` chunks, all `active`, and their files
+    /// `indexed`. `code` is stored verbatim, so a test can grep it.
+    async fn pool_with_chunks(files: &[(&'static str, &'static str)]) -> SQLite3Pool {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        let files: Vec<(String, String)> = files
+            .iter()
+            .map(|(p, c)| ((*p).to_string(), (*c).to_string()))
+            .collect();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                params![guid(), MODEL],
+            )?;
+            for (path, code) in &files {
+                let lang = if path.ends_with(".md") {
+                    "markdown"
+                } else {
+                    "rust"
+                };
+                tx.execute(
+                    "INSERT INTO project_files
+                         (project_guid, model_id, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'indexing')",
+                    params![guid(), MODEL, path, "0".repeat(64), lang],
+                )?;
+                tx.execute(
+                    "UPDATE project_files SET status = 'indexed'
+                      WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
+                    params![guid(), MODEL, path],
+                )?;
+                tx.execute(
+                    "INSERT INTO project_file_chunks
+                         (project_guid, file_path, model_id, code, qdrant_guid,
+                          start_line, end_line, start_column, end_column, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 10, 0, 1, 'active')",
+                    params![
+                        guid(),
+                        path,
+                        MODEL,
+                        code,
+                        Uuid::new_v4().simple().to_string()
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed");
+        pool
+    }
+
+    fn unscoped() -> crate::research::ToolScope {
+        crate::research::ToolScope {
+            include: None,
+            exclude: None,
+        }
+    }
+
+    fn scoped_to(paths: &[&str]) -> crate::research::ToolScope {
+        crate::research::ToolScope {
+            include: Some(SearchFilter {
+                paths: Some(paths.iter().map(|p| glob(p)).collect()),
+                programming_languages: None,
+            }),
+            exclude: None,
+        }
+    }
+
+    /// An empty `grep` result has **three** meanings, and reporting them as one is
+    /// how a run honestly reports 0 hits for a literal the next run finds five times.
+    /// `searched_chunks`/`searched_files` are what separate "nothing here was
+    /// searchable" from "no indexed chunk contains this", and they are read only on a
+    /// miss — the second scan is worth paying for exactly when it changes the answer.
+    #[tokio::test]
+    async fn a_grep_miss_says_whether_anything_was_searchable() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "fn alpha() { let x = 1; }"),
+            ("src/b.rs", "fn beta() { let y = 2; }"),
+        ])
+        .await;
+        let s = router_state(pool);
+
+        // (a) A hit: the counts are not paid for.
+        let hit = grep_core(
+            &s,
+            guid(),
+            "alpha",
+            None,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(hit.total, 1);
+        assert_eq!(hit.matches.len(), 1);
+        assert_eq!(hit.matches[0].path, "src/a.rs");
+        assert!(
+            hit.searched_chunks.is_none() && hit.searched_files.is_none(),
+            "the reach counts were computed on a hit, where they change nothing"
+        );
+
+        // (b) Genuinely absent: there *was* something to search, and it said so.
+        let absent = grep_core(
+            &s,
+            guid(),
+            "gamma",
+            None,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(absent.total, 0);
+        assert_eq!(
+            (absent.searched_chunks, absent.searched_files),
+            (Some(2), Some(2)),
+            "a real absence must say how much was in reach to make it meaningful"
+        );
+
+        // (c) Nothing searchable: the glob matches no file, so the same zero means
+        // something entirely different. This is the case that used to read as proof.
+        let unreachable = grep_core(
+            &s,
+            guid(),
+            "alpha",
+            Some("docs/**"),
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(unreachable.total, 0);
+        assert_eq!(
+            (unreachable.searched_chunks, unreachable.searched_files),
+            (Some(0), Some(0)),
+            "a glob that matched no file reported the same reach as a real search"
+        );
+    }
+
+    /// `like_escape` is mandatory, not cosmetic: `_` is a `LIKE` wildcard, so an
+    /// unescaped `read_chunks` also matches `readAchunks` — and, worse, an unescaped
+    /// `%` matches everything, turning a miss into a full-corpus hit.
+    #[tokio::test]
+    async fn a_grep_pattern_is_matched_literally_not_as_a_like_expression() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "fn read_chunks() {}"),
+            ("src/b.rs", "fn readXchunks() {}"),
+            ("src/c.rs", "let pct = 100;"),
+        ])
+        .await;
+        let s = router_state(pool);
+
+        let underscore = grep_core(
+            &s,
+            guid(),
+            "read_chunks",
+            None,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(
+            underscore.total,
+            1,
+            "`_` was treated as a wildcard: {:?}",
+            underscore
+                .matches
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(underscore.matches[0].path, "src/a.rs");
+
+        // A bare `%` must match nothing here, not everything.
+        let percent = grep_core(
+            &s,
+            guid(),
+            "%",
+            None,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(
+            percent.total, 0,
+            "`%` matched the whole corpus instead of a literal percent sign"
+        );
+    }
+
+    /// Scope is enforced in SQL, and for a text-keyed tool the rows are dropped
+    /// **and counted**: a filtered total that silently shrinks is indistinguishable
+    /// from a string that simply occurs less often.
+    #[tokio::test]
+    async fn a_scoped_grep_counts_what_the_walls_hid() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "fn target() {}"),
+            ("tests/b.rs", "fn target() {}"),
+            ("tests/c.rs", "fn target() {}"),
+        ])
+        .await;
+        let s = router_state(pool);
+
+        let scoped = grep_core(
+            &s,
+            guid(),
+            "target",
+            None,
+            &scoped_to(&["src/**"]),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+
+        assert_eq!(scoped.total, 1, "the scope did not hold");
+        assert_eq!(scoped.matches[0].path, "src/a.rs");
+        assert_eq!(
+            scoped.out_of_scope, 2,
+            "the run was not told how much its own scope hid"
+        );
+
+        // Unscoped, the same pattern finds all three — so `out_of_scope` was real.
+        let all = grep_core(
+            &s,
+            guid(),
+            "target",
+            None,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(all.total, 3);
+        assert_eq!(all.out_of_scope, 0, "an unscoped run hid nothing");
+    }
+
+    /// A soft-deleted chunk is gone from every read path — the `status = 'active'`
+    /// rule. Without it a `DELETE /files` would keep answering greps until GC ran.
+    #[tokio::test]
+    async fn grep_never_returns_a_soft_deleted_chunk() {
+        let pool = pool_with_chunks(&[("src/a.rs", "fn target() {}")]).await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "UPDATE project_file_chunks SET status = 'deleted' WHERE project_guid = ?1",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("soft delete");
+        let s = router_state(pool);
+
+        let out = grep_core(
+            &s,
+            guid(),
+            "target",
+            None,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("grep runs");
+        assert_eq!(out.total, 0, "a soft-deleted chunk is still being searched");
+        assert_eq!(
+            (out.searched_chunks, out.searched_files),
+            (Some(0), Some(0)),
+            "and it must not count toward what was in reach either"
+        );
+    }
+
+    /// `read_chunks` reads the **index**, never the file, and a path the scope
+    /// refuses is an explicit refusal — `in_scope: false` — not an empty range. The
+    /// two are opposite answers: one says "I am not allowed to look", the other says
+    /// "I looked and there is nothing there".
+    #[tokio::test]
+    async fn read_chunks_distinguishes_refusal_from_absence_and_from_no_such_file() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "fn alpha() {}"),
+            ("tests/b.rs", "fn beta() {}"),
+        ])
+        .await;
+        let s = router_state(pool);
+
+        // In scope, in range: the indexed code comes back.
+        let hit = read_chunks_core(
+            &s,
+            guid(),
+            "src/a.rs",
+            1,
+            10,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read runs");
+        assert!(hit.indexed && hit.in_scope);
+        assert_eq!(hit.chunks.len(), 1);
+        assert_eq!(hit.chunks[0].code, "fn alpha() {}");
+
+        // Out of scope: a refusal, and deliberately not an empty range.
+        let refused = read_chunks_core(
+            &s,
+            guid(),
+            "tests/b.rs",
+            1,
+            10,
+            &scoped_to(&["src/**"]),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read runs");
+        assert!(!refused.in_scope, "a refused path did not say so");
+        assert!(refused.chunks.is_empty());
+
+        // Indexed, but that range holds no chunk: a different answer again.
+        let empty_range = read_chunks_core(
+            &s,
+            guid(),
+            "src/a.rs",
+            900,
+            999,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read runs");
+        assert!(
+            empty_range.indexed && empty_range.in_scope,
+            "the file is indexed and allowed; only the range is empty"
+        );
+        assert!(empty_range.chunks.is_empty());
+
+        // A path that was never indexed at all: the third answer.
+        let unknown = read_chunks_core(
+            &s,
+            guid(),
+            "src/never.rs",
+            1,
+            10,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read runs");
+        assert!(
+            !unknown.indexed,
+            "an unindexed path read as indexed-with-no-chunks"
+        );
+    }
+
+    /// The scope is enforced on `read_chunks` in SQL, which is what stops a scoped
+    /// run using the excerpt channel to read bytes it was refused. This must hold
+    /// for the *content*, not merely the flag.
+    #[tokio::test]
+    async fn a_scoped_read_chunks_never_returns_refused_bytes() {
+        let pool =
+            pool_with_chunks(&[("secrets/keys.rs", "const TOKEN: &str = \"hunter2\";")]).await;
+        let s = router_state(pool);
+
+        let refused = read_chunks_core(
+            &s,
+            guid(),
+            "secrets/keys.rs",
+            1,
+            10,
+            &scoped_to(&["src/**"]),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read runs");
+
+        assert!(!refused.in_scope);
+        assert!(
+            refused.chunks.is_empty(),
+            "a scoped run was handed the bytes its scope refused"
+        );
+    }
+
+    /// A soft-deleted chunk must not come back through `read_chunks` either — the
+    /// same `status = 'active'` rule, on the path that ships code to the model.
+    #[tokio::test]
+    async fn read_chunks_never_returns_a_soft_deleted_chunk() {
+        let pool = pool_with_chunks(&[("src/a.rs", "fn alpha() {}")]).await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "UPDATE project_file_chunks SET status = 'deleted' WHERE project_guid = ?1",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("soft delete");
+        let s = router_state(pool);
+
+        let out = read_chunks_core(
+            &s,
+            guid(),
+            "src/a.rs",
+            1,
+            10,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read runs");
+        assert!(
+            out.chunks.is_empty(),
+            "a soft-deleted chunk was shipped to the model"
+        );
+        assert!(
+            out.indexed,
+            "the file itself is still indexed; only its chunks are gone"
+        );
     }
 }
