@@ -525,14 +525,20 @@ pub enum ResearchEvent {
     /// Field reports of "verified: 0 / unverified: 0 even though it read the files"
     /// are this, and nothing else.
     ///
-    /// `shown_paths` is how many files any tool actually returned during the run —
-    /// the denominator `total` never had. It exists so a caller can *machine-check*
+    /// `shown_paths` is how many files the run was shown the **inside** of — the
+    /// denominator `total` never had. It exists so a caller can *machine-check*
     /// admissibility instead of relying on a reader's discipline: a report with
     /// `verified: 0` over `shown_paths: 12` read a dozen files and cited none of
     /// them, while the same `verified: 0` over `shown_paths: 0` is the honest "no
     /// tool showed me anything in this scope" answer — the one case the ungrounded
     /// gate deliberately exempts, and therefore the one case that reaches a caller
     /// looking exactly like a clean run.
+    ///
+    /// "Shown the inside of" is load-bearing and narrower than "named": it counts
+    /// only paths a span was recorded for, because those are exactly the ones a
+    /// `verified` citation could have landed in. Counting every path a tool
+    /// mentioned would let one `list_files("**")` report the whole project as read,
+    /// inflating the denominator precisely where `verified: 0` needs explaining.
     Citations {
         report: CitationReport,
         revalidation: Option<Revalidation>,
@@ -2112,17 +2118,26 @@ fn parse_claim_verdicts(text: &str) -> Vec<ClaimVerdict> {
 /// The symmetric half arrived with the majority rule in `grounded` (2026-08-02):
 /// capping only the accusation left the cheaper error — laundering a report the
 /// challenge never checked into `trust: confirmed` — uncapped.
-fn resolve_challenge_verdict(claims: &[ClaimVerdict], grounded: bool) -> Option<&'static str> {
+/// The severity fold alone, before the grounding cap — `None` on no claims.
+///
+/// Extracted so the cap's effect is *derivable* rather than duplicated: the call
+/// site learns "the cap changed the answer" by comparing this with
+/// [`resolve_challenge_verdict`], and a second copy of the fold, written to
+/// answer that question, is how the two would come to disagree about severity.
+fn worst_claim_verdict(claims: &[ClaimVerdict]) -> Option<&'static str> {
     if claims.is_empty() {
-        return None;
-    }
-    let worst = if claims.iter().any(|c| c.verdict == "refuted") {
-        "refuted"
+        None
+    } else if claims.iter().any(|c| c.verdict == "refuted") {
+        Some("refuted")
     } else if claims.iter().any(|c| c.verdict == "disputed") {
-        "disputed"
+        Some("disputed")
     } else {
-        "confirmed"
-    };
+        Some("confirmed")
+    }
+}
+
+fn resolve_challenge_verdict(claims: &[ClaimVerdict], grounded: bool) -> Option<&'static str> {
+    let worst = worst_claim_verdict(claims)?;
     match (worst, grounded) {
         ("refuted", false) => Some("disputed"),
         ("confirmed", false) => None,
@@ -2140,6 +2155,14 @@ pub struct ChallengeOutcome {
     /// Whether the challenge's own report had at least one verified citation.
     /// `false` caps the verdict at `disputed` (already applied to `verdict`).
     pub grounded: bool,
+    /// Whether the cap actually changed the answer — the claims folded to
+    /// something more severe than `verdict` reports.
+    ///
+    /// Deliberately **not on the wire**, unlike `grounded` and `verdict`. It is a
+    /// counter's input, not a reader's: "the challenge tried to refute and was not
+    /// allowed to" is precisely the inference the cap exists to forbid, and a field
+    /// saying it would be read as the verdict underneath the verdict.
+    pub capped: bool,
     pub claims: Vec<ClaimVerdict>,
 }
 
@@ -3229,6 +3252,12 @@ struct ResearchOutcome {
     /// `run_research` — cannot reach it, and because "what the loop produced" is
     /// exactly this struct's contract.
     file_baselines: Vec<FileBaseline>,
+    /// How many of those files the run was shown the *inside* of — the wire's
+    /// `citations.shown_paths`. Carried separately because it is a strictly smaller
+    /// set than the baselines above and the two must not be conflated: freshness
+    /// watches every path a tool named, while the admission check may only count the
+    /// ones a citation could have landed in. See `Evidence::content_path_count`.
+    content_paths: usize,
     /// The finished report. Streamed already — carried back only so the run can
     /// be journalled; nothing re-sends it.
     report: String,
@@ -3632,6 +3661,30 @@ impl Evidence {
             .collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));
         out
+    }
+
+    /// How many paths the run was shown **the inside of** — the `shown_paths`
+    /// denominator.
+    ///
+    /// Not [`Self::paths`], which is every path the run ever saw *named*: one
+    /// `list_files("**")` puts the whole project in there, and a run that read one
+    /// file would report a denominator of 188. Worse than merely inflated, it is
+    /// inflated in the direction that hides the fault — `verified: 0` looks most
+    /// excusable exactly when the denominator is largest.
+    ///
+    /// A span is the right discriminator because it is the same one the citation
+    /// verdict uses: a path with no span can only ever score `path_only`, never
+    /// `verified`. So this counts precisely the files that *could* have produced a
+    /// verified citation, which is what makes `verified > 0` over it an arithmetic
+    /// admission check rather than a reader's impression.
+    ///
+    /// [`Self::baselines`] deliberately keeps the wider set: freshness must watch
+    /// every path the run was shown, including the ones it only saw listed.
+    fn content_path_count(&self) -> usize {
+        self.by_path
+            .values()
+            .filter(|e| !e.spans.is_empty())
+            .count()
     }
 
     /// Every path's shown spans, for the journal — the other persistent half,
@@ -5184,6 +5237,7 @@ pub async fn run_research(
         revalidation,
         tools: run_tools,
         file_baselines,
+        content_paths,
         mut report,
         evidence_spans,
         trace,
@@ -5272,10 +5326,10 @@ pub async fn run_research(
         // `total: 0` the model chose. Sourced from the same flag the journal has
         // always recorded — the fact existed, it just never reached the wire.
         server_written: run_tools.forced_synthesis,
-        // The baselines are one row per path any tool returned — the same set the
-        // journal stores and `probe_freshness` asks about, so the wire and the
-        // record cannot disagree about what the run was shown.
-        shown_paths: file_baselines.len(),
+        // Files the run was shown the *inside* of — not every path a tool named.
+        // `list_files("**")` names the whole project, and counting those made the
+        // denominator largest exactly when `verified: 0` was least excusable.
+        shown_paths: content_paths,
     });
     // The code behind the citations, verbatim. Under the **job** token, not the
     // report window: that window bounds what the *model* is given to write in, and
@@ -5940,24 +5994,52 @@ async fn research_inner(
                 // `research_inner` six different ways ("fn research_inner", "fn
                 // research_inner impl", …) — every key distinct, so nothing fired, and
                 // every search cost a GPU embed to return almost the same five chunks.
+                // The *colliding* query, not merely whether one exists: a refusal that
+                // quotes the model its own words back tells it nothing it did not just
+                // write, while the earlier query is the fact it has lost — the whole
+                // reason it is rephrasing is that it no longer remembers asking.
                 let near_duplicate = match action {
                     Action::Search { query, .. } => seen_queries
                         .iter()
-                        .any(|prev| is_near_duplicate(prev, query)),
-                    _ => false,
+                        .find(|prev| is_near_duplicate(prev, query))
+                        .cloned(),
+                    _ => None,
                 };
-                if !seen_calls.insert(call_key) || near_duplicate {
+                // The tool's own name, recovered from the key it is built from.
+                let tool = call_key
+                    .split('\u{0}')
+                    .next()
+                    .unwrap_or("that tool")
+                    .to_string();
+                if !seen_calls.insert(call_key) || near_duplicate.is_some() {
                     duplicate_calls += 1;
-                    let detail = match action {
-                        Action::Search { query, .. } if near_duplicate => format!(
-                            "You already searched for something equivalent to \"{query}\" — its \
-                         results are above. Rephrasing does not find new code. Get a real \
-                         name with outline/list_files and search for that, read a location \
-                         with read_chunks, or finalize."
+                    // Named, and spent-out-of-granted: a refusal is a step in all but
+                    // name, and the run is stopped when these run out. A model told
+                    // only "you already did that" has no way to know it is three
+                    // refusals from being cut off, which is how a loop that could have
+                    // changed tack spends its budget insisting.
+                    let left = format!(
+                        " (duplicate {} of {}; the run is stopped after that)",
+                        duplicate_calls,
+                        MAX_DUPLICATE_CALLS + 1
+                    );
+                    let detail = match near_duplicate {
+                        Some(prev) => format!(
+                            "Not executed{left}. This is equivalent to your earlier search \
+                             \"{prev}\", whose results are above — rephrasing does not find new \
+                             code, because the index matches meaning rather than wording. To \
+                             find something the earlier search did not: name a symbol exactly \
+                             (`symbols`), match a literal (`grep`), list the structure of a \
+                             file you have (`outline`), or read a location you already have \
+                             (`read_chunks`). If the earlier results answered it, say so and \
+                             move to the next plan item."
                         ),
-                        _ => "You already made exactly this call — its results are above. Ask \
-                          something new, or finalize."
-                            .to_string(),
+                        None => format!(
+                            "Not executed{left}. You already made exactly this `{tool}` call and \
+                             its result is above — the index has not changed since. Ask a \
+                             different question, narrow it to a different path, or move to the \
+                             next plan item."
+                        ),
                     };
                     reply(&mut messages, detail);
                     if duplicate_calls > MAX_DUPLICATE_CALLS {
@@ -6888,6 +6970,9 @@ async fn research_inner(
         Some(_) if run_tools.forced_synthesis => Some(ChallengeOutcome {
             verdict: None,
             grounded: false,
+            // No verdict turn ran, so nothing was overridden — inconclusive here
+            // is the absence of an accusation, not a capped one.
+            capped: false,
             claims: Vec::new(),
         }),
         Some(_) => {
@@ -6932,6 +7017,18 @@ async fn research_inner(
             // majority has to hold up too.
             let grounded = citations.verified > 0 && citations.unverified <= citations.verified;
             let verdict = resolve_challenge_verdict(&claims, grounded);
+            // Derived from the one severity fold, never a second copy of it.
+            let capped = worst_claim_verdict(&claims) != verdict;
+            if capped {
+                warn!(
+                    claimed = worst_claim_verdict(&claims).unwrap_or("none"),
+                    recorded = verdict.unwrap_or("inconclusive"),
+                    verified = citations.verified,
+                    unverified = citations.unverified,
+                    "The grounding cap overrode this challenge's verdict: its own \
+                     report did not show enough code to sustain the claim."
+                );
+            }
             if verdict.is_none() {
                 warn!(
                     "The challenge verdict turn produced nothing parseable; the \
@@ -6942,6 +7039,7 @@ async fn research_inner(
             Some(ChallengeOutcome {
                 verdict,
                 grounded,
+                capped,
                 claims,
             })
         }
@@ -6957,6 +7055,7 @@ async fn research_inner(
         revalidation,
         tools: run_tools,
         file_baselines: evidence.baselines(),
+        content_paths: evidence.content_path_count(),
         report: summary,
         evidence_spans: evidence.spans_snapshot(),
         trace,
@@ -10237,6 +10336,67 @@ mod tests {
         assert!(!notes.contains("CHANGED in the index"), "{notes}");
         assert!(!notes.contains("LEFT the index"), "{notes}");
         assert!(!notes.contains("being reindexed right now"), "{notes}");
+    }
+
+    /// The `shown_paths` denominator counts files the run was shown the inside of,
+    /// not every path a tool named.
+    ///
+    /// The distinction is the whole value of the field: one `list_files("**")` names
+    /// the project, and counting those would report a run that read a single file as
+    /// having been shown two hundred — inflating the denominator in exactly the
+    /// direction that makes `verified: 0` look excusable. A path with no span can
+    /// only ever score `path_only`, so it could never have produced the verified
+    /// citation the admission rule is asking about.
+    ///
+    /// Freshness keeps the wider set: `paths()` must still cover the listed ones.
+    #[test]
+    fn only_files_the_run_was_shown_inside_count_toward_shown_paths() {
+        let mut ev = Evidence::default();
+        // Named by `list_files`, never opened.
+        ev.record("src/listed_a.rs", None);
+        ev.record("src/listed_b.rs", None);
+        // Read.
+        ev.record("src/read.rs", Some(Span { start: 10, end: 20 }));
+
+        assert_eq!(ev.content_path_count(), 1);
+        assert_eq!(ev.paths().len(), 3, "freshness still watches all three");
+
+        // A path first seen listed and later read counts once, from then on.
+        ev.record("src/listed_a.rs", Some(Span { start: 1, end: 4 }));
+        assert_eq!(ev.content_path_count(), 2);
+    }
+
+    /// `capped` is the call site's expression, pinned here: the cap fired exactly
+    /// when the severity fold and the resolved verdict disagree.
+    ///
+    /// It is derived rather than stored precisely so it cannot drift from the fold —
+    /// and it is a counter's input rather than a wire field, because "it tried to
+    /// refute and was not allowed to" is the inference the cap exists to forbid.
+    #[test]
+    fn the_cap_is_visible_exactly_when_it_changed_the_answer() {
+        let claim = |v: &'static str| ClaimVerdict {
+            claim: "c".into(),
+            verdict: v,
+        };
+        let capped = |claims: &[ClaimVerdict], grounded: bool| {
+            worst_claim_verdict(claims) != resolve_challenge_verdict(claims, grounded)
+        };
+
+        // Grounded: the fold stands, whatever it says.
+        assert!(!capped(&[claim("refuted")], true));
+        assert!(!capped(&[claim("confirmed")], true));
+
+        // Ungrounded: an accusation is capped to `disputed`, an acquittal to
+        // inconclusive — both are overrides.
+        assert!(capped(&[claim("refuted")], false));
+        assert!(capped(&[claim("confirmed")], false));
+
+        // `disputed` is what an ungrounded run is entitled to either way, so it
+        // passes through and nothing was overridden.
+        assert!(!capped(&[claim("disputed")], false));
+
+        // No claims at all is inconclusive by absence, not by capping.
+        assert!(!capped(&[], false));
     }
 
     /// The ledger's own rules, away from the loop: `changed` is sticky because the

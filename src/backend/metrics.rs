@@ -329,6 +329,18 @@ pub struct ResearchMetrics {
     /// cardinality rule holds. Rare by nature: chart with `increase()`, never
     /// `rate()` (the rare-counter rule in CLAUDE.md).
     pub challenges: Family<OutcomeLabels, Counter>,
+    /// Challenge verdicts the grounding cap downgraded — an ungrounded `refuted`
+    /// resolved to `disputed`, or an ungrounded `confirmed` to inconclusive.
+    ///
+    /// It exists because the cap is the one safety property of the whole challenge
+    /// mechanism that leaves no trace: the verdict it *would* have returned is not
+    /// stored, so a run whose accusation was capped is indistinguishable in the
+    /// journal from one that genuinely disputed. Unlabelled — the two directions
+    /// share a counter deliberately, since the question this answers is "does the
+    /// cap ever fire on this hardware", not which way. Rarer than
+    /// `research_challenges_total`, so the same rule applies twice over:
+    /// `increase()`, never `rate()`.
+    pub challenge_verdict_caps: Counter,
     pub revalidations: Counter,
     /// Reports the *server* wrote because the report window expired before the model
     /// produced one. The operational symptom of `[research].report_timeout_ms` set too
@@ -716,6 +728,7 @@ impl Metrics {
             tool_duration: hist_family(request_hist),
             citations: Family::default(),
             challenges: Family::default(),
+            challenge_verdict_caps: Counter::default(),
             revalidations: Counter::default(),
             forced_syntheses: Counter::default(),
             parse_retries: Counter::default(),
@@ -787,6 +800,11 @@ impl Metrics {
             "research_challenges",
             "Challenge runs recorded, by overall verdict.",
             research.challenges.clone(),
+        );
+        registry.register(
+            "research_challenge_verdict_caps",
+            "Challenge verdicts downgraded because the challenge's own report was ungrounded.",
+            research.challenge_verdict_caps.clone(),
         );
         registry.register(
             "research_revalidations",
@@ -1283,6 +1301,7 @@ mod tests {
             .challenges
             .get_or_create(&OutcomeLabels { outcome: "refuted" })
             .inc();
+        m.research.challenge_verdict_caps.inc();
         m.research.revalidations.inc();
         m.research.parse_retries.inc();
         m.gc.research_pruned.inc();
@@ -1477,6 +1496,7 @@ mod tests {
             ("mindex_research_active", "gauge"),
             ("mindex_research_citations_total", "counter"),
             ("mindex_research_challenges_total", "counter"),
+            ("mindex_research_challenge_verdict_caps_total", "counter"),
             ("mindex_research_context_used_ratio", "histogram"),
             ("mindex_research_duration_seconds", "histogram"),
             ("mindex_research_inflight_oldest_age_seconds", "gauge"),

@@ -385,8 +385,15 @@ is the `research_runs` table.) The hard invariants:
   nonexistent tool. Duplicates rejected, not re-executed; for `search`
   "duplicate" is near-duplicate (normalized, token-set Jaccard
   `NEAR_DUPLICATE_JACCARD` 0.5, ≥ `NEAR_DUPLICATE_MIN_TOKENS` tokens) —
-  deliberately also rejecting a mild refinement, naming the earlier query.
-  Only *executed* searches enter `seen_queries`.
+  deliberately also rejecting a mild refinement. Only *executed* searches enter
+  `seen_queries`. **A refusal names the colliding query, the ladder out of it,
+  and what it costs**: the *earlier* query (found, not merely detected — quoting
+  the model its own new words back tells it nothing it did not just write), the
+  four tools that find what a rephrasing cannot (`symbols`/`grep`/`outline`/
+  `read_chunks`), and `duplicate N of MAX_DUPLICATE_CALLS+1`, because a refusal
+  is a step in all but name and a model that cannot see the counter spends its
+  budget insisting. Measured: a `high` challenge ended `repeated_calls` at 11
+  steps and 126k prompt tokens.
 - **`read_chunks` reads the index, never the file** (pure SQL,
   `status='active'`, span overlap, `READ_CHUNKS_LIMIT` 8 × the run's
   `evidence_width`); gaps reported
@@ -499,8 +506,15 @@ is the `research_runs` table.) The hard invariants:
   though it read the files" is that collision. The flag comes from the same
   `RunTools.forced_synthesis` the journal already recorded; the fact existed
   and never reached the wire. Its sibling **`citations.shown_paths`** is the
-  denominator the counts never had — how many files any tool actually returned
-  (`file_baselines.len()`, the same set the journal stores). It is what makes
+  denominator the counts never had — how many files the run was shown the
+  **inside** of (`Evidence::content_path_count`: paths with at least one
+  recorded span). Deliberately *not* `file_baselines.len()`, which it was at
+  first: that is every path any tool *named*, so one `list_files("**")` reported
+  188 for a run that read one file — inflating the denominator exactly where
+  `verified: 0` needs explaining. A span is the right discriminator because it
+  is the citation verdict's own: a span-less path can only ever score
+  `path_only`, never `verified`. The baselines keep the wider set on purpose —
+  freshness must watch every path the run saw named. It is what makes
   the admission rule `steps > 0 && verified > 0` a *machine* check rather than
   a reader's discipline: `verified: 0` over `shown_paths: 12` cited none of what
   it read, while over `shown_paths: 0` it is the honest "nothing in this scope
@@ -588,7 +602,16 @@ is the `research_runs` table.) The hard invariants:
   `verdict_wire_fields_are_stable`). `worker::research_stats` filters
   `kind='research'` (`observed` is a promise about `POST /research`);
   `mindex_research_challenges_total{outcome}` counts verdicts
-  (rare counter — `increase()`, never `rate()`).
+  (rare counter — `increase()`, never `rate()`). **The cap's own firing is
+  counted, not published**: `ChallengeOutcome.capped` (derived at the call site
+  as `worst_claim_verdict != resolve_challenge_verdict`, so the severity fold is
+  never copied) drives `mindex_research_challenge_verdict_caps_total` and a
+  `warn!` naming both verdicts. It is deliberately **absent from the `verdict`
+  event** — "it tried to refute and was not allowed to" is precisely the
+  inference the cap exists to forbid, and a wire field saying it would read as
+  the verdict underneath the verdict. The counter exists because the override
+  leaves no other trace: a capped accusation and an honest `disputed` are the
+  same row, so this is the only answer to "does the cap ever fire here".
 - **Stored runs as context**: `context_run_ids` injects prior reports before
   the plan turn. **Prior reports are hearsay** — never seeded into `Evidence`
   (`a_prior_report_never_seeds_the_evidence`); truncated with a marker at
@@ -791,6 +814,22 @@ is the `research_runs` table.) The hard invariants:
 - **`num_ctx`** = `min(model limit from /api/show, [research].
   max_num_ctx_tokens)` — a VRAM ceiling (default 131072), not a window; an
   unreachable `/api/show` degrades to the ceiling, never zero.
+- **One `/api/show` per model per process, two facts** (`ShowFacts`, cached
+  together because it is one request — two caches would disagree about a model
+  re-pulled between them): the context length above, and `capabilities`. The
+  second is the **pre-flight** half of `research.model_lacks_tools`, checked in
+  `launch_research_job` before the permit like the scope count, so it covers the
+  challenge entrance too. **Three-valued, and the third value is load-bearing**:
+  only `Some(false)` refuses; `None` (unreachable Ollama, or one too old to have
+  the field) must let the run proceed — a pre-flight that cannot be performed is
+  not a refusal, and the trait's default impl returns `None` so no fake opts into
+  a refusal it cannot substantiate. `Some(true)` is **not** a promise, which is
+  why the mid-run symptom check (`looks_like_tool_call_attempt`) stays exactly
+  where it is: a model can declare `tools` and have a template that never emits
+  them. Both report the same code at different planes — a 400 before the run, an
+  `error` event during it. Present on this host: `qwen2.5vl:7b` declares
+  `["completion","vision"]`, and used to cost a slot, a model load and a turn to
+  discover it.
 - **Model catalog** (`worker::ollama_catalog` → `research.models` in
   `GET /config`, refresh `models_refresh_interval_seconds` 300): a failed
   tick keeps the previous list (`refreshed_at` not re-stamped — the only

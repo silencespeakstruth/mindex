@@ -4742,7 +4742,7 @@ out-of-scope path is refused by name rather than answered empty; the stored-repo
 tools (`list_research`/`read_research`) are the one unscoped exception, offer only valid \
 runs, and their content is hearsay that cannot be cited. A run whose `context_run_ids` name \
 an invalid run is refused up front with 400 `validation.research_context_invalid`.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, an include/exclude scope matching no indexed file — `research.scope_matches_nothing`, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
+        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, an include/exclude scope matching no indexed file — `research.scope_matches_nothing`, a model Ollama reports cannot call tools — `research.model_lacks_tools`, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
     ),
 )]
@@ -4856,7 +4856,7 @@ pub async fn post_research(
     request_body = ChallengeRequest,
     responses(
         (status = 200, description = "SSE stream of research events, exactly as `POST /v0/{project_guid}/research` emits them, plus one `verdict` event on this stream only — `{challenged_run_id, overall, grounded, claims}` after `excerpts` and before `done`. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), or a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`).", body = ProblemDetails),
+        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`), or a model Ollama reports cannot call tools (`research.model_lacks_tools`).", body = ProblemDetails),
         (status = 404, description = "This project has no such run.", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
     ),
@@ -5009,6 +5009,18 @@ async fn launch_research_job(
     kind: &'static str,
     challenged_run_id: Option<String>,
 ) -> Result<Response, ApiError> {
+    // Before the permit, and before the scope count: a run is a tool-calling loop, so
+    // a model that cannot call tools spends a slot, a model load and a turn only to
+    // fail on the symptom check inside the loop. `supports_tools` is three-valued and
+    // only `Some(false)` refuses — an unreachable Ollama answers `None`, and a
+    // pre-flight that cannot be performed must never become a refusal. The cost is a
+    // per-process cached `/api/show`, the same one `num_ctx` already pays for.
+    if s.research_ollama.supports_tools(&params.model).await == Some(false) {
+        return Err(ApiError::ResearchModelLacksTools {
+            model: params.model.clone(),
+        });
+    }
+
     // Before the permit, like the model-policy gate above it: a scope that admits no
     // file cannot produce a run worth a slot. Every model-facing tool is bounded by
     // the same subquery this counts, so such a run refuses every lookup and then

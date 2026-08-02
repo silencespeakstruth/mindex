@@ -177,6 +177,17 @@ pub enum ApiError {
     /// cost of the commonest spelling of it (`"src/"`, where the glob wanted
     /// `"src/**"`): one 302-second run, zero citations, no error anywhere.
     ResearchScopeEmpty { scope: String },
+    /// Ollama says the resolved model has no `tools` capability. 400 before the
+    /// semaphore.
+    ///
+    /// It shares its code with the mid-run diagnosis of the same fault, and that is
+    /// the point: one fault, one code, reported at whichever plane sees it first.
+    /// The mid-run one is a *symptom* check (the model wrote a call as text) and it
+    /// can only fire after admission, a permit, a model load and a turn or two; this
+    /// one reads the model's own declaration and costs a cached `/api/show`. The
+    /// converse does not hold — `capabilities: ["tools"]` is not proof the template
+    /// drives them — so the symptom check stays exactly where it is.
+    ResearchModelLacksTools { model: String },
 }
 
 impl ApiError {
@@ -228,6 +239,7 @@ impl ApiError {
                 "research.challenge_subject_is_challenge"
             }
             ApiError::ResearchScopeEmpty { .. } => "research.scope_matches_nothing",
+            ApiError::ResearchModelLacksTools { .. } => "research.model_lacks_tools",
         }
     }
 
@@ -293,6 +305,7 @@ impl ApiError {
             ApiError::ChallengeSubjectInvalid { .. } => "Challenge subject is not valid",
             ApiError::ChallengeSubjectIsChallenge { .. } => "Cannot challenge a challenge",
             ApiError::ResearchScopeEmpty { .. } => "Research scope matches no indexed file",
+            ApiError::ResearchModelLacksTools { .. } => "Research model cannot call tools",
         }
     }
 
@@ -313,9 +326,9 @@ impl ApiError {
             | ApiError::CommitMessageTooLarge { .. }
             | ApiError::CommitInvalid { .. } => Some("commits"),
             ApiError::HistoryBoundMissing => Some("keep_last/older_than"),
-            ApiError::ResearchModelMissing | ApiError::ResearchModelNotAllowed { .. } => {
-                Some("model")
-            }
+            ApiError::ResearchModelMissing
+            | ApiError::ResearchModelNotAllowed { .. }
+            | ApiError::ResearchModelLacksTools { .. } => Some("model"),
             ApiError::ResearchBudgetOutOfRange { field, .. }
             | ApiError::ResearchShapeOutOfRange { field, .. } => Some(field),
             ApiError::ResearchContextTooMany { .. } | ApiError::ResearchContextInvalid { .. } => {
@@ -496,6 +509,12 @@ impl ApiError {
                  neither `src/` nor `src` matches anything. GET /projects/{{guid}}/files \
                  lists what is indexed."
             ),
+            ApiError::ResearchModelLacksTools { model } => format!(
+                "Ollama reports that \"{model}\" has no `tools` capability, and a research \
+                 run is a tool-calling loop — it would spend a slot and a model load only \
+                 to fail on its first turn. Pick a model that lists `tools` in `ollama show \
+                 {model}`; GET /config lists the ones this server will accept."
+            ),
         }
     }
 
@@ -557,6 +576,7 @@ impl ApiError {
             }
             ApiError::ChallengeSubjectIsChallenge { run_id } => Some(json!({ "run_id": run_id })),
             ApiError::ResearchScopeEmpty { scope } => Some(json!({ "scope": scope })),
+            ApiError::ResearchModelLacksTools { model } => Some(json!({ "model": model })),
             _ => None,
         }
     }
@@ -731,6 +751,9 @@ mod tests {
             ApiError::ResearchScopeEmpty {
                 scope: String::new(),
             },
+            ApiError::ResearchModelLacksTools {
+                model: String::new(),
+            },
         ];
         let mut codes: Vec<&str> = all.iter().map(ApiError::code).collect();
         codes.sort_unstable();
@@ -749,6 +772,7 @@ mod tests {
             "research.busy",
             "research.challenge_subject_invalid",
             "research.challenge_subject_is_challenge",
+            "research.model_lacks_tools",
             "research.model_missing",
             "research.model_not_allowed",
             "research.run_not_found",

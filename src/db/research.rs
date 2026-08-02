@@ -455,6 +455,13 @@ impl ResearchJournal for MeteredJournal {
                     outcome: challenge.verdict.unwrap_or("inconclusive"),
                 })
                 .inc();
+            // The cap is the challenge mechanism's one safety property that leaves
+            // no trace anywhere else: the verdict it overrode is not stored, so a
+            // capped accusation and an honest `disputed` are the same row. This
+            // counter is the only answer to "does it ever fire on this hardware".
+            if challenge.capped {
+                r.challenge_verdict_caps.inc();
+            }
         }
         if record.tools.forced_synthesis {
             r.forced_syntheses.inc();

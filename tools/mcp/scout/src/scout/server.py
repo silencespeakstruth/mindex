@@ -182,10 +182,15 @@ _VERDICT_KEYS = ("challenged_run_id", "overall", "grounded", "claims")
 # re-verify reports — can only know that if we say so.
 # Mid-stream failures worth explaining to the caller rather than just raising.
 _ERROR_HINTS = {
+    # Mid-stream, this code means the *template* failed, not the capability: a model
+    # that declares no `tools` capability is refused before the run starts, with the
+    # same code on a 400. So reaching here means the model claimed tool support and
+    # then wrote a call as prose — still a configuration problem, and still not
+    # retryable, but a subtler one to report.
     "research.model_lacks_tools": (
-        "The configured local model cannot call tools (its Ollama template lacks "
-        "support). This is a server configuration problem, not something to retry: "
-        "report it and stop."
+        "The configured local model declares tool support but its Ollama template "
+        "does not drive it — it wrote a tool call as text. This is a server "
+        "configuration problem, not something to retry: report it and stop."
     ),
 }
 

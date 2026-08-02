@@ -311,6 +311,24 @@ pub trait OllamaModel: Send + Sync {
             .collect())
     }
 
+    /// Whether the model declares Ollama's `tools` capability — the pre-flight half
+    /// of the `research.model_lacks_tools` diagnosis.
+    ///
+    /// **Three-valued, and the third value is the load-bearing one.** `Some(false)`
+    /// is the only answer a caller may refuse on; `None` means the question could not
+    /// be asked (Ollama unreachable, or too old to report capabilities) and must let
+    /// the run proceed. The default impl returns `None` so every fake — and any
+    /// future non-Ollama backend — keeps working without opting into a refusal it
+    /// cannot substantiate.
+    ///
+    /// `Some(true)` is not a promise: a model can declare `tools` and still have a
+    /// template that never emits them, which is why the mid-run symptom check
+    /// (`looks_like_tool_call_attempt`) stays. This method only catches the case
+    /// that is knowable before a slot is spent.
+    async fn supports_tools(&self, _model: &str) -> Option<bool> {
+        None
+    }
+
     /// Liveness ping of the Ollama server (used by `GET /health`). Ollama is an
     /// *optional* dependency — a failure here is reported, never fatal.
     ///
@@ -363,6 +381,29 @@ pub struct ModelDescriptor {
 struct ShowResponse {
     #[serde(default)]
     model_info: HashMap<String, serde_json::Value>,
+    /// What the model declares it can do (`tools`, `thinking`, `vision`, …).
+    /// Absent on old Ollamas — hence `default`, and hence [`ShowFacts`] reading
+    /// "no `capabilities` key at all" as unknown rather than as "cannot".
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+/// Ollama's name for the capability a research run is made of.
+const TOOLS_CAPABILITY: &str = "tools";
+
+/// What one `/api/show` answers, cached per model for the process.
+///
+/// One struct rather than two caches because it is one request: asking twice for
+/// two fields of the same response is how the two would disagree about a model
+/// re-pulled between them.
+#[derive(Debug, Clone, Copy, Default)]
+struct ShowFacts {
+    /// The model's own trained context length, `None` when Ollama does not say.
+    context_limit: Option<u64>,
+    /// Whether the model declares the `tools` capability. **`None` is not `false`**
+    /// — it means Ollama did not answer, or is too old to have the field, and a
+    /// missing answer must never refuse a run that would have worked.
+    supports_tools: Option<bool>,
 }
 
 /// One NDJSON line of `POST /api/chat` with `stream: true`.
@@ -430,11 +471,10 @@ pub struct OllamaHttpClient {
     /// normal reply. Set by `with_metrics`; `None` in tests that build a bare
     /// client.
     metrics: Option<Arc<Metrics>>,
-    /// `model → its own trained context length`, from `/api/show`. Cached because
-    /// it is a property of the model file, asked once per model per process.
-    /// `None` = asked and unknowable (old Ollama, odd model_info), so it is not
-    /// re-asked every turn.
-    context_limits: tokio::sync::Mutex<HashMap<String, Option<u64>>>,
+    /// `model → what /api/show said about it`. Cached because these are properties
+    /// of the model file, asked once per model per process; an unreachable or
+    /// unhelpful answer caches as all-`None` rather than being re-asked every turn.
+    show_facts: tokio::sync::Mutex<HashMap<String, ShowFacts>>,
 }
 
 impl OllamaHttpClient {
@@ -443,7 +483,7 @@ impl OllamaHttpClient {
             client: reqwest::Client::new(),
             base_url,
             tuning,
-            context_limits: tokio::sync::Mutex::new(HashMap::new()),
+            show_facts: tokio::sync::Mutex::new(HashMap::new()),
             metrics: None,
         }
     }
@@ -457,17 +497,22 @@ impl OllamaHttpClient {
         self
     }
 
-    /// The model's own trained context length, or `None` when Ollama does not say.
+    /// What `/api/show` says about one model, asked once per process.
     ///
-    /// `/api/show`'s `model_info` keys are namespaced per architecture
-    /// (`glm4moelite.context_length`, `qwen3.context_length`, …), so the key is
-    /// found by suffix rather than named.
-    async fn model_context_limit(&self, model: &str) -> Option<u64> {
-        if let Some(cached) = self.context_limits.lock().await.get(model) {
+    /// `model_info`'s keys are namespaced per architecture
+    /// (`glm4moelite.context_length`, `qwen3.context_length`, …), so the context
+    /// length is found by suffix rather than named.
+    ///
+    /// Every failure path caches [`ShowFacts::default`] — all fields `None`, which
+    /// each consumer reads as "no hint", never as a negative answer. That is the
+    /// difference between an unreachable Ollama costing a run its full window and
+    /// an unreachable Ollama refusing the run outright.
+    async fn show_facts(&self, model: &str) -> ShowFacts {
+        if let Some(cached) = self.show_facts.lock().await.get(model) {
             return *cached;
         }
         let url = self.base_url.join("api/show").unwrap(); // join of a literal cannot fail
-        let limit = match self
+        let facts = match self
             .client
             .post(url)
             .timeout(Duration::from_millis(self.tuning.health_timeout_ms))
@@ -476,26 +521,31 @@ impl OllamaHttpClient {
             .await
         {
             Ok(resp) => match resp.json::<ShowResponse>().await {
-                Ok(show) => show
-                    .model_info
-                    .iter()
-                    .find(|(k, _)| k.ends_with(".context_length"))
-                    .and_then(|(_, v)| v.as_u64()),
+                Ok(show) => ShowFacts {
+                    context_limit: show
+                        .model_info
+                        .iter()
+                        .find(|(k, _)| k.ends_with(".context_length"))
+                        .and_then(|(_, v)| v.as_u64()),
+                    supports_tools: show
+                        .capabilities
+                        .map(|caps| caps.iter().any(|c| c == TOOLS_CAPABILITY)),
+                },
                 Err(e) => {
-                    warn!(%model, error = %e, "Could not read the model's context length from Ollama /api/show; leaving the configured num_ctx as-is.");
-                    None
+                    warn!(%model, error = %e, "Could not read Ollama /api/show for this model; leaving the configured num_ctx as-is and making no claim about its tool support.");
+                    ShowFacts::default()
                 }
             },
             Err(e) => {
-                warn!(%model, error = %e, "Ollama /api/show is unreachable; leaving the configured num_ctx as-is.");
-                None
+                warn!(%model, error = %e, "Ollama /api/show is unreachable; leaving the configured num_ctx as-is and making no claim about the model's tool support.");
+                ShowFacts::default()
             }
         };
-        self.context_limits
+        self.show_facts
             .lock()
             .await
-            .insert(model.to_string(), limit);
-        limit
+            .insert(model.to_string(), facts);
+        facts
     }
 
     /// The `num_ctx` to actually request: **the model's own trained length**, capped
@@ -512,7 +562,7 @@ impl OllamaHttpClient {
     /// ceiling is used as-is — a missing hint must not fail a run.
     async fn effective_num_ctx(&self, model: &str) -> u64 {
         let ceiling = self.tuning.max_num_ctx_tokens;
-        match self.model_context_limit(model).await {
+        match self.show_facts(model).await.context_limit {
             Some(limit) if limit > ceiling => {
                 info!(
                     %model,
@@ -848,6 +898,10 @@ impl OllamaModel for OllamaHttpClient {
                     .and_then(|d| serde_json::to_string(d).ok()),
             })
             .collect())
+    }
+
+    async fn supports_tools(&self, model: &str) -> Option<bool> {
+        self.show_facts(model).await.supports_tools
     }
 }
 
@@ -1272,7 +1326,12 @@ mod tests {
         assert_eq!(big.effective_num_ctx("test-model").await, 4096);
         // Cached: the second call must not need the server.
         assert_eq!(
-            *big.context_limits.lock().await.get("test-model").unwrap(),
+            big.show_facts
+                .lock()
+                .await
+                .get("test-model")
+                .unwrap()
+                .context_limit,
             Some(4096)
         );
     }
@@ -1292,6 +1351,62 @@ mod tests {
             },
         );
         assert_eq!(small.effective_num_ctx("test-model").await, 2048);
+    }
+
+    /// An `/api/show` stub answering one fixed body, for the capability reads.
+    async fn show_stub(body: &'static str) -> OllamaHttpClient {
+        let app = Router::new().route("/api/show", post(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                health_timeout_ms: 2000,
+            },
+        )
+    }
+
+    /// The three answers, and the third is why this is an `Option`.
+    ///
+    /// `Some(false)` is the only one a caller may refuse a run on. A model that lists
+    /// `tools` says so; a model that lists other capabilities and not `tools` says
+    /// so too; and an Ollama that reports no capabilities at all — the stub above,
+    /// and every Ollama older than the field — says nothing, which must not be read
+    /// as "cannot".
+    #[tokio::test]
+    async fn tool_support_is_read_from_the_model_and_absence_is_not_a_no() {
+        let yes = show_stub(r#"{"capabilities":["completion","tools","thinking"]}"#).await;
+        assert_eq!(yes.supports_tools("m").await, Some(true));
+
+        // Measured on this host: `qwen2.5vl:7b` reports exactly this.
+        let no = show_stub(r#"{"capabilities":["completion","vision"]}"#).await;
+        assert_eq!(no.supports_tools("m").await, Some(false));
+
+        let silent = show_stub(r#"{"model_info":{"testarch.context_length":4096}}"#).await;
+        assert_eq!(silent.supports_tools("m").await, None);
+    }
+
+    /// An Ollama that cannot be reached answers `None`, not `Some(false)` — a
+    /// pre-flight check that cannot be performed must never become a refusal.
+    #[tokio::test]
+    async fn an_unreachable_ollama_makes_no_claim_about_tool_support() {
+        // A port nothing is listening on: the request fails, and the failure caches.
+        let client = OllamaHttpClient::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                health_timeout_ms: 500,
+            },
+        );
+        assert_eq!(client.supports_tools("m").await, None);
+        // And the ceiling still applies, from the same cached all-`None` answer.
+        assert_eq!(client.effective_num_ctx("m").await, 4096);
     }
 
     #[tokio::test]
