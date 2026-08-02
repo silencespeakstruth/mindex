@@ -260,6 +260,221 @@ mod tests {
         assert!(observed.is_empty());
     }
 
+    /// A migrated in-memory database with one project.
+    async fn pool() -> SQLite3Pool {
+        let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
+                ["p".repeat(32)],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("migrations apply");
+        pool
+    }
+
+    /// One journalled run. Only the NOT NULL columns are supplied; everything the
+    /// estimate does not read is left to its default.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per column the tests below vary; a struct here would \
+                  be a second spelling of the row"
+    )]
+    async fn seed_run(
+        pool: &SQLite3Pool,
+        id: &'static str,
+        seq: i64,
+        model: &'static str,
+        effort: &'static str,
+        elapsed_ms: i64,
+        kind: &'static str,
+        created_at: i64,
+    ) {
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO research_runs (
+                     id, project_guid, created_at, seq, kind, question, model,
+                     prompt_version, effort,
+                     granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
+                     done_reason, steps, turns, elapsed_ms,
+                     prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx,
+                     citations_total, citations_verified, citations_path_only,
+                     citations_unverified, cited_paths_json, unverified_paths_json,
+                     changed_files, removed_files, stale_citations, stale_paths_json,
+                     notes_written, notes_rejected, plan_revisions,
+                     grep_calls, grep_hits, out_of_scope_refusals, out_of_scope_rows,
+                     scoped, forced_synthesis, report_window_ms, report_elapsed_ms,
+                     report
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, 'why', ?6,
+                     '2.5', ?7,
+                     300, 400000, 8, 5,
+                     'finalized', 3, 4, ?8,
+                     10, 20, 30, 4096,
+                     0, 0, 0,
+                     0, '[]', '[]',
+                     0, 0, 0, '[]',
+                     0, 0, 0,
+                     0, 0, 0, 0,
+                     0, 0, 120000, 1000,
+                     '# R'
+                 )",
+                rusqlite::params![
+                    id,
+                    "p".repeat(32),
+                    created_at,
+                    seq,
+                    kind,
+                    model,
+                    effort,
+                    elapsed_ms
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    }
+
+    /// `observed` is the promise `GET /config` makes about `POST /research`, and a
+    /// challenge's cost profile is a different thing entirely — the whole subject
+    /// report rides in its prompt. Counting challenges would quietly move the
+    /// number a caller prices an ordinary run by, in the direction of "slower", with
+    /// nothing on the wire to say the sample was mixed.
+    #[tokio::test]
+    async fn a_challenge_never_enters_the_observed_cost_of_research() {
+        let pool = pool().await;
+        let now = unix_now();
+        for (i, ms) in [10_000, 10_000, 10_000].into_iter().enumerate() {
+            seed_run(
+                &pool,
+                Box::leak(format!("r{i}").into_boxed_str()),
+                i as i64 + 1,
+                "m",
+                "low",
+                ms,
+                "research",
+                now,
+            )
+            .await;
+        }
+        // Three challenges at ten times the cost, same model and level.
+        for (i, ms) in [100_000, 100_000, 100_000].into_iter().enumerate() {
+            seed_run(
+                &pool,
+                Box::leak(format!("c{i}").into_boxed_str()),
+                i as i64 + 10,
+                "m",
+                "low",
+                ms,
+                "challenge",
+                now,
+            )
+            .await;
+        }
+
+        let observed = refresh_once(&pool, &CancellationToken::new())
+            .await
+            .expect("reads");
+
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].runs, 3,
+            "challenges were counted as research runs"
+        );
+        assert_eq!(
+            observed[0].p50_seconds, 10,
+            "a challenge's cost leaked into the price of an ordinary run"
+        );
+    }
+
+    /// The window is what makes the estimate current. A run from before it must not
+    /// hold the number down (or up) for ever — the whole point is that `observed`
+    /// tracks what this host does *now*, on this model, at this load.
+    #[tokio::test]
+    async fn runs_older_than_the_window_are_not_counted() {
+        let pool = pool().await;
+        let now = unix_now();
+        let ancient = now - (OBSERVED_WINDOW_DAYS + 1) * 86_400;
+
+        for i in 0..3 {
+            seed_run(
+                &pool,
+                Box::leak(format!("old{i}").into_boxed_str()),
+                i + 1,
+                "m",
+                "low",
+                1_000,
+                "research",
+                ancient,
+            )
+            .await;
+        }
+        let observed = refresh_once(&pool, &CancellationToken::new())
+            .await
+            .expect("reads");
+        assert!(
+            observed.is_empty(),
+            "runs outside the window were counted: {observed:?}"
+        );
+
+        // Three fresh ones, and the estimate is theirs alone.
+        for i in 0..3 {
+            seed_run(
+                &pool,
+                Box::leak(format!("new{i}").into_boxed_str()),
+                i + 10,
+                "m",
+                "low",
+                60_000,
+                "research",
+                now,
+            )
+            .await;
+        }
+        let observed = refresh_once(&pool, &CancellationToken::new())
+            .await
+            .expect("reads");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].runs, 3);
+        assert_eq!(observed[0].p50_seconds, 60);
+    }
+
+    /// A read that fails must be an `Err`, never an empty list. The loop keeps the
+    /// previous snapshot on `Err` and re-stamps `refreshed_at` on `Ok` — so an empty
+    /// `Ok` would blank every published estimate *and* date the blank as fresh,
+    /// which is the "I could not measure" / "it is zero" collision this codebase
+    /// spends most of its metrics rules avoiding.
+    #[tokio::test]
+    async fn a_read_that_could_not_run_is_an_error_not_an_empty_estimate() {
+        let pool = pool().await;
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        let res = refresh_once(&pool, &cancelled).await;
+        assert!(
+            res.is_err(),
+            "a read that never ran published an empty estimate: {res:?}"
+        );
+    }
+
+    /// An empty corpus is a legitimate `Ok(vec![])` — a server that has run no
+    /// research yet publishes no estimates, and the client falls back to the grant.
+    /// This is the boundary against the test above.
+    #[tokio::test]
+    async fn an_empty_corpus_reads_successfully_and_publishes_nothing() {
+        let pool = pool().await;
+        let observed = refresh_once(&pool, &CancellationToken::new())
+            .await
+            .expect("an empty corpus is not an error");
+        assert!(observed.is_empty());
+    }
+
     #[test]
     fn the_same_model_at_two_levels_stays_two_rows() {
         let observed = summarize(rows(&[
