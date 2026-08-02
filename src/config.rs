@@ -44,6 +44,15 @@ const DEFAULT_UPSERT_BATCH_POINTS: usize = 256;
 const DEFAULT_DENSE_PREFETCH_LIMIT: u32 = 200;
 const DEFAULT_SPARSE_PREFETCH_LIMIT: u32 = 200;
 const DEFAULT_FUSION_LIMIT: u32 = 200;
+/// Whole-request ceiling for one Qdrant call. The client's own default is **5 s**,
+/// which nothing in this repo set or could override: a project whose candidate set is
+/// large enough that fusion + ColBERT rerank exceeds it failed *every* search with
+/// `qdrant.unavailable` 503, untunably. 30 s is generous for a query and still short
+/// enough to fail a wedged connection rather than hold a request open.
+const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 30_000;
+/// Establishing the connection, as opposed to answering. Separate because a Qdrant
+/// that is down should be reported in seconds, whatever the request ceiling above is.
+const DEFAULT_QDRANT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 
 const DEFAULT_DB_PATH: &str = "mindex.db";
 const DEFAULT_DB_POOL_SIZE: usize = 4;
@@ -369,7 +378,8 @@ pub struct ModelConfig {
     pub max_429_retries: u32,
     /// First 429 backoff; doubles each retry.
     pub backoff_base_ms: u64,
-    /// Whole-request timeout for one `/encode` call, applied per attempt.
+    /// Ceiling on one `/encode` call, its 429 retries and their backoffs included —
+    /// not per attempt. See `BGEm3Tuning::encode_timeout_ms`.
     pub encode_timeout_ms: u64,
 }
 
@@ -381,6 +391,10 @@ pub struct QdrantConfig {
     pub dense_prefetch_limit: u32,
     pub sparse_prefetch_limit: u32,
     pub fusion_limit: u32,
+    /// Whole-request timeout for one Qdrant call.
+    pub timeout_ms: u64,
+    /// Connection-establishment timeout for one Qdrant call.
+    pub connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -912,6 +926,8 @@ impl Default for QdrantConfig {
             dense_prefetch_limit: DEFAULT_DENSE_PREFETCH_LIMIT,
             sparse_prefetch_limit: DEFAULT_SPARSE_PREFETCH_LIMIT,
             fusion_limit: DEFAULT_FUSION_LIMIT,
+            timeout_ms: DEFAULT_QDRANT_TIMEOUT_MS,
+            connect_timeout_ms: DEFAULT_QDRANT_CONNECT_TIMEOUT_MS,
         }
     }
 }
@@ -1428,12 +1444,32 @@ impl Config {
         if self.qdrant.upsert_batch_points < 1 {
             e.push("[qdrant].upsert_batch_points = 0 would never upsert. Fix: use at least 1 (e.g. 256).".to_string());
         }
-        if self.qdrant.fusion_limit < self.search.default_top_k as u32 {
+        // Checked against `max_top_k`, not `default_top_k`: the default is only what a
+        // request gets when it asks for nothing, while the maximum is what a request is
+        // *permitted* to ask for. With the looser check a caller asking for the
+        // documented maximum got a silently short result set — no warning at startup,
+        // none at query time, and a correct-looking response.
+        if self.qdrant.fusion_limit < self.search.max_top_k as u32 {
             e.push(format!(
-                "[qdrant].fusion_limit = {} is below [search].default_top_k = {}; the reranker \
-                 cannot return top_k results. Fix: set fusion_limit >= default_top_k.",
-                self.qdrant.fusion_limit, self.search.default_top_k
+                "[qdrant].fusion_limit = {} is below [search].max_top_k = {}; a request \
+                 asking for max_top_k results would be silently truncated by the reranker. \
+                 Fix: set fusion_limit >= max_top_k.",
+                self.qdrant.fusion_limit, self.search.max_top_k
             ));
+        }
+        if self.qdrant.timeout_ms < 1 {
+            e.push(
+                "[qdrant].timeout_ms = 0 would time out every call immediately. \
+                 Fix: use at least 1000 (e.g. 30000)."
+                    .to_string(),
+            );
+        }
+        if self.qdrant.connect_timeout_ms < 1 {
+            e.push(
+                "[qdrant].connect_timeout_ms = 0 would fail every connection attempt. \
+                 Fix: use at least 1000 (e.g. 5000)."
+                    .to_string(),
+            );
         }
         if self.qdrant.dense_prefetch_limit < self.qdrant.fusion_limit {
             e.push(format!(

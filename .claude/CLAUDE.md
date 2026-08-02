@@ -1493,6 +1493,56 @@ prompt half of that knob is dead weight and only `num_predict` earns its place.
 hardware, in which case the shed path is insurance and should be described as
 such rather than as a mechanism.
 
+**Every wait has a number, and it is the server's not the library's.** The class of
+bug this closes is a default nobody chose: `[qdrant].timeout_ms`/`connect_timeout_ms`
+exist because the client's own default is 5 s and no knob reached it — a project
+whose fusion + ColBERT rerank ran past that failed **every** search with
+`qdrant.unavailable`, untunably. `[model].encode_timeout_ms` now bounds the whole
+`/encode` call rather than each attempt: per attempt the worst case was
+`(1 + max_429_retries)` timeouts plus backoffs — forty minutes at the defaults —
+while a throttled embedder held a search open or kept a file's indexing claim
+(`EncodeError::Timeout`, its own metric label, because "too busy for too long" is a
+capacity diagnosis and not a network one). `GET /health` runs its probes
+**concurrently** under `HEALTH_PROBE_TIMEOUT_MS` (3 s, not configurable — this is
+"how long may the liveness endpoint be made to wait", not "how long may the
+dependency take"); they were sequential, and the SQLite one was the file's only
+`transaction` without `with_cancellation_token`, so a wedged pool hung the one
+endpoint that must always answer. The ten research/management cores gained the same
+binding, so a disconnected client stops paying for a full `LIKE '%…%'` scan.
+Shutdown now **drains** for `SHUTDOWN_DRAIN` (8 s, under both systemd's and
+Docker's defaults): the signal arms used to cancel the token and return, logging
+"Shutdown complete." while in-flight batches were torn out mid-flight.
+
+**HTTP/3 streams frame by frame.** `send_axum_response` buffered the whole body
+before the first `send_data`, so `/index?stream=yes` and `/research` did not stream
+over h3 at all — the client saw nothing until the run ended (up to seventy minutes
+for a `high` run) and the server accumulated every event in memory, unbounded. Both
+endpoints exist *because* their output is worth watching arrive.
+
+**A number off the wire is not a capacity.** `Reader::checked_capacity` refuses a
+`Vec::with_capacity` the `/encode` body could not fill: reads were bounds-checked,
+capacities were not, and the count is a `u32` from the wire — a corrupt body asked
+for ~100 GB and aborted the process. Separately, `embed_and_upsert` now checks the
+row counts against the text count: `zip` silently truncated a short response,
+leaving a file marked `indexed` with vectors missing and no error anywhere, and a
+long one indexed `guids[i]` out of bounds.
+
+**Ollama's two failure classes are two codes.** `ollama.unavailable` is unreachable
+or reachable-and-mute; `ollama.error` is Ollama answering *with* an error — nearly
+always a model that is not pulled. Collapsed into one, a client could not word the
+message or decide whether re-reading `/health` would say anything (the VS Code
+extension refreshes on `ollama.unavailable`, and for a typo health is green every
+time). `show_facts` caches **successes only**: caching the failure made one blip
+permanent for the process, silently running every later run of that model at the
+configured ceiling instead of its own window.
+
+**`cancel_overdue` returns only what it cancelled.** A run wedged in an await its
+token cannot reach stays registered, so the sweep kept finding it: re-cancelled,
+re-warned and re-counted every 30 s for the life of the process, turning
+`research_watchdog_cancels_total` — the counter documented to stay at zero — into an
+unbounded number describing one event. It stays visible through
+`oldest_inflight_age_ms` and the `unhealthy` verdict.
+
 **Three families exist because "nothing" and "broken" were the same number.**
 `search_orphaned_winners` counts chunks Qdrant scored whose SQLite row was gone —
 silent before, and when *every* winner was one the caller got a 200 with an empty

@@ -484,6 +484,16 @@ async fn retry_file(
         match embed_and_upsert(embedder, store, &collection, &to_embed, token, embed, None).await {
             Ok(()) => true,
             Err(EmbedUpsertError::Cancelled) => false,
+            Err(EmbedUpsertError::Timeout(budget)) => {
+                error!(
+                    ?budget,
+                    %project_guid,
+                    %path,
+                    "Retry worker: embedder stayed busy for the whole call budget; \
+                     leaving file 'failed'. Sysadmin: the embedder is saturated."
+                );
+                false
+            }
             Err(EmbedUpsertError::Embed(e)) => {
                 error!(
                     error = ?e,

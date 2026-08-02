@@ -81,6 +81,7 @@ utoipa-swagger-ui = { version = "9.0", default-features = false, features = ["ax
 # recorder — the same rule config follows, and the only shape under which two
 # unit tests in one binary can each own an independent metric set.
 prometheus-client = "0.25.0"
+http-body-util = "0.1"
 
 [dev-dependencies]
 # Exercises the `?stream=` query grammar in unit tests exactly as axum's Query

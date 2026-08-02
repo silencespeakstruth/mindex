@@ -566,10 +566,16 @@ impl OllamaHttpClient {
     /// (`glm4moelite.context_length`, `qwen3.context_length`, …), so the context
     /// length is found by suffix rather than named.
     ///
-    /// Every failure path caches [`ShowFacts::default`] — all fields `None`, which
+    /// Every failure path yields [`ShowFacts::default`] — all fields `None`, which
     /// each consumer reads as "no hint", never as a negative answer. That is the
     /// difference between an unreachable Ollama costing a run its full window and
     /// an unreachable Ollama refusing the run outright.
+    ///
+    /// **Only successes are cached.** Caching the failure made one transient blip
+    /// permanent for the life of the process: every later run of that model silently
+    /// used the configured ceiling instead of the model's own window, and its tool
+    /// support stayed unknown, with the first `warn!` as the only evidence. The retry
+    /// costs one bounded request per run, which is what the fact is worth.
     async fn show_facts(&self, model: &str) -> ShowFacts {
         if let Some(cached) = self.show_facts.lock().await.get(model) {
             return *cached;
@@ -595,13 +601,13 @@ impl OllamaHttpClient {
                         .map(|caps| caps.iter().any(|c| c == TOOLS_CAPABILITY)),
                 },
                 Err(e) => {
-                    warn!(%model, error = %e, "Could not read Ollama /api/show for this model; leaving the configured num_ctx as-is and making no claim about its tool support.");
-                    ShowFacts::default()
+                    warn!(%model, error = %e, "Could not read Ollama /api/show for this model; leaving the configured num_ctx as-is and making no claim about its tool support. The next run re-asks.");
+                    return ShowFacts::default();
                 }
             },
             Err(e) => {
-                warn!(%model, error = %e, "Ollama /api/show is unreachable; leaving the configured num_ctx as-is and making no claim about the model's tool support.");
-                ShowFacts::default()
+                warn!(%model, error = %e, "Ollama /api/show is unreachable; leaving the configured num_ctx as-is and making no claim about the model's tool support. The next run re-asks.");
+                return ShowFacts::default();
             }
         };
         self.show_facts

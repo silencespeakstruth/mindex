@@ -11,10 +11,11 @@ use clap::Parser;
 use qdrant_client::Qdrant;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 use tokenizers::Tokenizer;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Spawn a background worker under supervision.
@@ -83,6 +84,13 @@ mod slicing;
 mod worker;
 
 type BoxError = Box<dyn Error + Send + Sync>;
+
+/// How long a signalled shutdown waits for in-flight work before exiting anyway.
+///
+/// Not configurable: it is a floor on politeness, not a tuning knob, and the real
+/// ceiling is whatever the supervisor allows before SIGKILL (systemd's default
+/// `TimeoutStopSec` is 90 s, Docker's `--time` is 10 s). Sized under both.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
 
 // Applied in order on startup: only migrations whose version exceeds the
 // current `PRAGMA user_version` are run, inside one transaction. `pub(crate)`
@@ -305,7 +313,14 @@ async fn main() -> Result<(), BoxError> {
     // caller the way an edited call site could.
     let qdrant_client: Arc<dyn VectorStore> = Arc::new(MeteredVectorStore::new(
         Arc::new(QdrantStore::new(
-            Qdrant::from_url(cfg.qdrant.server_url.as_str()).build()?,
+            // Both timeouts set explicitly. The client's own defaults are 5 s for
+            // each, and nothing here could override them: a project big enough that
+            // fusion + ColBERT rerank ran past five seconds failed every single search
+            // with `qdrant.unavailable`, with no knob to reach for.
+            Qdrant::from_url(cfg.qdrant.server_url.as_str())
+                .timeout(Duration::from_millis(cfg.qdrant.timeout_ms))
+                .connect_timeout(Duration::from_millis(cfg.qdrant.connect_timeout_ms))
+                .build()?,
             cfg.qdrant.dense_prefetch_limit,
             cfg.qdrant.sparse_prefetch_limit,
             cfg.qdrant.fusion_limit,
@@ -531,89 +546,102 @@ async fn main() -> Result<(), BoxError> {
 
     // Whichever arm fires first wins and we proceed to shutdown — there is no
     // looping (a server exit, SIGINT, or SIGTERM all end the process).
-    tokio::select! {
-        res = backend::http3::run(
-            cfg.server.bind,
-            (cfg.server.cert_path.as_path(), cfg.server.key_path.as_path()),
-            RouterState {
-                tokenizer: Arc::new(Tokenizer::from_pretrained(model_id, None)?),
-                db_pool: db_pool.clone(),
-                qdrant: qdrant_client.clone(),
-                model: EmbeddingModel::BGEm3 {
-                    model_id: model_id.to_string(),
-                    client: embed_client.clone(),
-                },
-                query_model: query_embed_client.clone(),
-                embed_tuning,
-                min_chunk_tokens: cfg.slicer.min_chunk_tokens,
-                max_chunk_tokens: cfg.slicer.max_chunk_tokens,
-                fill_gaps: cfg.slicer.fill_gaps,
-                max_doc_chunk_tokens: cfg.slicer.max_doc_chunk_tokens,
-                doc_semantic_weight: cfg.slicer.doc_semantic_weight,
-                default_top_k: cfg.search.default_top_k,
-                max_top_k: cfg.search.max_top_k,
-                max_query_bytes: cfg.search.max_query_bytes,
-                max_code_bytes: cfg.limits.max_code_bytes,
-                max_files_per_request: cfg.limits.max_files_per_request,
-                max_drift_files: cfg.limits.max_drift_files,
-                max_history_commits: cfg.limits.max_history_commits,
-                max_commit_message_bytes: cfg.limits.max_commit_message_bytes,
-                max_research_delete_ids: cfg.limits.max_research_delete_ids,
-                max_selector_patterns: cfg.limits.max_selector_patterns,
-                max_symbol_name_bytes: cfg.limits.max_symbol_name_bytes,
-                max_symbol_results: cfg.limits.max_symbol_results,
-                path_batch_size: cfg.indexing.path_batch_size,
-                status_log_retention_days: cfg.workers.status_log_retention_days,
-                max_retries: cfg.workers.max_retries,
-                indexing_locks: indexing_locks.clone(),
-                gc_flag: gc_flag.clone(),
-                stuck_grace_mins: cfg.indexing.stuck_grace_minutes,
-                db_pool_size: cfg.database.pool_size,
-                db_schema_version,
-                research_handle,
-                research_semaphore: research_semaphore.clone(),
-                research_max_concurrent: cfg.research.max_concurrent,
-                research_registry: research_registry.clone(),
-                research_stats: research_stats.clone(),
-                research_ollama,
-                research_default_model: cfg.research.default_model.clone(),
-                research_allowed_models: config::AllowedModels::compile(
-                    &cfg.research.allowed_models,
-                )
+    //
+    // The server future is pinned rather than consumed by the `select!` so a signal
+    // can cancel it and then **wait for it**. Before, the signal arms cancelled the
+    // token and the `select!` returned immediately: "Shutdown complete." was logged
+    // while in-flight requests, the HTTP/3 acceptor and live research runs were still
+    // being dropped mid-flight, which for an indexing batch means files left
+    // `indexing` and for a research run means a client's stream cut without a
+    // terminal event.
+    let server = backend::http3::run(
+        cfg.server.bind,
+        (
+            cfg.server.cert_path.as_path(),
+            cfg.server.key_path.as_path(),
+        ),
+        RouterState {
+            tokenizer: Arc::new(Tokenizer::from_pretrained(model_id, None)?),
+            db_pool: db_pool.clone(),
+            qdrant: qdrant_client.clone(),
+            model: EmbeddingModel::BGEm3 {
+                model_id: model_id.to_string(),
+                client: embed_client.clone(),
+            },
+            query_model: query_embed_client.clone(),
+            embed_tuning,
+            min_chunk_tokens: cfg.slicer.min_chunk_tokens,
+            max_chunk_tokens: cfg.slicer.max_chunk_tokens,
+            fill_gaps: cfg.slicer.fill_gaps,
+            max_doc_chunk_tokens: cfg.slicer.max_doc_chunk_tokens,
+            doc_semantic_weight: cfg.slicer.doc_semantic_weight,
+            default_top_k: cfg.search.default_top_k,
+            max_top_k: cfg.search.max_top_k,
+            max_query_bytes: cfg.search.max_query_bytes,
+            max_code_bytes: cfg.limits.max_code_bytes,
+            max_files_per_request: cfg.limits.max_files_per_request,
+            max_drift_files: cfg.limits.max_drift_files,
+            max_history_commits: cfg.limits.max_history_commits,
+            max_commit_message_bytes: cfg.limits.max_commit_message_bytes,
+            max_research_delete_ids: cfg.limits.max_research_delete_ids,
+            max_selector_patterns: cfg.limits.max_selector_patterns,
+            max_symbol_name_bytes: cfg.limits.max_symbol_name_bytes,
+            max_symbol_results: cfg.limits.max_symbol_results,
+            path_batch_size: cfg.indexing.path_batch_size,
+            status_log_retention_days: cfg.workers.status_log_retention_days,
+            max_retries: cfg.workers.max_retries,
+            indexing_locks: indexing_locks.clone(),
+            gc_flag: gc_flag.clone(),
+            stuck_grace_mins: cfg.indexing.stuck_grace_minutes,
+            db_pool_size: cfg.database.pool_size,
+            db_schema_version,
+            research_handle,
+            research_semaphore: research_semaphore.clone(),
+            research_max_concurrent: cfg.research.max_concurrent,
+            research_registry: research_registry.clone(),
+            research_stats: research_stats.clone(),
+            research_ollama,
+            research_default_model: cfg.research.default_model.clone(),
+            research_allowed_models: config::AllowedModels::compile(&cfg.research.allowed_models)
                 .expect("validated at startup"),
-                research_effort: cfg.research.effort.clone(),
-                research_max_request_seconds: cfg.research.max_request_seconds,
-                research_max_request_tokens: cfg.research.max_request_tokens,
-                research_max_request_steps: cfg.research.max_request_steps,
-                research_max_request_report_sections: cfg.research.max_request_report_sections,
-                research_max_request_report_words: cfg.research.max_request_report_words,
-                research_max_evidence_width: cfg.research.max_evidence_width,
-                research_report_timeout_ms: cfg.research.report_timeout_ms,
-                research_checkpoint_every_steps: cfg.research.checkpoint_every_steps,
-                research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
-                research_retention_days: cfg.research.retention_days,
-                research_max_context_runs: cfg.research.max_context_runs,
-                research_max_context_chars: cfg.research.max_context_chars,
-                research_list_page_limit: cfg.research.list_page_limit,
-                research_sampling: models::ollama::Sampling {
-                    temperature: cfg.research.temperature,
-                    top_p: cfg.research.top_p,
-                    seed: cfg.research.seed,
-                    // Not config: `write_report` arms it from the effort level's
-                    // `max_report_words`, and only for the turn that writes the
-                    // report. Every other turn sends no `num_predict` at all.
-                    num_predict: None,
-                },
-                research_models: research_models.clone(),
-                metrics: metrics.clone(),
+            research_effort: cfg.research.effort.clone(),
+            research_max_request_seconds: cfg.research.max_request_seconds,
+            research_max_request_tokens: cfg.research.max_request_tokens,
+            research_max_request_steps: cfg.research.max_request_steps,
+            research_max_request_report_sections: cfg.research.max_request_report_sections,
+            research_max_request_report_words: cfg.research.max_request_report_words,
+            research_max_evidence_width: cfg.research.max_evidence_width,
+            research_report_timeout_ms: cfg.research.report_timeout_ms,
+            research_checkpoint_every_steps: cfg.research.checkpoint_every_steps,
+            research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
+            research_retention_days: cfg.research.retention_days,
+            research_max_context_runs: cfg.research.max_context_runs,
+            research_max_context_chars: cfg.research.max_context_chars,
+            research_list_page_limit: cfg.research.list_page_limit,
+            research_sampling: models::ollama::Sampling {
+                temperature: cfg.research.temperature,
+                top_p: cfg.research.top_p,
+                seed: cfg.research.seed,
+                // Not config: `write_report` arms it from the effort level's
+                // `max_report_words`, and only for the turn that writes the
+                // report. Every other turn sends no `num_predict` at all.
+                num_predict: None,
             },
-            cfg.server.max_body_mib * 1024 * 1024,
-            cfg.server.http3,
-            backend::http3::MetricsRouting {
-                enabled: cfg.metrics.enabled,
-                per_project_http_labels: cfg.metrics.per_project_http_labels,
-            },
-            sigterm_token.child_token()) => {
+            research_models: research_models.clone(),
+            metrics: metrics.clone(),
+        },
+        cfg.server.max_body_mib * 1024 * 1024,
+        cfg.server.http3,
+        backend::http3::MetricsRouting {
+            enabled: cfg.metrics.enabled,
+            per_project_http_labels: cfg.metrics.per_project_http_labels,
+        },
+        sigterm_token.child_token(),
+    );
+    tokio::pin!(server);
+
+    let signalled = tokio::select! {
+        res = &mut server => {
             if let Err(err) = res {
                 error!(
                     error = ?err,
@@ -622,14 +650,35 @@ async fn main() -> Result<(), BoxError> {
                      Check the bind address is free and the TLS cert/key paths are valid."
                 );
             }
+            false
         }
         _ = signal::ctrl_c() => {
             info!("Received SIGINT. Shutting down...");
             sigterm_token.cancel();
+            true
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM. Shutting down...");
             sigterm_token.cancel();
+            true
+        }
+    };
+
+    if signalled {
+        // Bounded: a `high` research run may legitimately have an hour left, and a
+        // supervisor that sent SIGTERM will send SIGKILL long before that. The point is
+        // that the common case — a few in-flight requests and an indexing batch — gets
+        // to finish and land its rows, instead of the process claiming to be done while
+        // they are torn out from under it.
+        match tokio::time::timeout(SHUTDOWN_DRAIN, &mut server).await {
+            Ok(Ok(())) => info!("In-flight work drained."),
+            Ok(Err(err)) => error!(error = ?err, "HTTP server errored while draining."),
+            Err(_) => warn!(
+                drain = ?SHUTDOWN_DRAIN,
+                "Shutdown drain expired with work still in flight; exiting anyway. \
+                 Sysadmin: an indexing batch may be left 'indexing' — the retry worker \
+                 recovers it on the next start."
+            ),
         }
     }
 

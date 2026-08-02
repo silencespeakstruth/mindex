@@ -21,8 +21,12 @@ pub struct BGEm3Tuning {
     pub backoff_base_ms: u64,
     /// Liveness-ping timeout for the embedder's `/health`.
     pub health_timeout_ms: u64,
-    /// Whole-request timeout for one `/encode` call (connect + response body);
-    /// applied per attempt, so each 429 retry gets a fresh budget.
+    /// Ceiling on one `/encode` **call**, retries and 429 backoffs included.
+    ///
+    /// Per attempt it bounded nothing useful: the worst case was
+    /// `(1 + max_429_retries)` full timeouts plus the backoffs between them — forty
+    /// minutes at the defaults — while a throttled embedder held a search open or kept
+    /// a file's indexing claim. Each attempt now gets whatever is left of this.
     pub encode_timeout_ms: u64,
 }
 
@@ -59,6 +63,12 @@ const ENCODE_MAGIC: &[u8; 4] = b"BM3\x01";
 pub enum EncodeError {
     Cancelled,
     Request(reqwest::Error),
+    /// The whole call — every attempt and every 429 backoff between them — ran past
+    /// `[model].encode_timeout_ms`. Distinct from `Request`, which carries reqwest's
+    /// own per-request timeout: this one means the embedder kept answering "busy"
+    /// until the caller's budget was gone, which is a load diagnosis, not a network
+    /// one.
+    Timeout(std::time::Duration),
     /// The embedder's binary body didn't match the wire format (truncated, bad
     /// magic, or trailing bytes) — a client/embedder version skew.
     Decode(String),
@@ -123,6 +133,24 @@ impl<'a> Reader<'a> {
     fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
+
+    /// Refuse a `Vec::with_capacity` the body could not possibly fill.
+    ///
+    /// Reads are bounds-checked; capacities were not, and `count` comes straight off
+    /// the wire as a `u32`. A corrupt or hostile `/encode` body therefore asked for a
+    /// ~100 GB allocation and aborted the process before a single read could reject it.
+    /// The bound needs no invented constant: `count` elements of `per` bytes cannot
+    /// exceed what is left in the buffer.
+    fn checked_capacity(&self, count: usize, per: usize) -> Result<usize, EncodeError> {
+        match count.checked_mul(per) {
+            Some(bytes) if bytes <= self.remaining() => Ok(count),
+            _ => Err(EncodeError::Decode(format!(
+                "/encode body claims {count} elements of {per} bytes but only \
+                 {} bytes remain; truncated or wire-format mismatch",
+                self.remaining()
+            ))),
+        }
+    }
 }
 
 /// Parse the binary `/encode` body into the same shape the rest of the code
@@ -138,12 +166,15 @@ fn parse_encode_response(buf: &[u8]) -> Result<BGEm3EmbedResponse, EncodeError> 
     let n = r.read_u32()? as usize;
     let dim = r.read_u32()? as usize;
 
-    let mut dense_vecs = Vec::with_capacity(n);
+    // Each of the three sections is at least `n` elements of its own smallest possible
+    // size, so the buffer must be able to hold that much before anything is reserved.
+    let mut dense_vecs = Vec::with_capacity(r.checked_capacity(n, dim * 4)?);
     for _ in 0..n {
         dense_vecs.push(r.read_f32s(dim)?);
     }
 
-    let mut sparse_vecs = Vec::with_capacity(n);
+    // A sparse row is at least its own `count` u32, so 4 bytes each at minimum.
+    let mut sparse_vecs = Vec::with_capacity(r.checked_capacity(n, 4)?);
     for _ in 0..n {
         let count = r.read_u32()? as usize;
         let ids = r.read_u32s(count)?;
@@ -151,10 +182,10 @@ fn parse_encode_response(buf: &[u8]) -> Result<BGEm3EmbedResponse, EncodeError> 
         sparse_vecs.push(ids.into_iter().zip(weights).collect());
     }
 
-    let mut colbert_vecs = Vec::with_capacity(n);
+    let mut colbert_vecs = Vec::with_capacity(r.checked_capacity(n, 4)?);
     for _ in 0..n {
         let tokens = r.read_u32()? as usize;
-        let mut chunk = Vec::with_capacity(tokens);
+        let mut chunk = Vec::with_capacity(r.checked_capacity(tokens, dim * 4)?);
         for _ in 0..tokens {
             chunk.push(r.read_f32s(dim)?);
         }
@@ -282,6 +313,10 @@ impl BGEm3Model for MeteredEmbedder {
             Ok(_) => "ok",
             Err(EncodeError::Cancelled) => "cancelled",
             Err(EncodeError::Request(_)) => "request",
+            // Its own label: "the embedder was too busy for too long" is a capacity
+            // problem, and bucketing it with network failures would send the reader
+            // looking at the wrong thing.
+            Err(EncodeError::Timeout(_)) => "timeout",
             Err(EncodeError::Decode(_)) => "decode",
         };
         e.requests
@@ -307,12 +342,31 @@ impl BGEm3Model for BGEm3HttpClient {
     ) -> Result<BGEm3EmbedResponse, EncodeError> {
         let url = self.base_url.join("encode").unwrap(); // This should not ever happen.
 
+        // `encode_timeout` bounds the **whole call**, retries and backoffs included,
+        // rather than each attempt separately. Per attempt it bounded nothing useful:
+        // the worst case was `(1 + max_429_retries)` timeouts plus the backoffs between
+        // them — at the defaults, forty minutes — during which a throttled embedder held
+        // a search open or kept a file's indexing claim. Each attempt now gets whatever
+        // is left, so a busy embedder still gets its retries but the caller's wait has a
+        // number it can be told.
+        let deadline = tokio::time::Instant::now() + self.encode_timeout;
         let mut attempt: u32 = 0;
         loop {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                warn!(
+                    attempts = attempt,
+                    budget = ?self.encode_timeout,
+                    "Embedder call exhausted its whole-call budget while retrying; \
+                     giving up. Sysadmin: the embedder is saturated — check its load, \
+                     or raise [model].encode_timeout_ms."
+                );
+                return Err(EncodeError::Timeout(self.encode_timeout));
+            };
             let send = self
                 .client
                 .post(url.clone())
-                .timeout(self.encode_timeout)
+                .timeout(remaining)
                 .json(&req)
                 .send();
 
@@ -326,7 +380,9 @@ impl BGEm3Model for BGEm3HttpClient {
             if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
                 && attempt < self.max_429_retries
             {
-                let delay = self.backoff_base * 2u32.pow(attempt);
+                // Clamped to what is left, so the sleep cannot outlive the budget and
+                // the next iteration's check is the one that reports it.
+                let delay = (self.backoff_base * 2u32.pow(attempt)).min(remaining);
                 warn!(
                     attempt = attempt + 1,
                     max_attempts = self.max_429_retries,

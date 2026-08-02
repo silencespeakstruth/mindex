@@ -124,6 +124,7 @@ use rusqlite::params_from_iter;
 use sha2::Sha256;
 use sha2::digest::FixedOutputReset;
 use sha2::digest::Update;
+use std::time::Duration;
 use tokenizers::Tokenizer;
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
@@ -1683,6 +1684,16 @@ async fn run_index_job(
         }
         match embed_result {
             Ok(()) => {}
+            Err(EmbedUpsertError::Timeout(budget)) => {
+                error!(
+                    ?budget,
+                    "Embedder stayed busy for the whole call budget; marking batch \
+                     'failed'. Sysadmin: the embedder is saturated — check its load, \
+                     or raise [model].encode_timeout_ms."
+                );
+                indexer.recover_all(&prepared, "failed", true).await;
+                return Err(ApiError::EmbedderUnavailable);
+            }
             Err(EmbedUpsertError::Cancelled) => {
                 indexer.recover_all(&prepared, "cancelled", false).await;
                 return Err(ApiError::Cancelled);
@@ -2380,6 +2391,15 @@ async fn search_core_inner(
     {
         Ok(val) => Ok(val),
         Err(EncodeError::Cancelled) => Err(ApiError::Cancelled),
+        Err(EncodeError::Timeout(budget)) => {
+            error!(
+                ?budget,
+                "Embedding the query ran past the whole-call budget while the embedder \
+                 kept answering 'busy'. Sysadmin: the embedder is saturated — check its \
+                 load, or raise [model].encode_timeout_ms."
+            );
+            Err(ApiError::EmbedderUnavailable)
+        }
         Err(EncodeError::Request(request_err)) => {
             error!(
                 error = ?request_err,
@@ -2895,7 +2915,9 @@ async fn path_in_scope(
                 .transpose()?;
             Ok(hit.is_some())
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -2986,7 +3008,9 @@ pub(crate) async fn outline_core(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((language, rows))
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -3148,7 +3172,9 @@ pub(crate) async fn callers_core(
             };
             Ok((defined, rows, all_sites))
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -3264,7 +3290,9 @@ pub(crate) async fn read_chunks_core(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((indexed.is_some(), rows))
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -3491,7 +3519,9 @@ pub(crate) async fn list_files_core(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -3689,7 +3719,9 @@ pub(crate) async fn grep_core(
             };
             Ok((matches, total, all, coverage))
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -3802,7 +3834,9 @@ pub(crate) async fn file_versions_core(
             }
             Ok(out)
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = %e,
@@ -3886,7 +3920,9 @@ pub(crate) async fn list_research_core(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(out)
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = ?e,
@@ -3936,7 +3972,9 @@ pub(crate) async fn read_research_core(
                 .optional()?;
             Ok(row)
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = ?e,
@@ -4279,7 +4317,9 @@ async fn load_prior_reports(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(out)
         })
+        .with_cancellation_token(token)
         .await
+        .from_cancelled()
         .map_err(|e| {
             error!(
                 error = ?e,
@@ -7698,6 +7738,43 @@ pub async fn get_metrics(State(s): State<RouterState>) -> Result<Response, ApiEr
         .into_response())
 }
 
+/// Ceiling on one `GET /health` dependency probe.
+///
+/// Not configurable, and deliberately shorter than the clients' own health timeouts:
+/// this is not "how long may the dependency take", it is "how long may the endpoint
+/// that answers whether the service is alive be made to wait". A probe that has not
+/// answered in three seconds is reported as failing, which is the honest verdict for
+/// a caller deciding whether to send traffic here.
+const HEALTH_PROBE_TIMEOUT_MS: u64 = 3_000;
+
+/// A probe with its own ceiling, rendered as a failure when it does not answer in
+/// time — `Err(Elapsed)` reads as `error` on the wire and logs a timeout in the
+/// journal, which is what a stalled dependency deserves from a liveness check.
+async fn bounded<T, E>(
+    limit: Duration,
+    fut: impl Future<Output = Result<T, E>>,
+) -> Result<T, ProbeFailure<E>> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(ProbeFailure::Failed(e)),
+        Err(_) => Err(ProbeFailure::TimedOut(limit)),
+    }
+}
+
+/// Why a bounded probe did not succeed. Kept apart from the dependency's own error
+/// so the log says "did not answer in 3s" rather than reporting nothing at all.
+#[derive(Debug)]
+enum ProbeFailure<E> {
+    Failed(E),
+    #[allow(
+        dead_code,
+        reason = "read through the derived Debug in `probe`'s warn!, which dead-code \
+                  analysis does not count. The duration is the whole point of the \
+                  variant: \"did not answer in 3s\" is the diagnosis."
+    )]
+    TimedOut(Duration),
+}
+
 /// One dependency probe: the verdict for the wire, the reason for the log.
 ///
 /// The raw error deliberately does not travel — see [`CheckState`]. Every probe
@@ -7750,21 +7827,55 @@ fn probe<T, E: std::fmt::Debug>(
 pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
     let guard = http3::CancellationGuard(CancellationToken::new());
 
+    // Every probe concurrently, and each of them bounded.
+    //
+    // They used to run one after another, so the worst case was the *sum* of the
+    // dependency timeouts rather than the largest — and the SQLite probe had no bound
+    // at all: it was the one `transaction` in the file without
+    // `with_cancellation_token`, so a wedged pool or a stalled writer hung `GET /health`
+    // itself. This is the endpoint every other liveness decision is made from; it is
+    // the last one allowed to stop answering.
+    let health_deadline = Duration::from_millis(HEALTH_PROBE_TIMEOUT_MS);
+    let (sqlite_res, qdrant_res, embedder_res, query_res, ollama_res) = tokio::join!(
+        async {
+            bounded(
+                health_deadline,
+                s.db_pool.transaction(guard.0.child_token(), |tx| {
+                    tx.query_row(
+                        "SELECT COUNT(*) FROM project_files WHERE status = 'indexing'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(SQLite3PoolError::from)
+                }),
+            )
+            .await
+        },
+        bounded(health_deadline, s.qdrant.health()),
+        bounded(health_deadline, {
+            let EmbeddingModel::BGEm3 { client, .. } = &s.model;
+            client.health()
+        }),
+        async {
+            // Pinged separately only when it *is* separate: a split deployment can have
+            // a healthy indexer and a dead query instance, which would otherwise show as
+            // a green health check and every search failing.
+            let EmbeddingModel::BGEm3 { client, .. } = &s.model;
+            if Arc::ptr_eq(client, &s.query_model) {
+                None
+            } else {
+                Some(bounded(health_deadline, s.query_model.health()).await)
+            }
+        },
+        bounded(health_deadline, s.research_ollama.health()),
+    );
+
     // SQLite: the global indexing-file count doubles as the liveness query.
     let (sqlite, count) = probe(
         "sqlite",
         "the database file must exist, be writable and have disk behind it; see \
          [database].path.",
-        s.db_pool
-            .transaction(guard.0.child_token(), |tx| {
-                tx.query_row(
-                    "SELECT COUNT(*) FROM project_files WHERE status = 'indexing'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map_err(SQLite3PoolError::from)
-            })
-            .await,
+        sqlite_res,
     );
     // `-1` is "not known", which is a different answer from `0` and the reason
     // the count rides on a probe that may have failed.
@@ -7773,33 +7884,25 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
     let (qdrant, _) = probe(
         "qdrant",
         "check Qdrant is running and that [qdrant].url resolves from this process.",
-        s.qdrant.health().await,
+        qdrant_res,
     );
 
-    let EmbeddingModel::BGEm3 { client, .. } = &s.model;
     let (embedder, _) = probe(
         "embedder",
         "check the BGE-M3 server is up and reachable from here — a 0.0.0.0 bind \
          there is not 127.0.0.1 from this process.",
-        client.health().await,
+        embedder_res,
     );
-    // Pinged separately only when it *is* separate: a split deployment can have a
-    // healthy indexer and a dead query instance, which would otherwise show as a
-    // green health check and every search failing.
-    let query_embedder = if Arc::ptr_eq(client, &s.query_model) {
-        None
-    } else {
-        Some(
-            probe(
-                "query_embedder",
-                "check [model].query_server_url — the query instance fails \
-                 independently of the indexing one, and every search embeds \
-                 through it.",
-                s.query_model.health().await,
-            )
-            .0,
+    let query_embedder = query_res.map(|r| {
+        probe(
+            "query_embedder",
+            "check [model].query_server_url — the query instance fails \
+             independently of the indexing one, and every search embeds \
+             through it.",
+            r,
         )
-    };
+        .0
+    });
 
     // The one optional dependency: only `/research` needs it, so it is the sole
     // producer of `degraded` and can never produce `unhealthy`.
@@ -7807,7 +7910,7 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
         "ollama",
         "optional — only /research needs it; check `ollama serve` and \
          [research].url.",
-        s.research_ollama.health().await,
+        ollama_res,
     );
 
     // Research slots. Free reads off in-process state, so they cost nothing and are

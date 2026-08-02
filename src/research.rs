@@ -5815,6 +5815,23 @@ impl From<OllamaError> for ResearchAbort {
     fn from(e: OllamaError) -> Self {
         match e {
             OllamaError::Cancelled => ResearchAbort::Cancelled,
+            // `Decode` is Ollama answering — with an in-band `{"error": …}` line, a
+            // non-2xx body, or an unparseable stream. The commonest instance by far is
+            // a model name that does not exist on the host, which is the caller's typo
+            // and not an unreachable server. Collapsed into `ollama.unavailable` it was
+            // indistinguishable from a dead Ollama, so a client could neither word the
+            // message correctly nor decide whether re-reading `/health` would tell it
+            // anything (the VS Code extension does exactly that on `ollama.unavailable`,
+            // and health comes back green every time for a typo).
+            OllamaError::Decode(detail) => ResearchAbort::Failed {
+                code: "ollama.error".into(),
+                detail: format!(
+                    "Ollama rejected the chat call: {detail}. If this names a model, \
+                     check it is pulled on the Ollama host."
+                ),
+            },
+            // Unreachable, or reachable and mute — both mean "do not expect research to
+            // work right now", which is what `ollama.unavailable` tells a client.
             other => ResearchAbort::Failed {
                 code: "ollama.unavailable".into(),
                 detail: format!("The Ollama chat call failed: {other}"),
@@ -14652,6 +14669,10 @@ mod tests {
         );
     }
 
+    /// The code separates "Ollama answered, and what it said was an error" from
+    /// "Ollama did not answer". A client acts on the difference: the VS Code extension
+    /// re-reads `/health` on `ollama.unavailable`, which for a mistyped model name
+    /// comes back green every time and tells the user nothing.
     #[tokio::test]
     async fn ollama_failure_becomes_an_error_event() {
         // Script exhausted on the very first turn → Decode error. The budget
@@ -14664,7 +14685,7 @@ mod tests {
             .filter(|e| e.name() != "progress")
             .collect();
         match &events[0] {
-            ResearchEvent::Error { code, .. } => assert_eq!(code, "ollama.unavailable"),
+            ResearchEvent::Error { code, .. } => assert_eq!(code, "ollama.error"),
             other => panic!("expected an error event, got {other:?}"),
         }
     }

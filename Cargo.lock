@@ -1678,6 +1678,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "hex",
+ "http-body-util",
  "prometheus-client",
  "qdrant-client",
  "quinn",

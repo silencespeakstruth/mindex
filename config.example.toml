@@ -23,7 +23,7 @@ server_url = "http://localhost:11211" # the BGE-M3 embedder
 health_timeout_ms = 2000             # /health ping timeout
 max_429_retries = 3                  # retries when the embedder returns 429 (busy)
 backoff_base_ms = 200                # first 429 backoff; doubles each retry
-encode_timeout_ms = 600000           # per-attempt /encode request timeout (ms); 10 min
+encode_timeout_ms = 600000           # whole /encode call incl. 429 retries (ms); 10 min
 
 # OPTIONAL second embedder instance serving only the QUERY path (/search, and every
 # search a /research run makes). Commented out = one instance does both, which is
@@ -49,7 +49,12 @@ upsert_batch_points = 256            # points per Qdrant upsert
 dense_prefetch_limit = 200           # dense candidates before RRF fusion
 sparse_prefetch_limit = 200          # sparse candidates before RRF fusion
 fusion_limit = 200                   # candidates after fusion, before ColBERT rerank
-# Invariant: dense/sparse_prefetch_limit >= fusion_limit >= search.default_top_k.
+timeout_ms = 30000                   # ceiling on one Qdrant call
+connect_timeout_ms = 5000            # ceiling on establishing the connection
+# Invariant: dense/sparse_prefetch_limit >= fusion_limit >= search.max_top_k.
+# The two timeouts exist because the client's own default is 5s for each and nothing
+# could override it: a project whose candidate set made fusion + ColBERT rerank run
+# past five seconds failed every search with `qdrant.unavailable`, untunably.
 
 [database]
 path = "mindex.db"      # SQLite file (use ":memory:" for ephemeral)

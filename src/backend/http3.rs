@@ -789,17 +789,33 @@ async fn serve_h3_request(
 
 /// Send an axum `Response` back over an HTTP/3 bidi stream. Shared by the normal
 /// routing path and the over-limit 413 so both emit the same problem+json envelope.
+///
+/// **Frame by frame, never buffered.** This used to be
+/// `axum::body::to_bytes(body, usize::MAX)` before the first `send_data`, which made
+/// the two SSE endpoints — `/index?stream=yes` and `/research` — not stream at all
+/// over h3: an event was produced, held, and the client saw nothing until the run
+/// finished, up to seventy minutes later for a `high` research run. The whole
+/// event history was accumulated in memory meanwhile, with no bound. Both endpoints
+/// exist *because* their output is worth watching as it arrives, so buffering them
+/// does not degrade the feature, it removes it.
 async fn send_axum_response(
     resp: Response<Body>,
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (resp_parts, resp_body) = resp.into_parts();
+    use http_body_util::BodyExt as _;
+
+    let (resp_parts, mut resp_body) = resp.into_parts();
     stream
         .send_response(Response::from_parts(resp_parts, ()))
         .await?;
-    let data = axum::body::to_bytes(resp_body, usize::MAX).await?;
-    if !data.is_empty() {
-        stream.send_data(data).await?;
+    // Trailers are dropped, as they were before: nothing this server emits uses them,
+    // and h3's trailer API is a different call.
+    while let Some(frame) = resp_body.frame().await {
+        if let Ok(data) = frame?.into_data()
+            && !data.is_empty()
+        {
+            stream.send_data(data).await?;
+        }
     }
     stream.finish().await?;
     Ok(())

@@ -194,14 +194,29 @@ impl ResearchRegistry {
             .collect()
     }
 
-    /// Cancel every run past its worst case, returning what was cancelled so the
-    /// caller can log and count it.
+    /// Cancel every run past its worst case, returning **only the ones this call
+    /// actually cancelled** so the caller can log and count them.
+    ///
+    /// The already-cancelled filter is what makes the counter mean something.
+    /// Cancelling a token is idempotent, but a run parked in an await the token cannot
+    /// reach does not leave the registry when it is cancelled — so without the filter
+    /// the same wedged run was re-cancelled, re-warned and re-counted on every sweep,
+    /// every 30 seconds, for as long as the process lived. It inflated the one counter
+    /// documented to stay at zero into an unbounded number describing a single event,
+    /// and filled the log with the same line. A run that stays here after being
+    /// cancelled is still visible: `oldest_inflight_age_ms` keeps climbing and
+    /// `GET /health` keeps saying `unhealthy`.
     pub fn cancel_overdue(&self, grace: Duration) -> Vec<InflightRun> {
-        let overdue = self.overdue(grace);
-        for run in &overdue {
-            run.token.cancel();
-        }
-        overdue
+        self.overdue(grace)
+            .into_iter()
+            .filter(|run| {
+                let fresh = !run.token.is_cancelled();
+                if fresh {
+                    run.token.cancel();
+                }
+                fresh
+            })
+            .collect()
     }
 
     /// Move a run's start backwards, so a test can age it without sleeping.
@@ -318,6 +333,32 @@ mod tests {
         assert_eq!(cancelled[0].run_id, "stale");
         assert!(stale.is_cancelled());
         assert!(!fresh.is_cancelled());
+    }
+
+    /// A run wedged in an await its token cannot reach stays registered after being
+    /// cancelled, so the sweep keeps finding it. It was re-cancelled, re-warned and
+    /// re-counted every 30 seconds for the life of the process — turning
+    /// `research_watchdog_cancels_total`, the one counter documented to stay at zero,
+    /// into an unbounded number describing a single event, and filling the log with
+    /// the same line. The run stays visible through `oldest_age_ms` and `wedged`.
+    #[test]
+    fn a_wedged_run_is_only_cancelled_once() {
+        let reg = ResearchRegistry::new();
+        let token = CancellationToken::new();
+        let _g = register(&reg, "wedged", token.clone());
+        reg.backdate("wedged", Duration::from_secs(700));
+
+        assert_eq!(reg.cancel_overdue(Duration::ZERO).len(), 1);
+        assert!(token.is_cancelled());
+        assert!(
+            reg.cancel_overdue(Duration::ZERO).is_empty(),
+            "a second sweep must report nothing to count"
+        );
+        assert_eq!(
+            reg.wedged().len(),
+            1,
+            "and the run is still visible to /health, which is what says it is stuck"
+        );
     }
 
     /// A question is arbitrary UTF-8; the preview must never split a character.

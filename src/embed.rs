@@ -48,6 +48,8 @@ pub enum EmbedUpsertError {
     Cancelled,
     /// The model server request failed.
     Embed(reqwest::Error),
+    /// The embedder stayed busy until the whole-call budget was spent.
+    Timeout(std::time::Duration),
     /// The embedder's binary response couldn't be decoded (wire-format skew).
     Decode(String),
     /// A vector-store upsert failed.
@@ -92,8 +94,29 @@ pub async fn embed_and_upsert(
             Ok(val) => val,
             Err(EncodeError::Cancelled) => return Err(EmbedUpsertError::Cancelled),
             Err(EncodeError::Request(e)) => return Err(EmbedUpsertError::Embed(e)),
+            Err(EncodeError::Timeout(d)) => return Err(EmbedUpsertError::Timeout(d)),
             Err(EncodeError::Decode(e)) => return Err(EmbedUpsertError::Decode(e)),
         };
+
+        // The embedder's contract is one row per text, positionally aligned. Nothing
+        // checked it: the `zip` below silently truncates a short response — those
+        // chunks are never upserted and their file is still marked `indexed`, so the
+        // file is permanently missing vectors with no error anywhere — and a long one
+        // indexes `guids[i]` out of bounds and panics.
+        if dense_vecs.len() != guids.len()
+            || sparse_vecs.len() != guids.len()
+            || colbert_vecs.len() != guids.len()
+        {
+            return Err(EmbedUpsertError::Decode(format!(
+                "embedder returned {} dense / {} sparse / {} colbert rows for {} texts; \
+                 the embedder and this binary disagree about the wire format — redeploy \
+                 them from the same revision",
+                dense_vecs.len(),
+                sparse_vecs.len(),
+                colbert_vecs.len(),
+                guids.len()
+            )));
+        }
 
         let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
         for (i, ((dense, sparse), colbert)) in dense_vecs

@@ -290,7 +290,10 @@ export function activate(context: vscode.ExtensionContext): void {
         onError: (code: string, detail: string) => {
             panel.error(`${code}: ${detail}`, code);
             // The run just proved Ollama is unreachable — re-read health
-            // so the status bar and the Ask notice say so too.
+            // so the status bar and the Ask notice say so too. Deliberately not
+            // `ollama.error`, which is Ollama answering *with* an error (usually a
+            // model that is not pulled): health comes back green every time, so the
+            // refresh would only replace the useful message with a reassuring one.
             if (code === "ollama.unavailable") {
                 void statusProvider.refresh();
             }
