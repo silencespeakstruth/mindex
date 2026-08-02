@@ -8056,12 +8056,31 @@ async fn write_sectioned_report(
             // fake-tool-call salvage uses, and otherwise spend the attempt.
             let parsed = parse_numbered_sections(&text);
             if !parsed.is_empty() && !parsed.contains_key(&item.number) {
+                // Logged both ways: a silent refusal is indistinguishable in the
+                // journal from a model that returned nothing, and "does this fire on
+                // this host at all" is the only question the guard cannot answer
+                // about itself.
+                let found: Vec<String> = parsed.keys().map(usize::to_string).collect();
                 match prefix_before_first_numbered_heading(&text) {
                     Some(p) if p.chars().count() >= MIN_TRUNCATED_SECTION_CHARS => {
+                        warn!(
+                            section = item.number,
+                            reproduced = %found.join(","),
+                            "The section reply carried other sections; keeping the prose \
+                             before the first of them."
+                        );
                         body = Some(p.to_string());
                         break;
                     }
-                    _ => continue,
+                    _ => {
+                        warn!(
+                            section = item.number,
+                            reproduced = %found.join(","),
+                            "The section reply reproduced other sections instead of \
+                             writing this one; spending the attempt."
+                        );
+                        continue;
+                    }
                 }
             }
             body = Some(text);
