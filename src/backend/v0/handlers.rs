@@ -13257,4 +13257,195 @@ mod tests {
             "a file that no longer exists was reported as indexed"
         );
     }
+
+    // ── /health, including the split-embedder configuration ──────────────────
+
+    /// An embedder that answers or refuses on command.
+    struct HealthEmbedder {
+        ok: bool,
+    }
+
+    #[async_trait]
+    impl crate::models::bge_m3::BGEm3Model for HealthEmbedder {
+        async fn encode(
+            &self,
+            _req: BGEm3EmbedRequest,
+            _token: CancellationToken,
+        ) -> Result<BGEm3EmbedResponse, EncodeError> {
+            unreachable!("health does not encode")
+        }
+        async fn health(&self) -> Result<(), EncodeError> {
+            if self.ok {
+                Ok(())
+            } else {
+                Err(EncodeError::Decode("embedder is down".into()))
+            }
+        }
+    }
+
+    /// A store that answers `health` and nothing else.
+    struct HealthyStore;
+    #[async_trait]
+    impl VectorStore for HealthyStore {
+        async fn health(&self) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn ensure_project(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn insert_batch(
+            &self,
+            _c: &str,
+            _v: Vec<ChunkAsVector>,
+        ) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_batch(&self, _c: &str, _g: Vec<String>) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_collection(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn search(
+            &self,
+            _c: &str,
+            _ids: Vec<UUIDv4>,
+            _d: Vec<f32>,
+            _si: Vec<u32>,
+            _sv: Vec<f32>,
+            _cb: Vec<Vec<f32>>,
+            _k: u64,
+        ) -> Result<Vec<SearchHit>, VectorStoreError> {
+            unreachable!()
+        }
+    }
+
+    async fn health_state(index_ok: bool, query: Option<bool>) -> RouterState {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("migrations apply");
+
+        let mut s = router_state(pool);
+        s.qdrant = Arc::new(HealthyStore);
+        let indexer: Arc<dyn crate::models::bge_m3::BGEm3Model> =
+            Arc::new(HealthEmbedder { ok: index_ok });
+        s.model = EmbeddingModel::BGEm3 {
+            model_id: MODEL.to_string(),
+            client: Arc::clone(&indexer),
+        };
+        // `None` = one instance does both, which is the *same* `Arc` — that identity
+        // is what `/health` decides on.
+        s.query_model = match query {
+            None => indexer,
+            Some(ok) => Arc::new(HealthEmbedder { ok }),
+        };
+        s
+    }
+
+    /// A single-instance deployment must report **no** `query_embedder` check at
+    /// all. Reporting one would claim a second instance exists, and the decision is
+    /// made by `Arc::ptr_eq` rather than by comparing URLs precisely because the two
+    /// URLs are equal in that configuration — comparing them would call one instance
+    /// two things.
+    #[tokio::test]
+    async fn one_embedder_instance_reports_one_check() {
+        let s = health_state(true, None).await;
+        let Json(out) = get_health(axum::extract::State(s)).await;
+
+        assert!(
+            out.checks.query_embedder.is_none(),
+            "a single-instance deployment claimed a second embedder"
+        );
+        assert_eq!(out.checks.embedder, CheckState::Ok);
+        assert_eq!(
+            out.status,
+            crate::backend::v0::models::HealthStatus::Ok,
+            "every check answers, so the verdict is ok — and a check that does not              exist must not be able to drag it down"
+        );
+    }
+
+    /// The split configuration is rare and entirely possible — it is what frees the
+    /// ~6 GiB of VRAM a resident fp32 model holds — and it has a failure mode the
+    /// single-instance one does not: a healthy indexer beside a dead query instance,
+    /// which without a separate probe is a green health check and every search
+    /// failing.
+    #[tokio::test]
+    async fn a_split_deployment_probes_the_query_instance_separately() {
+        // Both alive: two checks, both ok.
+        let s = health_state(true, Some(true)).await;
+        let Json(out) = get_health(axum::extract::State(s)).await;
+        assert_eq!(out.checks.query_embedder, Some(CheckState::Ok));
+
+        // The one that matters: indexing healthy, queries dead.
+        let s = health_state(true, Some(false)).await;
+        let Json(out) = get_health(axum::extract::State(s)).await;
+        assert_eq!(
+            out.checks.embedder,
+            CheckState::Ok,
+            "the indexing instance is fine and must say so"
+        );
+        assert_eq!(
+            out.checks.query_embedder,
+            Some(CheckState::Error),
+            "a dead query instance was invisible; every search fails while health is green"
+        );
+        assert_eq!(
+            out.status,
+            crate::backend::v0::models::HealthStatus::Unhealthy,
+            "the query embedder is a *required* dependency when it exists"
+        );
+    }
+
+    /// `checks.*` is exactly `ok` or `error` — never the reason. This response is
+    /// readable by anything that can reach the port, and a driver's error chain
+    /// carries paths, URLs and versions.
+    #[tokio::test]
+    async fn a_failing_check_never_puts_its_reason_on_the_wire() {
+        let s = health_state(false, None).await;
+        let Json(out) = get_health(axum::extract::State(s)).await;
+
+        let body = serde_json::to_string(&out).expect("serializes");
+        assert!(
+            body.contains(r#""embedder":"error""#),
+            "the failing check must be named: {body}"
+        );
+        assert!(
+            !body.contains("embedder is down"),
+            "the probe's reason reached the wire: {body}"
+        );
+    }
+
+    /// HTTP is always 200 — the verdict is in the body. A client keying on the
+    /// status code would read "the service is fine" from a transport success.
+    #[tokio::test]
+    async fn health_answers_200_whatever_the_verdict() {
+        for (index_ok, query) in [(true, None), (false, None), (true, Some(false))] {
+            let s = health_state(index_ok, query).await;
+            let resp = get_health(axum::extract::State(s)).await.into_response();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "health answered a non-200; inspect `status`, not the code"
+            );
+        }
+    }
+
+    /// `indexing_files` rides on a probe that can fail, and `-1` is "not known" — a
+    /// different answer from `0`, which would say the index is idle.
+    #[tokio::test]
+    async fn the_indexing_count_is_real_when_the_database_answers() {
+        let s = health_state(true, None).await;
+        let Json(out) = get_health(axum::extract::State(s)).await;
+        assert_eq!(
+            out.indexing_files, 0,
+            "an answering database reports a real count, not the unknown sentinel"
+        );
+        assert_eq!(out.checks.sqlite, CheckState::Ok);
+    }
 }
