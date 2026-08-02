@@ -10,10 +10,19 @@ use crate::db::sqlite3::SQLite3Pool;
 /// 0 on reaching `'indexed'` (a clean success clears prior failures), bumped when
 /// `increment_retry` (a failure), and left untouched otherwise.
 ///
-/// Best-effort: callers invoke this on recovery/retry paths where there is nothing
-/// better to do on failure — but a rejected transition (the state-machine triggers
-/// raise `SQLITE_CONSTRAINT_TRIGGER`) is a real bug, so it is logged rather than
-/// silently swallowed.
+/// Returns whether the file actually moved — `false` for a database error, a
+/// transition the state-machine triggers rejected, **and** for an `UPDATE` that
+/// matched no row at all (the file was deleted meanwhile). All three are logged
+/// here; the return value exists because some callers cannot treat them as
+/// best-effort. The retry worker in particular reported `"indexed"` to its own
+/// metric on the strength of a write it never checked, so a database that had
+/// stopped accepting writes still produced a clean-looking success rate.
+///
+/// A caller with genuinely nothing better to do on failure (the indexing recovery
+/// paths, where the alternative to a failed `failed`-mark is nothing at all) may
+/// discard it — but that has to be written down rather than happen by default.
+#[must_use = "a status write can be refused by the triggers or match no row; \
+              discard it explicitly if the caller has no recourse"]
 pub async fn set_file_status(
     db_pool: &SQLite3Pool,
     project_guid: &str,
@@ -22,7 +31,7 @@ pub async fn set_file_status(
     status: &'static str,
     increment_retry: bool,
     token: CancellationToken,
-) {
+) -> bool {
     let (pg, p, m) = (
         project_guid.to_string(),
         path.to_string(),
@@ -45,19 +54,37 @@ pub async fn set_file_status(
 
     let result = db_pool
         .transaction(token, move |tx| {
-            tx.execute(&sql, rusqlite::params![status, pg, p, m])?;
-            Ok(())
+            Ok(tx.execute(&sql, rusqlite::params![status, pg, p, m])?)
         })
         .await;
 
-    if let Err(e) = result {
-        warn!(
-            error = %e,
-            project_guid,
-            path,
-            new_status = status,
-            "Failed to set file status (rejected state transition or DB error)."
-        );
+    match result {
+        Ok(1..) => true,
+        // Not an error and not a success: the row is gone (the project or the file was
+        // deleted while this attempt ran). Reported because every caller here believes
+        // it is moving a file it just read, and "the file stopped existing" is a
+        // different answer from "the file moved".
+        Ok(_) => {
+            warn!(
+                project_guid,
+                path,
+                new_status = status,
+                "Status write matched no file row; it was deleted since this attempt began."
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                project_guid,
+                path,
+                new_status = status,
+                "Failed to set file status (rejected state transition or DB error). \
+                 Sysadmin: a rejected transition is a bug in this service; a DB error \
+                 means the database file is unwritable or locked by another process."
+            );
+            false
+        }
     }
 }
 
@@ -478,7 +505,7 @@ mod tests {
         let pool = pool_with_file("indexing").await;
 
         // A failure bumps retry_count.
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             PG,
             PATH,
@@ -491,7 +518,7 @@ mod tests {
         assert_eq!(current(&pool).await, ("failed".to_string(), 1));
 
         // Retry: failed→indexing (no change), then a success resets the counter.
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             PG,
             PATH,
@@ -503,7 +530,7 @@ mod tests {
         .await;
         assert_eq!(current(&pool).await, ("indexing".to_string(), 1));
 
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             PG,
             PATH,

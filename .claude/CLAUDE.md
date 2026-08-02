@@ -169,6 +169,29 @@ as `just_uploaded`/`indexing`. Anything else raises
   `status_updated_at`, WARNs on rejection); AFTER-triggers log every transition
   to `project_file_status_log`. A file exhausting `MAX_RETRIES` (3) stays
   `failed` forever (`warn_permanently_failed` surfaces it at startup + hourly).
+- **It returns `bool` and is `#[must_use]`: a status write can fail, and the
+  caller decides what that means.** `false` covers a DB error, a trigger
+  rejection *and* a 0-row `UPDATE` (the file was deleted meanwhile). Discarding
+  it is legitimate on the indexing recovery paths — the request is already
+  failing, there is nothing else to try — but it has to be written as `let _ =`
+  with the reason, because the default was the bug: the retry worker reported
+  `"indexed"` to `retry.files{outcome}` on the strength of a write it never
+  checked, so a database that had stopped accepting writes kept a clean success
+  rate while every file stayed stuck.
+- **Recovery runs under its own token, never the request's**
+  (`FileIndexer::recover`, `drop_cancelled`'s chunk cleanup). `SQLite3Pool::run`
+  short-circuits on a cancelled token *before* touching the database, so a child
+  of the request token made recovery a no-op in the one case it exists for — a
+  cancelled/disconnected request left every prepared file `indexing` until the
+  30-minute stuck-grace sweep. The unit test passed a fresh token and so agreed
+  with the bug; `recovery_still_writes_when_the_requests_token_is_already_cancelled`
+  is the guard.
+- **The retry worker never infers "no chunks" from a failed read.** The
+  active-chunk query fed the branch that marks a file `indexed` with zero
+  vectors, behind an `unwrap_or_default()` — so a `PoolEmpty` or a locked
+  database silently promoted files to permanently-indexed-and-empty, at `info!`.
+  A read that fails leaves the file `indexing` for the next sweep
+  (`a_database_error_never_passes_for_a_file_with_no_chunks`).
 
 **sha256 + derivation-version skip / empty 404.** Identical content is skipped
 by hash — but only if the *derivation versions* also match (a hash answers "did

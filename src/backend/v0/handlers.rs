@@ -894,7 +894,12 @@ impl FileIndexer<'_> {
     /// since it was prepared — without it the raw `cancelled → indexed` UPDATE would
     /// trip the state-machine trigger and error the whole batch, leaving sibling
     /// files stuck in `indexing`.
-    async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<(), ApiError> {
+    /// Returns whether the row actually moved. `false` is the cancel race the
+    /// `AND status = 'indexing'` guard exists for — and it is not an error, but it is
+    /// also not an indexed file: the caller used to report `indexed` to the client and
+    /// to `index.files{outcome}` for a file that stayed `cancelled` in the database,
+    /// because a 0-row `UPDATE` is `Ok(())`.
+    async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<bool, ApiError> {
         let project_guid = self.project_guid;
         let (sha256_f, path_f, model_id_f) = (
             sha256.to_string(),
@@ -910,8 +915,8 @@ impl FileIndexer<'_> {
                      WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4
                        AND status = 'indexing'",
                     params![sha256_f, project_guid, path_f, model_id_f],
-                )?;
-                Ok(())
+                )
+                .map_err(SQLite3PoolError::from)
             })
             .with_cancellation_token(self.token)
             .await
@@ -919,21 +924,34 @@ impl FileIndexer<'_> {
             .map_err(|err| {
                 error!(error = ?err, "Failed to mark the file 'indexed' in SQLite.");
                 ApiError::from(err)
-            })?;
-        Ok(())
+            })
+            .map(|rows| rows > 0)
     }
 
     /// Best-effort recovery: move the file to `status` (incrementing `retry_count`
     /// when `increment_retry`) on a cancellation/failure path.
+    ///
+    /// **Runs under a token of its own, never `self.token`.** The commonest reason to
+    /// be here is that `self.token` was just cancelled — and `SQLite3Pool::run`
+    /// short-circuits on a cancelled token before touching the database, so passing a
+    /// child of it made the whole mechanism a no-op in exactly the case it exists for:
+    /// the file stayed `indexing` and only the stuck-grace sweep (30 minutes) ever
+    /// picked it up. The write is a single `UPDATE` and it is the thing that hands the
+    /// file to the retry worker, so it must outlive the cancellation that caused it.
+    /// The unit test used a fresh token and so agreed with the bug.
     async fn recover(&self, path: &str, status: &'static str, increment_retry: bool) {
-        set_file_status(
+        // Discarded deliberately, and this is the one caller entitled to: the request
+        // is already failing or cancelled, so there is no answer to give and nothing
+        // further to try. `set_file_status` has logged whatever went wrong, and the
+        // stuck-grace sweep is the backstop.
+        let _ = set_file_status(
             self.db_pool,
             &self.project_guid.0.as_simple().to_string(),
             path,
             self.model_id,
             status,
             increment_retry,
-            self.token.child_token(),
+            CancellationToken::new(),
         )
         .await;
     }
@@ -1121,7 +1139,23 @@ impl FileIndexer<'_> {
             .with_cancellation_token(self.token)
             .await
             .from_cancelled()
-            .unwrap_or_default();
+            // Reading a failure as "nothing was cancelled" is the safe direction — the
+            // batch proceeds, and `mark_indexed`'s `AND status = 'indexing'` still
+            // refuses to resurrect a cancelled file — but it was also silent, so a
+            // database that had stopped answering looked exactly like an ordinary run.
+            .unwrap_or_else(|err| {
+                if !matches!(err, SQLite3PoolError::Cancelled) {
+                    warn!(
+                        error = %err,
+                        project_guid = %project_guid.0,
+                        files = prepared.len(),
+                        "Failed to re-read which files were cancelled mid-flight; \
+                         embedding the whole batch. Any file cancelled since Phase 1 \
+                         keeps its 'cancelled' status and its chunks are reclaimed by GC."
+                    );
+                }
+                HashSet::new()
+            });
 
         if cancelled.is_empty() {
             return prepared;
@@ -1129,9 +1163,13 @@ impl FileIndexer<'_> {
 
         for path in &cancelled {
             let (pg, p, m) = (project_guid, path.clone(), self.model_id.to_string());
-            let _ = self
+            // Not `self.token`: this is the cleanup half of a cancellation, so the
+            // token that brought us here is routinely already cancelled — see
+            // `recover`. Leaving the chunks `active` would let a cancelled file keep
+            // stale vectors that nothing marks for GC.
+            let dropped = self
                 .db_pool
-                .transaction(self.token.child_token(), move |tx| {
+                .transaction(CancellationToken::new(), move |tx| {
                     tx.execute(
                         "UPDATE project_file_chunks SET status = 'deleted'
                          WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
@@ -1145,10 +1183,22 @@ impl FileIndexer<'_> {
                     )?;
                     Ok(())
                 })
-                .with_cancellation_token(self.token)
-                .await
-                .from_cancelled();
-            info!(%path, "Indexing cancelled mid-flight; skipping the embed pass for this file.");
+                .await;
+            // The line used to be unconditional, and so asserted a cleanup it had not
+            // checked: the `let _ =` above it discarded the only evidence either way.
+            match dropped {
+                Ok(()) => info!(
+                    %path,
+                    "Indexing cancelled mid-flight; skipping the embed pass for this file."
+                ),
+                Err(err) => warn!(
+                    error = %err,
+                    %path,
+                    "Indexing was cancelled mid-flight but this file's chunks could not \
+                     be marked deleted; skipping its embed pass anyway. Its old chunks \
+                     stay 'active' until the next successful reindex."
+                ),
+            }
         }
 
         prepared
@@ -1566,24 +1616,27 @@ async fn run_index_job(
         //    drop any file a `POST /cancel` flipped to 'cancelled' since it was prepared.
         //    Streaming reports the dropped files by set difference — computed only when
         //    someone is listening, so the JSON path pays nothing for it.
-        let before: Vec<(ProgrammingLanguage, String)> = if events.is_some() {
-            prepared.iter().map(|p| (p.pl, p.path.clone())).collect()
-        } else {
-            Vec::new()
-        };
+        //
+        // Collected unconditionally now: the `events.is_some()` guard was right when
+        // the only consumer was the SSE event, but a dropped file must also be counted
+        // in `index.files{outcome}`, or a cancelled file vanishes from the per-file
+        // outcome family in JSON mode — the two modes would tally differently, which
+        // is the one thing `run_index_job` being shared is meant to prevent.
+        let before: Vec<(ProgrammingLanguage, String)> =
+            prepared.iter().map(|p| (p.pl, p.path.clone())).collect();
         let mut prepared = indexer.drop_cancelled(prepared).await;
-        if events.is_some() {
-            let kept: HashSet<&str> = prepared.iter().map(|p| p.path.as_str()).collect();
-            for (pl, path) in before {
-                if !kept.contains(path.as_str()) {
-                    emit(IndexEvent::Skipped {
-                        path,
-                        language: pl,
-                        reason: SkipReason::Cancelled,
-                    });
-                }
+        let kept: HashSet<&str> = prepared.iter().map(|p| p.path.as_str()).collect();
+        for (pl, path) in before {
+            if !kept.contains(path.as_str()) {
+                file_outcome(pl, "cancelled");
+                emit(IndexEvent::Skipped {
+                    path,
+                    language: pl,
+                    reason: SkipReason::Cancelled,
+                });
             }
         }
+        drop(kept);
 
         // ── Phase 2: embed + upsert every chunk across all files in one batched pass.
         let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
@@ -1668,7 +1721,24 @@ async fn run_index_job(
         // ── Phase 3: mark each prepared file 'indexed' and tally the response.
         let mark_started = std::time::Instant::now();
         for (p, count) in prepared.iter().zip(counts) {
-            indexer.mark_indexed(&p.path, &p.sha256).await?;
+            if !indexer.mark_indexed(&p.path, &p.sha256).await? {
+                // A `/cancel` landed after `drop_cancelled` re-read the statuses, so
+                // this file is `cancelled` and its chunks are already marked deleted.
+                // Saying `indexed` here — which is what an unchecked `UPDATE` used to
+                // do — would report a file as indexed while the database says
+                // otherwise, and the client would see no drift to correct it.
+                info!(
+                    path = %p.path,
+                    "File was cancelled during the embed pass; not reporting it as indexed."
+                );
+                file_outcome(p.pl, "cancelled");
+                emit(IndexEvent::Skipped {
+                    path: p.path.clone(),
+                    language: p.pl,
+                    reason: SkipReason::Cancelled,
+                });
+                continue;
+            }
             file_outcome(p.pl, "indexed");
             emit(IndexEvent::Indexed {
                 path: p.path.clone(),
@@ -5728,7 +5798,20 @@ pub async fn delete_files(
             .await
             .from_cancelled()
             .map_err(|e| {
-                error!(error = ?e, project_guid = %pg.0, "Failed to soft-delete files.");
+                // The count is the point: batches before this one are committed, so
+                // the 500 the caller receives does not mean "nothing happened" — it
+                // used to be indistinguishable from a no-op failure. Retrying the same
+                // request is safe and completes the job (the `status != 'deleted'`
+                // guard makes it idempotent), which is why this is a log rather than a
+                // new response shape: the client's remedy is the same either way.
+                error!(
+                    error = ?e,
+                    project_guid = %pg.0,
+                    files_deleted_before_failure = deleted_files,
+                    files_matched = paths.len(),
+                    "Failed to soft-delete files part-way through; earlier batches are \
+                     already committed. Re-running the same request completes it."
+                );
                 ApiError::from(e)
             })?;
         deleted_files += n;
@@ -5854,7 +5937,17 @@ pub async fn post_cancel(
             .await
             .from_cancelled()
             .map_err(|e| {
-                error!(error = ?e, project_guid = %pg.0, "Failed to cancel indexing files.");
+                // As in `delete_files`: earlier batches are committed, so the 500 does
+                // not mean nothing was cancelled. Re-running is safe — the
+                // `status = 'indexing'` guard makes an already-cancelled file a no-op.
+                error!(
+                    error = ?e,
+                    project_guid = %pg.0,
+                    files_cancelled_before_failure = cancelled_files,
+                    files_matched = paths.len(),
+                    "Failed to cancel indexing part-way through; earlier batches are \
+                     already committed. Re-running the same request completes it."
+                );
                 ApiError::from(e)
             })?;
         cancelled_files += n;
@@ -9087,7 +9180,7 @@ mod tests {
         // an old status_updated_at directly — both are plain column writes, not status
         // transitions, so no trigger fires.
         let pg = guid().0.as_simple().to_string();
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             &pg,
             "a.rs",
@@ -9581,7 +9674,7 @@ mod tests {
 
         // A concurrent POST /cancel lands between prepare and embed: indexing → cancelled.
         let pg = guid().0.as_simple().to_string();
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             &pg,
             "a.rs",
@@ -9643,6 +9736,35 @@ mod tests {
             .recover_all(&prepared, "cancelled", false)
             .await;
         assert_eq!(file_state(&pool, "c.rs").await.0, "cancelled");
+    }
+
+    /// The test above passes a *fresh* token, and for its whole life that is what made
+    /// it green: `recover` used `self.token.child_token()`, and `SQLite3Pool::run`
+    /// short-circuits on a cancelled token before touching the database. So on the one
+    /// path this mechanism exists for — the client disconnected, cancelling the
+    /// request token — recovery wrote nothing at all, and every prepared file stayed
+    /// `indexing` until the 30-minute stuck-grace sweep. The token being cancelled is
+    /// the case, not an edge of it.
+    #[tokio::test]
+    async fn recovery_still_writes_when_the_requests_token_is_already_cancelled() {
+        let pool = pool_with_prepared_files(&["d.rs", "e.rs"], 1).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let prepared = vec![prepared_for(&locks, "d.rs"), prepared_for(&locks, "e.rs")];
+        let fx = fixture();
+        fx.token.cancel();
+
+        indexer(&pool, &locks, &fx)
+            .recover_all(&prepared, "cancelled", false)
+            .await;
+
+        for path in ["d.rs", "e.rs"] {
+            assert_eq!(
+                file_state(&pool, path).await.0,
+                "cancelled",
+                "{path} must be handed to the retry worker even though the request \
+                 token is cancelled — that is when recovery is needed"
+            );
+        }
     }
 
     // ── symbol lifecycle: a file's symbol rows always parallel its chunk set ──
@@ -9719,7 +9841,7 @@ mod tests {
         let prepared = vec![prepared_for(&locks, "a.rs"), prepared_for(&locks, "b.rs")];
 
         let pg = guid().0.as_simple().to_string();
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             &pg,
             "a.rs",
@@ -9753,7 +9875,7 @@ mod tests {
         let pool = pool_with_prepared_files(&["a.rs"], 0).await;
         insert_symbol(&pool, "a.rs", "s").await;
         let pg = guid().0.as_simple().to_string();
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             &pg,
             "a.rs",

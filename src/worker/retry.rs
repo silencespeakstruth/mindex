@@ -342,7 +342,12 @@ async fn retry_file(
     // Move to 'indexing' first so the whole attempt is a clean
     // {failed,indexing,…}→indexing→{indexed,failed} path through the state machine
     // (the triggers forbid failed→failed / failed→indexed directly).
-    set_file_status(
+    // Checked, not fire-and-forget: everything below spends GPU time on the strength
+    // of this file being 'indexing'. If the write was refused, the terminal
+    // 'failed'->'indexed' write at the end is illegal too and the trigger rejects it,
+    // so the whole attempt would be a batch of embeddings thrown away plus one
+    // confusing warning. Stop here and let the next sweep retry.
+    if !set_file_status(
         db_pool,
         project_guid,
         path,
@@ -351,9 +356,18 @@ async fn retry_file(
         false,
         token.clone(),
     )
-    .await;
+    .await
+    {
+        error!(
+            %project_guid,
+            %path,
+            "Retry worker: could not move the file to 'indexing'; abandoning this \
+             attempt before spending the embedder on it."
+        );
+        return "error";
+    }
 
-    let chunks: Vec<(String, String)> = db_pool
+    let chunks: Result<Vec<(String, String)>, _> = db_pool
         .transaction(token.clone(), {
             let (pg, p, m) = (
                 project_guid.to_string(),
@@ -374,15 +388,37 @@ async fn retry_file(
                 .map_err(SQLite3PoolError::from)
             }
         })
-        .await
-        .unwrap_or_default();
+        .await;
+
+    // Read as a `Vec` this used to be `unwrap_or_default()`, and an empty vec is the
+    // input to the branch below that marks the file **`indexed`**. So a `PoolEmpty`, a
+    // locked database or a shutdown-cancelled token silently promoted a file to
+    // "successfully indexed" with not one vector behind it — permanent, invisible data
+    // loss out of a transient error, logged at `info!` as a normal outcome. Leaving it
+    // `indexing` is right instead: the file was already moved there above, so the next
+    // sweep picks it up past the stuck grace.
+    let chunks = match chunks {
+        Ok(c) => c,
+        Err(SQLite3PoolError::Cancelled) => return "cancelled",
+        Err(e) => {
+            error!(
+                error = ?e,
+                %project_guid,
+                %path,
+                "Retry worker: failed to read the file's active chunks; leaving it \
+                 'indexing' for the next sweep rather than guessing it has none. \
+                 Check the DB file is readable and not locked by another process."
+            );
+            return "error";
+        }
+    };
 
     if chunks.is_empty() {
         // No active chunks → the file sliced to nothing (too short). The worker can't
         // re-slice, so mark it 'indexed' (0 chunks) rather than looping it to 'failed'
         // forever — 'failed'→'indexed' is illegal, so a wrong 'failed' here would trap it.
         info!(%project_guid, %path, "Retry worker: no active chunks (too short); marking 'indexed'.");
-        set_file_status(
+        let moved = set_file_status(
             db_pool,
             project_guid,
             path,
@@ -392,7 +428,9 @@ async fn retry_file(
             token.clone(),
         )
         .await;
-        return "zero_chunk";
+        // The outcome the metric records has to be the outcome that happened: a
+        // refused write leaves the file 'indexing', which is not "zero chunks".
+        return if moved { "zero_chunk" } else { "error" };
     }
 
     let collection = collection_name(project_guid);
@@ -426,7 +464,10 @@ async fn retry_file(
             "Retry worker: every stored chunk has a corrupt qdrant_guid; leaving the file 'failed'. \
              Re-push the file to reindex it from source."
         );
-        set_file_status(
+        // Discarded deliberately: this is already the failure branch, and
+        // `set_file_status` has logged whatever went wrong. There is no third thing
+        // to try.
+        let _ = set_file_status(
             db_pool,
             project_guid,
             path,
@@ -475,7 +516,7 @@ async fn retry_file(
             }
         };
 
-    set_file_status(
+    let moved = set_file_status(
         db_pool,
         project_guid,
         path,
@@ -486,7 +527,24 @@ async fn retry_file(
     )
     .await;
 
-    if success { "indexed" } else { "failed" }
+    // The return value is what `retry.files{outcome}` counts, so it must describe the
+    // database and not the embedder. Reporting "indexed" on the strength of an
+    // unchecked write let a database that had stopped accepting them keep a clean
+    // success rate while every file stayed stuck.
+    match (success, moved) {
+        (true, true) => "indexed",
+        (false, true) => "failed",
+        (_, false) => {
+            error!(
+                %project_guid,
+                %path,
+                embed_succeeded = success,
+                "Retry worker: the attempt finished but its terminal status write did \
+                 not land; the file keeps its old status and the next sweep re-attempts it."
+            );
+            "error"
+        }
+    }
 }
 
 #[cfg(test)]
@@ -611,7 +669,7 @@ mod tests {
         .await
         .unwrap();
         // indexing → failed (retry_count = 1): the state the worker retries from.
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             PG,
             PATH,
@@ -746,6 +804,50 @@ mod tests {
         // No chunks (too short) → indexing → indexed, retry_count reset. Must NOT be
         // 'failed' (that would trap it: failed→indexed is an illegal transition).
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
+    }
+
+    /// The branch above reads "no active chunks" as "this file sliced to nothing, mark
+    /// it `indexed`". The query feeding it ended in `unwrap_or_default()`, so a
+    /// `PoolEmpty`, a locked database or any SQL error produced the same empty vec and
+    /// the file was promoted to **successfully indexed with zero vectors** — permanent,
+    /// silent data loss out of a transient failure, logged at `info!` as a normal
+    /// outcome. A file that cannot be read about must keep its status, not gain one.
+    #[tokio::test]
+    async fn a_database_error_never_passes_for_a_file_with_no_chunks() {
+        let pool = pool_with_failed_file(0).await;
+        // Make the chunk read fail the way a real one does — an error from SQLite,
+        // rather than an empty answer.
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute_batch("DROP TABLE project_file_chunks;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let store = Store {
+            fail_upsert: false,
+            upserted: std::sync::Mutex::new(vec![]),
+        };
+
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let outcome = retry_file(
+            &pool,
+            &store,
+            &OkEmbedder,
+            PG,
+            PATH,
+            MODEL,
+            TEST_EMBED,
+            &locks,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, "error", "the metric must not record a success");
+        assert_eq!(
+            current(&pool).await.0,
+            "indexing",
+            "the file keeps the status this attempt gave it, for the next sweep"
+        );
     }
 
     #[tokio::test]
@@ -975,7 +1077,7 @@ mod tests {
         // Reuse the failed-file fixture, then legally move indexing→...→cancelled.
         let pool = pool_with_failed_file(2).await;
         // failed→indexing (re-push) →cancelled, the state a concurrent /cancel leaves.
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             PG,
             PATH,
@@ -985,7 +1087,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await;
-        set_file_status(
+        let _ = set_file_status(
             &pool,
             PG,
             PATH,
