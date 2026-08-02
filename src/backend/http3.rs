@@ -1237,4 +1237,90 @@ mod tests {
             "an abandoned request must still be reconcilable against in_flight: {counted}"
         );
     }
+
+    /// The cardinality rule's other half. `project_guid` is the label a *caller*
+    /// chooses, and it is UUID-validated above; `method` and `proto` come off the
+    /// wire too, and both must collapse to a closed set. An unrecognised verb
+    /// reaching the label raw is unbounded cardinality from a single attacker — or
+    /// from one misconfigured client — and Prometheus does not degrade gracefully
+    /// under it.
+    #[test]
+    fn the_method_label_comes_from_a_closed_set() {
+        for (m, want) in [
+            ("GET", "GET"),
+            ("POST", "POST"),
+            ("PUT", "PUT"),
+            ("DELETE", "DELETE"),
+            ("PATCH", "PATCH"),
+            ("HEAD", "HEAD"),
+            ("OPTIONS", "OPTIONS"),
+        ] {
+            let method = axum::http::Method::from_bytes(m.as_bytes()).expect("a method");
+            assert_eq!(method_label(&method), want);
+        }
+
+        for exotic in ["PROPFIND", "MKCOL", "BREW", "XXXXXXXXXXXXXXXXXXXXXXXX"] {
+            let method = axum::http::Method::from_bytes(exotic.as_bytes()).expect("a method");
+            assert_eq!(
+                method_label(&method),
+                "other",
+                "{exotic} reached the label raw; the method label is caller-chosen \
+                 and must collapse to a closed set"
+            );
+        }
+    }
+
+    /// Same for the protocol. It cannot be attacker-chosen the way a method can, but
+    /// the rule is one rule and a new `Version` variant appearing in a dependency
+    /// bump must land in `other` rather than as a new series.
+    #[test]
+    fn the_proto_label_comes_from_a_closed_set() {
+        for (v, want) in [
+            (axum::http::Version::HTTP_09, "HTTP/0.9"),
+            (axum::http::Version::HTTP_10, "HTTP/1.0"),
+            (axum::http::Version::HTTP_11, "HTTP/1.1"),
+            (axum::http::Version::HTTP_2, "HTTP/2"),
+            (axum::http::Version::HTTP_3, "HTTP/3"),
+        ] {
+            assert_eq!(proto_label(v), want);
+        }
+    }
+
+    /// Every label a request produces must be one of the closed values, end to end —
+    /// this is the check that the middleware actually uses `method_label` rather
+    /// than the method itself.
+    #[tokio::test]
+    async fn an_exotic_method_is_counted_under_other_not_under_itself() {
+        let metrics = Arc::new(Metrics::new());
+        let app = Router::new()
+            .route("/status", axum::routing::any(|| async { "ok" }))
+            .layer(axum::middleware::from_fn({
+                let m = Arc::clone(&metrics);
+                move |req: Request<Body>, next: Next| {
+                    let m = Arc::clone(&m);
+                    async move { record_request(m, false, req, next).await }
+                }
+            }));
+
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .method("PROPFIND")
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains(r#"method="other""#),
+            "the exotic method was not collapsed: {text}"
+        );
+        assert!(
+            !text.contains("PROPFIND"),
+            "a caller-chosen method string became a metric label: {text}"
+        );
+    }
 }
