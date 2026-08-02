@@ -3,6 +3,7 @@ use qdrant_client::Payload;
 use qdrant_client::Qdrant;
 use qdrant_client::QdrantError;
 use qdrant_client::qdrant::Condition;
+use qdrant_client::qdrant::CountPointsBuilder;
 use qdrant_client::qdrant::CreateCollectionBuilder;
 use qdrant_client::qdrant::DeletePointsBuilder;
 use qdrant_client::qdrant::Distance;
@@ -158,6 +159,23 @@ pub trait VectorStore: Send + Sync {
     /// Liveness ping of Qdrant itself (used by the mindex `/health` endpoint).
     async fn health(&self) -> Result<(), VectorStoreError>;
 
+    /// Points currently in `collection`, or `None` when this store cannot say.
+    ///
+    /// The one detector for the failure documented at the top of this file: a lost
+    /// Qdrant volume (or a bumped `COLLECTION_SCHEMA_VERSION`) leaves SQLite reporting
+    /// every file `indexed` while `ensure_project` quietly makes an empty collection,
+    /// so search answers `404 search.no_match` for ever with **no error anywhere**.
+    /// Compared against `project_chunks_active`, a count is the difference between
+    /// "this project is empty" and "this project's vectors are gone".
+    ///
+    /// Provided rather than required so the test fakes — which have no notion of point
+    /// counts — opt out by saying so, rather than by inventing a number that would be
+    /// compared against a real one.
+    async fn count_points(&self, collection: &str) -> Result<Option<u64>, VectorStoreError> {
+        let _ = collection;
+        Ok(None)
+    }
+
     /// Hybrid search: dense + sparse prefetch → RRF fusion → ColBERT MaxSim rerank,
     /// restricted to `chunk_ids` via a `has_id` filter, returning the top `top_k`.
     #[allow(clippy::too_many_arguments)] // irreducible inputs of one hybrid query
@@ -261,6 +279,23 @@ impl VectorStore for QdrantStore {
     async fn health(&self) -> Result<(), VectorStoreError> {
         self.client.health_check().await?;
         Ok(())
+    }
+
+    async fn count_points(&self, collection: &str) -> Result<Option<u64>, VectorStoreError> {
+        // A missing collection is `Ok(Some(0))`, not an error: "the vectors are gone"
+        // is precisely the answer being asked for, and raising here would make the
+        // caller treat the interesting case as an unreachable Qdrant.
+        if !self.client.collection_exists(collection).await? {
+            return Ok(Some(0));
+        }
+        // Approximate: this runs on a metrics tick against every project, and an exact
+        // count walks the collection. The number is compared against SQLite to spot an
+        // order-of-magnitude divergence, not to reconcile row by row.
+        let resp = self
+            .client
+            .count(CountPointsBuilder::new(collection).exact(false))
+            .await?;
+        Ok(resp.result.map(|r| r.count))
     }
 
     async fn search(

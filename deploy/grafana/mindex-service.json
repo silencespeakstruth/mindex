@@ -1447,6 +1447,197 @@
     },
     {
       "id": 17,
+      "type": "timeseries",
+      "title": "Index vs vector store",
+      "description": "The two must track each other. Qdrant dropping to zero while SQLite holds steady is the failure with no error anywhere: every file still reads `indexed` and search answers 404 for ever. Needs `[metrics].probe_dependencies`; a project Qdrant cannot be asked about is absent rather than zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (project_guid) (mindex_project_chunks_active)",
+          "legendFormat": "{{project_guid}} sqlite",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "mindex_project_vectors",
+          "legendFormat": "{{project_guid}} qdrant",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Divergence & staleness",
+      "description": "An orphaned winner is a chunk Qdrant scored and SQLite no longer has; a few mean a reindex raced a search, a steady rate means divergence. `state age` climbing means the collector's snapshot is failing and every gauge on this dashboard is frozen at its last good value.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_search_orphaned_winners_total[$__rate_interval])",
+          "legendFormat": "orphaned winners",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "time() - mindex_state_refreshed_timestamp_seconds",
+          "legendFormat": "state age (s)",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "orphaned winners"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "state age (s)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 19,
       "type": "row",
       "title": "HTTP API",
       "collapsed": false,
@@ -1454,12 +1645,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 30
       },
       "panels": []
     },
     {
-      "id": 18,
+      "id": 20,
       "type": "timeseries",
       "title": "Requests by route",
       "description": "",
@@ -1471,7 +1662,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 25
+        "y": 31
       },
       "targets": [
         {
@@ -1534,7 +1725,7 @@
       }
     },
     {
-      "id": 19,
+      "id": 21,
       "type": "timeseries",
       "title": "Latency percentiles",
       "description": "",
@@ -1546,7 +1737,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 25
+        "y": 31
       },
       "targets": [
         {
@@ -1672,7 +1863,7 @@
       }
     },
     {
-      "id": 20,
+      "id": 22,
       "type": "heatmap",
       "title": "Latency distribution",
       "description": "The percentile lines hide bimodality; this does not.",
@@ -1684,7 +1875,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 33
+        "y": 39
       },
       "targets": [
         {
@@ -1740,7 +1931,7 @@
       }
     },
     {
-      "id": 21,
+      "id": 23,
       "type": "table",
       "title": "Error codes",
       "description": "The stable machine `code` from the problem+json envelope, carried on the response extensions. `request.cancelled` at 499 is a client disconnect, not a fault.",
@@ -1752,7 +1943,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 33
+        "y": 39
       },
       "targets": [
         {
@@ -1814,7 +2005,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 24,
       "type": "timeseries",
       "title": "Transport",
       "description": "Whether anyone actually reaches the HTTP/3 listener.",
@@ -1826,7 +2017,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 41
+        "y": 47
       },
       "targets": [
         {
@@ -1886,7 +2077,7 @@
       }
     },
     {
-      "id": 23,
+      "id": 25,
       "type": "timeseries",
       "title": "In-flight by route",
       "description": "A route stuck above zero with no traffic is a leaked gauge \u2014 which is exactly what the Drop guard exists to prevent.",
@@ -1898,7 +2089,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 41
+        "y": 47
       },
       "targets": [
         {
@@ -1954,7 +2145,7 @@
       }
     },
     {
-      "id": 24,
+      "id": 26,
       "type": "timeseries",
       "title": "Error ratio",
       "description": "",
@@ -1966,7 +2157,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 41
+        "y": 47
       },
       "targets": [
         {
@@ -2038,7 +2229,7 @@
       }
     },
     {
-      "id": 25,
+      "id": 27,
       "type": "row",
       "title": "Indexing",
       "collapsed": false,
@@ -2046,12 +2237,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 53
       },
       "panels": []
     },
     {
-      "id": 26,
+      "id": 28,
       "type": "timeseries",
       "title": "Files by outcome",
       "description": "`skipped_unchanged` dominating is the hash skip working. `in_flight` is claim contention, not an error.",
@@ -2063,7 +2254,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 54
       },
       "targets": [
         {
@@ -2202,7 +2393,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 29,
       "type": "timeseries",
       "title": "Derived rows produced",
       "description": "",
@@ -2214,7 +2405,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 54
       },
       "targets": [
         {
@@ -2313,7 +2504,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 30,
       "type": "timeseries",
       "title": "Chunks by language",
       "description": "",
@@ -2325,7 +2516,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 62
       },
       "targets": [
         {
@@ -2388,7 +2579,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 31,
       "type": "timeseries",
       "title": "Phase latency (p95)",
       "description": "prepare = slice + insert; embed = the GPU pass; mark = the status writes. An embed phase that dwarfs the others is the normal shape.",
@@ -2400,7 +2591,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 56
+        "y": 62
       },
       "targets": [
         {
@@ -2502,7 +2693,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 32,
       "type": "heatmap",
       "title": "Submitted file size",
       "description": "Language-labelled but never project-labelled \u2014 a histogram per project would multiply the series count for a breakdown nobody reads.",
@@ -2514,7 +2705,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 70
       },
       "targets": [
         {
@@ -2570,7 +2761,7 @@
       }
     },
     {
-      "id": 31,
+      "id": 33,
       "type": "heatmap",
       "title": "Chunks per file",
       "description": "A spike at the 1-2 bucket means files are slicing to almost nothing.",
@@ -2582,7 +2773,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 70
       },
       "targets": [
         {
@@ -2638,7 +2829,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 34,
       "type": "row",
       "title": "Embedder & Qdrant",
       "collapsed": false,
@@ -2646,12 +2837,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 78
       },
       "panels": []
     },
     {
-      "id": 33,
+      "id": 35,
       "type": "heatmap",
       "title": "Embed batch size",
       "description": "Texts per /encode call. Indexing should cluster near `[indexing].embed_batch_chunks`; queries are always 1.",
@@ -2663,7 +2854,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 73
+        "y": 79
       },
       "targets": [
         {
@@ -2719,7 +2910,7 @@
       }
     },
     {
-      "id": 34,
+      "id": 36,
       "type": "timeseries",
       "title": "Embed latency (p95)",
       "description": "`index` and `query` are separate series even when one server does both \u2014 that is the split `[model].query_server_url` would create.",
@@ -2731,7 +2922,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 73
+        "y": 79
       },
       "targets": [
         {
@@ -2818,7 +3009,7 @@
       }
     },
     {
-      "id": 35,
+      "id": 37,
       "type": "timeseries",
       "title": "Embedder outcomes",
       "description": "",
@@ -2830,7 +3021,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 81
+        "y": 87
       },
       "targets": [
         {
@@ -2951,7 +3142,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 38,
       "type": "timeseries",
       "title": "Embedder 429 backoffs",
       "description": "Counted inside the client: from outside, three retries then a success is indistinguishable from one success.",
@@ -2963,7 +3154,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 81
+        "y": 87
       },
       "targets": [
         {
@@ -3035,7 +3226,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 39,
       "type": "timeseries",
       "title": "Qdrant points",
       "description": "",
@@ -3047,7 +3238,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 81
+        "y": 87
       },
       "targets": [
         {
@@ -3134,7 +3325,7 @@
       }
     },
     {
-      "id": 38,
+      "id": 40,
       "type": "timeseries",
       "title": "Qdrant latency (p95)",
       "description": "",
@@ -3146,7 +3337,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 88
+        "y": 94
       },
       "targets": [
         {
@@ -3205,7 +3396,7 @@
       }
     },
     {
-      "id": 39,
+      "id": 41,
       "type": "timeseries",
       "title": "Qdrant errors",
       "description": "`delete_batch` errors here are the GC failures that keep chunk rows marked deleted for the next sweep \u2014 deliberately, since deleting the row first would orphan the vector forever.",
@@ -3217,7 +3408,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 88
+        "y": 94
       },
       "targets": [
         {
@@ -3273,7 +3464,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 42,
       "type": "row",
       "title": "Search",
       "collapsed": false,
@@ -3281,12 +3472,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 95
+        "y": 101
       },
       "panels": []
     },
     {
-      "id": 41,
+      "id": 43,
       "type": "timeseries",
       "title": "Searches by outcome",
       "description": "`no_match` is an answer, not a failure \u2014 an empty candidate set returns 404 without ever calling Qdrant.",
@@ -3298,7 +3489,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 96
+        "y": 102
       },
       "targets": [
         {
@@ -3404,7 +3595,7 @@
       }
     },
     {
-      "id": 42,
+      "id": 44,
       "type": "timeseries",
       "title": "Stage latency (p95)",
       "description": "The two-SQL-queries-around-Qdrant shape, made visible: embed -> candidates -> qdrant -> fetch.",
@@ -3416,7 +3607,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 96
+        "y": 102
       },
       "targets": [
         {
@@ -3533,7 +3724,7 @@
       }
     },
     {
-      "id": 43,
+      "id": 45,
       "type": "timeseries",
       "title": "No-match ratio",
       "description": "",
@@ -3545,7 +3736,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 96
+        "y": 102
       },
       "targets": [
         {
@@ -3617,7 +3808,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 46,
       "type": "heatmap",
       "title": "Candidate set size",
       "description": "The has_id filter lists every candidate GUID, so this grows linearly with a project's active-chunk count \u2014 the known scaling limit.",
@@ -3629,7 +3820,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 104
+        "y": 110
       },
       "targets": [
         {
@@ -3685,7 +3876,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 47,
       "type": "heatmap",
       "title": "Results returned",
       "description": "",
@@ -3697,7 +3888,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 104
+        "y": 110
       },
       "targets": [
         {
@@ -3753,7 +3944,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 48,
       "type": "row",
       "title": "Research",
       "collapsed": false,
@@ -3761,12 +3952,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 118
       },
       "panels": []
     },
     {
-      "id": 47,
+      "id": 49,
       "type": "timeseries",
       "title": "Runs by stop reason",
       "description": "The 'is a budget binding?' panel. `finalized` means the model judged the evidence sufficient; anything else is a wall it hit. Counted, not rated: one run per label set per process lifetime is invisible to `rate()`.",
@@ -3778,7 +3969,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 113
+        "y": 119
       },
       "targets": [
         {
@@ -3948,7 +4139,7 @@
       }
     },
     {
-      "id": 48,
+      "id": 50,
       "type": "timeseries",
       "title": "Run duration",
       "description": "One point per window that actually contained a run \u2014 with a few runs a day there is nothing to join into a line.",
@@ -3960,7 +4151,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 113
+        "y": 119
       },
       "targets": [
         {
@@ -4029,7 +4220,7 @@
       }
     },
     {
-      "id": 49,
+      "id": 51,
       "type": "timeseries",
       "title": "Steps per run",
       "description": "A step is a poor unit \u2014 one turn may execute several, and `outline` is one indexed SELECT while `search` is a GPU embed plus a vector query. That is why it is the backstop and not the budget. One point per window that contained a run; the gaps are real.",
@@ -4041,7 +4232,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 121
+        "y": 127
       },
       "targets": [
         {
@@ -4110,7 +4301,7 @@
       }
     },
     {
-      "id": 50,
+      "id": 52,
       "type": "timeseries",
       "title": "Turns per run",
       "description": "Turns above steps means turns that produced no step: rejected duplicates, or a model rephrasing instead of learning a name.",
@@ -4122,7 +4313,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 121
+        "y": 127
       },
       "targets": [
         {
@@ -4191,7 +4382,7 @@
       }
     },
     {
-      "id": 51,
+      "id": 53,
       "type": "timeseries",
       "title": "Context used",
       "description": "Peak prompt tokens over the run's num_ctx. Approaching 1.0 means Ollama is about to trim the transcript in silence.",
@@ -4203,7 +4394,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 121
+        "y": 127
       },
       "targets": [
         {
@@ -4273,7 +4464,7 @@
       }
     },
     {
-      "id": 52,
+      "id": 54,
       "type": "timeseries",
       "title": "Tokens processed",
       "description": "The whole transcript is resent every turn, so prompt tokens grow super-linearly with turns. This is the real cost axis.",
@@ -4285,7 +4476,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 128
+        "y": 134
       },
       "targets": [
         {
@@ -4377,7 +4568,7 @@
       }
     },
     {
-      "id": 53,
+      "id": 55,
       "type": "timeseries",
       "title": "Tool calls",
       "description": "The intended path is list_files -> outline -> symbols/search/callers -> read_chunks. A run that only ever calls `search` never learned a name.",
@@ -4389,7 +4580,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 128
+        "y": 134
       },
       "targets": [
         {
@@ -4453,7 +4644,7 @@
       }
     },
     {
-      "id": 54,
+      "id": 56,
       "type": "timeseries",
       "title": "Tool latency (p95)",
       "description": "",
@@ -4465,7 +4656,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 128
+        "y": 134
       },
       "targets": [
         {
@@ -4522,7 +4713,7 @@
       }
     },
     {
-      "id": 55,
+      "id": 57,
       "type": "timeseries",
       "title": "Citations by provenance",
       "description": "`unverified` = a path no tool returned this run, i.e. invented. `stale` is orthogonal to the other three: a citation can be impeccably verified and stale.",
@@ -4534,7 +4725,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 135
+        "y": 141
       },
       "targets": [
         {
@@ -4659,7 +4850,7 @@
       }
     },
     {
-      "id": 56,
+      "id": 58,
       "type": "stat",
       "title": "Unverified citation share",
       "description": "Over the dashboard's time range. A model that answers from its weights rather than from the index shows up here and nowhere else.",
@@ -4671,7 +4862,7 @@
         "h": 7,
         "w": 4,
         "x": 12,
-        "y": 135
+        "y": 141
       },
       "targets": [
         {
@@ -4729,7 +4920,7 @@
       }
     },
     {
-      "id": 57,
+      "id": 59,
       "type": "timeseries",
       "title": "Repairs & upstream faults",
       "description": "A revalidation is a draft sent back because its citations did not check out. A truncation means Ollama trimmed the transcript and streamed on \u2014 otherwise a completely silent failure.",
@@ -4741,7 +4932,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 135
+        "y": 141
       },
       "targets": [
         {
@@ -4868,7 +5059,7 @@
       }
     },
     {
-      "id": 58,
+      "id": 60,
       "type": "timeseries",
       "title": "Report length (words)",
       "description": "Granted versus actual is the whole measurement: the per-effort max_report_words is announced to the model as a ceiling, and nothing makes it obey. If this sits wherever it likes regardless of the grant, the prompt half of that knob is dead weight and only num_predict earns its place.",
@@ -4880,7 +5071,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 142
+        "y": 148
       },
       "targets": [
         {
@@ -4949,7 +5140,7 @@
       }
     },
     {
-      "id": 59,
+      "id": 61,
       "type": "timeseries",
       "title": "Report sections",
       "description": "A report of 3+ plan items is written one section per turn, so one failing costs a section rather than the document. This says how often that trade is actually made. Rising `empty` means the per-section word budget or the model is wrong; `timed_out`/`skipped` mean report_timeout_ms is too tight for the plans being produced.",
@@ -4961,7 +5152,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 142
+        "y": 148
       },
       "targets": [
         {
@@ -5086,7 +5277,7 @@
       }
     },
     {
-      "id": 60,
+      "id": 62,
       "type": "timeseries",
       "title": "Report-phase faults",
       "description": "All three are expected to stay at zero. `generation cut off` means num_predict fired, so REPORT_WORDS_TO_TOKENS or the model is wrong and a cut landed mid-token \u2014 which can sever a fence and cost a rewrite. `prompt shed` means the report turn's transcript was over the context ceiling and the server dropped old tool output rather than letting Ollama trim it in silence; on this hardware it may never fire, in which case it is insurance. `server wrote the report` means the report window expired first \u2014 those runs cite nothing, which is why the citation panels beside this one must be read together with it.",
@@ -5098,7 +5289,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 142
+        "y": 148
       },
       "targets": [
         {
@@ -5228,7 +5419,125 @@
       }
     },
     {
-      "id": 61,
+      "id": 63,
+      "type": "timeseries",
+      "title": "Runs that stored nothing",
+      "description": "Every other research metric is recorded by the journal decorator, so a run that never journals is missing from all of them at once \u2014 the GPU hour was spent and the dashboard says it never happened, which also leaves every success rate computed from `research_runs` without a denominator. `cancelled` is a client hanging up or a slot being reaped; `failed` sent an error event instead of a report; `report_rejected` produced a report that failed the Markdown gate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 155
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "editorMode": "code",
+          "expr": "increase(mindex_research_unjournalled_runs_total{model=~\"$model\"}[$__rate_interval])",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "barAlignment": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cancelled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "report_rejected"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 64,
       "type": "timeseries",
       "title": "Stored research",
       "description": "The corpus a new run can be given as context. `outdated` counts runs at least one of whose files has changed since \u2014 still useful for names, unreliable on specifics. `pinned` runs have no expiry and GC never reaps them, so a rising pinned count is the thing that stops retention from bounding this table.",
@@ -5240,7 +5549,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 149
+        "y": 161
       },
       "targets": [
         {
@@ -5366,7 +5675,7 @@
       }
     },
     {
-      "id": 62,
+      "id": 65,
       "type": "timeseries",
       "title": "Context reuse",
       "description": "Does prior research get reused, and does the character cap bite? Counted with increase() and drawn as bars: these are a handful of events a day, and a label set seeing one event in a process lifetime is flat at 1 under rate() forever.",
@@ -5378,7 +5687,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 149
+        "y": 161
       },
       "targets": [
         {
@@ -5535,7 +5844,7 @@
       }
     },
     {
-      "id": 63,
+      "id": 66,
       "type": "row",
       "title": "GC & retry",
       "collapsed": false,
@@ -5543,12 +5852,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 156
+        "y": 168
       },
       "panels": []
     },
     {
-      "id": 64,
+      "id": 67,
       "type": "timeseries",
       "title": "GC rows removed",
       "description": "Only chunks whose Qdrant delete was confirmed are hard-deleted; the rest keep their rows for the next sweep.",
@@ -5560,7 +5869,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 157
+        "y": 169
       },
       "targets": [
         {
@@ -5686,7 +5995,7 @@
       }
     },
     {
-      "id": 65,
+      "id": 68,
       "type": "timeseries",
       "title": "GC backlog",
       "description": "Soft-deleted chunks whose vectors still sit in Qdrant. Indexing is append-only, so this rises on every reindex and falls on the hourly sweep. A monotonic rise means the sweep is failing.",
@@ -5698,7 +6007,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 157
+        "y": 169
       },
       "targets": [
         {
@@ -5770,10 +6079,10 @@
       }
     },
     {
-      "id": 66,
+      "id": 69,
       "type": "timeseries",
       "title": "GC passes",
-      "description": "",
+      "description": "Split by outcome, because `ok` used to be recorded even when every phase had failed: each phase mapped its errors to zero removals, so a GC broken for days was indistinguishable from an idle one. Any `error` series means a phase could not run and its backlog is still there.",
       "datasource": {
         "type": "prometheus",
         "uid": "${ds}"
@@ -5782,7 +6091,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 157
+        "y": 169
       },
       "targets": [
         {
@@ -5791,8 +6100,8 @@
             "uid": "${ds}"
           },
           "editorMode": "code",
-          "expr": "sum by (trigger) (rate(mindex_gc_runs_total[$__rate_interval]))",
-          "legendFormat": "{{trigger}}",
+          "expr": "sum by (trigger, outcome) (rate(mindex_gc_runs_total[$__rate_interval]))",
+          "legendFormat": "{{trigger}} {{outcome}}",
           "range": true,
           "instant": false,
           "refId": "A"
@@ -5826,7 +6135,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "worker"
+              "options": "worker ok"
             },
             "properties": [
               {
@@ -5841,7 +6150,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "manual"
+              "options": "manual ok"
             },
             "properties": [
               {
@@ -5849,6 +6158,66 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "worker error"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "manual error"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "worker cancelled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "manual cancelled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
                 }
               }
             ]
@@ -5869,7 +6238,7 @@
       }
     },
     {
-      "id": 67,
+      "id": 70,
       "type": "timeseries",
       "title": "Retry outcomes",
       "description": "`skipped_claim` dominating means the worker is racing live /index traffic, which is different from it failing.",
@@ -5881,7 +6250,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 164
+        "y": 176
       },
       "targets": [
         {
@@ -6065,7 +6434,7 @@
       }
     },
     {
-      "id": 68,
+      "id": 71,
       "type": "timeseries",
       "title": "Permanently failed files",
       "description": "Files that exhausted `[workers].max_retries`. The retry worker will never touch them again \u2014 they need a re-push. Until now this existed only as an hourly WARN.",
@@ -6077,7 +6446,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 164
+        "y": 176
       },
       "targets": [
         {
@@ -6133,7 +6502,7 @@
       }
     },
     {
-      "id": 69,
+      "id": 72,
       "type": "row",
       "title": "Per-project state",
       "collapsed": false,
@@ -6141,12 +6510,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 171
+        "y": 183
       },
       "panels": []
     },
     {
-      "id": 70,
+      "id": 73,
       "type": "table",
       "title": "Projects",
       "description": "Recomputed by the metrics collector every `[metrics].refresh_interval_seconds`, and cleared and repopulated each tick \u2014 so a deleted project disappears here rather than reporting its last known state forever.",
@@ -6158,7 +6527,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 172
+        "y": 184
       },
       "targets": [
         {
@@ -6395,7 +6764,7 @@
       }
     },
     {
-      "id": 71,
+      "id": 74,
       "type": "bargauge",
       "title": "Files by language",
       "description": "A bar rather than a pie: there are more than a handful of languages and their values are close, which is exactly where a pie stops being readable.",
@@ -6407,7 +6776,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 181
+        "y": 193
       },
       "targets": [
         {
@@ -6456,7 +6825,7 @@
       }
     },
     {
-      "id": 72,
+      "id": 75,
       "type": "timeseries",
       "title": "Files by status",
       "description": "",
@@ -6468,7 +6837,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 181
+        "y": 193
       },
       "targets": [
         {
@@ -6622,7 +6991,7 @@
       }
     },
     {
-      "id": 73,
+      "id": 76,
       "type": "timeseries",
       "title": "Drift reported per check",
       "description": "A counter, not a gauge: /drift compares against a manifest only the client can produce, so there is no server-side drift level. This is what the checks that ran reported.",
@@ -6634,7 +7003,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 181
+        "y": 193
       },
       "targets": [
         {

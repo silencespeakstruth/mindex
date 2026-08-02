@@ -39,7 +39,7 @@ use crate::backend::metrics::{
     ProjectStatusLabels,
 };
 use crate::backend::v0::models::ProgrammingLanguage;
-use crate::db::qdrant::VectorStore;
+use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
 use crate::models::bge_m3::BGEm3Model;
 use crate::models::ollama::OllamaModel;
@@ -140,6 +140,7 @@ pub async fn run(
 
         if let Some(p) = &probes {
             probe_dependencies(p, &metrics).await;
+            probe_vector_counts(&p.store, &db_pool, &metrics, &token).await;
         }
     }
 }
@@ -399,6 +400,78 @@ fn apply(metrics: &Metrics, snapshot: &Snapshot) {
         }
     }
     s.db_size_bytes.set(snapshot.db_size_bytes);
+    // Last, and only on the path that got a whole snapshot: this is what tells a
+    // reader that the frozen-looking gauges above are current rather than stale.
+    s.state_refreshed_at.set(crate::unix_now());
+}
+
+/// Ask Qdrant how many points each project actually holds.
+///
+/// Every other number on this dashboard comes from SQLite, which is why the failure
+/// documented in `db/qdrant.rs` has no detector: with Qdrant's volume gone, SQLite
+/// still reports every file `indexed`, `ensure_project` silently makes an empty
+/// collection, and search answers `404 search.no_match` for ever. Against
+/// `project_chunks_active`, this is the number that disagrees.
+///
+/// Costs one round-trip per project per tick, so it rides with the other probes under
+/// `[metrics].probe_dependencies`. A project the store cannot answer for is **left
+/// unwritten**, not zeroed — zero is the alarming value here and must never be
+/// manufactured by an unreachable Qdrant, which `dependency_up{qdrant}` already
+/// reports.
+async fn probe_vector_counts(
+    store: &Arc<dyn VectorStore>,
+    db_pool: &SQLite3Pool,
+    metrics: &Metrics,
+    token: &CancellationToken,
+) {
+    let projects = match db_pool
+        .transaction(token.clone(), |tx| {
+            tx.prepare("SELECT guid FROM projects")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
+        })
+        .with_cancellation_token(token)
+        .await
+    {
+        Some(Ok(p)) => p,
+        Some(Err(SQLite3PoolError::Cancelled)) | None => return,
+        Some(Err(e)) => {
+            warn!(
+                error = ?e,
+                "Metrics collector: failed to list projects for the vector-count probe; \
+                 keeping the previous counts for this tick."
+            );
+            return;
+        }
+    };
+
+    let mut counted: Vec<(String, u64)> = Vec::with_capacity(projects.len());
+    for guid in projects {
+        match store.count_points(&collection_name(&guid)).await {
+            Ok(Some(n)) => counted.push((guid, n)),
+            // The store declines to answer (every test fake, by design). Not an error,
+            // and not a zero.
+            Ok(None) => return,
+            Err(e) => warn!(
+                error = %e,
+                project_guid = %guid,
+                "Metrics collector: could not count this project's vectors; leaving its \
+                 previous count in place. Sysadmin: check Qdrant is reachable."
+            ),
+        }
+    }
+
+    // Cleared and repopulated whole, like every other family here, so a deleted
+    // project stops reporting its last known count. Nothing awaits between the two.
+    metrics.state.project_vectors.clear();
+    for (project_guid, n) in counted {
+        metrics
+            .state
+            .project_vectors
+            .get_or_create(&ProjectLabels { project_guid })
+            .set(n as i64);
+    }
 }
 
 /// Ping every dependency concurrently. Each probe is already bounded by its

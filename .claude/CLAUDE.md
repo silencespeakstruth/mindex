@@ -1493,6 +1493,41 @@ prompt half of that knob is dead weight and only `num_predict` earns its place.
 hardware, in which case the shed path is insurance and should be described as
 such rather than as a mechanism.
 
+**Three families exist because "nothing" and "broken" were the same number.**
+`search_orphaned_winners` counts chunks Qdrant scored whose SQLite row was gone —
+silent before, and when *every* winner was one the caller got a 200 with an empty
+list while an over-narrow filter gets a 404, i.e. the reassuring spelling for the
+case that means the two stores disagree (`search_core_inner` now returns `NoMatch`
+there too, so 404 uniformly means "nothing active matched"). `project_vectors` is
+Qdrant's own point count per project, the *only* detector for the
+no-mismatch-detection failure `db/qdrant.rs` documents: against
+`project_chunks_active` it separates "this project is empty" from "this project's
+vectors are gone"; it rides under `[metrics].probe_dependencies` (one round-trip
+per project per tick) and a project the store cannot answer for is **absent, not
+zero** — zero is the alarming value and must never be manufactured by an
+unreachable Qdrant. `state_refreshed_timestamp_seconds` dates the last *successful*
+snapshot: a failed read deliberately keeps the previous gauges, which was
+indistinguishable from a healthy tick, so every `StateMetrics` value could sit
+frozen with nothing saying so.
+
+**GC reports per phase whether it finished** (`gc::Phase`/`GcOutcome`). Each phase
+used to return a bare `usize` with every error mapped to `0`, and `collect`
+incremented `gc_runs{outcome="ok"}` whenever the token was live — so a GC failing
+for days looked idle, and `POST /gc` answered 200 with zeros either way. Now
+`outcome="error"` outranks `"cancelled"` (a shutdown mid-pass is routine; a phase
+that could not run is not), `sweep`'s anti-spin `break`s set `failed`, and
+`GcResponse.failed_phases` names them on the wire. The counts stay real — a phase
+that failed part-way reports what it managed — so the list is what says whether
+they are the whole story.
+
+**`research_unjournalled_runs{model,outcome}` is the denominator every research
+rate lacked.** All per-run research metrics live in the `MeteredJournal`
+decorator, so the three endings that write no row — `cancelled`, `failed`,
+`report_rejected` (failed the markdown gate) — were absent from `research_runs`,
+`_duration`, `_steps`, `_tokens` and `_citations` simultaneously: the GPU hour was
+spent and the dashboard said the run never happened. `run_research` therefore takes
+an `Option<Arc<Metrics>>` of its own; the journal seam cannot see these.
+
 **The workers are supervised, and the gauge lives outside `StateMetrics`.**
 Every background worker goes through `supervise()` in `main.rs`: it publishes
 `worker_running{worker}` before the task starts (a series that never existed

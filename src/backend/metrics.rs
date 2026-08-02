@@ -210,6 +210,15 @@ pub struct ModelReasonLabels {
     pub done_reason: &'static str,
 }
 
+/// A research run that produced no journal row, and why. Deliberately not folded
+/// into `ModelReasonLabels`: `done_reason` describes how a run that *finished*
+/// finished, and these are the runs that never got one.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ModelOutcomeLabels {
+    pub model: String,
+    pub outcome: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModelEffortLabels {
     pub model: String,
@@ -320,6 +329,14 @@ pub struct SearchMetrics {
     pub stage_duration: HistFamily<StageLabels>,
     pub candidates: Histogram,
     pub results: Histogram,
+    /// Winners Qdrant scored whose SQLite chunk row was gone by the time the second
+    /// query ran. The response just got shorter, silently, and if *every* winner was
+    /// one the caller got a 200 with an empty list — the opposite spelling of the
+    /// "nothing" an over-narrow filter gets (404 `search.no_match`), and the one that
+    /// actually means the two stores disagree. Benign in small numbers (a reindex
+    /// soft-deleted the chunk between this request's two queries); a sustained rate is
+    /// divergence.
+    pub orphaned_winners: Counter,
 }
 
 #[derive(Clone)]
@@ -328,6 +345,17 @@ pub struct ResearchMetrics {
     /// client-supplied string, and effort × done_reason × model is the one
     /// genuine cardinality hazard in the set.
     pub runs: Family<ModelReasonLabels, Counter>,
+    /// Runs that ended without a journal row, by why: `cancelled` (client hung up,
+    /// `DELETE /research/active`, or the watchdog), `failed` (an `error` event went
+    /// out instead of a report) and `report_rejected` (a report that failed the
+    /// markdown gate — streamed to the caller, deliberately not stored).
+    ///
+    /// Every per-run research metric lives in the `MeteredJournal` decorator, so a run
+    /// that never journals is absent from **all** of them: `runs`, `duration`, `steps`,
+    /// `tokens`, `citations`. The GPU hour was spent and nothing on the dashboard knew
+    /// it happened, which also makes every success rate computed from `runs` a rate
+    /// with no denominator. Rare per label set — chart with `increase()`.
+    pub unjournalled: Family<ModelOutcomeLabels, Counter>,
     pub runs_by_effort: Family<ModelEffortLabels, Counter>,
     pub duration: HistFamily<ModelLabels>,
     pub steps: HistFamily<ModelLabels>,
@@ -544,6 +572,20 @@ pub struct StateMetrics {
     pub project_research_pinned: Family<ProjectLabels, Gauge>,
     pub project_research_stale: Family<ProjectLabels, Gauge>,
     pub dependency_up: Family<DependencyLabels, Gauge>,
+    /// Points Qdrant holds for the project, against `project_chunks_active`'s sum from
+    /// SQLite. The pair is the only detector for the failure `db/qdrant.rs` documents
+    /// and nothing catches: lose Qdrant's volume (or bump `COLLECTION_SCHEMA_VERSION`)
+    /// and SQLite still calls every file `indexed` while search answers
+    /// `404 search.no_match` for ever, with no error logged anywhere. Written only when
+    /// `[metrics].probe_dependencies` is on — it costs one Qdrant round-trip per
+    /// project per tick — and absent, not zero, when the store cannot answer.
+    pub project_vectors: Family<ProjectLabels, Gauge>,
+    /// Unix time of the last **successful** state snapshot. A failed read keeps the
+    /// previous gauges, deliberately, but that used to be indistinguishable from a
+    /// healthy tick: every `StateMetrics` value would sit frozen at its last good
+    /// number with nothing saying so. `time() - this` is the staleness a dashboard
+    /// alerts on.
+    pub state_refreshed_at: Gauge,
     // ── Process state, refreshed on scrape rather than on tick (all free reads) ──
     pub indexing_claims: Gauge,
     pub research_active: Gauge,
@@ -755,6 +797,7 @@ impl Metrics {
             stage_duration: hist_family(request_hist),
             candidates: count_hist(),
             results: count_hist(),
+            orphaned_winners: Counter::default(),
         };
         registry.register(
             "search_requests",
@@ -776,10 +819,16 @@ impl Metrics {
             "Results returned to the caller",
             search.results.clone(),
         );
+        registry.register(
+            "search_orphaned_winners",
+            "Qdrant winners dropped because their SQLite chunk row was gone",
+            search.orphaned_winners.clone(),
+        );
 
         // ── Research ──
         let research = ResearchMetrics {
             runs: Family::default(),
+            unjournalled: Family::default(),
             runs_by_effort: Family::default(),
             duration: hist_family(long_hist),
             steps: hist_family(count_hist),
@@ -817,6 +866,11 @@ impl Metrics {
             "research_runs",
             "Research runs finished, by model and why they stopped",
             research.runs.clone(),
+        );
+        registry.register(
+            "research_unjournalled_runs",
+            "Research runs that produced no stored row, by model and why",
+            research.unjournalled.clone(),
         );
         registry.register(
             "research_runs_by_effort",
@@ -1084,6 +1138,8 @@ impl Metrics {
             project_research_pinned: Family::default(),
             project_research_stale: Family::default(),
             dependency_up: Family::default(),
+            project_vectors: Family::default(),
+            state_refreshed_at: Gauge::default(),
             indexing_claims: Gauge::default(),
             research_active: Gauge::default(),
             research_permits_available: Gauge::default(),
@@ -1161,6 +1217,16 @@ impl Metrics {
             "dependency_up",
             "1 when a dependency answered its health probe",
             state.dependency_up.clone(),
+        );
+        registry.register(
+            "project_vectors",
+            "Points Qdrant holds for the project, to compare against project_chunks_active",
+            state.project_vectors.clone(),
+        );
+        registry.register(
+            "state_refreshed_timestamp_seconds",
+            "Unix time of the last successful state-aggregate snapshot",
+            state.state_refreshed_at.clone(),
         );
         registry.register(
             "indexing_claims",
@@ -1448,6 +1514,22 @@ mod tests {
         m.gc.status_log_pruned.inc();
         m.gc.running.set(0);
 
+        m.research
+            .unjournalled
+            .get_or_create(&ModelOutcomeLabels {
+                model: "m".into(),
+                outcome: "cancelled",
+            })
+            .inc();
+        m.search.orphaned_winners.inc();
+        m.state
+            .project_vectors
+            .get_or_create(&ProjectLabels {
+                project_guid: "p".into(),
+            })
+            .set(1);
+        m.state.state_refreshed_at.set(1);
+
         m.supervisor
             .running
             .get_or_create(&WorkerLabels { worker: "gc" })
@@ -1610,6 +1692,7 @@ mod tests {
             ("mindex_project_files_permanently_failed", "gauge"),
             ("mindex_project_last_indexed_timestamp_seconds", "gauge"),
             ("mindex_project_symbols", "gauge"),
+            ("mindex_project_vectors", "gauge"),
             ("mindex_projects", "gauge"),
             ("mindex_qdrant_op_duration_seconds", "histogram"),
             ("mindex_qdrant_ops_total", "counter"),
@@ -1643,15 +1726,18 @@ mod tests {
             ("mindex_research_report_words", "histogram"),
             ("mindex_research_transcript_truncations_total", "counter"),
             ("mindex_research_turns", "histogram"),
+            ("mindex_research_unjournalled_runs_total", "counter"),
             ("mindex_research_watchdog_cancels_total", "counter"),
             ("mindex_research_worker_threads", "gauge"),
             ("mindex_retry_files_total", "counter"),
             ("mindex_retry_sweeps_total", "counter"),
             ("mindex_search_candidates", "histogram"),
+            ("mindex_search_orphaned_winners_total", "counter"),
             ("mindex_search_requests_total", "counter"),
             ("mindex_search_results", "histogram"),
             ("mindex_search_stage_duration_seconds", "histogram"),
             ("mindex_start_time_seconds", "gauge"),
+            ("mindex_state_refreshed_timestamp_seconds", "gauge"),
             ("mindex_status_log_rows", "gauge"),
             ("mindex_worker_exits_total", "counter"),
             ("mindex_worker_running", "gauge"),
@@ -1692,6 +1778,7 @@ mod tests {
             "mindex_project_research_runs",
             "mindex_project_research_stale",
             "mindex_project_symbols",
+            "mindex_project_vectors",
             "mindex_projects",
             "mindex_research_active",
             "mindex_research_context_used_ratio",

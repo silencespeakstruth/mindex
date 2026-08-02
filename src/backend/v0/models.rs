@@ -1229,6 +1229,17 @@ pub struct GcResponse {
     /// Stored research runs reaped for having passed their `expires_at`. A **pinned**
     /// run (`expires_at` null) has no expiry and is never counted here.
     pub research_runs_pruned: usize,
+    /// Phases that did not run to completion — `chunks`, `files`, `status_log`,
+    /// `research` — empty when the pass was clean.
+    ///
+    /// Without it every count above is ambiguous: each phase mapped its errors to `0`,
+    /// so a 200 full of zeros meant either "nothing needed collecting" or "collection
+    /// is broken", and a caller had no way to tell. The counts are still real — a phase
+    /// that failed part-way reports what it did manage — so this is the field that says
+    /// whether they are the whole story. The reasons are in the server log; this names
+    /// where to look.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_phases: Vec<String>,
 }
 
 /// `GET /projects/{guid}/research` query. **Keyset**, not offset: pages are

@@ -107,6 +107,13 @@ impl VectorStore for MeteredVectorStore {
         r
     }
 
+    async fn count_points(&self, collection: &str) -> Result<Option<u64>, VectorStoreError> {
+        let t = Instant::now();
+        let r = self.inner.count_points(collection).await;
+        self.record("count_points", t, &r);
+        r
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors the trait method, whose inputs are the irreducible parts \

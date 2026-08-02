@@ -5546,7 +5546,23 @@ pub async fn run_research(
     params: ResearchParams,
     tx: UnboundedSender<ResearchEvent>,
     token: CancellationToken,
+    // `Option`, like every other metrics seam here, so the test call sites construct
+    // unchanged. Needed at all because the three endings below produce no journal row,
+    // and `MeteredJournal` is where every other per-run research metric is recorded —
+    // a cancelled or failed run was therefore absent from all of them at once.
+    metrics: Option<Arc<crate::backend::metrics::Metrics>>,
 ) {
+    let unjournalled = |outcome: &'static str| {
+        if let Some(m) = &metrics {
+            m.research
+                .unjournalled
+                .get_or_create(&crate::backend::metrics::ModelOutcomeLabels {
+                    model: params.model.clone(),
+                    outcome,
+                })
+                .inc();
+        }
+    };
     let started = Instant::now();
     let ResearchOutcome {
         steps,
@@ -5567,11 +5583,13 @@ pub async fn run_research(
     } = match research_inner(&*ollama, &*tools, &params, &tx, &token).await {
         Ok(outcome) => outcome,
         Err(ResearchAbort::Cancelled) => {
-            info!("Research cancelled (client disconnected).");
+            info!("Research cancelled (client disconnected, cancelled or reaped).");
+            unjournalled("cancelled");
             return;
         }
         Err(ResearchAbort::Failed { code, detail }) => {
             warn!(%code, %detail, "Research job failed; emitting an error event.");
+            unjournalled("failed");
             let _ = tx.send(ResearchEvent::Error { code, detail });
             return;
         }
@@ -5763,6 +5781,11 @@ pub async fn run_research(
              the repair pass; it was streamed to the client but will not be \
              journalled."
         );
+        // Skipping `journal.record` skips `MeteredJournal` and therefore every per-run
+        // research metric at once, so without this the run is invisible: no duration,
+        // no steps, no tokens, no citations — a whole GPU run that the dashboard says
+        // never happened.
+        unjournalled("report_rejected");
         None
     };
     let _ = tx.send(ResearchEvent::Done {
@@ -9126,6 +9149,7 @@ mod tests {
             params(8),
             tx,
             CancellationToken::new(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -9181,6 +9205,7 @@ mod tests {
             p,
             tx,
             CancellationToken::new(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -10150,6 +10175,7 @@ mod tests {
             params(max_steps),
             tx,
             CancellationToken::new(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -10319,6 +10345,7 @@ mod tests {
             params(16),
             tx,
             CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -11112,6 +11139,7 @@ mod tests {
             params,
             tx,
             CancellationToken::new(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -11197,6 +11225,7 @@ mod tests {
             params,
             tx,
             CancellationToken::new(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -14614,6 +14643,7 @@ mod tests {
             params(8),
             tx,
             token.clone(),
+            None,
         )
         .await;
         assert!(

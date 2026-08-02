@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::backend::metrics::{Metrics, TriggerOutcomeLabels};
 use crate::db::qdrant::{VectorStore, collection_name};
@@ -36,11 +36,66 @@ impl Drop for GcGuard {
     }
 }
 
+/// One phase's result: rows removed, and whether the phase ran to completion.
+///
+/// Every phase used to return a bare `usize` with each error mapped to `0`, so
+/// "nothing needed pruning" and "pruning failed" were the same answer — `POST /gc`
+/// answered 200 with zeros either way, and `gc_runs{outcome="ok"}` was incremented
+/// even when all four phases had failed. A GC broken for days looked idle.
+///
+/// A phase that fails part-way carries both a non-zero `removed` and `failed`.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct Phase {
+    pub removed: usize,
+    pub failed: bool,
+}
+
+impl Phase {
+    fn done(removed: usize) -> Self {
+        Self {
+            removed,
+            failed: false,
+        }
+    }
+    fn broke(removed: usize) -> Self {
+        Self {
+            removed,
+            failed: true,
+        }
+    }
+}
+
+/// What one pass did, per phase, so a caller can tell a clean idle sweep from a
+/// broken one.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct GcOutcome {
+    pub chunks: Phase,
+    pub files: Phase,
+    pub status_log: Phase,
+    pub research: Phase,
+}
+
+impl GcOutcome {
+    /// The phases that did not finish, by name — what `POST /gc` reports and what the
+    /// `outcome="error"` label is decided from.
+    pub(crate) fn failed_phases(&self) -> Vec<&'static str> {
+        [
+            ("chunks", self.chunks.failed),
+            ("files", self.files.failed),
+            ("status_log", self.status_log.failed),
+            ("research", self.research.failed),
+        ]
+        .into_iter()
+        .filter_map(|(name, failed)| failed.then_some(name))
+        .collect()
+    }
+}
+
 /// One full GC pass: hard-delete confirmed-removed chunks, then drop now-empty
 /// `deleted` file rows, prune the old status log, then reap expired research runs.
 /// The step order is the invariant (chunks before files, since the chunk→file FK is
 /// RESTRICT), so it lives in one place shared by the worker and `POST /gc`. Returns
-/// `(chunks_removed, files_removed, status_log_pruned, research_runs_pruned)`.
+/// a [`GcOutcome`] — per phase, what it removed *and* whether it finished.
 /// Callers serialize this behind [`GcGuard`].
 ///
 /// The research step is last only because it is newest — it shares no foreign key
@@ -58,36 +113,52 @@ pub(crate) async fn collect(
     metrics: &Metrics,
     trigger: &'static str,
     token: &CancellationToken,
-) -> (usize, usize, usize, usize) {
+) -> GcOutcome {
     let started = std::time::Instant::now();
     metrics.gc.running.set(1);
 
-    let chunks = sweep(db_pool, store, token).await;
-    let files = prune_deleted_files(db_pool, token).await;
-    let log = prune_status_log(db_pool, status_log_retention_days, token).await;
-    let research = prune_expired_research(db_pool, token).await;
+    let out = GcOutcome {
+        chunks: sweep(db_pool, store, token).await,
+        files: prune_deleted_files(db_pool, token).await,
+        status_log: prune_status_log(db_pool, status_log_retention_days, token).await,
+        research: prune_expired_research(db_pool, token).await,
+    };
 
     let g = &metrics.gc;
     g.duration.observe(started.elapsed().as_secs_f64());
-    g.chunks_removed.inc_by(chunks as u64);
-    g.files_pruned.inc_by(files as u64);
-    g.status_log_pruned.inc_by(log as u64);
-    g.research_pruned.inc_by(research as u64);
-    // A pass that ran to completion under a cancelled token did partial work; say
-    // so rather than calling it a clean sweep.
-    g.runs
-        .get_or_create(&TriggerOutcomeLabels {
+    g.chunks_removed.inc_by(out.chunks.removed as u64);
+    g.files_pruned.inc_by(out.files.removed as u64);
+    g.status_log_pruned.inc_by(out.status_log.removed as u64);
+    g.research_pruned.inc_by(out.research.removed as u64);
+
+    // Severity order, and `error` outranks `cancelled`: a shutdown that interrupts a
+    // pass is routine, a phase that could not run is not, and the label had neither —
+    // `ok` was recorded whenever the token was live, however many phases had failed.
+    let failed = out.failed_phases();
+    let outcome = if failed.is_empty() {
+        // A pass that ran to completion under a cancelled token did partial work; say
+        // so rather than calling it a clean sweep.
+        if token.is_cancelled() {
+            "cancelled"
+        } else {
+            "ok"
+        }
+    } else {
+        error!(
+            failed_phases = ?failed,
             trigger,
-            outcome: if token.is_cancelled() {
-                "cancelled"
-            } else {
-                "ok"
-            },
-        })
+            "GC pass did not complete; the backlog it would have cleared is still there. \
+             Sysadmin: the phase errors are logged above — check the database is \
+             writable and Qdrant is reachable."
+        );
+        "error"
+    };
+    g.runs
+        .get_or_create(&TriggerOutcomeLabels { trigger, outcome })
         .inc();
     g.running.set(0);
 
-    (chunks, files, log, research)
+    out
 }
 
 pub async fn run(
@@ -120,7 +191,7 @@ pub async fn run(
         };
 
         info!("GC worker: starting sweep.");
-        let (chunks, files, _log, research) = collect(
+        let out = collect(
             &db_pool,
             &*store,
             status_log_retention_days,
@@ -129,12 +200,26 @@ pub async fn run(
             &token,
         )
         .await;
-        info!(
-            chunks_removed = chunks,
-            files_removed = files,
-            research_runs_pruned = research,
-            "GC worker: sweep complete."
-        );
+        let failed = out.failed_phases();
+        // "Sweep complete" was logged unconditionally, including for a pass in which
+        // every phase had errored. `collect` already logs the failure; this keeps the
+        // routine line from claiming the opposite of it.
+        if failed.is_empty() {
+            info!(
+                chunks_removed = out.chunks.removed,
+                files_removed = out.files.removed,
+                research_runs_pruned = out.research.removed,
+                "GC worker: sweep complete."
+            );
+        } else {
+            warn!(
+                chunks_removed = out.chunks.removed,
+                files_removed = out.files.removed,
+                research_runs_pruned = out.research.removed,
+                failed_phases = ?failed,
+                "GC worker: sweep ended early; some phases did not run."
+            );
+        }
     }
 }
 
@@ -143,7 +228,7 @@ pub async fn run(
 /// hard-deleted their (soft-deleted) chunks. The FK to chunks is RESTRICT, so this
 /// can only fire after the chunks are gone; running it after `sweep` in the same
 /// pass is what makes a delete eventually physical. Returns the rows removed.
-pub(crate) async fn prune_deleted_files(db_pool: &SQLite3Pool, token: &CancellationToken) -> usize {
+pub(crate) async fn prune_deleted_files(db_pool: &SQLite3Pool, token: &CancellationToken) -> Phase {
     let removed = db_pool
         .transaction(token.clone(), move |tx| {
             let n = tx.execute(
@@ -162,11 +247,17 @@ pub(crate) async fn prune_deleted_files(db_pool: &SQLite3Pool, token: &Cancellat
         .await;
 
     match removed {
-        Ok(n) => n,
-        Err(SQLite3PoolError::Cancelled) => 0,
+        Ok(n) => Phase::done(n),
+        // Shutdown, not breakage: the next pass does the work.
+        Err(SQLite3PoolError::Cancelled) => Phase::done(0),
         Err(e) => {
-            error!(error = ?e, "GC worker: failed to prune deleted file rows.");
-            0
+            error!(
+                error = ?e,
+                "GC worker: failed to prune deleted file rows. Sysadmin: check the \
+                 database file is writable — until this succeeds, emptied file rows \
+                 accumulate."
+            );
+            Phase::broke(0)
         }
     }
 }
@@ -179,7 +270,7 @@ pub(crate) async fn prune_status_log(
     db_pool: &SQLite3Pool,
     retention_days: u64,
     token: &CancellationToken,
-) -> usize {
+) -> Phase {
     let max_age_secs = retention_days as i64 * SECONDS_PER_DAY;
 
     let pruned = db_pool
@@ -193,18 +284,23 @@ pub(crate) async fn prune_status_log(
         .await;
 
     match pruned {
-        Ok(0) => 0,
+        Ok(0) => Phase::done(0),
         Ok(rows) => {
             info!(
                 rows,
                 retention_days, "GC worker: pruned old status-log rows."
             );
-            rows
+            Phase::done(rows)
         }
-        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(SQLite3PoolError::Cancelled) => Phase::done(0),
         Err(e) => {
-            error!(error = ?e, "GC worker: failed to prune the status log.");
-            0
+            error!(
+                error = ?e,
+                "GC worker: failed to prune the status log. Sysadmin: check the \
+                 database file is writable — the log grows without bound until this \
+                 succeeds."
+            );
+            Phase::broke(0)
         }
     }
 }
@@ -225,7 +321,7 @@ pub(crate) async fn prune_status_log(
 pub(crate) async fn prune_expired_research(
     db_pool: &SQLite3Pool,
     token: &CancellationToken,
-) -> usize {
+) -> Phase {
     let pruned = db_pool
         .transaction(token.clone(), move |tx| {
             let n = tx.execute(
@@ -238,15 +334,20 @@ pub(crate) async fn prune_expired_research(
         .await;
 
     match pruned {
-        Ok(0) => 0,
+        Ok(0) => Phase::done(0),
         Ok(rows) => {
             info!(rows, "GC worker: reaped expired research runs.");
-            rows
+            Phase::done(rows)
         }
-        Err(SQLite3PoolError::Cancelled) => 0,
+        Err(SQLite3PoolError::Cancelled) => Phase::done(0),
         Err(e) => {
-            error!(error = ?e, "GC worker: failed to reap expired research runs.");
-            0
+            error!(
+                error = ?e,
+                "GC worker: failed to reap expired research runs. Sysadmin: check the \
+                 database file is writable — expired reports are being retained past \
+                 their retention window until this succeeds."
+            );
+            Phase::broke(0)
         }
     }
 }
@@ -258,8 +359,12 @@ pub(crate) async fn sweep(
     db_pool: &SQLite3Pool,
     store: &dyn VectorStore,
     token: &CancellationToken,
-) -> usize {
+) -> Phase {
     let mut total_removed = 0usize;
+    // Every `break` below that is not "the work is done" sets this. The loop
+    // deliberately stops rather than spinning on a batch it cannot clear, but stopping
+    // early and finishing are opposite states and the caller could not tell them apart.
+    let mut failed = false;
     loop {
         if token.is_cancelled() {
             break;
@@ -284,7 +389,12 @@ pub(crate) async fn sweep(
             Ok(b) => b,
             Err(SQLite3PoolError::Cancelled) => break,
             Err(e) => {
-                error!(error = ?e, "GC worker: failed to query deleted chunks from SQLite; aborting this sweep.");
+                error!(
+                    error = ?e,
+                    "GC worker: failed to query deleted chunks from SQLite; aborting this \
+                     sweep. Sysadmin: check the database file is readable and not locked."
+                );
+                failed = true;
                 break;
             }
         };
@@ -325,7 +435,9 @@ pub(crate) async fn sweep(
         if confirmed_deleted.is_empty() {
             // Nothing was confirmed removed from Qdrant this iteration (every collection
             // failed). Stop the inner loop to avoid spinning on the same un-deletable
-            // batch; the next scheduled sweep will retry.
+            // batch; the next scheduled sweep will retry. The per-collection errors are
+            // already logged above; what was missing is that the *pass* did not finish.
+            failed = true;
             break;
         }
 
@@ -349,14 +461,23 @@ pub(crate) async fn sweep(
             Ok(n) => total_removed += n,
             Err(SQLite3PoolError::Cancelled) => break,
             Err(e) => {
-                error!(error = ?e, "GC worker: failed to hard-delete swept chunk rows.");
+                error!(
+                    error = ?e,
+                    "GC worker: failed to hard-delete swept chunk rows. Sysadmin: check \
+                     the database file is writable."
+                );
                 // Vectors are already gone from Qdrant; the rows stay 'deleted' and a
                 // later sweep retries the SQLite delete. Avoid spinning on this batch.
+                failed = true;
                 break;
             }
         }
     }
-    total_removed
+    if failed {
+        Phase::broke(total_removed)
+    } else {
+        Phase::done(total_removed)
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +651,50 @@ mod tests {
         );
     }
 
+    /// A sweep that could clear nothing stops rather than spinning — correct, and for
+    /// its whole life indistinguishable from a sweep with nothing to do. Both returned
+    /// `0`, `collect` counted `gc_runs{outcome="ok"}` either way, and `POST /gc`
+    /// answered 200 with zeros. A GC that had been failing for days read as idle.
+    #[tokio::test]
+    async fn a_sweep_that_cleared_nothing_says_whether_it_could_not_or_need_not() {
+        let guid = "c".repeat(32);
+
+        // Nothing to do.
+        let pool = migrated_pool().await;
+        let idle = sweep(
+            &pool,
+            &FakeStore {
+                fail: HashSet::new(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((idle.removed, idle.failed), (0, false));
+
+        // Everything to do, and Qdrant refusing all of it.
+        let pool = migrated_pool().await;
+        seed_deleted_chunks(&pool, &guid, 2).await;
+        let broken = sweep(
+            &pool,
+            &FakeStore {
+                fail: HashSet::from([collection_name(&guid)]),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            (broken.removed, broken.failed),
+            (0, true),
+            "same count as the idle sweep, opposite meaning"
+        );
+
+        let out = GcOutcome {
+            chunks: broken,
+            ..GcOutcome::default()
+        };
+        assert_eq!(out.failed_phases(), vec!["chunks"]);
+    }
+
     #[tokio::test]
     async fn sweep_on_empty_is_a_noop() {
         let pool = migrated_pool().await;
@@ -633,7 +798,8 @@ mod tests {
         seed_run(&pool, "future", Some(4_000_000_000)).await; // 2096
 
         let pruned = prune_expired_research(&pool, &CancellationToken::new()).await;
-        assert_eq!(pruned, 1, "exactly the expired run should go");
+        assert_eq!(pruned.removed, 1, "exactly the expired run should go");
+        assert!(!pruned.failed);
 
         let ids: i64 = count(
             &pool,
@@ -673,7 +839,12 @@ mod tests {
         seed_run(&pool, "expired", Some(1)).await;
         let token = CancellationToken::new();
         token.cancel();
-        assert_eq!(prune_expired_research(&pool, &token).await, 0);
+        let phase = prune_expired_research(&pool, &token).await;
+        assert_eq!(phase.removed, 0);
+        assert!(
+            !phase.failed,
+            "a cancelled token is a shutdown, not a broken phase"
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM research_runs").await, 1);
     }
 
@@ -779,7 +950,10 @@ mod tests {
         .unwrap();
 
         let removed = prune_deleted_files(&pool, &CancellationToken::new()).await;
-        assert_eq!(removed, 1, "only the emptied deleted file should be pruned");
+        assert_eq!(
+            removed.removed, 1,
+            "only the emptied deleted file should be pruned"
+        );
         // keep.rs (indexed) and pending.rs (deleted but still has a chunk) remain.
         assert_eq!(file_count(&pool, &guid).await, 2);
     }

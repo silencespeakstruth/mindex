@@ -2557,6 +2557,31 @@ async fn search_core_inner(
         })
         .collect();
 
+    // Winners whose chunk row was gone by the second query. Benign one at a time — the
+    // candidate set was read from SQLite moments earlier, so a reindex soft-deleting a
+    // chunk in between produces exactly this — but it was entirely silent, and the
+    // all-orphaned case answered `200` with an empty list while an over-narrow filter
+    // answers `404`. Two opposite spellings of "nothing", with the one meaning "the two
+    // stores disagree" wearing the reassuring one.
+    let orphaned = scored.len() - results.len();
+    if orphaned > 0 {
+        state
+            .metrics
+            .search
+            .orphaned_winners
+            .inc_by(orphaned as u64);
+        warn!(
+            orphaned,
+            winners = scored.len(),
+            "Qdrant scored chunks whose SQLite rows are gone; dropping them from the \
+             results. A few mean a reindex raced this request; a steady rate means the \
+             vector store and the index have diverged and the project needs reindexing."
+        );
+    }
+    if results.is_empty() {
+        return Err(ApiError::NoMatch);
+    }
+
     // Guarantee the response is sorted by score (descending), independent of the
     // order Qdrant's fusion/rerank happens to return.
     results.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -5300,6 +5325,10 @@ async fn launch_research_job(
         worst_case_ms,
     });
 
+    // Cloned before the spawn, like every other handle the job takes ownership of.
+    // The job needs its own because the endings that produce no journal row are
+    // exactly the ones `MeteredJournal` cannot see.
+    let metrics_for_run = Arc::clone(&s.metrics);
     let registration = s.research_registry.register(
         run_id.clone(),
         project_guid.0.simple().to_string(),
@@ -5322,7 +5351,16 @@ async fn launch_research_job(
         // that is not.
         let _permit = permit;
         let _registration = registration;
-        crate::research::run_research(ollama, tools, journal, params, tx, job_token).await;
+        crate::research::run_research(
+            ollama,
+            tools,
+            journal,
+            params,
+            tx,
+            job_token,
+            Some(metrics_for_run),
+        )
+        .await;
     });
 
     let stream = SseEventStream::new(rx, token);
@@ -7559,21 +7597,21 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, A
         return Err(ApiError::GcRunning);
     };
     let cg = http3::CancellationGuard(CancellationToken::new());
-    let (chunks_removed, files_removed, status_log_pruned, research_runs_pruned) =
-        crate::worker::gc::collect(
-            &s.db_pool,
-            &*s.qdrant,
-            s.status_log_retention_days,
-            &s.metrics,
-            "manual",
-            &cg.0,
-        )
-        .await;
+    let out = crate::worker::gc::collect(
+        &s.db_pool,
+        &*s.qdrant,
+        s.status_log_retention_days,
+        &s.metrics,
+        "manual",
+        &cg.0,
+    )
+    .await;
     Ok(Json(GcResponse {
-        chunks_removed,
-        files_removed,
-        status_log_pruned,
-        research_runs_pruned,
+        chunks_removed: out.chunks.removed,
+        files_removed: out.files.removed,
+        status_log_pruned: out.status_log.removed,
+        research_runs_pruned: out.research.removed,
+        failed_phases: out.failed_phases().into_iter().map(str::to_owned).collect(),
     }))
 }
 

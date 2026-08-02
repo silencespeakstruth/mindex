@@ -554,6 +554,48 @@ P += [
 ]
 y += 6
 
+P += [
+    ts(
+        "Index vs vector store",
+        gp(6, 12, 0, y),
+        targets(
+            (
+                "sum by (project_guid) (mindex_project_chunks_active)",
+                "{{project_guid}} sqlite",
+            ),
+            ("mindex_project_vectors", "{{project_guid}} qdrant"),
+        ),
+        desc="The two must track each other. Qdrant dropping to zero while "
+        "SQLite holds steady is the failure with no error anywhere: every file "
+        "still reads `indexed` and search answers 404 for ever. Needs "
+        "`[metrics].probe_dependencies`; a project Qdrant cannot be asked about "
+        "is absent rather than zero.",
+    ),
+    ts(
+        "Divergence & staleness",
+        gp(6, 12, 12, y),
+        targets(
+            (
+                "increase(mindex_search_orphaned_winners_total[$__rate_interval])",
+                "orphaned winners",
+            ),
+            (
+                "time() - mindex_state_refreshed_timestamp_seconds",
+                "state age (s)",
+            ),
+        ),
+        desc="An orphaned winner is a chunk Qdrant scored and SQLite no longer "
+        "has; a few mean a reindex raced a search, a steady rate means "
+        "divergence. `state age` climbing means the collector's snapshot is "
+        "failing and every gauge on this dashboard is frozen at its last good "
+        "value.",
+        overrides=by_name_overrides(
+            {"orphaned winners": "orange", "state age (s)": "yellow"}
+        ),
+    ),
+]
+y += 6
+
 # ─── Row 2 — HTTP API ───────────────────────────────────────────────────────
 P.append(row("HTTP API", y))
 y += 1
@@ -1286,6 +1328,33 @@ y += 7
 
 P += [
     ts(
+        "Runs that stored nothing",
+        gp(6, 12, 0, y),
+        targets(
+            (
+                ev('mindex_research_unjournalled_runs_total{model=~"$model"}'),
+                "{{outcome}}",
+            ),
+        ),
+        unit="short",
+        desc="Every other research metric is recorded by the journal decorator, "
+        "so a run that never journals is missing from all of them at once — the "
+        "GPU hour was spent and the dashboard says it never happened, which also "
+        "leaves every success rate computed from `research_runs` without a "
+        "denominator. `cancelled` is a client hanging up or a slot being reaped; "
+        "`failed` sent an error event instead of a report; `report_rejected` "
+        "produced a report that failed the Markdown gate.",
+        overrides=by_name_overrides(
+            {"cancelled": "yellow", "failed": "red", "report_rejected": "orange"}
+        ),
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
+    ),
+]
+y += 6
+
+P += [
+    ts(
         "Stored research",
         gp(7, 12, 0, y),
         targets(
@@ -1373,12 +1442,29 @@ P += [
         gp(7, 8, 16, y),
         targets(
             (
-                "sum by (trigger) (rate(mindex_gc_runs_total[$__rate_interval]))",
-                "{{trigger}}",
+                (
+                    "sum by (trigger, outcome) "
+                    "(rate(mindex_gc_runs_total[$__rate_interval]))"
+                ),
+                "{{trigger}} {{outcome}}",
             ),
         ),
         unit="cps",
-        overrides=by_name_overrides({"worker": "blue", "manual": "purple"}),
+        desc="Split by outcome, because `ok` used to be recorded even when every "
+        "phase had failed: each phase mapped its errors to zero removals, so a "
+        "GC broken for days was indistinguishable from an idle one. Any "
+        "`error` series means a phase could not run and its backlog is still "
+        "there.",
+        overrides=by_name_overrides(
+            {
+                "worker ok": "blue",
+                "manual ok": "purple",
+                "worker error": "red",
+                "manual error": "red",
+                "worker cancelled": "yellow",
+                "manual cancelled": "yellow",
+            }
+        ),
     ),
 ]
 y += 7
