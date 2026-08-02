@@ -1225,4 +1225,176 @@ mod tests {
         assert_eq!(partial.chunks.removed, 17);
         assert_eq!(partial.failed_phases(), vec!["chunks"]);
     }
+
+    /// GC and indexing run concurrently by design — GC is never allowed to block
+    /// indexing — so the sweep must be safe against a file that is *resurrecting*.
+    /// `deleted → indexing` is a legal transition, so a soft-deleted file can regain
+    /// active chunks between one GC phase and the next. Pruning it then would either
+    /// orphan those chunks or be refused by the RESTRICT FK, and the `NOT EXISTS`
+    /// guard is what makes it neither.
+    #[tokio::test]
+    async fn a_resurrected_file_survives_the_pass_that_was_about_to_prune_it() {
+        let pool = migrated_pool().await;
+        let guid = "4".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 2).await;
+
+        // The `DELETE /files` state: file and chunks both soft-deleted.
+        let g = guid.clone();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "UPDATE project_files SET status = 'deleted' WHERE project_guid = ?1",
+                params![g],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // A reindex lands while the row is still `deleted`: the file goes back to
+        // `indexing` and a fresh chunk is inserted. This is the window GC must not
+        // act in.
+        let g = guid.clone();
+        let fresh = Uuid::new_v4().simple().to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "UPDATE project_files SET status = 'indexing' WHERE project_guid = ?1",
+                params![g],
+            )?;
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid,
+                      start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'a.rs', 'BAAI/bge-m3', 'new code', ?2, 1, 2, 0, 1, 'active')",
+                params![g, fresh],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
+        let out = collect(
+            &pool,
+            &store,
+            30,
+            &Metrics::new(),
+            "worker",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(out.chunks.removed, 2, "the old chunks are still swept");
+        assert_eq!(
+            out.files.removed, 0,
+            "GC pruned a file that had come back to life; its fresh chunk is now \
+             orphaned, or the FK refused and the pass failed"
+        );
+        assert_eq!(
+            file_count(&pool, &guid).await,
+            1,
+            "the file row must survive"
+        );
+        // And the new chunk is untouched: only `deleted` rows are ever swept.
+        let active: i64 = pool
+            .transaction(CancellationToken::new(), {
+                let g = guid.clone();
+                move |tx| {
+                    tx.query_row(
+                        "SELECT COUNT(*) FROM project_file_chunks
+                          WHERE project_guid = ?1 AND status = 'active'",
+                        params![g],
+                        |r| r.get(0),
+                    )
+                    .map_err(SQLite3PoolError::from)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(active, 1, "the live chunk was swept");
+    }
+
+    /// A live file — never soft-deleted at all — must be invisible to every phase.
+    /// This is the plainest form of "GC does not block indexing": a pass running
+    /// against a project mid-index must change nothing about it.
+    #[tokio::test]
+    async fn a_pass_over_a_live_project_changes_nothing() {
+        let pool = migrated_pool().await;
+        let guid = "5".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 0).await;
+        let g = guid.clone();
+        let live = Uuid::new_v4().simple().to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid,
+                      start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'a.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'active')",
+                params![g, live],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
+        let out = collect(
+            &pool,
+            &store,
+            30,
+            &Metrics::new(),
+            "worker",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(out.chunks.removed, 0);
+        assert_eq!(out.files.removed, 0);
+        assert!(out.failed_phases().is_empty());
+        assert_eq!(file_count(&pool, &guid).await, 1);
+    }
+
+    /// The guard is what serializes the hourly worker against `POST /gc`, and it
+    /// must hold under real contention: exactly one of many concurrent acquirers
+    /// wins, and the flag is free again once they have all finished. A leaked flag
+    /// turns every later `POST /gc` into a 409 and makes the worker skip every tick
+    /// — GC off for the life of the process, silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_of_many_concurrent_passes_holds_the_gc_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let (flag, winners, gate) =
+                (Arc::clone(&flag), Arc::clone(&winners), Arc::clone(&gate));
+            tasks.push(tokio::spawn(async move {
+                if let Some(_guard) = GcGuard::try_acquire(&flag) {
+                    winners.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                }
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "two GC passes ran at once; they would race the same deleted rows"
+        );
+
+        gate.notify_waiters();
+        for t in tasks {
+            t.await.expect("acquirer finishes");
+        }
+        assert!(
+            GcGuard::try_acquire(&flag).is_some(),
+            "the GC flag was leaked — every POST /gc is now a 409 and the worker \
+             skips every tick, for the life of the process"
+        );
+    }
 }
