@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::metrics::{DbMetrics, Metrics, OutcomeLabels};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use thiserror::Error;
@@ -20,6 +20,16 @@ pub enum SQLite3PoolError {
 
     #[error("cancelled")]
     Cancelled,
+
+    /// The transaction closure panicked (or its blocking task was aborted). Kept
+    /// apart from [`Cancelled`](SQLite3PoolError::Cancelled) because the two are
+    /// opposite diagnoses that were once the same value: a panic is a bug in this
+    /// process, and reporting it as a cancellation told the client it had closed a
+    /// connection it never closed, told the dashboard a disconnect had happened,
+    /// and suppressed the call sites' own `error!` (every one of them skips logging
+    /// for `Cancelled`). It also costs a pool connection, so it must be loud.
+    #[error("transaction task panicked")]
+    Panicked,
 
     #[error("status code: {0}")]
     HTTPStatusCode(StatusCode),
@@ -178,9 +188,17 @@ impl SQLite3Pool {
 
         let started = std::time::Instant::now();
         let Some(conn) = self.acquire().await else {
-            // `PoolEmpty` collapses into an opaque `ApiError::Internal` on the
-            // wire, so without this counter pool exhaustion is invisible — a 500
-            // indistinguishable from any other.
+            // Logged as well as counted: a metric says how often, a line says when and
+            // what to do, and pool exhaustion used to produce neither from the pool
+            // itself — the single most likely production failure left no journal trace
+            // at all. `warn!` rather than `error!` because the request is retryable and
+            // a burst under load is not yet a defect.
+            warn!(
+                pool_size = self.size,
+                "Every SQLite pool connection is checked out; refusing the transaction. \
+                 Sysadmin: if this is not a brief burst, raise [database].pool_size or \
+                 find the request holding a connection — GET /status reports saturation."
+            );
             if let Some(m) = &self.metrics {
                 m.pool_acquire_failures.inc();
                 m.transactions
@@ -246,8 +264,16 @@ impl SQLite3Pool {
             // The blocking task panicked (a bug in `f`) or was aborted. The connection
             // for a panicked task is dropped rather than returned — acceptable, since a
             // panicking transaction closure is a programmer error, not a runtime condition.
-            error!(%join_err, "SQLite transaction task failed to join (closure panicked?).");
-            SQLite3PoolError::Cancelled
+            // It is not free, though: the pool is now one connection smaller for the life
+            // of the process, so the hint names the symptom that follows.
+            error!(
+                %join_err,
+                "SQLite transaction task failed to join (closure panicked?). \
+                 Sysadmin: this connection is gone for good — after [database].pool_size \
+                 such panics every request fails with `pool empty`; restart, and treat the \
+                 panic above as the bug to fix."
+            );
+            SQLite3PoolError::Panicked
         });
 
         if let Some(m) = &self.metrics {
@@ -255,7 +281,10 @@ impl SQLite3Pool {
                 .observe(started.elapsed().as_secs_f64());
             let outcome = match &joined {
                 Ok(Ok(_)) => "ok",
-                Ok(Err(SQLite3PoolError::Cancelled)) | Err(_) => "cancelled",
+                Ok(Err(SQLite3PoolError::Cancelled)) => "cancelled",
+                // A panic is its own outcome: bucketed under "cancelled" it read as a
+                // client disconnect, which is the one thing a dashboard must not be told.
+                Ok(Err(SQLite3PoolError::Panicked)) | Err(_) => "panic",
                 Ok(Err(_)) => "error",
             };
             m.transactions
@@ -291,6 +320,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 42);
+    }
+
+    /// A panic in the closure is a bug in this process, and it used to be reported as
+    /// `Cancelled` — i.e. HTTP 499 "the client closed the connection", a diagnosis
+    /// pointing at the caller, and one every call site deliberately declines to log.
+    /// The two must stay distinguishable: the panic also costs a pool connection, so
+    /// it is the one pool error nobody may confuse with routine traffic.
+    #[tokio::test]
+    async fn a_panicking_closure_is_not_reported_as_a_cancellation() {
+        let p = pool(2);
+        let res: Result<(), _> = p
+            .transaction(CancellationToken::new(), |_tx| {
+                panic!("deliberate: a bug inside a transaction closure")
+            })
+            .await;
+        assert!(
+            matches!(res, Err(SQLite3PoolError::Panicked)),
+            "a closure panic must be its own error, got {res:?}"
+        );
+        // And it must not read as a client disconnect on the wire either.
+        let api = crate::backend::error::ApiError::from(SQLite3PoolError::Panicked);
+        assert_eq!(api.code(), "internal.error");
+    }
+
+    /// Pool exhaustion is transient: the same request succeeds once a connection frees.
+    /// Collapsed into `internal.error` it told the client not to bother retrying and
+    /// told the operator nothing about load — the two most likely readings both wrong.
+    #[tokio::test]
+    async fn an_exhausted_pool_is_a_retryable_503() {
+        let api = crate::backend::error::ApiError::from(SQLite3PoolError::PoolEmpty);
+        assert_eq!(api.code(), "database.busy");
+        assert_eq!(api.status().as_u16(), 503);
     }
 
     #[tokio::test]

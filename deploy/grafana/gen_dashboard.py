@@ -481,9 +481,10 @@ P += [
             ),
         ),
         unit="cps",
-        desc="Pool exhaustion is otherwise invisible — it collapses into an "
-        "opaque 500. A claim conflict is two writers on one file; the "
-        "request still succeeds for the rest of its batch.",
+        desc="Pool exhaustion answers 503 `database.busy` and logs a hint, so "
+        "this is the trend rather than the only evidence. A claim conflict is "
+        "two writers on one file; the request still succeeds for the rest of "
+        "its batch.",
         overrides=by_name_overrides({"pool empty": "red", "claim conflict": "orange"}),
     ),
     ts(
@@ -519,6 +520,36 @@ P += [
                 "watchdog cancel": "red",
             }
         ),
+    ),
+]
+y += 6
+
+P += [
+    ts(
+        "Background workers alive",
+        gp(6, 12, 0, y),
+        targets(("mindex_worker_running", "{{worker}}")),
+        desc="Every worker is a detached task: a panic inside one stops it "
+        "permanently, and the only other symptom is some unrelated gauge "
+        "quietly ceasing to move. A line that drops to 0 while the process "
+        "keeps serving is that, and it needs a restart.",
+    ),
+    ts(
+        "Worker deaths",
+        gp(6, 12, 12, y),
+        targets(
+            (
+                (
+                    'increase(mindex_worker_exits_total{outcome="panic"}'
+                    "[$__rate_interval])"
+                ),
+                "{{worker}}",
+            ),
+        ),
+        unit="short",
+        desc="`increase`, not `rate`: a worker dies at most once per process "
+        "lifetime, so the series is flat at 1 forever and a rate over it reads "
+        "as zero. Expected to stay empty.",
     ),
 ]
 y += 6

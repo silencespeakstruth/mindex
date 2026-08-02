@@ -17,6 +17,62 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Spawn a background worker under supervision.
+///
+/// Every worker used to be a bare `tokio::spawn` with its `JoinHandle` dropped, which
+/// makes a panic inside one **silent and permanent**: the task dies, nothing joins it,
+/// nothing restarts it, and the only trace is that whatever the worker maintained
+/// quietly stops changing. GC ceasing to reclaim vectors and the retry sweep ceasing
+/// to rescue stuck files both look, from outside, exactly like a healthy idle system.
+///
+/// This does not restart anything — a worker that panicked once will panic again, and
+/// a restart loop would bury the bug under its own noise. It makes the death *visible*:
+/// an `error!` naming the worker, a counter, and a gauge that drops to 0 and stays
+/// there, which is the alertable signal. Restarting is a decision for after there is
+/// evidence any of these ever die.
+fn supervise<F>(name: &'static str, metrics: &Arc<backend::metrics::Metrics>, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use backend::metrics::{WorkerLabels, WorkerOutcomeLabels};
+
+    let running = metrics
+        .supervisor
+        .running
+        .get_or_create(&WorkerLabels { worker: name })
+        .clone();
+    // Published before the task starts, so the series exists from the first scrape.
+    // A worker that dies immediately would otherwise be *absent* rather than zero,
+    // and no alert can fire on a series that was never written.
+    running.set(1);
+
+    let metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        let outcome = if tokio::spawn(fut).await.is_ok() {
+            info!(worker = name, "Background worker exited.");
+            "ok"
+        } else {
+            error!(
+                worker = name,
+                "Background worker task died and will not be restarted; the work it \
+                 does is not happening any more. Sysadmin: find the panic above this \
+                 line and restart the service — mindex_worker_running{{worker}} stays \
+                 at 0 until it is."
+            );
+            "panic"
+        };
+        running.set(0);
+        metrics
+            .supervisor
+            .exits
+            .get_or_create(&WorkerOutcomeLabels {
+                worker: name,
+                outcome,
+            })
+            .inc();
+    });
+}
+
 mod backend;
 mod config;
 mod db;
@@ -127,7 +183,12 @@ async fn main() -> Result<(), BoxError> {
 
     let token = CancellationToken::new();
 
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+    // The one startup panic that used to be a bare `unwrap`. Registering a signal
+    // handler fails only if the process cannot install one at all, and without it
+    // `docker stop` / `systemctl stop` would go unheard — so panicking is right, but
+    // it has to say which of the startup steps failed, like every other one here.
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("cannot install a SIGTERM handler; the process would ignore every stop request");
     let sigterm_token = token.child_token();
 
     let provider = rustls::crypto::ring::default_provider();
@@ -357,59 +418,71 @@ async fn main() -> Result<(), BoxError> {
     let gc_token = sigterm_token.child_token();
     let retry_token = sigterm_token.child_token();
 
-    tokio::spawn(worker::gc::run(
-        db_pool.clone(),
-        qdrant_client.clone(),
-        gc_flag.clone(),
-        cfg.workers.gc_interval_seconds,
-        cfg.workers.status_log_retention_days,
-        metrics.clone(),
-        gc_token,
-    ));
+    supervise(
+        "gc",
+        &metrics,
+        worker::gc::run(
+            db_pool.clone(),
+            qdrant_client.clone(),
+            gc_flag.clone(),
+            cfg.workers.gc_interval_seconds,
+            cfg.workers.status_log_retention_days,
+            metrics.clone(),
+            gc_token,
+        ),
+    );
 
-    tokio::spawn(worker::retry::run(
-        db_pool.clone(),
-        qdrant_client.clone(),
-        embed_client.clone(),
-        model_id.to_string(),
-        RetryTuning {
-            embed: embed_tuning,
-            retry_interval_seconds: cfg.workers.retry_interval_seconds,
-            failed_warn_interval_seconds: cfg.workers.failed_warn_interval_seconds,
-            max_retries: cfg.workers.max_retries,
-            stuck_grace_secs: cfg.indexing.stuck_grace_minutes * 60,
-        },
-        indexing_locks.clone(),
-        metrics.clone(),
-        retry_token,
-    ));
+    supervise(
+        "retry",
+        &metrics,
+        worker::retry::run(
+            db_pool.clone(),
+            qdrant_client.clone(),
+            embed_client.clone(),
+            model_id.to_string(),
+            RetryTuning {
+                embed: embed_tuning,
+                retry_interval_seconds: cfg.workers.retry_interval_seconds,
+                failed_warn_interval_seconds: cfg.workers.failed_warn_interval_seconds,
+                max_retries: cfg.workers.max_retries,
+                stuck_grace_secs: cfg.indexing.stuck_grace_minutes * 60,
+            },
+            indexing_locks.clone(),
+            metrics.clone(),
+            retry_token,
+        ),
+    );
 
     if cfg.metrics.enabled {
-        tokio::spawn(worker::metrics::run(
-            db_pool.clone(),
-            metrics.clone(),
-            worker::metrics::MetricsTuning {
-                refresh_interval_seconds: cfg.metrics.refresh_interval_seconds,
-                probe_dependencies: cfg.metrics.probe_dependencies,
-                max_retries: cfg.workers.max_retries,
-                model_id: cfg.model.name.clone(),
-            },
-            cfg.metrics.probe_dependencies.then(|| {
-                worker::metrics::ProbeTargets {
-                    store: qdrant_client.clone(),
-                    embedder: embed_client.clone(),
-                    // Probed separately only when it *is* separate — the same
-                    // `Arc::ptr_eq` rule `GET /health` uses, because comparing URLs
-                    // would call one instance two things.
-                    query_embedder: (!Arc::ptr_eq(&embed_client, &query_embed_client))
-                        .then(|| query_embed_client.clone()),
-                    ollama: research_ollama.clone(),
-                }
-            }),
-            research_semaphore.clone(),
-            cfg.research.max_concurrent,
-            sigterm_token.child_token(),
-        ));
+        supervise(
+            "metrics",
+            &metrics,
+            worker::metrics::run(
+                db_pool.clone(),
+                metrics.clone(),
+                worker::metrics::MetricsTuning {
+                    refresh_interval_seconds: cfg.metrics.refresh_interval_seconds,
+                    probe_dependencies: cfg.metrics.probe_dependencies,
+                    max_retries: cfg.workers.max_retries,
+                    model_id: cfg.model.name.clone(),
+                },
+                cfg.metrics.probe_dependencies.then(|| {
+                    worker::metrics::ProbeTargets {
+                        store: qdrant_client.clone(),
+                        embedder: embed_client.clone(),
+                        // Probed separately only when it *is* separate — the same
+                        // `Arc::ptr_eq` rule `GET /health` uses, because comparing URLs
+                        // would call one instance two things.
+                        query_embedder: (!Arc::ptr_eq(&embed_client, &query_embed_client))
+                            .then(|| query_embed_client.clone()),
+                        ollama: research_ollama.clone(),
+                    }
+                }),
+                research_semaphore.clone(),
+                cfg.research.max_concurrent,
+                sigterm_token.child_token(),
+            ),
+        );
     }
 
     // What a run at each level has actually cost, for `GET /config`. Shares the
@@ -418,31 +491,43 @@ async fn main() -> Result<(), BoxError> {
     let research_stats: worker::research_stats::SharedRunStats = Arc::new(
         tokio::sync::RwLock::new(worker::research_stats::RunStats::default()),
     );
-    tokio::spawn(worker::research_stats::run(
-        db_pool.clone(),
-        research_stats.clone(),
-        cfg.research.models_refresh_interval_seconds,
-        sigterm_token.child_token(),
-    ));
+    supervise(
+        "research_stats",
+        &metrics,
+        worker::research_stats::run(
+            db_pool.clone(),
+            research_stats.clone(),
+            cfg.research.models_refresh_interval_seconds,
+            sigterm_token.child_token(),
+        ),
+    );
 
     // Unconditional on purpose, unlike the collector above: this is the backstop
     // that keeps a research slot from being held forever, and gating a safety
     // mechanism on `[metrics].enabled` would make an observability switch decide
     // whether the service can recover.
-    tokio::spawn(worker::research_watchdog::run(
-        research_registry.clone(),
-        metrics.clone(),
-        sigterm_token.child_token(),
-    ));
+    supervise(
+        "research_watchdog",
+        &metrics,
+        worker::research_watchdog::run(
+            research_registry.clone(),
+            metrics.clone(),
+            sigterm_token.child_token(),
+        ),
+    );
 
     // Unconditional: an Ollama that comes up an hour from now must still be picked
     // up, so there is nothing to gate this on. A failed tick keeps the last list.
-    tokio::spawn(worker::ollama_catalog::run(
-        research_ollama.clone(),
-        research_models.clone(),
-        cfg.research.models_refresh_interval_seconds,
-        sigterm_token.child_token(),
-    ));
+    supervise(
+        "ollama_catalog",
+        &metrics,
+        worker::ollama_catalog::run(
+            research_ollama.clone(),
+            research_models.clone(),
+            cfg.research.models_refresh_interval_seconds,
+            sigterm_token.child_token(),
+        ),
+    );
 
     // Whichever arm fires first wins and we proceed to shutdown — there is no
     // looping (a server exit, SIGINT, or SIGTERM all end the process).

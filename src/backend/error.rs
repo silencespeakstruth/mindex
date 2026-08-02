@@ -43,6 +43,12 @@ pub enum ApiError {
     EmbedderUnavailable,
     /// Qdrant is unreachable / the query failed. 503.
     QdrantUnavailable,
+    /// Every SQLite pool connection is checked out. 503, not 500: the condition is
+    /// transient and the same request will succeed once a connection frees, which is
+    /// the opposite of what `internal.error` tells a client. It is also the most
+    /// likely production failure of all, and collapsing it into `Internal` left no
+    /// way for a caller — or a dashboard — to tell load from a bug.
+    DatabaseBusy,
     /// A GC pass is already running (manual or the hourly worker). 409.
     GcRunning,
     /// The same file is already being indexed by another in-flight request.
@@ -199,6 +205,7 @@ impl ApiError {
             ApiError::Internal => "internal.error",
             ApiError::EmbedderUnavailable => "embedder.unavailable",
             ApiError::QdrantUnavailable => "qdrant.unavailable",
+            ApiError::DatabaseBusy => "database.busy",
             ApiError::GcRunning => "gc.already_running",
             ApiError::FileInFlight => "index.file_in_flight",
             ApiError::ProjectNotFound => "project.not_found",
@@ -248,9 +255,9 @@ impl ApiError {
         match self {
             ApiError::Cancelled => status_499(),
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::EmbedderUnavailable | ApiError::QdrantUnavailable => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ApiError::EmbedderUnavailable
+            | ApiError::QdrantUnavailable
+            | ApiError::DatabaseBusy => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::GcRunning => StatusCode::CONFLICT,
             ApiError::FileInFlight | ApiError::ResearchBusy => StatusCode::TOO_MANY_REQUESTS,
             ApiError::ProjectNotFound
@@ -269,6 +276,7 @@ impl ApiError {
             ApiError::Internal => "Internal server error",
             ApiError::EmbedderUnavailable => "Embedder unavailable",
             ApiError::QdrantUnavailable => "Vector store unavailable",
+            ApiError::DatabaseBusy => "Database busy",
             ApiError::GcRunning => "Garbage collection already running",
             ApiError::FileInFlight => "File already being indexed",
             ApiError::ProjectNotFound => "Project not found",
@@ -356,6 +364,11 @@ impl ApiError {
             }
             ApiError::QdrantUnavailable => {
                 "The vector store is unreachable or the query failed.".into()
+            }
+            ApiError::DatabaseBusy => {
+                "Every database connection is in use; retry shortly. If this persists, \
+                 raise [database].pool_size or look for a request holding a connection."
+                    .into()
             }
             ApiError::GcRunning => {
                 "A garbage-collection pass is already running; retry later.".into()
@@ -657,6 +670,10 @@ impl From<SQLite3PoolError> for ApiError {
     fn from(e: SQLite3PoolError) -> Self {
         match e {
             SQLite3PoolError::Cancelled => ApiError::Cancelled,
+            // Retryable, and the only pool failure that is: everything else here is a
+            // bug or a broken database, where telling the client to retry would be a
+            // lie. `Panicked` deliberately lands in `Internal` with the rest.
+            SQLite3PoolError::PoolEmpty => ApiError::DatabaseBusy,
             // `HTTPStatusCode` is only ever set to 500 by the slicer error mapping;
             // preserve that as an internal error.
             _ => ApiError::Internal,
@@ -679,6 +696,7 @@ mod tests {
             ApiError::Internal,
             ApiError::EmbedderUnavailable,
             ApiError::QdrantUnavailable,
+            ApiError::DatabaseBusy,
             ApiError::GcRunning,
             ApiError::FileInFlight,
             ApiError::ProjectNotFound,
@@ -759,6 +777,7 @@ mod tests {
         codes.sort_unstable();
 
         let expected = [
+            "database.busy",
             "embedder.unavailable",
             "gc.already_running",
             "index.file_in_flight",

@@ -3621,7 +3621,14 @@ pub(crate) async fn grep_core(
 fn locate_match(code: &str, pattern: &str, start_line: usize) -> (usize, String) {
     let lower_code = code.to_lowercase();
     let offset = lower_code.find(&pattern.to_lowercase()).unwrap_or(0);
-    let line_index = code[..offset].matches('\n').count();
+    // Counted in `lower_code`, never in `code`: lowercasing is not length-preserving
+    // (`İ` U+0130 is two bytes and lowercases to three), so `offset` is a byte index
+    // into the *lowered* string only. Slicing the original with it panics — out of
+    // bounds, or mid-character — and this runs inside `spawn_blocking`, where a panic
+    // costs a pool connection and reaches the client as a 499. The line number
+    // survives the detour because no character lowercases into or out of a newline,
+    // so the two strings hold the same newlines in the same order.
+    let line_index = lower_code[..offset].matches('\n').count();
     let line = code.lines().nth(line_index).unwrap_or("").trim();
     let excerpt = if line.chars().count() > GREP_EXCERPT_CHARS {
         format!(
@@ -9842,6 +9849,26 @@ mod tests {
         assert_eq!(excerpt, "let guard = GcGuard::new();");
         // Case-insensitive, as the tool description says.
         assert_eq!(locate_match(code, "gcguard", 10).0, 11);
+    }
+
+    /// Lowercasing is not length-preserving, so an offset found in the lowered copy is
+    /// not an index into the original. Slicing the original with it panicked — and the
+    /// panic happens inside `spawn_blocking`, where it costs a pool connection and
+    /// reaches the caller as a 499 blaming them for a disconnect they never made. Any
+    /// indexed file containing `İ` (Turkish, and ordinary in prose) made `grep` a way
+    /// to take the pool apart four requests at a time.
+    #[test]
+    fn a_grep_match_survives_a_pattern_preceded_by_a_growing_character() {
+        // Eight `İ` are 16 bytes and lowercase to 24, so the offset of the match in the
+        // lowered string is past the end of the original.
+        let code = "İİİİİİİİ\nlet x = 1;";
+        assert!("İ".to_lowercase().len() > "İ".len(), "the premise");
+        let (line, excerpt) = locate_match(code, "let x", 10);
+        assert_eq!(line, 11, "the match is on the chunk's second line");
+        assert_eq!(excerpt, "let x = 1;");
+        // The same growth landing mid-character rather than out of bounds.
+        let code = "İ İ let y = 2;";
+        assert_eq!(locate_match(code, "let y", 1), (1, "İ İ let y = 2;".into()));
     }
 
     /// `symbols_core` rewrites the role bind **by Vec index**, so anything appended to

@@ -111,6 +111,19 @@ pub struct ProjectLabels {
     pub project_guid: String,
 }
 
+/// The worker's own name. Bounded by the supervised set in `main.rs`, which is a
+/// literal list — the cardinality rule holds by construction.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WorkerLabels {
+    pub worker: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WorkerOutcomeLabels {
+    pub worker: &'static str,
+    pub outcome: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ProjectLangLabels {
     pub project_guid: String,
@@ -460,6 +473,27 @@ pub struct GcMetrics {
     pub running: Gauge,
 }
 
+/// Liveness of the background workers, which are otherwise unobservable: each is a
+/// detached `tokio::spawn` whose `JoinHandle` used to be dropped, so a panic stopped
+/// GC or the retry sweep permanently and in total silence — the only symptom was
+/// some *other* gauge slowly ceasing to move, months later.
+///
+/// Not part of [`StateMetrics`]: that family set is cleared and repopulated whole by
+/// the metrics worker, and a liveness gauge belonging to the metrics worker itself
+/// would be erased by the very tick that proves it is alive.
+#[derive(Clone)]
+pub struct SupervisorMetrics {
+    /// `1` while the worker's task is running, `0` once it has left. Every supervised
+    /// worker publishes `0` before it starts, so a series exists to alert on from the
+    /// first scrape — a worker that panicked on its first tick is otherwise absent
+    /// rather than zero, and absence is what a dashboard cannot see.
+    pub running: Family<WorkerLabels, Gauge>,
+    /// Task exits, by how they ended. A clean shutdown ends every worker, so this is
+    /// read together with `running`: `outcome="panic"` at any time, or `outcome="ok"`
+    /// while the process is still serving, is the defect.
+    pub exits: Family<WorkerOutcomeLabels, Counter>,
+}
+
 #[derive(Clone)]
 pub struct RetryMetrics {
     pub sweeps: Counter,
@@ -542,6 +576,7 @@ pub struct Metrics {
     pub search: SearchMetrics,
     pub research: ResearchMetrics,
     pub gc: GcMetrics,
+    pub supervisor: SupervisorMetrics,
     pub retry: RetryMetrics,
     pub db: DbMetrics,
     pub state: StateMetrics,
@@ -967,6 +1002,22 @@ impl Metrics {
             gc.running.clone(),
         );
 
+        // ── Worker supervision ──
+        let supervisor = SupervisorMetrics {
+            running: Family::default(),
+            exits: Family::default(),
+        };
+        registry.register(
+            "worker_running",
+            "1 while a background worker's task is alive, 0 once it has exited",
+            supervisor.running.clone(),
+        );
+        registry.register(
+            "worker_exits",
+            "Background worker task exits, by worker and how it ended",
+            supervisor.exits.clone(),
+        );
+
         // ── Retry worker ──
         let retry = RetryMetrics {
             sweeps: Counter::default(),
@@ -1156,6 +1207,7 @@ impl Metrics {
             search,
             research,
             gc,
+            supervisor,
             retry,
             db,
             state,
@@ -1396,6 +1448,18 @@ mod tests {
         m.gc.status_log_pruned.inc();
         m.gc.running.set(0);
 
+        m.supervisor
+            .running
+            .get_or_create(&WorkerLabels { worker: "gc" })
+            .set(1);
+        m.supervisor
+            .exits
+            .get_or_create(&WorkerOutcomeLabels {
+                worker: "gc",
+                outcome: "panic",
+            })
+            .inc();
+
         m.retry.sweeps.inc();
         m.retry
             .files
@@ -1589,6 +1653,8 @@ mod tests {
             ("mindex_search_stage_duration_seconds", "histogram"),
             ("mindex_start_time_seconds", "gauge"),
             ("mindex_status_log_rows", "gauge"),
+            ("mindex_worker_exits_total", "counter"),
+            ("mindex_worker_running", "gauge"),
         ]
         .iter()
         .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
@@ -1630,6 +1696,8 @@ mod tests {
             "mindex_research_active",
             "mindex_research_context_used_ratio",
             "mindex_research_permits_available",
+            // A liveness flag, like `gc_running` and `dependency_up` above it.
+            "mindex_worker_running",
             // A count of words, like `steps` and `turns` beside it: the unit is the
             // thing being counted, and `_words` would only restate the name.
             "mindex_research_report_words",

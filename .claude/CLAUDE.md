@@ -1329,9 +1329,26 @@ catalogue in `openapi.rs` `info.description` + clients). Handlers return
 `EncodeError`, `VectorStoreError`, `EmbedUpsertError`) convert via
 `From`/constructors at the call site — the call site keeps the contextual log
 + sysadmin hint, `From` never logs. Mappings: `SQLite3PoolError::Cancelled` →
-499 (rest `Internal`); embed request/decode → `EmbedderUnavailable` 503;
-Qdrant search → `QdrantUnavailable`, upsert/drop → `Internal`. No external
-error crates.
+499, `PoolEmpty` → `DatabaseBusy` 503 (rest `Internal`); embed request/decode
+→ `EmbedderUnavailable` 503; Qdrant search → `QdrantUnavailable`, upsert/drop
+→ `Internal`. No external error crates.
+
+**The three pool failures are three diagnoses and must not be one.**
+`Cancelled` is the *caller* leaving — 499, and every call site deliberately
+skips its own `error!` for it. `PoolEmpty` is load: retryable, so 503
+`database.busy`, and the pool itself now `warn!`s with a hint (as `Internal`
+it was an unretryable-looking 500 that produced no journal line at all — the
+likeliest production failure, invisible). `Panicked` is a bug here: it stays
+`Internal` 500, and it exists as its own variant because a `JoinError` used to
+become `Cancelled`, which told the client it had closed a connection it never
+closed, told the dashboard a disconnect, and silenced every call site's log.
+It also costs a pool connection permanently, so `db.transactions` counts it as
+`outcome="panic"` rather than burying it in `"cancelled"` — after
+`db_pool_size` of them every request fails with `database.busy` and nothing
+says why. The reachable instance was `locate_match` slicing the original
+string with an offset found in its lowercased copy (`İ` grows by a byte), so
+any indexed file containing one made `grep` a way to dismantle the pool four
+requests at a time.
 
 **Validation happens at the edge (`backend/v0/validate.rs`), before any
 work** — bad input is a 400 with a precise `code`, never an opaque 500 from a
@@ -1452,6 +1469,20 @@ prompt half of that knob is dead weight and only `num_predict` earns its place.
 `research_report_context_sheds` may legitimately stay at zero forever on this
 hardware, in which case the shed path is insurance and should be described as
 such rather than as a mechanism.
+
+**The workers are supervised, and the gauge lives outside `StateMetrics`.**
+Every background worker goes through `supervise()` in `main.rs`: it publishes
+`worker_running{worker}` before the task starts (a series that never existed
+cannot be alerted on — a worker that panics on its first tick is *absent*, not
+zero), joins the task, and on a `JoinError` emits an `error!` naming the worker
+plus `worker_exits_total{worker,outcome="panic"}`. It deliberately does **not**
+restart: a worker that panicked once panics again, and the loop would bury the
+backtrace under its own noise. Before this, all six were bare `tokio::spawn`
+with the `JoinHandle` dropped, so a panic stopped GC or the retry sweep
+permanently and in silence — from outside indistinguishable from a healthy idle
+system. `SupervisorMetrics` is its own group precisely because `StateMetrics` is
+cleared and repopulated whole by the metrics worker, whose own liveness gauge
+would then be erased by the tick that proves it alive.
 
 **What is deliberately not measured.** Per-project code bytes as a gauge
 (`SUM(LENGTH(code))` full-scans the biggest column every tick and evicts the
