@@ -1397,4 +1397,100 @@ mod tests {
              skips every tick, for the life of the process"
         );
     }
+
+    /// The rule underneath the `delete_batch` change in `db/qdrant.rs`: `sweep`
+    /// hard-deletes a chunk row **only** when the store said its vector is gone, and
+    /// it takes that answer at face value. A store reporting success for a
+    /// collection that no longer exists is therefore what lets the backlog from a
+    /// lost Qdrant volume ever clear — and a store reporting failure is what keeps a
+    /// row whose vector might still be there.
+    ///
+    /// Both directions are already covered by `sweep_removes_all_rows_when_qdrant_succeeds`
+    /// and `sweep_keeps_rows_whose_qdrant_delete_failed`; this pins the consequence
+    /// the two of them exist for, which is that the *file* row follows in the same
+    /// pass and the project becomes physically empty.
+    #[tokio::test]
+    async fn a_confirmed_delete_lets_the_whole_project_go_in_one_pass() {
+        let pool = migrated_pool().await;
+        let guid = "6".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 4).await;
+        let g = guid.clone();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "UPDATE project_files SET status = 'deleted' WHERE project_guid = ?1",
+                params![g],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // The store confirms — which, after the `delete_batch` change, is also what a
+        // missing collection now reports.
+        let out = collect(
+            &pool,
+            &FakeStore {
+                fail: HashSet::new(),
+            },
+            30,
+            &Metrics::new(),
+            "worker",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(out.failed_phases().is_empty());
+        assert_eq!(out.chunks.removed, 4);
+        assert_eq!(out.files.removed, 1);
+        assert_eq!(deleted_count(&pool, &guid).await, 0);
+        assert_eq!(file_count(&pool, &guid).await, 0);
+    }
+
+    /// And its opposite, stated as the consequence rather than the mechanism: while
+    /// the store refuses, nothing is reclaimed and the pass says so. Before
+    /// `delete_batch` converted a missing collection, this was the *permanent* state
+    /// of every project whose collection had been lost — a backlog that could only
+    /// grow, reported as an error on every sweep for ever.
+    #[tokio::test]
+    async fn an_unconfirmed_delete_reclaims_nothing_and_says_so() {
+        let pool = migrated_pool().await;
+        let guid = "7".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 4).await;
+        let g = guid.clone();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "UPDATE project_files SET status = 'deleted' WHERE project_guid = ?1",
+                params![g],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let out = collect(
+            &pool,
+            &FakeStore {
+                fail: HashSet::from([collection_name(&guid)]),
+            },
+            30,
+            &Metrics::new(),
+            "worker",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(out.failed_phases(), vec!["chunks"]);
+        assert_eq!(out.chunks.removed, 0);
+        assert_eq!(
+            deleted_count(&pool, &guid).await,
+            4,
+            "rows must be kept while their vectors are unconfirmed"
+        );
+        assert_eq!(
+            file_count(&pool, &guid).await,
+            1,
+            "and the file row stays behind them — the RESTRICT FK, and the reason \
+             an unclearable chunk backlog is an unclearable file backlog too"
+        );
+    }
 }
