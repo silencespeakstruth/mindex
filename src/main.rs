@@ -697,6 +697,202 @@ mod tests {
         SQLite3Pool::new(Path::new(":memory:"), 1, 16384, "NORMAL")
     }
 
+    /// Wait for `worker_running{worker}` to reach `want`, or give up. The supervisor
+    /// bookkeeping happens in a spawned task, so there is no handle to await — but a
+    /// bounded poll keeps the test from hanging if the gauge never moves.
+    async fn await_running(
+        metrics: &Arc<backend::metrics::Metrics>,
+        worker: &'static str,
+        want: i64,
+    ) -> i64 {
+        use backend::metrics::WorkerLabels;
+        let gauge = metrics
+            .supervisor
+            .running
+            .get_or_create(&WorkerLabels { worker })
+            .clone();
+        for _ in 0..200 {
+            if gauge.get() == want {
+                return want;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        gauge.get()
+    }
+
+    fn exits(
+        metrics: &Arc<backend::metrics::Metrics>,
+        worker: &'static str,
+        outcome: &'static str,
+    ) -> u64 {
+        use backend::metrics::WorkerOutcomeLabels;
+        metrics
+            .supervisor
+            .exits
+            .get_or_create(&WorkerOutcomeLabels { worker, outcome })
+            .get()
+    }
+
+    /// The liveness gauge must exist from the moment the worker is launched, not
+    /// from its first successful tick. A worker that panics on its first tick would
+    /// otherwise leave a series that was never written — and no alert can fire on a
+    /// series that does not exist. All six workers were bare `tokio::spawn` with the
+    /// `JoinHandle` dropped, so a panic stopped GC or the retry sweep permanently and
+    /// in silence.
+    #[tokio::test]
+    async fn a_supervised_worker_is_marked_running_before_it_does_anything() {
+        let metrics = Arc::new(backend::metrics::Metrics::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let held = Arc::clone(&gate);
+        supervise("gate_keeper", &metrics, async move {
+            held.notified().await;
+        });
+
+        assert_eq!(
+            await_running(&metrics, "gate_keeper", 1).await,
+            1,
+            "a launched worker must publish worker_running = 1 immediately"
+        );
+        assert!(
+            metrics
+                .render()
+                .expect("renders")
+                .contains(r#"mindex_worker_running{worker="gate_keeper"} 1"#),
+            "the gauge must be scrapeable, not merely set"
+        );
+
+        gate.notify_one();
+        assert_eq!(await_running(&metrics, "gate_keeper", 0).await, 0);
+        assert_eq!(exits(&metrics, "gate_keeper", "ok"), 1);
+        assert_eq!(
+            exits(&metrics, "gate_keeper", "panic"),
+            0,
+            "a clean exit must not be counted as a death"
+        );
+    }
+
+    /// A panicking worker is the case this exists for: the gauge must fall to zero
+    /// and the death must be counted, so "the retry sweep stopped happening" is
+    /// visible from outside instead of looking like a healthy idle system.
+    #[tokio::test]
+    async fn a_worker_that_panics_falls_to_zero_and_is_counted_as_a_death() {
+        let metrics = Arc::new(backend::metrics::Metrics::new());
+
+        supervise("doomed", &metrics, async {
+            panic!("a worker fell over");
+        });
+
+        assert_eq!(
+            await_running(&metrics, "doomed", 0).await,
+            0,
+            "a dead worker still reports itself alive"
+        );
+        assert_eq!(
+            exits(&metrics, "doomed", "panic"),
+            1,
+            "the death was not counted"
+        );
+        assert_eq!(
+            exits(&metrics, "doomed", "ok"),
+            0,
+            "a panic was recorded as a clean exit"
+        );
+    }
+
+    /// Supervision must not restart: a worker that panicked once panics again, and
+    /// a restart loop buries the backtrace under its own noise. One death, one
+    /// count, and the process keeps serving.
+    #[tokio::test]
+    async fn a_dead_worker_is_not_restarted() {
+        let metrics = Arc::new(backend::metrics::Metrics::new());
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let counter = Arc::clone(&runs);
+        supervise("never_again", &metrics, async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("down");
+        });
+
+        await_running(&metrics, "never_again", 0).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the supervisor restarted a worker it is documented never to restart"
+        );
+        assert_eq!(exits(&metrics, "never_again", "panic"), 1);
+    }
+
+    /// One worker dying must not touch any other worker's series — the gauge is
+    /// per-worker, and a shared one would make the whole set unreadable the moment
+    /// any single worker fell over.
+    #[tokio::test]
+    async fn one_worker_dying_leaves_the_others_alone() {
+        let metrics = Arc::new(backend::metrics::Metrics::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let held = Arc::clone(&gate);
+        supervise("survivor", &metrics, async move { held.notified().await });
+        supervise("casualty", &metrics, async { panic!("down") });
+
+        assert_eq!(await_running(&metrics, "casualty", 0).await, 0);
+        assert_eq!(
+            await_running(&metrics, "survivor", 1).await,
+            1,
+            "a healthy worker was marked dead by its neighbour's panic"
+        );
+        assert_eq!(exits(&metrics, "survivor", "panic"), 0);
+
+        gate.notify_one();
+    }
+
+    /// `SupervisorMetrics` is deliberately **not** part of `StateMetrics`: the
+    /// metrics worker clears and repopulates that whole group every tick, so a
+    /// liveness gauge living there would be erased by the very tick that proves the
+    /// worker alive — and its own death would then be indistinguishable from any
+    /// other tick.
+    #[tokio::test]
+    async fn the_liveness_gauge_survives_a_state_metrics_tick() {
+        let metrics = Arc::new(backend::metrics::Metrics::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let held = Arc::clone(&gate);
+        supervise("metrics", &metrics, async move { held.notified().await });
+        await_running(&metrics, "metrics", 1).await;
+
+        let pool = pool();
+        pool.transaction(CancellationToken::new(), |tx| {
+            apply_pending_migrations(tx).map(|_| ())
+        })
+        .await
+        .expect("migrations apply");
+
+        worker::metrics::collect_once(
+            &pool,
+            &metrics,
+            &worker::metrics::MetricsTuning {
+                refresh_interval_seconds: 60,
+                probe_dependencies: false,
+                max_retries: 3,
+                model_id: "BAAI/bge-m3".to_string(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            metrics
+                .render()
+                .expect("renders")
+                .contains(r#"mindex_worker_running{worker="metrics"} 1"#),
+            "a state-metrics tick erased the gauge that says the collector is alive"
+        );
+
+        gate.notify_one();
+    }
+
     async fn user_version(pool: &SQLite3Pool) -> i32 {
         pool.transaction(CancellationToken::new(), |tx| {
             tx.pragma_query_value(None, "user_version", |r| r.get(0))

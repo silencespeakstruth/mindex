@@ -210,6 +210,43 @@ mod tests {
         }
     }
 
+    /// An embedder whose reply does not have one row per text — the wire-format
+    /// skew that used to be silent. Each head's row count is `texts.len() + delta`,
+    /// clamped at zero, so one fake covers both the short and the long response.
+    struct MisalignedEmbedder {
+        dense_delta: isize,
+        sparse_delta: isize,
+        colbert_delta: isize,
+    }
+
+    impl MisalignedEmbedder {
+        fn rows(n: usize, delta: isize) -> usize {
+            n.saturating_add_signed(delta)
+        }
+    }
+
+    #[async_trait]
+    impl BGEm3Model for MisalignedEmbedder {
+        async fn encode(
+            &self,
+            req: BGEm3EmbedRequest,
+            _token: CancellationToken,
+        ) -> Result<BGEm3EmbedResponse, EncodeError> {
+            let n = req.texts.len();
+            Ok(BGEm3EmbedResponse {
+                dense_vecs: vec![vec![0.1; 4]; Self::rows(n, self.dense_delta)],
+                sparse_vecs: vec![
+                    HashMap::from([(1u32, 0.5f32)]);
+                    Self::rows(n, self.sparse_delta)
+                ],
+                colbert_vecs: vec![vec![vec![0.1; 4]]; Self::rows(n, self.colbert_delta)],
+            })
+        }
+        async fn health(&self) -> Result<(), EncodeError> {
+            unreachable!("embed_and_upsert does not call health")
+        }
+    }
+
     /// Store fake: records the guids it was asked to upsert, or fails when configured.
     struct RecordingStore {
         upserted: Mutex<Vec<UUIDv4>>,
@@ -387,6 +424,152 @@ mod tests {
         )
         .await;
         assert!(matches!(res, Err(EmbedUpsertError::Store(_))));
+    }
+
+    /// A response with fewer rows than texts used to be truncated by `zip`: those
+    /// chunks were never upserted, the file was still marked `indexed`, and nothing
+    /// anywhere said so. The only honest answer is to fail the batch — the retry
+    /// worker then re-attempts it.
+    #[tokio::test]
+    async fn a_short_embedder_response_fails_the_batch_instead_of_losing_chunks() {
+        for (dense, sparse, colbert) in [(-1, 0, 0), (0, -1, 0), (0, 0, -1)] {
+            let embedder = MisalignedEmbedder {
+                dense_delta: dense,
+                sparse_delta: sparse,
+                colbert_delta: colbert,
+            };
+            let store = RecordingStore {
+                upserted: Mutex::new(vec![]),
+                fail_upsert: false,
+            };
+
+            let res = embed_and_upsert(
+                &embedder,
+                &store,
+                "c",
+                &chunks(4),
+                &CancellationToken::new(),
+                TEST_TUNING,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(res, Err(EmbedUpsertError::Decode(_))),
+                "a short {dense}/{sparse}/{colbert} response was accepted: {res:?}"
+            );
+            assert!(
+                store.upserted.lock().unwrap().is_empty(),
+                "a misaligned batch must upsert nothing at all"
+            );
+        }
+    }
+
+    /// The mirror case: more rows than texts indexed `guids[i]` out of bounds and
+    /// panicked — which `SQLite3Pool` would then have reported to the client as a
+    /// disconnect. It must be a decode error, on the wire and in the log.
+    #[tokio::test]
+    async fn a_long_embedder_response_is_an_error_not_a_panic() {
+        for (dense, sparse, colbert) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+            let embedder = MisalignedEmbedder {
+                dense_delta: dense,
+                sparse_delta: sparse,
+                colbert_delta: colbert,
+            };
+            let store = RecordingStore {
+                upserted: Mutex::new(vec![]),
+                fail_upsert: false,
+            };
+
+            let res = embed_and_upsert(
+                &embedder,
+                &store,
+                "c",
+                &chunks(4),
+                &CancellationToken::new(),
+                TEST_TUNING,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(res, Err(EmbedUpsertError::Decode(_))),
+                "a long {dense}/{sparse}/{colbert} response was accepted: {res:?}"
+            );
+        }
+    }
+
+    /// The misalignment check runs per batch, so a reply that is correct for the
+    /// first batch and short for the second must still fail — and must not report
+    /// progress for a batch it did not complete.
+    #[tokio::test]
+    async fn misalignment_is_caught_in_a_later_batch_too() {
+        /// Correct for every batch but the second.
+        struct SecondBatchShort {
+            calls: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl BGEm3Model for SecondBatchShort {
+            async fn encode(
+                &self,
+                req: BGEm3EmbedRequest,
+                _token: CancellationToken,
+            ) -> Result<BGEm3EmbedResponse, EncodeError> {
+                let nth = {
+                    let mut c = self.calls.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                let n = req.texts.len();
+                let dense = if nth == 2 { n - 1 } else { n };
+                Ok(BGEm3EmbedResponse {
+                    dense_vecs: vec![vec![0.1; 4]; dense],
+                    sparse_vecs: vec![HashMap::from([(1u32, 0.5f32)]); n],
+                    colbert_vecs: vec![vec![vec![0.1; 4]]; n],
+                })
+            }
+            async fn health(&self) -> Result<(), EncodeError> {
+                unreachable!()
+            }
+        }
+
+        let embedder = SecondBatchShort {
+            calls: Mutex::new(0),
+        };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
+        let seen: Mutex<Vec<EmbedProgress>> = Mutex::new(vec![]);
+        let record = |p: EmbedProgress| seen.lock().unwrap().push(p);
+
+        // 100 chunks at embed_batch 64 → batches of 64 then 36; the second is short.
+        let res = embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &chunks(100),
+            &CancellationToken::new(),
+            TEST_TUNING,
+            Some(&record),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(EmbedUpsertError::Decode(_))),
+            "the second batch's misalignment slipped through: {res:?}"
+        );
+        assert_eq!(
+            store.upserted.lock().unwrap().len(),
+            64,
+            "the first batch is legitimately upserted; the second must not be"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "progress must be reported only for batches that completed"
+        );
     }
 
     #[tokio::test]

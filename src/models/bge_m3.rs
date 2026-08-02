@@ -558,6 +558,60 @@ mod tests {
         );
     }
 
+    /// The whole-call budget, not the per-attempt one. A `Request(timeout)` means a
+    /// single attempt hung; this is the other diagnosis — the embedder answered
+    /// promptly every time, always "busy", until the caller's budget was gone. It
+    /// used to have no bound at all: `(1 + max_429_retries)` full timeouts plus the
+    /// backoffs between them, forty minutes at the defaults, with a search held open
+    /// or a file's indexing claim held throughout.
+    #[tokio::test]
+    async fn a_permanently_busy_embedder_ends_the_call_at_the_whole_call_budget() {
+        let (mut client, hits) = stub_embedder(usize::MAX).await;
+        // Ten retries would be granted, but the budget only affords a couple of
+        // backoffs — so the *budget* must be what ends the call, not the retry count.
+        client.max_429_retries = 10;
+        client.backoff_base = Duration::from_millis(100);
+        client.encode_timeout = Duration::from_millis(250);
+
+        let started = std::time::Instant::now();
+        let res = client.encode(req(), CancellationToken::new()).await;
+
+        match res {
+            Err(EncodeError::Timeout(budget)) => {
+                assert_eq!(budget, Duration::from_millis(250), "reports its own budget")
+            }
+            other => panic!("expected Err(Timeout), got {other:?}"),
+        }
+        assert!(
+            hits.load(Ordering::SeqCst) < 1 + 10,
+            "the retry budget must not have been spent in full; the clock ended it"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "overran the whole-call budget by more than an order of magnitude"
+        );
+    }
+
+    /// The backoff is clamped to what is left of the budget, so a base delay far
+    /// larger than the whole budget cannot make one sleep outlive it.
+    #[tokio::test]
+    async fn a_backoff_longer_than_the_budget_does_not_outlive_it() {
+        let (mut client, _hits) = stub_embedder(usize::MAX).await;
+        client.max_429_retries = 5;
+        client.backoff_base = Duration::from_secs(30);
+        client.encode_timeout = Duration::from_millis(150);
+
+        let started = std::time::Instant::now();
+        let res = client.encode(req(), CancellationToken::new()).await;
+
+        assert!(matches!(res, Err(EncodeError::Timeout(_))), "got {res:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a 30s backoff was not clamped to the 150ms budget: took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// Build a wire-format body by hand (the encoding side `pack_encode` lives in
     /// Python; this mirrors it byte-for-byte to guard the Rust parser).
     fn pack(
@@ -612,6 +666,74 @@ mod tests {
         assert_eq!(out.sparse_vecs[0][&7], 0.25);
         assert_eq!(out.sparse_vecs[1][&9], 0.9);
         assert_eq!(out.sparse_vecs[1].len(), 2);
+    }
+
+    /// A count off the wire is not a capacity. `n` and the per-chunk ColBERT token
+    /// count are `u32`s the embedder sends; a corrupt body asked for ~100 GB and
+    /// aborted the process before any bounds-checked *read* could reject it. There
+    /// is no invented ceiling here — the body simply cannot hold what it claims.
+    ///
+    /// Note the failure shape this guards: without `checked_capacity` these do not
+    /// fail the assertion, they abort the whole test binary on allocation.
+    #[test]
+    fn a_count_off_the_wire_cannot_ask_for_an_impossible_allocation() {
+        // A header claiming 4 billion chunks, and nothing after it.
+        let mut absurd_n = ENCODE_MAGIC.to_vec();
+        absurd_n.extend_from_slice(&u32::MAX.to_le_bytes());
+        absurd_n.extend_from_slice(&1024u32.to_le_bytes());
+        assert!(
+            matches!(
+                parse_encode_response(&absurd_n),
+                Err(EncodeError::Decode(_))
+            ),
+            "an impossible chunk count was reserved instead of rejected"
+        );
+
+        // A believable header whose *sparse* section then claims 4 billion weights.
+        let mut absurd_sparse = ENCODE_MAGIC.to_vec();
+        absurd_sparse.extend_from_slice(&1u32.to_le_bytes());
+        absurd_sparse.extend_from_slice(&1u32.to_le_bytes());
+        absurd_sparse.extend_from_slice(&0.5f32.to_le_bytes()); // the one dense value
+        absurd_sparse.extend_from_slice(&u32::MAX.to_le_bytes()); // sparse count
+        assert!(
+            matches!(
+                parse_encode_response(&absurd_sparse),
+                Err(EncodeError::Decode(_))
+            ),
+            "an impossible sparse count was accepted"
+        );
+
+        // ...and one whose ColBERT section claims 4 billion tokens for one chunk.
+        let mut absurd_tokens = ENCODE_MAGIC.to_vec();
+        absurd_tokens.extend_from_slice(&1u32.to_le_bytes());
+        absurd_tokens.extend_from_slice(&1u32.to_le_bytes());
+        absurd_tokens.extend_from_slice(&0.5f32.to_le_bytes()); // dense
+        absurd_tokens.extend_from_slice(&0u32.to_le_bytes()); // empty sparse row
+        absurd_tokens.extend_from_slice(&u32::MAX.to_le_bytes()); // colbert tokens
+        assert!(
+            matches!(
+                parse_encode_response(&absurd_tokens),
+                Err(EncodeError::Decode(_))
+            ),
+            "an impossible ColBERT token count was accepted"
+        );
+    }
+
+    /// The guard must reject only what the body cannot hold — a legitimate reply
+    /// whose counts are large but paid for still parses.
+    #[test]
+    fn the_capacity_guard_does_not_reject_a_body_that_delivers_what_it_claims() {
+        let dense: Vec<Vec<f32>> = (0..64).map(|i| vec![i as f32; 8]).collect();
+        let sparse: Vec<Vec<(u32, f32)>> = (0..64)
+            .map(|i| (0..32).map(|k| (i * 32 + k, 0.5_f32)).collect())
+            .collect();
+        let colbert: Vec<Vec<Vec<f32>>> = (0..64).map(|_| vec![vec![1.0_f32; 8]; 40]).collect();
+
+        let buf = pack(8, &dense, &sparse, &colbert);
+        let out = parse_encode_response(&buf).expect("a body that delivers must parse");
+        assert_eq!(out.dense_vecs.len(), 64);
+        assert_eq!(out.sparse_vecs[63].len(), 32);
+        assert_eq!(out.colbert_vecs[63].len(), 40);
     }
 
     #[test]

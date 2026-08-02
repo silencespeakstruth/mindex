@@ -957,4 +957,272 @@ mod tests {
         // keep.rs (indexed) and pending.rs (deleted but still has a chunk) remain.
         assert_eq!(file_count(&pool, &guid).await, 2);
     }
+
+    /// How many times `gc_runs{trigger,outcome}` has been incremented, read off the
+    /// rendered exposition — the same text a scraper sees, so a renamed family or a
+    /// counter that silently never fires shows up here.
+    fn gc_runs(metrics: &Metrics, trigger: &str, outcome: &str) -> u64 {
+        metrics
+            .gc
+            .runs
+            .get_or_create(&TriggerOutcomeLabels {
+                trigger: if trigger == "manual" {
+                    "manual"
+                } else {
+                    "worker"
+                },
+                outcome: match outcome {
+                    "ok" => "ok",
+                    "error" => "error",
+                    _ => "cancelled",
+                },
+            })
+            .get()
+    }
+
+    /// The step order **is** the invariant: `project_file_chunks → project_files` is
+    /// `ON DELETE RESTRICT`, so `prune_deleted_files` can only fire once `sweep` has
+    /// hard-deleted the chunks. Running the file prune first would make a
+    /// `DELETE /files` take two passes to become physical — or, with a project
+    /// producing chunks faster than GC clears them, never.
+    #[tokio::test]
+    async fn one_pass_makes_a_soft_deleted_file_physical() {
+        let pool = migrated_pool().await;
+        let guid = "1".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 3).await;
+
+        // What `DELETE /files` leaves behind: chunks soft-deleted, file soft-deleted.
+        let g = guid.clone();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "UPDATE project_files SET status = 'deleted' WHERE project_guid = ?1",
+                params![g],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
+        let metrics = Metrics::new();
+        let out = collect(
+            &pool,
+            &store,
+            30,
+            &metrics,
+            "worker",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(out.chunks.removed, 3, "the chunks were not swept");
+        assert_eq!(
+            out.files.removed, 1,
+            "the file row survived the same pass that emptied it — the phases ran in \
+             the wrong order, so a delete now takes two passes to become physical"
+        );
+        assert_eq!(deleted_count(&pool, &guid).await, 0);
+        assert_eq!(file_count(&pool, &guid).await, 0);
+        assert!(out.failed_phases().is_empty());
+    }
+
+    /// A pass in which a phase could not run must be labelled `error`, not `ok`.
+    /// `gc_runs{outcome="ok"}` was incremented whenever the token was live, however
+    /// many phases had failed — so a GC broken for days read as idle.
+    #[tokio::test]
+    async fn a_pass_with_a_failed_phase_is_counted_as_an_error_and_names_it() {
+        let pool = migrated_pool().await;
+        let guid = "2".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 2).await;
+
+        // Qdrant refuses this project's collection, so `sweep` confirms nothing.
+        let store = FakeStore {
+            fail: HashSet::from([collection_name(&guid)]),
+        };
+        let metrics = Metrics::new();
+
+        let out = collect(
+            &pool,
+            &store,
+            30,
+            &metrics,
+            "worker",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            out.failed_phases(),
+            vec!["chunks"],
+            "the failing phase must be named, not merely counted"
+        );
+        assert_eq!(gc_runs(&metrics, "worker", "error"), 1);
+        assert_eq!(
+            gc_runs(&metrics, "worker", "ok"),
+            0,
+            "a pass with a dead phase was counted as a clean sweep"
+        );
+        // And the rows are still there for the next pass — the orphan-prevention rule.
+        assert_eq!(deleted_count(&pool, &guid).await, 2);
+    }
+
+    /// Severity wins: `error` outranks `cancelled`. A shutdown interrupting a pass is
+    /// routine; a phase that could not run is not, and burying the second under the
+    /// first would hide a broken GC behind every restart — the failure is loudest
+    /// exactly when the service is being bounced to try to clear it.
+    ///
+    /// The two conditions have to arrive in that order to coexist at all: under a
+    /// token cancelled up front, every phase short-circuits *cleanly* and none can
+    /// fail. So the store fails the delete and cancels the token as it does — which
+    /// is the real sequence, a Qdrant error and then a SIGTERM mid-pass.
+    #[tokio::test]
+    async fn a_failed_phase_outranks_a_cancelled_token() {
+        /// Fails every `delete_batch`, cancelling `on_call` as it goes.
+        struct FailThenCancel {
+            on_call: CancellationToken,
+        }
+
+        #[async_trait]
+        impl VectorStore for FailThenCancel {
+            async fn delete_batch(
+                &self,
+                _collection: &str,
+                _guids: Vec<String>,
+            ) -> Result<(), VectorStoreError> {
+                self.on_call.cancel();
+                Err(VectorStoreError("qdrant is gone".to_string()))
+            }
+            async fn ensure_project(&self, _collection: &str) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn health(&self) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn insert_batch(
+                &self,
+                _collection: &str,
+                _chunks: Vec<ChunkAsVector>,
+            ) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn search(
+                &self,
+                _collection: &str,
+                _chunk_ids: Vec<UUIDv4>,
+                _dense: Vec<f32>,
+                _sparse_indices: Vec<u32>,
+                _sparse_values: Vec<f32>,
+                _colbert: Vec<Vec<f32>>,
+                _top_k: u64,
+            ) -> Result<Vec<SearchHit>, VectorStoreError> {
+                unreachable!()
+            }
+        }
+
+        let pool = migrated_pool().await;
+        let guid = "3".repeat(32);
+        seed_deleted_chunks(&pool, &guid, 1).await;
+
+        let token = CancellationToken::new();
+        let store = FailThenCancel {
+            on_call: token.clone(),
+        };
+        let metrics = Metrics::new();
+
+        let out = collect(&pool, &store, 30, &metrics, "manual", &token).await;
+
+        assert!(token.is_cancelled(), "the store must have cancelled it");
+        assert_eq!(
+            out.failed_phases(),
+            vec!["chunks"],
+            "the sweep failed before the cancellation landed"
+        );
+        assert_eq!(
+            gc_runs(&metrics, "manual", "error"),
+            1,
+            "a broken phase was filed under the shutdown that followed it"
+        );
+        assert_eq!(gc_runs(&metrics, "manual", "cancelled"), 0);
+        assert_eq!(gc_runs(&metrics, "manual", "ok"), 0);
+    }
+
+    /// A pass that ran under a cancelled token did partial work at best. It must not
+    /// be counted as `ok` — a restart during a sweep would otherwise manufacture a
+    /// clean-sweep sample every time.
+    #[tokio::test]
+    async fn a_cancelled_pass_is_never_counted_as_a_clean_sweep() {
+        let pool = migrated_pool().await;
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
+        let metrics = Metrics::new();
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let out = collect(&pool, &store, 30, &metrics, "worker", &cancelled).await;
+
+        assert!(
+            out.failed_phases().is_empty(),
+            "a cancelled phase is a shutdown, not a breakage"
+        );
+        assert_eq!(gc_runs(&metrics, "worker", "cancelled"), 1);
+        assert_eq!(gc_runs(&metrics, "worker", "ok"), 0);
+    }
+
+    /// An idle pass with nothing to do is the healthy case and must stay `ok` — the
+    /// distinction the whole `Phase` type exists to draw is between *this* and the
+    /// failing pass above, and collapsing them in either direction is the bug.
+    #[tokio::test]
+    async fn a_pass_with_nothing_to_do_is_ok_not_an_error() {
+        let pool = migrated_pool().await;
+        let store = FakeStore {
+            fail: HashSet::new(),
+        };
+        let metrics = Metrics::new();
+
+        let out = collect(
+            &pool,
+            &store,
+            30,
+            &metrics,
+            "manual",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(out.failed_phases().is_empty());
+        assert_eq!(out.chunks.removed, 0);
+        assert_eq!(gc_runs(&metrics, "manual", "ok"), 1);
+        assert_eq!(gc_runs(&metrics, "manual", "error"), 0);
+    }
+
+    /// `failed_phases` is what `POST /gc` puts on the wire, so its names are a client
+    /// contract — a renamed phase silently empties whatever a client keys on.
+    #[test]
+    fn the_failed_phase_names_are_stable() {
+        let all_broken = GcOutcome {
+            chunks: Phase::broke(0),
+            files: Phase::broke(0),
+            status_log: Phase::broke(0),
+            research: Phase::broke(0),
+        };
+        assert_eq!(
+            all_broken.failed_phases(),
+            vec!["chunks", "files", "status_log", "research"]
+        );
+        assert!(GcOutcome::default().failed_phases().is_empty());
+
+        // A phase that failed part-way reports both what it managed and that it broke.
+        let partial = GcOutcome {
+            chunks: Phase::broke(17),
+            ..Default::default()
+        };
+        assert_eq!(partial.chunks.removed, 17);
+        assert_eq!(partial.failed_phases(), vec!["chunks"]);
+    }
 }

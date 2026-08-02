@@ -8069,6 +8069,80 @@ mod tests {
         }
     }
 
+    /// A probe that never answers must become a *failure*, not an unbounded wait.
+    /// `GET /health` is the endpoint every other liveness decision is made from, and
+    /// its SQLite probe was the one `transaction` in this file without a cancellation
+    /// binding — a wedged pool hung the check that exists to report a wedged pool.
+    #[tokio::test]
+    async fn a_probe_that_never_answers_becomes_a_failure_at_the_deadline() {
+        let limit = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+
+        let out: Result<(), ProbeFailure<&str>> = bounded(limit, async {
+            std::future::pending::<Result<(), &str>>().await
+        })
+        .await;
+
+        assert!(
+            matches!(out, Err(ProbeFailure::TimedOut(d)) if d == limit),
+            "a hung probe must time out and say how long it waited: {out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe outlived its own ceiling"
+        );
+    }
+
+    /// The dependency's own error must survive as `Failed`, distinct from a timeout —
+    /// "Qdrant said no" and "Qdrant said nothing" are different things to go and look
+    /// at, and the `warn!` at the probe site is the only place either is readable.
+    #[tokio::test]
+    async fn a_probe_that_fails_is_not_reported_as_a_timeout() {
+        let out: Result<(), ProbeFailure<&str>> =
+            bounded(Duration::from_secs(30), async { Err("connection refused") }).await;
+
+        match out {
+            Err(ProbeFailure::Failed(e)) => assert_eq!(e, "connection refused"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A probe that answers in time passes its value through untouched — the SQLite
+    /// probe's row count rides out this way, and `-1` (not known) has to stay
+    /// distinguishable from a real `0`.
+    #[tokio::test]
+    async fn a_probe_that_answers_in_time_returns_its_value() {
+        let out: Result<i64, ProbeFailure<&str>> =
+            bounded(Duration::from_secs(30), async { Ok(0i64) }).await;
+        assert_eq!(out.expect("should succeed"), 0);
+    }
+
+    /// The endpoint's worst case must be **one** ceiling, not the sum of them. The
+    /// probes ran one after another for their whole life, so five dead dependencies
+    /// cost five timeouts — on the one endpoint that is never allowed to stop
+    /// answering. This pins the shape `get_health` relies on: bounded probes joined,
+    /// not awaited in sequence.
+    #[tokio::test]
+    async fn five_hung_probes_cost_one_deadline_not_five() {
+        let limit = Duration::from_millis(80);
+        let hung =
+            || async move { bounded(limit, std::future::pending::<Result<(), &str>>()).await };
+
+        let started = std::time::Instant::now();
+        let (a, b, c, d, e) = tokio::join!(hung(), hung(), hung(), hung(), hung());
+        let elapsed = started.elapsed();
+
+        for out in [a, b, c, d, e] {
+            assert!(matches!(out, Err(ProbeFailure::TimedOut(_))));
+        }
+        assert!(
+            elapsed < limit * 3,
+            "five probes took {elapsed:?} against a {limit:?} ceiling — they are \
+             running in sequence, so the worst case is the sum of the dependency \
+             timeouts rather than the largest"
+        );
+    }
+
     /// A detached job that dies without a terminal event — the shape a panic
     /// takes — must not read as a completed stream. Before this, a research job
     /// that panicked in `parse_citations` closed its channel silently and every

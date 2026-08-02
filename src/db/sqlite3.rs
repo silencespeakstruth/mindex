@@ -453,6 +453,188 @@ mod tests {
         assert_eq!(p.available().await, 2);
     }
 
+    /// Create a parent/child pair joined by `ON DELETE RESTRICT` — the shape of
+    /// `project_file_chunks → project_files`, the FK the whole soft-delete lifecycle
+    /// rests on — and seed one row of each.
+    async fn seed_restrict_fk(p: &SQLite3Pool) {
+        p.transaction(CancellationToken::new(), |tx| {
+            tx.execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (
+                     id        INTEGER PRIMARY KEY,
+                     parent_id INTEGER NOT NULL
+                         REFERENCES parent(id) ON DELETE RESTRICT
+                 );
+                 INSERT INTO parent (id) VALUES (1);
+                 INSERT INTO child (id, parent_id) VALUES (1, 1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    }
+
+    /// Does an ordinary transaction on this pool still refuse to orphan a child row?
+    async fn foreign_keys_enforced(p: &SQLite3Pool) -> bool {
+        p.transaction(CancellationToken::new(), |tx| {
+            tx.execute("DELETE FROM parent WHERE id = 1", [])?;
+            Ok(())
+        })
+        .await
+        .is_err()
+    }
+
+    /// `migration_transaction` runs with `PRAGMA foreign_keys = OFF`, and the restore
+    /// is **outside** the closure precisely because it must also happen when the
+    /// closure failed. A connection pushed back with enforcement still off silently
+    /// disables foreign keys for every unrelated caller that later borrows it — for
+    /// the life of the process, with no error anywhere, on the one constraint the
+    /// chunk/file lifecycle depends on.
+    #[tokio::test]
+    async fn a_failed_migration_returns_a_connection_that_still_enforces_foreign_keys() {
+        // Size 1 and ":memory:": every transaction below is served by the very
+        // connection the migration borrowed, which is what makes the leak observable.
+        let p = pool(1);
+        seed_restrict_fk(&p).await;
+        assert!(
+            foreign_keys_enforced(&p).await,
+            "sanity: the FK must be enforced before the migration"
+        );
+
+        let res: Result<(), _> = p
+            .migration_transaction(CancellationToken::new(), |tx| {
+                // Prove enforcement really is suspended in here...
+                tx.execute("DELETE FROM parent WHERE id = 1", [])?;
+                // ...then fail, so the transaction rolls back and the restore has to
+                // happen on the error path.
+                Err(SQLite3PoolError::HTTPStatusCode(StatusCode::BAD_REQUEST))
+            })
+            .await;
+        assert!(res.is_err(), "the migration closure was supposed to fail");
+
+        assert_eq!(p.available().await, 1, "the connection must come back");
+        assert!(
+            foreign_keys_enforced(&p).await,
+            "a failed migration handed back a connection with foreign keys disabled; \
+             every later borrower of it silently ignores ON DELETE RESTRICT"
+        );
+    }
+
+    /// The same restoration after a migration that *succeeded* — the ordinary path,
+    /// and the one that runs on every cold start.
+    #[tokio::test]
+    async fn a_successful_migration_returns_a_connection_that_still_enforces_foreign_keys() {
+        let p = pool(1);
+        seed_restrict_fk(&p).await;
+
+        p.migration_transaction(CancellationToken::new(), |tx| {
+            // A table rebuild is what this mode exists for; the FK suspension is what
+            // lets the child survive its parent being dropped and recreated.
+            tx.execute_batch(
+                "CREATE TABLE parent_new (id INTEGER PRIMARY KEY);
+                 INSERT INTO parent_new (id) SELECT id FROM parent;
+                 DROP TABLE parent;
+                 ALTER TABLE parent_new RENAME TO parent;",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("the migration should commit");
+
+        assert!(
+            foreign_keys_enforced(&p).await,
+            "a committed migration left foreign keys disabled on its connection"
+        );
+    }
+
+    /// A migration closure that panics must not hand an unenforced connection back —
+    /// the connection is dropped with the panicked task, which is the safe outcome
+    /// and the reason the restore does not need to be panic-safe.
+    #[tokio::test]
+    async fn a_panicking_migration_drops_its_connection_rather_than_returning_it_unenforced() {
+        let p = pool(2);
+        let res: Result<(), _> = p
+            .migration_transaction(CancellationToken::new(), |_tx| {
+                panic!("deliberate: a bug inside a migration closure")
+            })
+            .await;
+
+        assert!(matches!(res, Err(SQLite3PoolError::Panicked)), "{res:?}");
+        assert_eq!(
+            p.available().await,
+            1,
+            "an unenforced connection was returned to the pool by a panicked migration"
+        );
+    }
+
+    /// A closure that returns an error is routine — a validation failure, a constraint
+    /// violation — and must cost the pool nothing. Only a *panic* may cost a
+    /// connection; if an ordinary error did too, a project that trips a CHECK on every
+    /// request would drain the pool in four tries and then answer `database.busy`
+    /// for ever.
+    #[tokio::test]
+    async fn an_erroring_closure_costs_the_pool_nothing() {
+        let p = pool(1);
+        for _ in 0..10 {
+            let res: Result<(), _> = p
+                .transaction(CancellationToken::new(), |_tx| {
+                    Err(SQLite3PoolError::HTTPStatusCode(StatusCode::BAD_REQUEST))
+                })
+                .await;
+            assert!(res.is_err());
+        }
+        assert_eq!(p.available().await, 1);
+        assert!(matches!(
+            p.transaction(CancellationToken::new(), |_tx| Ok(3)).await,
+            Ok(3)
+        ));
+    }
+
+    /// The four transaction outcomes are four separate diagnoses, and the metric label
+    /// is where an operator reads them. A panic bucketed under `cancelled` told the
+    /// dashboard a client had disconnected — the one thing it must not be told, since
+    /// it also hides that the pool just shrank permanently.
+    #[tokio::test]
+    async fn every_transaction_outcome_gets_its_own_metric_label() {
+        let metrics = Metrics::new();
+        let p = SQLite3Pool::new(Path::new(":memory:"), 2, 16384, "NORMAL").with_metrics(&metrics);
+
+        p.transaction(CancellationToken::new(), |_tx| Ok(()))
+            .await
+            .expect("ok");
+
+        let _: Result<(), _> = p
+            .transaction(CancellationToken::new(), |_tx| {
+                Err(SQLite3PoolError::HTTPStatusCode(StatusCode::BAD_REQUEST))
+            })
+            .await;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let _: Result<(), _> = p.transaction(cancelled, |_tx| Ok(())).await;
+
+        let _: Result<(), _> = p
+            .transaction(CancellationToken::new(), |_tx| panic!("deliberate"))
+            .await;
+
+        let text = metrics.render().expect("renders");
+        for outcome in ["ok", "error", "panic"] {
+            assert!(
+                text.contains(&format!(
+                    r#"mindex_db_transactions_total{{outcome="{outcome}"}} 1"#
+                )),
+                "outcome {outcome} was not counted once: {text}"
+            );
+        }
+        // A pre-cancelled token short-circuits before the metrics block, so it is
+        // deliberately *not* counted — the caller never reached the database. Pinned
+        // so a future refactor that starts counting it is a decision, not an accident.
+        assert!(
+            !text.contains(r#"mindex_db_transactions_total{outcome="cancelled"}"#),
+            "a transaction refused before it touched the pool was counted: {text}"
+        );
+    }
+
     // A panicking closure is a programmer error: its connection is deliberately
     // dropped (not returned), the caller gets an error instead of a propagated panic,
     // and the pool keeps serving on the remaining connections.

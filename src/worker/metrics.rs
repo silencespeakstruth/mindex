@@ -450,14 +450,18 @@ async fn probe_vector_counts(
     for guid in projects {
         match store.count_points(&collection_name(&guid)).await {
             Ok(Some(n)) => counted.push((guid, n)),
-            // The store declines to answer (every test fake, by design). Not an error,
-            // and not a zero.
-            Ok(None) => return,
+            // The store declines to answer (every test fake takes the trait's provided
+            // impl, by design). Not an error, and not a zero — but also not a reason to
+            // abandon the walk: `SELECT guid FROM projects` has no ORDER BY, so a
+            // `return` here would make every other project's count depend on which
+            // project happened to be created first.
+            Ok(None) => continue,
             Err(e) => warn!(
                 error = %e,
                 project_guid = %guid,
-                "Metrics collector: could not count this project's vectors; leaving its \
-                 previous count in place. Sysadmin: check Qdrant is reachable."
+                "Metrics collector: could not count this project's vectors; it will be \
+                 absent from mindex_project_vectors this tick rather than reported as \
+                 zero. Sysadmin: check Qdrant is reachable."
             ),
         }
     }
@@ -512,7 +516,84 @@ mod tests {
     use super::*;
     use crate::db::sqlite3::SQLite3Pool;
 
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+
+    use crate::backend::v0::models::UUIDv4;
+    use crate::db::qdrant::{ChunkAsVector, SearchHit, VectorStoreError};
+
     const MODEL: &str = "BAAI/bge-m3";
+
+    /// A store that answers the vector-count probe from a script keyed by collection
+    /// name: `Some(Ok(n))` counts, `Some(Err)` fails, and a name absent from the map
+    /// declines with `Ok(None)` exactly as the trait's provided default does.
+    struct CountingStore {
+        counts: HashMap<String, Result<u64, &'static str>>,
+        /// When set, every collection declines — the shape every other test fake has.
+        declines: bool,
+    }
+
+    impl CountingStore {
+        fn with(pairs: &[(&str, Result<u64, &'static str>)]) -> Self {
+            Self {
+                counts: pairs
+                    .iter()
+                    .map(|(g, r)| (collection_name(g), *r))
+                    .collect(),
+                declines: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VectorStore for CountingStore {
+        async fn count_points(&self, collection: &str) -> Result<Option<u64>, VectorStoreError> {
+            if self.declines {
+                return Ok(None);
+            }
+            match self.counts.get(collection) {
+                Some(Ok(n)) => Ok(Some(*n)),
+                Some(Err(e)) => Err(VectorStoreError((*e).to_string())),
+                None => Ok(None),
+            }
+        }
+
+        async fn ensure_project(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            unreachable!("the vector-count probe creates nothing")
+        }
+        async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn health(&self) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn insert_batch(
+            &self,
+            _collection: &str,
+            _chunks: Vec<ChunkAsVector>,
+        ) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_batch(
+            &self,
+            _collection: &str,
+            _guids: Vec<String>,
+        ) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn search(
+            &self,
+            _collection: &str,
+            _chunk_ids: Vec<UUIDv4>,
+            _dense: Vec<f32>,
+            _sparse_indices: Vec<u32>,
+            _sparse_values: Vec<f32>,
+            _colbert: Vec<Vec<f32>>,
+            _top_k: u64,
+        ) -> Result<Vec<SearchHit>, VectorStoreError> {
+            unreachable!()
+        }
+    }
 
     fn tuning() -> MetricsTuning {
         MetricsTuning {
@@ -623,6 +704,231 @@ mod tests {
                 r#"mindex_project_files_by_language{{project_guid="{a}",language="rust"}} 1"#
             )),
             "{text}"
+        );
+    }
+
+    /// The whole point of the probe: SQLite says the project holds chunks, Qdrant
+    /// says it holds no points. That divergence is the only detector for a lost
+    /// Qdrant volume — `ensure_collection` silently remakes an empty collection,
+    /// every file still reads `indexed`, and search answers 404 for ever.
+    #[tokio::test]
+    async fn a_project_whose_vectors_are_gone_reports_zero_against_its_chunk_count() {
+        let a = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let pool = pool().await;
+        seed_project(&pool, a).await;
+
+        let store: Arc<dyn VectorStore> = Arc::new(CountingStore::with(&[(a, Ok(0))]));
+        let metrics = Metrics::new();
+        let token = CancellationToken::new();
+
+        probe_vector_counts(&store, &pool, &metrics, &token).await;
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{a}"}} 0"#
+            )),
+            "a project the store answered zero for must say zero: {text}"
+        );
+    }
+
+    /// A store that cannot answer for a project must leave that project **absent**,
+    /// never zero — zero is the alarming value here, and an unreachable Qdrant
+    /// manufacturing it would page somebody about a healthy index. The projects the
+    /// same tick *could* count must still be reported.
+    #[tokio::test]
+    async fn a_project_the_store_cannot_count_is_absent_never_zero() {
+        let good = "11111111111111111111111111111111";
+        let bad = "22222222222222222222222222222222";
+        let pool = pool().await;
+        seed_project(&pool, good).await;
+        seed_project(&pool, bad).await;
+
+        let store: Arc<dyn VectorStore> = Arc::new(CountingStore::with(&[
+            (good, Ok(7)),
+            (bad, Err("qdrant down")),
+        ]));
+        let metrics = Metrics::new();
+
+        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{good}"}} 7"#
+            )),
+            "one project failing must not cost the others their counts: {text}"
+        );
+        assert!(
+            !text.contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{bad}"}}"#
+            )),
+            "an uncountable project was given a number anyway: {text}"
+        );
+    }
+
+    /// The clear-and-repopulate rule applies to this family too: a `Family` never
+    /// forgets a label set, so a deleted project would keep reporting the vector
+    /// count it had on the tick before it was dropped.
+    #[tokio::test]
+    async fn a_deleted_project_stops_reporting_its_vector_count() {
+        let a = "33333333333333333333333333333333";
+        let b = "44444444444444444444444444444444";
+        let pool = pool().await;
+        seed_project(&pool, a).await;
+        seed_project(&pool, b).await;
+
+        let store: Arc<dyn VectorStore> =
+            Arc::new(CountingStore::with(&[(a, Ok(11)), (b, Ok(22))]));
+        let metrics = Metrics::new();
+        let token = CancellationToken::new();
+
+        probe_vector_counts(&store, &pool, &metrics, &token).await;
+        assert!(metrics.render().expect("renders").contains(&format!(
+            r#"mindex_project_vectors{{project_guid="{b}"}} 22"#
+        )));
+
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute("DELETE FROM project_files WHERE project_guid = ?1", [b])?;
+            tx.execute("DELETE FROM projects WHERE guid = ?1", [b])?;
+            Ok(())
+        })
+        .await
+        .expect("delete");
+
+        probe_vector_counts(&store, &pool, &metrics, &token).await;
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{a}"}} 11"#
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&format!(r#"mindex_project_vectors{{project_guid="{b}"}}"#)),
+            "a deleted project is still reporting its last vector count: {text}"
+        );
+    }
+
+    /// Every other `VectorStore` in the tree — and every test fake — takes the
+    /// trait's provided `count_points`, which declines. Declining must publish
+    /// nothing at all: a store that cannot count is not a store reporting zeros.
+    #[tokio::test]
+    async fn a_store_that_declines_to_count_publishes_no_gauge() {
+        let a = "55555555555555555555555555555555";
+        let pool = pool().await;
+        seed_project(&pool, a).await;
+
+        let store: Arc<dyn VectorStore> = Arc::new(CountingStore {
+            counts: HashMap::new(),
+            declines: true,
+        });
+        let metrics = Metrics::new();
+
+        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+
+        assert!(
+            !metrics
+                .render()
+                .expect("renders")
+                .contains("mindex_project_vectors{"),
+            "a declining store manufactured a gauge"
+        );
+    }
+
+    /// One project the store declines to answer for must not cost every *other*
+    /// project its count. The probe walks projects in whatever order SQLite returns
+    /// them, so a decline that abandoned the walk would make the whole family's
+    /// contents depend on insertion order — a metric that is right or wrong
+    /// depending on which project was created first.
+    #[tokio::test]
+    async fn one_declined_project_does_not_abandon_the_rest_of_the_walk() {
+        let declined = "88888888888888888888888888888888";
+        let counted = "99999999999999999999999999999999";
+        let pool = pool().await;
+        // Seeded first, so it is the first row `SELECT guid FROM projects` returns.
+        seed_project(&pool, declined).await;
+        seed_project(&pool, counted).await;
+
+        // `declined` is absent from the map, so the store answers `Ok(None)` for it.
+        let store: Arc<dyn VectorStore> = Arc::new(CountingStore::with(&[(counted, Ok(5))]));
+        let metrics = Metrics::new();
+
+        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{counted}"}} 5"#
+            )),
+            "a decline on an earlier project swallowed a later project's count: {text}"
+        );
+        assert!(
+            !text.contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{declined}"}}"#
+            )),
+            "the declined project was given a number: {text}"
+        );
+    }
+
+    /// A cancelled tick must not clear the family it cannot refill — the same rule
+    /// `collect_once` follows, in the one place that reaches Qdrant.
+    #[tokio::test]
+    async fn a_cancelled_probe_leaves_the_previous_vector_counts_alone() {
+        let a = "66666666666666666666666666666666";
+        let pool = pool().await;
+        seed_project(&pool, a).await;
+
+        let store: Arc<dyn VectorStore> = Arc::new(CountingStore::with(&[(a, Ok(9))]));
+        let metrics = Metrics::new();
+
+        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+        assert!(metrics.render().expect("renders").contains(&format!(
+            r#"mindex_project_vectors{{project_guid="{a}"}} 9"#
+        )));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        probe_vector_counts(&store, &pool, &metrics, &cancelled).await;
+
+        assert!(
+            metrics.render().expect("renders").contains(&format!(
+                r#"mindex_project_vectors{{project_guid="{a}"}} 9"#
+            )),
+            "a cancelled probe wiped the counts it could not refresh"
+        );
+    }
+
+    /// `state_refreshed_timestamp_seconds` dates the last *successful* snapshot. A
+    /// failed read deliberately keeps the previous gauges, which was
+    /// indistinguishable from a healthy tick — so the timestamp must not advance
+    /// when nothing was read.
+    #[tokio::test]
+    async fn the_refresh_timestamp_advances_only_on_a_tick_that_read_something() {
+        let a = "77777777777777777777777777777777";
+        let pool = pool().await;
+        seed_project(&pool, a).await;
+
+        let metrics = Metrics::new();
+        assert_eq!(
+            metrics.state.state_refreshed_at.get(),
+            0,
+            "nothing has been collected yet"
+        );
+
+        collect_once(&pool, &metrics, &tuning(), &CancellationToken::new()).await;
+        let stamped = metrics.state.state_refreshed_at.get();
+        assert!(stamped > 0, "a successful tick did not date itself");
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        collect_once(&pool, &metrics, &tuning(), &cancelled).await;
+
+        assert_eq!(
+            metrics.state.state_refreshed_at.get(),
+            stamped,
+            "a tick that read nothing dated the gauges as fresh"
         );
     }
 
