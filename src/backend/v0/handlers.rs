@@ -12640,4 +12640,58 @@ mod tests {
             "the reference lives outside the scope"
         );
     }
+
+    // ── drift: the buckets the four clients act on ───────────────────────────
+
+    /// An in-flight file the client no longer has is left to settle rather than
+    /// called orphaned: a delete would race the batch that is writing it, and the
+    /// next sweep sees a settled state either way. Distinct from the in-flight case
+    /// above, which has the file still present locally.
+    #[test]
+    fn an_in_flight_file_missing_locally_is_not_orphaned_yet() {
+        let d = compute_drift(&map(&[("busy.rs", "h")]), &set(&["busy.rs"]), &map(&[]));
+
+        assert!(
+            d.orphaned.is_empty(),
+            "a file mid-index was proposed for deletion"
+        );
+        // Nor `indexing`: that bucket describes the posted manifest, and this path
+        // is not in it.
+        assert!(d.indexing.is_empty());
+        assert!(d.stale.is_empty() && d.missing.is_empty());
+    }
+
+    /// An empty manifest against a populated index means the working tree is gone,
+    /// and every indexed file is genuinely orphaned. A legitimate answer rather than
+    /// a malformed request — `validate_drift_request` agrees.
+    #[test]
+    fn an_empty_manifest_orphans_everything_indexed() {
+        let d = compute_drift(&map(&[("a.rs", "x"), ("b.rs", "y")]), &set(&[]), &map(&[]));
+        assert_eq!(d.orphaned, vec!["a.rs", "b.rs"]);
+        assert!(d.stale.is_empty() && d.missing.is_empty());
+    }
+
+    /// Every bucket comes back sorted. Three clients diff these lists between runs
+    /// and print them to humans, and the inputs are `HashMap`s — unsorted, an
+    /// unchanged project would look different on every call, and `--check`'s output
+    /// would reshuffle for no reason.
+    #[test]
+    fn every_drift_bucket_comes_back_sorted() {
+        let d = compute_drift(
+            &map(&[("z.rs", "1"), ("a.rs", "1"), ("m.rs", "1"), ("k.rs", "1")]),
+            &set(&["k.rs"]),
+            &map(&[
+                ("z.rs", "2"),
+                ("a.rs", "2"),
+                ("k.rs", "1"),
+                ("zz.rs", "3"),
+                ("aa.rs", "3"),
+            ]),
+        );
+
+        assert_eq!(d.stale, vec!["a.rs", "z.rs"]);
+        assert_eq!(d.missing, vec!["aa.rs", "zz.rs"]);
+        assert_eq!(d.orphaned, vec!["m.rs"]);
+        assert_eq!(d.indexing, vec!["k.rs"]);
+    }
 }
