@@ -798,12 +798,13 @@ impl Metrics {
         );
         registry.register(
             "research_challenges",
-            "Challenge runs recorded, by overall verdict.",
+            "Challenge runs recorded, by overall verdict",
             research.challenges.clone(),
         );
         registry.register(
             "research_challenge_verdict_caps",
-            "Challenge verdicts downgraded because the challenge's own report was ungrounded.",
+            // No trailing period: the encoder appends one.
+            "Challenge verdicts downgraded because the challenge's own report was ungrounded",
             research.challenge_verdict_caps.clone(),
         );
         registry.register(
