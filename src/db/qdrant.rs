@@ -25,6 +25,7 @@ use qdrant_client::qdrant::Vector;
 use qdrant_client::qdrant::VectorParamsBuilder;
 use qdrant_client::qdrant::VectorsConfigBuilder;
 use qdrant_client::qdrant::condition;
+use tracing::warn;
 
 use crate::backend::v0::models::UUIDv4;
 
@@ -258,11 +259,43 @@ impl VectorStore for QdrantStore {
         collection: &str,
         qdrant_guids: Vec<String>,
     ) -> Result<(), VectorStoreError> {
-        self.client
+        let attempt = self
+            .client
             .delete_points(DeletePointsBuilder::new(collection).points(qdrant_guids))
-            .await?;
+            .await;
+        let Err(err) = attempt else {
+            return Ok(());
+        };
 
-        Ok(())
+        // A **missing collection** is a success, like it is for `delete_collection`
+        // and `count_points` beside it: the vectors this was asked to remove are
+        // demonstrably not there. Reported as a failure it was worse than cosmetic —
+        // GC's rule is to keep a chunk row until its vector is confirmed gone, so
+        // those rows could never be swept, their `deleted` file rows could never be
+        // pruned behind the RESTRICT FK, and the backlog grew for the life of the
+        // deployment. That is precisely the state a lost Qdrant volume leaves behind,
+        // i.e. the one where GC needs to work most.
+        //
+        // Checked only after a failure, so the ordinary path pays no extra round
+        // trip. And **only a definitive `false` converts**: if `collection_exists`
+        // itself fails — an unreachable Qdrant — the original error stands. Reading
+        // "I could not ask" as "it is not there" would hard-delete SQLite rows whose
+        // vectors are still present, orphaning them with nothing left to track them,
+        // which is the exact failure the confirm-before-delete rule exists to prevent.
+        match self.client.collection_exists(collection).await {
+            Ok(false) => {
+                warn!(
+                    collection,
+                    "Qdrant has no such collection, so the vectors this delete would \
+                     have removed are already gone; treating it as done. Sysadmin: if \
+                     this project should have vectors, its collection has been lost — \
+                     compare mindex_project_vectors against mindex_project_chunks_active \
+                     and reindex."
+                );
+                Ok(())
+            }
+            _ => Err(err.into()),
+        }
     }
 
     async fn delete_collection(&self, collection: &str) -> Result<(), VectorStoreError> {

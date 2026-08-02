@@ -583,7 +583,13 @@ def test_ollama_failure_becomes_an_error_event(
     assert events, "an error event must be emitted"
     event, data = events[-1]
     assert event == "error"
-    assert "ollama.unavailable" in data
+    # Ollama's two failure classes are two codes, and the mock produces the second:
+    # it *answers*, with a 500. `ollama.error` means Ollama replied with an error —
+    # nearly always a model that is not pulled — while `ollama.unavailable` means it
+    # could not be reached or stayed mute. Collapsed into one, a client could neither
+    # word the message nor decide whether re-reading `/health` would say anything.
+    assert "ollama.error" in data, data
+    assert "ollama.unavailable" not in data, data
 
 
 def test_dead_ollama_degrades_health_and_carries_no_detail(

@@ -292,12 +292,27 @@ def test_concurrent_gc_is_serialized(client: httpx.Client, project: str) -> None
     assert any(r.status_code == 200 for r in responses)
     for r in responses:
         if r.status_code == 200:
-            assert set(r.json()) == {
+            body = set(r.json())
+            assert {
                 "chunks_removed",
                 "files_removed",
                 "status_log_pruned",
                 "research_runs_pruned",
-            }
+            } <= body
+            # `failed_phases` is optional on the wire — omitted on a clean pass,
+            # present naming the phases that could not run. It legitimately appears
+            # here: earlier tests drop projects whose collections then no longer
+            # exist, so the chunk sweep's `delete_batch` fails for them and those
+            # rows are kept for the next sweep. That is the counter this field was
+            # added to make visible, so the assertion allows it rather than
+            # pinning a key set that a broken GC would also satisfy.
+            assert body <= {
+                "chunks_removed",
+                "files_removed",
+                "status_log_pruned",
+                "research_runs_pruned",
+                "failed_phases",
+            }, f"unexpected key in the GC response: {body}"
 
 
 # ---------------------------------------------------------------------------

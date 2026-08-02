@@ -15037,4 +15037,114 @@ mod tests {
             }
         );
     }
+
+    /// **Order matters here, and getting it backwards corrupts the corpus every
+    /// effort preset is derived from.**
+    ///
+    /// A disconnect cancels the whole token tree, so a cancelled *child* proves
+    /// nothing on its own — the job token has to be ruled out first. Test the child
+    /// alone and a client hanging up mid-run is journalled as `time_exhausted`: the
+    /// run looks like it spent its whole budget, `observed` gets a wall-clock sample
+    /// from a run nobody waited for, and the ladder is priced off it.
+    ///
+    /// The other direction costs a whole run: a genuine deadline stop misread as a
+    /// disconnect makes `is_deadline_stop` false, and a run that had found things
+    /// aborts instead of writing them up.
+    #[test]
+    fn a_deadline_stop_and_a_disconnect_are_told_apart_in_that_order() {
+        let job = CancellationToken::new();
+        let deadline = job.child_token();
+
+        // Nothing has fired.
+        assert!(!stopped_by(&job, &deadline));
+
+        // The deadline fires on its own: the child is cancelled, the job is not.
+        let job = CancellationToken::new();
+        let deadline = job.child_token();
+        deadline.cancel();
+        assert!(
+            stopped_by(&job, &deadline),
+            "a deadline that fired on its own was not recognised, so the run throws \
+             away findings it was supposed to write up"
+        );
+
+        // The client leaves: cancelling the job cancels the child with it, and the
+        // child alone would say "deadline".
+        let job = CancellationToken::new();
+        let deadline = job.child_token();
+        job.cancel();
+        assert!(
+            deadline.is_cancelled(),
+            "sanity: a disconnect cancels the whole tree, which is why the child \
+             proves nothing on its own"
+        );
+        assert!(
+            !stopped_by(&job, &deadline),
+            "a client disconnect was recorded as the run's own deadline; every \
+             abandoned run then becomes a `time_exhausted` sample in the corpus the \
+             effort ladder is priced from"
+        );
+    }
+
+    /// A deadline stop is not a failure — the run keeps what it found and writes
+    /// about it. But only a *cancellation* can be one: an Ollama error or an index
+    /// failure is a failure whatever the clock says, and shipping a report over one
+    /// would present a broken run as a short one.
+    #[test]
+    fn only_a_cancellation_can_be_a_deadline_stop() {
+        let job = CancellationToken::new();
+        let deadline = job.child_token();
+        deadline.cancel();
+
+        assert!(
+            is_deadline_stop(&job, &deadline, &ResearchAbort::Cancelled),
+            "the deadline fired and the abort was a cancellation"
+        );
+        assert!(
+            !is_deadline_stop(
+                &job,
+                &deadline,
+                &ResearchAbort::Failed {
+                    code: "ollama.unavailable".to_string(),
+                    detail: "connection refused".into(),
+                }
+            ),
+            "a dependency failure was treated as the run's own deadline, so a broken \
+             run would ship a report as though it had merely run short"
+        );
+
+        // And a cancellation that was *the client* is not a deadline stop either.
+        let job = CancellationToken::new();
+        let deadline = job.child_token();
+        job.cancel();
+        assert!(!is_deadline_stop(
+            &job,
+            &deadline,
+            &ResearchAbort::Cancelled
+        ));
+    }
+
+    /// The report window is a child of the **job** token, never of the budget one —
+    /// otherwise the investigation deadline firing would take the report phase with
+    /// it, and a run that stopped exactly on time would return nothing. This pins
+    /// the tree shape the two functions above are read against.
+    #[test]
+    fn the_investigation_deadline_does_not_cancel_the_report_window() {
+        let job = CancellationToken::new();
+        let investigation = job.child_token();
+        let report = job.child_token();
+
+        investigation.cancel();
+        assert!(
+            !report.is_cancelled(),
+            "the report window is a sibling of the investigation deadline, not its \
+             child; a run that used its whole budget must still get to write up"
+        );
+        assert!(stopped_by(&job, &investigation));
+
+        // But the client leaving takes both.
+        job.cancel();
+        assert!(report.is_cancelled());
+        assert!(!stopped_by(&job, &report));
+    }
 }

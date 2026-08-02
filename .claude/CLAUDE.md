@@ -140,7 +140,18 @@ single "the" answer); ranking is purely path-based (anchor file > its exact dir
 sweep deletes from SQLite *only* chunks whose Qdrant `delete_batch` succeeded;
 failed collections keep their rows `deleted` for the next sweep (SQLite-first
 would orphan the vector forever). If every collection in a batch fails, the
-loop breaks rather than spinning. The same pass prunes
+loop breaks rather than spinning. **A missing collection is a confirmation, not
+a failure** — `delete_batch` (`db/qdrant.rs`) converts it, as `delete_collection`
+and `count_points` beside it already did: the vectors it was asked to remove are
+demonstrably not there. Reported as a failure it was worse than cosmetic, because
+"keep the row until the vector is confirmed gone" then meant *never*: the chunk
+rows were unsweepable, their `deleted` file rows unprunable behind the RESTRICT
+FK, and the backlog grew for the life of the deployment — in exactly the state a
+lost Qdrant volume leaves behind, where GC needs to work most. The conversion is
+checked only **after** a failure (the ordinary path pays no extra round trip) and
+only a definitive `Ok(false)` converts: if `collection_exists` cannot answer, the
+original error stands, since reading "I could not ask" as "it is not there" would
+hard-delete rows whose vectors are still present. The same pass prunes
 `project_file_status_log` (`[workers].status_log_retention_days`, default 30)
 and runs `prune_deleted_files` — drops `deleted` `project_files` rows once
 their chunks are gone (guard: `NOT EXISTS` over *any* chunk row; FK RESTRICT,
