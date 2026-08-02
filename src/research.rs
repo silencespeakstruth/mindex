@@ -41,7 +41,8 @@ use crate::models::ollama::{
 /// [`SUFFICIENCY_REQUEST`], the re-open nudge that follows it,
 /// [`REVALIDATION_SYSTEM_PROMPT`], [`format_citation_complaint`],
 /// [`format_ungrounded_complaint`], [`format_markdown_complaint`],
-/// [`REPORT_ROLE`] or [`report_system_prompt`], either report turn's
+/// [`REPORT_ROLE`], [`report_system_prompt`], [`section_system_prompt`] or
+/// [`section_request`], either report turn's
 /// user message, the
 /// budget-exhausted nudges, [`format_prior_reports`], or [`tool_specs`] — anything
 /// that changes what the model is asked or what it may call. The run-state note counts too, but only its
@@ -81,7 +82,16 @@ use crate::models::ollama::{
 /// ([`CHALLENGE_VERDICT_REQUEST`]). MINOR rather than MAJOR because an ordinary
 /// research run's transcript is byte-for-byte 2.1 — the new text reaches only
 /// runs of the new kind, and `kind` on the row is what separates the corpora.
-pub const PROMPT_VERSION: &str = "2.2";
+///
+/// 2.2 → 2.3: [`section_request`] forbids meta-narrative. Sections were arriving
+/// titled after a step of the plan ("## 1. File discovery bypassed") and spending
+/// their whole allowance explaining which route the run took instead of answering
+/// the sub-question — a section the reader cannot use, produced at the same price
+/// as one they can. The server already journals the trace, so the prompt now says
+/// the route is not a finding, and narrows the escape hatch: "not answered" now
+/// means nothing a tool returned bears on it, not that the plan was not followed.
+/// MINOR: the job is unchanged.
+pub const PROMPT_VERSION: &str = "2.3";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -2384,8 +2394,14 @@ fn section_request(
          summarise the other sections, and do not restate the question. Cite as \
          `path:start-end`, only locations a tool returned this run. Where a claim rests \
          on inference rather than on something a tool returned, say so in the sentence \
-         that makes it. If this sub-question was not answered, say so in two sentences \
-         and stop.",
+         that makes it.\n\nWRITE ABOUT THE CODE, NOT ABOUT THE INVESTIGATION. Which \
+         tools you called, which planned step you skipped, shortcut or found \
+         unnecessary, and how the budget was spent are not findings, and the server \
+         records all of it separately — a section titled after a step of your plan is a \
+         wasted section. If you reached this sub-question's answer by a different route \
+         than you planned, write the answer and say nothing about the route. Only if the \
+         sub-question is genuinely unanswered — nothing a tool returned this run bears on \
+         it — say so in two sentences and stop.",
         item.number
     ));
     s

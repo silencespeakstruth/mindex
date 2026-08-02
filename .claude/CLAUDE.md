@@ -182,7 +182,7 @@ current consts; both nullable, and NULL never matches. `post_search` returns
 the *way* something is produced changed; MAJOR = its *shape* did. All compared
 by plain equality, never ordered — both halves trigger the identical rebuild.
 The set: `CHUNKS_DERIVATION_VERSION`, `SYMBOLS_DERIVATION_VERSION` (both
-`"1.0"`), `PROMPT_VERSION` (`"2.2"`). Deliberately outside it:
+`"1.0"`), `PROMPT_VERSION` (`"2.3"`). Deliberately outside it:
 `COLLECTION_SCHEMA_VERSION` (`"v1"`, a collection-*name* component) and the
 migration `i32` in `PRAGMA user_version`.
 
@@ -421,7 +421,12 @@ is the `research_runs` table.) The hard invariants:
   `validate_markdown_body` (sections) + the heading check (documents), and
   **every sectioned run stores `title = NULL`**, since the heading is the
   server's and `extract_report_title` finds none — exactly what a
-  repaired-heading run already does.
+  repaired-heading run already does. `section_request` **forbids
+  meta-narrative**: the route the run took is not a finding (the trace is
+  journalled and streamed already), and "not answered" is narrowed to "nothing a
+  tool returned bears on it" — sections were arriving titled after a step of the
+  plan (`## 1. File discovery bypassed`) and spending the whole allowance
+  explaining a shortcut, which costs a section the reader can use.
 - **Citation repair regenerates one section, not the document.** The
   whole-document rewrite says "repeat everything that should survive" — a second
   full-volume generation of what just failed, when the run has least budget left.
