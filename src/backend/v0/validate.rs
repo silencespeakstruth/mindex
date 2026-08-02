@@ -910,6 +910,122 @@ mod tests {
         }
     }
 
+    /// `context_run_ids` dedups **before** the cap, like the batch delete beside it:
+    /// the ids become one lookup set where a repeat means nothing, so rejecting a
+    /// request that names three runs eleven times each would refuse work the server
+    /// is perfectly able to do, over a cap the request does not actually exceed.
+    #[test]
+    fn research_context_dedups_before_it_counts() {
+        let mut ids = vec!["a".to_string(); 20];
+        assert!(research_context(&mut ids, 3).is_ok());
+        assert_eq!(ids, vec!["a".to_string()], "the list was not deduplicated");
+
+        // Order is preserved — the ids are injected as prior reports, and the caller's
+        // ordering is the only thing that says which context comes first.
+        let mut ids = vec![
+            "c".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+        ];
+        assert!(research_context(&mut ids, 3).is_ok());
+        assert_eq!(ids, vec!["c".to_string(), "a".to_string(), "b".to_string()]);
+
+        // Genuinely over the cap after deduplication.
+        let mut ids: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+        assert_eq!(
+            err_code(research_context(&mut ids, 3).unwrap_err()),
+            "validation.research_context_too_many"
+        );
+
+        // Empty is the ordinary case — a run with no ancestry — not a refusal. This
+        // is the one place it differs from the batch delete, where an empty list is
+        // a whole corpus reached by omission.
+        let mut ids: Vec<String> = vec![];
+        assert!(research_context(&mut ids, 0).is_ok());
+    }
+
+    /// `max_context_runs = 0` switches the feature off, and it must actually refuse
+    /// rather than silently ignoring what the request named.
+    #[test]
+    fn context_is_refused_outright_when_the_feature_is_off() {
+        let mut ids = vec!["a".to_string()];
+        assert_eq!(
+            err_code(research_context(&mut ids, 0).unwrap_err()),
+            "validation.research_context_too_many"
+        );
+    }
+
+    /// The page limit is what a client sizes a paging loop by, and the loop's
+    /// termination rests on "a short page means no more". An accepted `0` would
+    /// return an empty page for ever.
+    #[test]
+    fn a_research_list_limit_must_be_a_usable_page_size() {
+        assert!(
+            research_list_limit(None, 100).is_ok(),
+            "absent = the default"
+        );
+        assert!(research_list_limit(Some(1), 100).is_ok());
+        assert!(
+            research_list_limit(Some(100), 100).is_ok(),
+            "the cap itself"
+        );
+
+        for got in [0, 101] {
+            assert_eq!(
+                err_code(research_list_limit(Some(got), 100).unwrap_err()),
+                "validation.research_list_limit_out_of_range",
+                "limit {got} was accepted"
+            );
+        }
+    }
+
+    /// `/drift` is read-only, but it is the widest request the server takes — the
+    /// whole tree's manifest — so its per-entry validation is what stops a bad path
+    /// or a bad hash reaching the SQL. It must reject on the *entry*, naming it,
+    /// rather than failing the batch anonymously.
+    #[test]
+    fn drift_validates_every_entry_and_respects_its_cap() {
+        let ok = DriftRequest {
+            files: std::collections::HashMap::from([
+                ("src/a.rs".to_string(), "a".repeat(64)),
+                ("src/b.rs".to_string(), "b".repeat(64)),
+            ]),
+        };
+        assert!(validate_drift_request(&ok, 10).is_ok());
+        assert_eq!(
+            err_code(validate_drift_request(&ok, 1).unwrap_err()),
+            "validation.too_many_files"
+        );
+
+        // A traversal in the manifest.
+        let bad_path = DriftRequest {
+            files: std::collections::HashMap::from([("../etc/passwd".to_string(), "a".repeat(64))]),
+        };
+        assert_eq!(
+            err_code(validate_drift_request(&bad_path, 10).unwrap_err()),
+            "validation.path_invalid"
+        );
+
+        // A hash that is the right length but not hex — the case SQLite's own CHECK
+        // does not cover.
+        let bad_sha = DriftRequest {
+            files: std::collections::HashMap::from([("src/a.rs".to_string(), "z".repeat(64))]),
+        };
+        assert_eq!(
+            err_code(validate_drift_request(&bad_sha, 10).unwrap_err()),
+            "validation.sha256_invalid"
+        );
+
+        // An empty manifest is legitimate: every indexed file is `orphaned`, which
+        // is a real answer about an emptied working tree, not a malformed request.
+        let empty = DriftRequest {
+            files: std::collections::HashMap::new(),
+        };
+        assert!(validate_drift_request(&empty, 10).is_ok());
+    }
+
     #[test]
     fn history_request_rejects_an_empty_subject() {
         let mut c = commit(vec![]);
