@@ -8,6 +8,17 @@ export type { Availability } from "./statusFetch";
 /** How fast to re-check while the server has files in flight. */
 const BUSY_POLL_SECONDS = 3;
 
+/**
+ * The hard bound on one whole refresh — health, status, config, stats, failed.
+ *
+ * Every one of those calls is individually bounded now, so this is a backstop
+ * rather than the mechanism. It is a backstop worth having because the failure it
+ * catches is silent and permanent: `reschedule` re-arms in a `.finally()`, so a
+ * refresh that never settles does not just miss a tick, it ends polling for the
+ * life of the window and freezes the indicator at whatever colour it last had.
+ */
+const REFRESH_DEADLINE_MS = 20_000;
+
 export { failedCount, UNAVAILABLE } from "./shared/status";
 export type { ServerState, StatusSnapshot, Unavailable } from "./shared/status";
 
@@ -30,6 +41,20 @@ export type { ServerState, StatusSnapshot, Unavailable } from "./shared/status";
 export class StatusMonitor {
     private readonly changed = new vscode.EventEmitter<StatusSnapshot>();
     readonly onDidChangeSnapshot = this.changed.event;
+
+    /**
+     * Whether a refresh is in flight, and a signal when that changes.
+     *
+     * The Status panel's refresh buttons echo this rather than only the press
+     * that started it. Without that they read as broken during a *background*
+     * poll: the panel is visibly re-rendering and the button that supposedly
+     * causes it is idle and clickable, which invites the second press the whole
+     * busy discipline exists to refuse.
+     */
+    private readonly refreshingChanged = new vscode.EventEmitter<boolean>();
+    readonly onDidChangeRefreshing = this.refreshingChanged.event;
+    private inFlight?: AbortController;
+    private disposed = false;
 
     private snapshot?: StatusSnapshot;
     private timer?: ReturnType<typeof setTimeout>;
@@ -58,6 +83,11 @@ export class StatusMonitor {
     /** The last completed refresh, for a surface that opens between refreshes. */
     get latest(): StatusSnapshot | undefined {
         return this.snapshot;
+    }
+
+    /** Whether a refresh is running right now. */
+    get refreshing(): boolean {
+        return this.inFlight !== undefined;
     }
 
     /**
@@ -106,8 +136,14 @@ export class StatusMonitor {
     }
 
     dispose(): void {
+        this.disposed = true;
         this.setPollInterval(0);
+        // An in-flight poll outliving the emitter it fires into is a leak with a
+        // visible end: `changed.fire` on a disposed emitter throws out of a
+        // promise nobody awaits.
+        this.inFlight?.abort();
         this.changed.dispose();
+        this.refreshingChanged.dispose();
     }
 
     /**
@@ -116,9 +152,38 @@ export class StatusMonitor {
      * Called from activation, the explicit refresh command, a `.mindex` edit, and
      * every reindex/delete/retry — which is why the Ask form's inventories are read
      * here and nowhere else.
+     *
+     * Single-flight, and the refusal is deliberate rather than a supersede: a
+     * tick landing on a slow refresh would otherwise start a second chain of five
+     * requests against a connection pool of four, which is how a slow refresh
+     * becomes a stuck one.
      */
     async refresh(): Promise<void> {
-        this.snapshot = await fetchStatus(this.api(), this.guid(), this.serverUrl(), this.fan);
-        this.changed.fire(this.snapshot);
+        if (this.inFlight !== undefined || this.disposed) {
+            return;
+        }
+        const controller = new AbortController();
+        this.inFlight = controller;
+        this.refreshingChanged.fire(true);
+        const deadline = setTimeout(() => controller.abort(), REFRESH_DEADLINE_MS);
+        try {
+            const snapshot = await fetchStatus(
+                this.api(),
+                this.guid(),
+                this.serverUrl(),
+                this.fan,
+                controller.signal
+            );
+            this.snapshot = snapshot;
+            if (!this.disposed) {
+                this.changed.fire(snapshot);
+            }
+        } finally {
+            clearTimeout(deadline);
+            this.inFlight = undefined;
+            if (!this.disposed) {
+                this.refreshingChanged.fire(false);
+            }
+        }
     }
 }

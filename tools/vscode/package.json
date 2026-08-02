@@ -193,12 +193,6 @@
         "icon": "$(history)"
       },
       {
-        "command": "mindex.browseResearch",
-        "title": "Browse Stored Research",
-        "category": "MINDex",
-        "icon": "$(book)"
-      },
-      {
         "command": "mindex.pickResearchContext",
         "title": "Pick Research Context",
         "category": "MINDex",
@@ -237,14 +231,9 @@
           "group": "navigation@1"
         },
         {
-          "command": "mindex.browseResearch",
-          "when": "view == mindexAsk",
-          "group": "navigation@2"
-        },
-        {
           "command": "mindex.openResearchHistory",
           "when": "view == mindexAsk",
-          "group": "navigation@3"
+          "group": "navigation@2"
         },
         {
           "command": "mindex.openSettings",
@@ -335,7 +324,7 @@
         "key": "ctrl+alt+."
       },
       {
-        "command": "mindex.browseResearch",
+        "command": "mindex.openResearchHistory",
         "key": "ctrl+alt+,"
       }
     ],
@@ -369,6 +358,22 @@
           "minimum": 0,
           "maximum": 3600,
           "description": "How often to re-check server health in the background, in seconds (0 disables it). This is what lets the Ask view stop offering Research when the server's Ollama goes away, and disable itself entirely when a required dependency does. Each poll is a handful of small local requests."
+        },
+        "mindex.requestTimeoutSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 600,
+          "description": "How long to wait for an ordinary request before giving up, in seconds (0 waits forever). Health polls use a shorter deadline of their own. Streaming research and indexing runs are not bounded by this — see mindex.streamIdleTimeoutSeconds.",
+          "scope": "machine-overridable"
+        },
+        "mindex.streamIdleTimeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "How long a streaming research or indexing run may send nothing at all before the connection is treated as dead, in seconds (0 waits forever). This is an idle clock, not a total one: a long run that keeps reporting progress is never cut off. Raise it if a slow model on loaded hardware is being dropped mid-run.",
+          "scope": "machine-overridable"
         },
         "mindex.indexingPanel": {
           "type": "string",

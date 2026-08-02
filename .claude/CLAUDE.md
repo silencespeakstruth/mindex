@@ -277,6 +277,26 @@ let GC clean up.
   the detail query indexes its four columns *from* that constant (a summary
   column added without moving it once handed the caller `invalid_flag` where
   `report` belonged).
+  The response also carries **`totals`** (`ResearchCorpusTotals`:
+  `total`/`current` + `gc_candidates` and its four buckets) — one extra `SELECT`
+  reusing the same recursive validity CTE the page already paid for, selecting
+  no report body. **No filter on the request touches them**, deliberately: they
+  are a fixed denominator, and a count that shrank as the caller typed into `q`
+  would be a worse rendering of `runs.len()` (`the_corpus_totals_query_takes_no_filter`
+  is the guard). `gc_candidates` is the **union** of the four buckets, never
+  their sum — a run that is both stale and partial is one report to delete —
+  and every bucket is unpinned-only, so the number and the proposal a client
+  builds from it cannot disagree. Two filters beyond `freshness`/`valid`/
+  `kind`/`pinned`: **`challenged_run_id`** (the first reader of
+  `idx_research_runs_challenged`, and the only way to find a challenge whose
+  verdict was inconclusive or whose own evidence has since moved — both of
+  which `trust` correctly stops counting) and **`completeness`**
+  (`finalized`/`partial` over `done_reason`). `completeness` is server-side
+  *because* a client pruning a corpus pages this list to exhaustion: every
+  filter applying before the `LIMIT` is what makes "a short page means no more"
+  true, and that inference is the contract. `[research].list_page_limit` and
+  `[limits].max_research_delete_ids` are published on `GET /config` for the
+  same reason — a client sizing a paging loop must not guess.
 - **Offline re-verification** (`GET /projects/{guid}/research/{run_id}/
   verification`): `check_citations` re-run as a pure function over journal rows
   (`report` + `research_run_evidence` spans + `research_run_files` vs
@@ -309,6 +329,22 @@ let GC clean up.
   search frontend); `/files?status=failed` is the dead-letter view. `/config`
   is static **except `research.models` and `research.observed`** — both worker
   -refreshed on a tick; don't cache it once.
+- **`GET /health` is tri-state, and the server owns the verdict**
+  (`HealthChecks::verdict`, next to the data so nothing computes it twice):
+  `ok`; `degraded` = only the **optional** Ollama is failing, which is exactly
+  the state where a client should keep offering search and stop offering
+  research; `unhealthy` = a required check failed (sqlite/qdrant/embedder, plus
+  `query_embedder` *when present*) or a run is wedged. Severity wins — Ollama
+  down *and* Qdrant down is `unhealthy`, never `degraded`. Two words rather than
+  three was the defect: every client then needed its own copy of which check is
+  required in order to decide whether `degraded` was worth disabling anything
+  over, and the extension's did not match the server's. **`checks.*` is exactly
+  `"ok"` or `"error"`** — the reason a probe failed goes to a `warn!` at the
+  probe site with a sysadmin hint (`probe()` in `handlers.rs`), because this
+  response is readable by anything that can reach the port and a driver's error
+  chain carries paths, URLs and versions. HTTP is always 200. A client must test
+  `== "ok"`, never `startsWith("error")` — an older server still sends
+  `"error: <reason>"`.
 - `GET /projects/{guid}` is the per-project **inventory**; the per-language
   *file* count is the load-bearing half. Keyed on chunks alone, a language
   whose files are all `failed` or sliced to zero chunks was absent from the map
@@ -347,7 +383,9 @@ is the `research_runs` table.) The hard invariants:
 - **`GET /health` reports the slots** (`research.{slots_total, slots_busy,
   oldest_inflight_age_ms}`), and this is the one place research moves the verdict:
   a **busy** slot is never a degradation (permanent at `max_concurrent = 1`), while
-  a run past `max_seconds + report_timeout_ms + inflight::WEDGE_GRACE` is. That
+  a run past `max_seconds + report_timeout_ms + inflight::WEDGE_GRACE` is
+  **`unhealthy`** — it is the one input to the verdict with no failing check
+  behind it. That
   same predicate is `worker::research_watchdog`'s cancel rule — one const, so
   health and the watchdog cannot disagree about "wedged". The watchdog is spawned
   **unconditionally**, unlike the metrics collector: gating a recovery mechanism on
@@ -669,9 +707,27 @@ is the `research_runs` table.) The hard invariants:
   **Trust is derived at read time, never stored** (`research_trust_column`,
   the validity philosophy): over *valid* challenges only — a stale challenge
   stops counting by itself — severity wins (`refuted` > `disputed` >
-  `confirmed` > `unchallenged`), inconclusive counts toward none. Surfaced as
-  `kind`/`challenged_run_id`/`challenge_verdict`/`trust` on every summary
-  (`RESEARCH_SUMMARY_COLUMNS` is 23 now), in `list_research` lines and as a
+  `confirmed` > `unchallenged`), inconclusive counts toward none.
+  **One challenge per report, newest verdict wins**: a challenge journalled
+  with a **parseable verdict** deletes every earlier `kind='challenge'` row
+  aimed at the same subject, inside `insert_run`'s own transaction — so a
+  failed journal (best-effort, `warn!` + `None`) cannot destroy the standing
+  verdict on behalf of a run that left no trace, and the `id <> ?3` in that
+  DELETE is what stops it deleting itself. An **inconclusive** run evicts
+  nothing: it produced no finding, and letting it erase a `refuted` would spend
+  the mechanism's most valuable output on its least informative outcome — so a
+  subject can legitimately carry an old verdict plus a new inconclusive row,
+  and the severity fold stays (pre-rule databases hold several anyway).
+  Not backed by a unique index on purpose: that would make the *insert* fail
+  instead of evicting, the opposite of "newest wins". Counted by
+  `mindex_research_challenges_replaced_total` (rare counter, `increase()`) and
+  an `info!` after the commit — the eviction leaves no other trace. Surfaced as
+  `kind`/`challenged_run_id`/`challenge_verdict`/`trust` on every summary,
+  plus `challenged_seq`/`challenged_title` — the subject **resolved
+  server-side** (`RESEARCH_SUMMARY_COLUMNS` is 26 now), because a challenge row
+  must name what it attacked wherever it is rendered and the client used to
+  hunt for the subject among the rows it happened to hold; NULL now means the
+  subject is genuinely gone. In `list_research` lines and as a
   warning block in `read_research` (a refuted report must not read as settled),
   in VS Code badges, and by scout (which also owns the `challenge` MCP tool).
   Wire: **one** new event, `verdict`
@@ -1572,22 +1628,70 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   (offering is a hint, validating is a contract; `undefined`/empty inventory
   falls back to `ALL_LANGUAGES`); state is pushed by `postMessage` and
   rebuilt, never by reassigning `webview.html`. `Availability {ask,
-  research, reason}` is split (Ollama down disables only Research; health
-  stays `"ok"`); a degradation aborts running work via `RunRegistry`,
+  research, reason}` is split (Ollama down disables only Research; the
+  server says `degraded`, not `unhealthy`), and derived by `readHealth` from
+  `status` **and** `checks` together — an older server spells the *required*
+  failure `degraded` too, so keying on `status` alone would paint yellow and
+  leave the form armed. **A degradation disables only what it costs**: the
+  question box, the fields and the scope buttons compose and stay live (and
+  undimmed); `#submit` and the context picker need `ask`, the Research tab
+  needs `research`, Stop is always live. `canSubmit()` gates the click *and*
+  the Enter keydown — one predicate, or a keyboard path fires research at a
+  dead Ollama. A degradation also aborts running work via `RunRegistry`,
   resetting handles **before** any notification (its thenable resolves only
   on dismissal), reported as a failure, not a cancellation; none of it is
   observable without `[mindex.statusPollSeconds]` (default 30, `0` = off).
+  **Every server-touching button single-flights through `BusyKeys`**
+  (`src/busy.ts`; `[data-busy-key]` + `applyBusy`/`setEnabled` in the
+  webview) — supersede reads, **refuse** writes and paging, and the greyed
+  button is the echo of the host's refusal, never its cause. **No raw error
+  reaches a user**: `humanize(e)` in `problem.ts` is the one funnel, the
+  machine `code` never appears in the sentence, and the stack goes to the
+  `MINDex` output channel via `logError`. Every request has a deadline
+  (`mindex.requestTimeoutSeconds`, health clamped to 5 s); a stream's is
+  **idle-only** (`mindex.streamIdleTimeoutSeconds`), never total — a `high`
+  run may legitimately live 70 minutes.
   Language marks: generated `shared/langGlyphs.ts` (never hand-edit),
-  two-toned colours derived and recomputed by `langIcons.test.ts`. A reindex
+  two-toned colours derived and recomputed by `langIcons.test.ts`.
   The challenge surfaces: history rows/preview carry kind/trust badges and a
-  challenge↔subject link; launching one is a QuickPick chain
+  challenge↔subject link built from the **server-resolved**
+  `challenged_seq`/`challenged_title`; launching one is a QuickPick chain
   (`challengeFlow.ts` — the server accepts only effort/model/budget/seed, the
   subject supplies the rest), streamed into the ordinary `ResearchPanel`
   under the same single-flight handles; `challengeGuard`/trust wording live
   in `shared/runsFormat.ts`; offline re-verify (Verify button) renders
   provenance and staleness as separate answers; `GET /research/active` +
   cancel is a palette QuickPick (`activeRunsPick.ts`), which the 429 names.
-  The history list's `kind` filter is the server-side query param. A reindex
+  **The preview always states what was said about a report**
+  (`challengeStateLine`, one indexed `challenged_run_id` lookup per preview):
+  it used to render a trust badge and nothing else, and trust is correctly
+  silent about an inconclusive challenge and about one whose own evidence has
+  moved — so a report that had been challenged and *refuted* could read as
+  untouched. The lookup asks for `limit: 2` because the server's replace rule
+  is verdict-gated, so two rows is a real state the line must name rather than
+  silently pick from. With a challenge standing, the button becomes
+  **Re-check** and forks (`recheckOptions`): "Links only" is
+  `GET …/{challenge_id}/verification` — the *challenge's* citations, captioned
+  as such, since reading them as the subject's would be a worse confusion than
+  the one being fixed — and "Fresh run" goes through the same modal that names
+  the verdict at risk. **Pruning**: `Select all` pages the server with the
+  current filters to exhaustion (capped by the published `max_delete_ids`,
+  `MAX_PAGES` as a runaway backstop) and the footer says when it stopped short;
+  a bulk selection is *defined by* those filters, so any filter change clears
+  it wholesale rather than pruning it row by row; the confirmation resolves
+  through `summaries` (every row ever fetched), not `rows` (the rendered page),
+  or a bulk delete would report `0` dependants for everything off screen.
+  `Collect garbage` proposes the union of invalid/stale/partial/inconclusive
+  (**pinned exempt, via the server's `pinned=false`**) into a review in the
+  right pane — not a QuickPick, which cannot show *why* a row is proposed or
+  that four reports were built on it, the two things a reviewer unchecks over —
+  each run in one group with its other reasons as labels, since three
+  checkboxes for one report would let an uncheck not stick. The counts line is
+  the corpus `totals`, a **fixed denominator** no filter moves. Head chrome:
+  the magnifier is inside the field, the refresh button sits in the search row
+  (the filter row wraps, and an icon button on its right edge was clipped past
+  the 260px grid minimum). `mindex.browseResearch` is **gone** — one reading
+  surface, and `ctrl+alt+,` now opens the panel. A reindex
   reads the server's claims from `/status.indexing_claims` + the follow-up
   `/drift`'s `indexing` bucket — never from the `/index` response, which
   swallows claim conflicts and 200s (a refused reindex otherwise reads as

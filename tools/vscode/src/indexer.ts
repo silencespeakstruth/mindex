@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { IndexFiles, IndexStreamCallbacks, MindexApi } from "./api";
 import { detectLanguage } from "./languages";
 import { readUtf8 } from "./scanner";
-import { isCancellation, reportError } from "./errors";
+import { humanize, isCancellation, logError, reportError } from "./errors";
 import { say } from "./brand";
 import { IndexStatusBar } from "./indexStatusBar";
 import { IndexingPanel, IndexingPanelPlacement } from "./indexingPanel";
@@ -247,8 +247,16 @@ async function doReindex(
     return summary;
 }
 
+/**
+ * One line for the run's own log, in the user's terms.
+ *
+ * Through the shared humanizer, so the sentence in the indexing panel and the
+ * one in a notification about the same failure cannot disagree — and so a raw
+ * `ECONNREFUSED` never reaches either. The full error goes to the output channel.
+ */
 function describe(e: unknown): string {
-    return e instanceof Error ? e.message : String(e);
+    logError("Indexing", e);
+    return humanize(e).text;
 }
 
 /**

@@ -13,8 +13,27 @@
  * quiet. They are restated at all only because `api.ts` is host-only.
  */
 
-/** How the server answered its last health check. */
-export type ServerState = "ok" | "degraded" | "unreachable";
+/**
+ * How the server answered its last health check.
+ *
+ * Four values, and the fourth is the client's own — `unreachable` is not
+ * something a server can say about itself. The other three are the server's
+ * verdict verbatim: `degraded` means only the optional Ollama is down (search
+ * and indexing still work), `unhealthy` means a required dependency failed.
+ *
+ * `unhealthy` and `unreachable` are painted the same colour on purpose — from
+ * the user's chair "nothing works" is one state — and separated only where the
+ * remedy differs, which is the tooltip and the panel.
+ */
+export type ServerState = "ok" | "degraded" | "unhealthy" | "unreachable";
+
+/** A best-effort section of the snapshot that failed, as a humanized sentence. */
+export interface SectionErrors {
+    runtime?: string;
+    inventory?: string;
+    failed?: string;
+    config?: string;
+}
 
 /**
  * A section that could not be fetched. Distinct from *absent* (an older server does
@@ -53,13 +72,29 @@ export interface StatusSnapshot {
     /** Why the server is unreachable. Only set when `state === "unreachable"`. */
     detail?: string;
     version?: string;
-    /** `GET /health`'s per-dependency verdicts, open-ended so a new check renders. */
+    /**
+     * `GET /health`'s per-dependency verdicts, open-ended so a new check renders.
+     *
+     * A value is `"ok"` or `"error"` — and, from a server older than the
+     * tri-state verdict, `"error: <reason>"`. **Every reader must test
+     * `=== "ok"`**, never `startsWith("error")`, or it silently stops noticing
+     * failures the day the server drops the reason.
+     */
     checks?: Record<string, string>;
     /**
-     * Whether `/research` can work at all. The server's Ollama is *optional*, so it
-     * never makes `state` anything but "ok" — it only costs Research.
+     * Whether `/research` can work at all. The server's Ollama is its one
+     * *optional* dependency, so its absence makes the state `degraded` — never
+     * `unhealthy` — and costs Research and nothing else.
      */
     researchAvailable: boolean;
+    /**
+     * Which best-effort sections failed and why, in the user's words.
+     *
+     * These used to be four bare `catch {}`: a `/config` that stopped answering
+     * left the Ask form quietly offering last week's model list, with nothing
+     * anywhere saying so.
+     */
+    sectionErrors?: SectionErrors;
     runtime?: RuntimeInfo | Unavailable;
     /**
      * What this project holds, per language. **Absent** = the server publishes no

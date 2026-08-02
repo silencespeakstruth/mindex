@@ -21,6 +21,7 @@ import {
 } from "../shared/askFields.js";
 import { formatValue } from "../shared/scale.js";
 import { el, pageData, vscodeApi, VsCodeApi } from "./host.js";
+import { applyBusy, setEnabled } from "./ui/busy.js";
 import { makePills } from "./ui/pills.js";
 import { makeSegmented } from "./ui/segmented.js";
 import { makeSlider, Slider } from "./ui/slider.js";
@@ -86,6 +87,16 @@ let languagePills: ReturnType<typeof makePills>;
 
 let mode: AskMode = "research";
 let running = false;
+/**
+ * A search round trip is in flight.
+ *
+ * Separate from `running`, which is Research's: a search has no Stop, no panel
+ * and no hint line, and it is short enough that the whole affordance is a
+ * disabled button that says what it is doing. What it *does* share is the need
+ * for one — five fast clicks used to be five concurrent searches and five quick
+ * picks racing to open.
+ */
+let searching = false;
 /** What the server can currently be asked for; optimistic until health first lands. */
 let available = { ask: true, research: true, reason: "" };
 let researchConfig: ResearchConfig | undefined;
@@ -480,8 +491,12 @@ function render(): void {
 
     const text = el<HTMLTextAreaElement>("text");
     text.placeholder = copy.placeholder;
-    el("submit-label").textContent = copy.label;
-    el("submit-icon").className = `codicon codicon-${copy.glyph} codicon-sm`;
+    // The button says what it is doing while it does it. A search is too short
+    // for a progress surface and too long to look like nothing happened.
+    el("submit-label").textContent = searching ? "Searching…" : copy.label;
+    el("submit-icon").className = searching
+        ? "codicon codicon-loading codicon-modifier-spin codicon-sm"
+        : `codicon codicon-${copy.glyph} codicon-sm`;
 
     // Group visibility falls straight out of the table: a group is shown when any of
     // its fields belongs to this mode.
@@ -508,8 +523,8 @@ function render(): void {
     }
 
     const usable = available.ask && (mode === "search" || available.research);
-    el<HTMLButtonElement>("submit").disabled = running || !usable;
-    setFormEnabled(available.ask);
+    setEnabled(el<HTMLButtonElement>("submit"), usable && !running && !searching);
+    setComposingEnabled();
 
     // Only in the Research tab: in Search the server's Ollama is irrelevant. Suppressed
     // entirely when the server itself is down — two notices saying the same thing at
@@ -533,27 +548,30 @@ function render(): void {
 }
 
 /**
- * Disable (or restore) everything that composes a query.
+ * Disable only what the server's absence actually costs.
  *
- * The Stop button is deliberately exempt: a run that was in flight when the server
- * went down still has a connection to drop, and the one control that ends it must not
- * be the one that disappears. Everything else is left visible and inert rather than
- * hidden — a form that collapses loses the question the user had typed into it, which
- * is the thing they are least willing to retype.
+ * The rule used to be "`!ask` disables every control", which was defensible while
+ * the only question this form answered was *can this be submitted*. It is the
+ * wrong shape for a form the user **composes** in. A question, a scope and a
+ * budget cost the server nothing to write down; the notice above already says it
+ * is down; and freezing the textarea takes away the one thing that still worked,
+ * along with whatever was half-typed in it.
+ *
+ * So the split is by what a control *reaches*, not by what it belongs to:
+ *
+ * - **Nothing** — the question box, every `ASK_FIELDS` control, the three scope
+ *   buttons, the disclosures. Local edits to local state.
+ * - **`ask`** — Submit, and the context picker, which lists stored runs over
+ *   HTTP and would open onto an error.
+ * - **`research`** — the Research tab, and Submit while that tab is selected.
+ *
+ * Stop is exempt from all of it: a run in flight when the server went down still
+ * has a connection to drop, and the one control that ends it must not be the one
+ * that disappears.
  */
-function setFormEnabled(enabled: boolean): void {
-    const nodes = [
-        el<HTMLTextAreaElement>("text"),
-        ...[...controls.values()].flatMap((c) => c.nodes),
-        ...["scope-folder", "scope-mindex", "scope-clear"].map((id) => el(id)),
-    ];
-    for (const node of nodes) {
-        for (const control of node.matches("input, textarea, select, button")
-            ? [node]
-            : node.querySelectorAll<HTMLElement>("input, textarea, select, button")) {
-            (control as HTMLInputElement).disabled = !enabled;
-        }
-    }
+function setComposingEnabled(): void {
+    // Reaches the server: gated. Everything not named here composes and stays live.
+    setEnabled(el<HTMLButtonElement>("context-runs-pick"), available.ask);
 }
 
 function capitalise(s: string): string {
@@ -604,6 +622,22 @@ function restore(): void {
     persist();
 }
 
+/**
+ * Whether a submit is allowed right now — asked at **every** entry point.
+ *
+ * There are two, and they used to disagree: the button checked its own
+ * `disabled`, and Enter in the question box called `submit()` blind. With Ollama
+ * down that meant the Research tab was disabled, Submit was disabled, the notice
+ * said so — and Enter still fired a research run that round-tripped to a 503.
+ *
+ * Reading the button's own `disabled` rather than recomputing the condition is
+ * the point: one predicate, decided in `render`, so a keyboard path can never
+ * drift from what the user can see.
+ */
+function canSubmit(): boolean {
+    return !running && !el<HTMLButtonElement>("submit").disabled;
+}
+
 function submit(extra: Record<string, unknown> = {}): void {
     api.postMessage({ type: "submit", mode, ...values(), ...extra });
 }
@@ -642,7 +676,7 @@ for (const button of el("mode").querySelectorAll("button")) {
 }
 
 el("submit").addEventListener("click", () => {
-    if (!el<HTMLButtonElement>("submit").disabled) {
+    if (canSubmit()) {
         submit();
     }
 });
@@ -653,7 +687,14 @@ for (const id of ["notice-status", "degraded-status"]) {
 
 // The webview has no editor API, so "this folder" is resolved host-side: the form asks
 // for it by name rather than keeping a copy of the active editor's folder in sync here.
-el("scope-folder").addEventListener("click", () => submit({ scopeCurrentFolder: true }));
+//
+// Its own message, not a `submit` the host early-returns on. A control that fills
+// in a text field has no business travelling on the channel that launches
+// research runs — and while it did, it was the one unguarded path into that
+// channel, live during an in-flight run and against a server that was down.
+el("scope-folder").addEventListener("click", () =>
+    api.postMessage({ type: "scopeFolder", ...values() })
+);
 el("scope-mindex").addEventListener("click", () => api.postMessage({ type: "scopeDefaults" }));
 el("scope-clear").addEventListener("click", () => {
     controls.get("sinclude")?.write("");
@@ -677,10 +718,13 @@ el("context-runs-pick").addEventListener("click", () => {
 });
 
 // Enter submits; Shift+Enter keeps the newline (the question box is multiline).
+// It goes through the same gate as the button — see `canSubmit`.
 el("text").addEventListener("keydown", (key) => {
     if (key.key === "Enter" && !key.shiftKey) {
         key.preventDefault();
-        submit();
+        if (canSubmit()) {
+            submit();
+        }
     }
 });
 
@@ -690,6 +734,18 @@ window.addEventListener("message", (e: MessageEvent<Record<string, unknown>>) =>
         case "running":
             running = msg.running === true;
             render();
+            break;
+        case "busy":
+            // Search's in-flight state. Research keeps `running`, which does
+            // strictly more — Stop, the hint line, blocking the tab switch — and
+            // folding the two would lose all three.
+            if (typeof msg.key === "string") {
+                if (msg.key === "submit") {
+                    searching = msg.busy === true;
+                    render();
+                }
+                applyBusy(msg.key, msg.busy === true);
+            }
             break;
         case "availability":
             available = {

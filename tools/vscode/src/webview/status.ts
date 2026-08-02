@@ -12,6 +12,7 @@
  * and the second one is what stops a green server reading as broken.
  */
 import { el, icon, langIcon, vscodeApi } from "./host.js";
+import { applyBusy, paintBusy } from "./ui/busy.js";
 import {
     FailedFile,
     LanguageInventory,
@@ -36,13 +37,29 @@ const retryAll = el<HTMLButtonElement>("retry-all");
 
 const CARDS = ["health-card", "runtime-card", "inventory-card", "failed-card"];
 
-el("refresh").addEventListener("click", () => api.postMessage({ type: "refresh" }));
+// Two buttons, one act: the head one beside the timestamp it explains, the card
+// one where the eye already is when a row has gone red. They share a busy key,
+// so pressing either greys both.
+for (const id of ["refresh", "health-refresh"]) {
+    el(id).addEventListener("click", () => api.postMessage({ type: "refresh" }));
+}
 for (const id of ["settings", "unreachable-settings"]) {
     el(id).addEventListener("click", () => api.postMessage({ type: "openSettings" }));
 }
 retryAll.addEventListener("click", () => api.postMessage({ type: "retryAll" }));
 
-window.addEventListener("message", (e: MessageEvent<{ snapshot?: StatusSnapshot }>) => {
+interface HostMessage {
+    snapshot?: StatusSnapshot;
+    type?: string;
+    key?: string;
+    busy?: boolean;
+}
+
+window.addEventListener("message", (e: MessageEvent<HostMessage>) => {
+    if (e.data.type === "busy" && typeof e.data.key === "string") {
+        applyBusy(e.data.key, e.data.busy === true);
+        return;
+    }
     render(e.data.snapshot);
 });
 
@@ -77,10 +94,18 @@ function line(
     return row;
 }
 
-/** The single dim row that stands in for a section whose fetch failed. */
-function unavailableRow(): HTMLElement {
+/**
+ * The single dim row that stands in for a section whose fetch failed.
+ *
+ * `reason` is already a sentence when it is present — the host humanizes it — so
+ * this never sees an exception's own words. It goes in the tooltip rather than
+ * the row: four sections can fail at once, and four wrapped sentences would push
+ * the thing the user came for off the screen.
+ */
+function unavailableRow(reason?: string): HTMLElement {
     return line("", "unavailable — the server answered health but not this", {
         tone: "muted",
+        ...(reason !== undefined && reason !== "" ? { title: reason } : {}),
     });
 }
 
@@ -91,7 +116,12 @@ function render(s?: StatusSnapshot): void {
     }
 
     stateIcon.className = `state-dot codicon codicon-${
-        { ok: "circle-filled", degraded: "warning", unreachable: "error" }[s.state]
+        {
+            ok: "circle-filled",
+            degraded: "warning",
+            unhealthy: "error",
+            unreachable: "error",
+        }[s.state]
     } state-${s.state}`;
     titleText.textContent = `MINDex — ${s.state}`;
     subtitle.textContent =
@@ -117,24 +147,33 @@ function render(s?: StatusSnapshot): void {
     renderRuntime(s);
     renderInventory(s);
     renderFailed(s);
+    // The failed rows were just rebuilt. Without this, a row re-rendered during
+    // an in-flight retry is the one live button on an otherwise frozen page.
+    paintBusy();
 }
 
 /**
  * What each dependency is, and what its absence costs.
  *
- * `optional` is the load-bearing column. The server's health stays `"ok"` without
- * Ollama or a split query embedder, so a red row beside a green header reads as a
- * contradiction unless the row says it is allowed to be red. Everything not listed
- * here is treated as **required**: a check the server adds later then renders red when
- * it fails, which is the safe direction to be wrong in.
+ * `optional` is the load-bearing column, and there is now exactly one entry in
+ * it. A failing optional dependency is the *only* thing that produces the
+ * server's `degraded`, so a yellow row beside a yellow header is the whole story;
+ * everything else failing is `unhealthy` and red. Anything not listed here is
+ * treated as **required**, which is the safe direction to be wrong in: a check
+ * the server adds later renders red when it fails.
+ *
+ * `query_embedder` used to be marked optional and was not — the server has always
+ * counted it when it is present, because a dead query instance is *every search
+ * failing*. It rendered as a soft warning for a hard outage.
  */
 const CHECK_META: Record<string, { optional?: boolean; costs: string }> = {
     sqlite: { costs: "The metadata database. Nothing works without it." },
     qdrant: { costs: "The vector store. Search and indexing both need it." },
     embedder: { costs: "BGE-M3. Indexing and search both embed through it." },
     query_embedder: {
-        optional: true,
-        costs: "The second embedder instance, only present on a split deployment.",
+        costs:
+            "The second embedder instance, present only on a split deployment — " +
+            "and required whenever it is: every search embeds through it.",
     },
     ollama: { optional: true, costs: "The local model behind Research." },
 };
@@ -156,9 +195,17 @@ function renderChecks(s: StatusSnapshot): void {
  * A failing optional dependency is **yellow, not red** — it is the difference between
  * "this server is broken" and "one feature is unavailable", and it is the whole reason
  * the row carries a sentence saying which.
+ *
+ * The value column renders a *word*, not the wire token. `error` beside a red dot
+ * says nothing the dot has not already said, and the reason it used to carry is
+ * no longer sent — it is in the server's log, which is where an error chain full
+ * of ports and versions can actually be acted on.
  */
 function checkRow(name: string, state: string): HTMLElement {
     const meta = CHECK_META[name];
+    // `=== "ok"` and never `startsWith("error")`: an older server sends
+    // `"error: <reason>"` and this one sends `"error"`, and only one of those
+    // tests survives both.
     const ok = state === "ok";
     const optional = meta?.optional === true;
     const tone = ok ? "ok" : optional ? "warn" : "bad";
@@ -167,10 +214,12 @@ function checkRow(name: string, state: string): HTMLElement {
     row.className = `line check check-${tone}`;
     row.title = ok
         ? (meta?.costs ?? "") + (optional ? "\nOptional — the server is fine without it." : "")
-        : `${state}\n${meta?.costs ?? ""}` +
+        : `${meta?.costs ?? ""}` +
           (optional
-              ? '\nOptional dependency, which is why Health can still say "ok".'
-              : "\nRequired — the server reports itself degraded without it.");
+              ? '\nOptional, which is why the server says "degraded" rather than ' +
+                '"unhealthy".'
+              : "\nRequired — the server reports itself unhealthy without it.") +
+          "\nThe reason is in the server's log.";
 
     const label = document.createElement("span");
     label.className = "name check-name";
@@ -181,7 +230,7 @@ function checkRow(name: string, state: string): HTMLElement {
 
     const value = document.createElement("span");
     value.className = "value check-state";
-    value.textContent = state;
+    value.textContent = ok ? "ok" : "not answering";
 
     row.append(label, value);
     if (optional) {
@@ -205,7 +254,7 @@ function checkRow(name: string, state: string): HTMLElement {
 function renderRuntime(s: StatusSnapshot): void {
     runtimeBox.replaceChildren();
     if (s.runtime === undefined || s.runtime === UNAVAILABLE) {
-        runtimeBox.appendChild(unavailableRow());
+        runtimeBox.appendChild(unavailableRow(s.sectionErrors?.runtime));
         return;
     }
     const r = s.runtime;
@@ -273,7 +322,7 @@ function renderInventory(s: StatusSnapshot): void {
     }
     if (s.inventory === UNAVAILABLE) {
         inventoryTotal.textContent = "";
-        inventoryBox.appendChild(unavailableRow());
+        inventoryBox.appendChild(unavailableRow(s.sectionErrors?.inventory));
         return;
     }
 
@@ -356,7 +405,7 @@ function renderFailed(s: StatusSnapshot): void {
         failedTotal.textContent = "";
         failedTotal.className = "card-note dim";
         retryAll.hidden = true;
-        failedBox.appendChild(unavailableRow());
+        failedBox.appendChild(unavailableRow(s.sectionErrors?.failed));
         return;
     }
     card.hidden = s.failed.length === 0;
@@ -390,7 +439,10 @@ function failedRow(f: FailedFile): HTMLElement {
 
     const retry = document.createElement("button");
     retry.className = "secondary retry";
-    retry.append(icon("debug-restart", true));
+    retry.dataset.busyKey = `row:${f.path}`;
+    const glyph = icon("debug-restart", true);
+    glyph.dataset.busyIcon = "";
+    retry.append(glyph);
     retry.appendChild(document.createTextNode("Retry"));
     retry.addEventListener("click", () =>
         api.postMessage({ type: "retryFile", path: f.path })

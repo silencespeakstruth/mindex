@@ -20,7 +20,7 @@ conftest = __import__("conftest")
 MINDEX_URL = conftest.MINDEX_URL
 MOCK_OLLAMA_URL = os.environ.get("MOCK_OLLAMA_URL", "http://localhost:11434")
 
-from test_e2e import FILE_PATH, RUST_V1, RUST_V2, index
+from test_e2e import FILE_PATH, RUST_V1, RUST_V2, index, search
 
 QUESTION = "how does process_records handle retries"
 
@@ -586,15 +586,26 @@ def test_ollama_failure_becomes_an_error_event(
     assert "ollama.unavailable" in data
 
 
-def test_dead_ollama_is_reported_but_health_stays_ok(
-    client: httpx.Client, ollama_knobs: object
+def test_dead_ollama_degrades_health_and_carries_no_detail(
+    client: httpx.Client, project: str, ollama_knobs: object
 ) -> None:
-    """Ollama is optional: /health pinpoints it, the overall verdict ignores it."""
+    """Ollama is the one optional dependency, and "degraded" is what that costs.
+
+    It is precisely the state in which a client should keep offering search and
+    stop offering research — which is why the verdict has a word for it instead
+    of collapsing into the one that means "nothing works".
+    """
     ollama_knobs(tags_down=1.0)  # type: ignore[operator]
 
     body = client.get(f"{MINDEX_URL}/health").json()
-    assert body["checks"]["ollama"].startswith("error:"), body
-    assert body["status"] == "ok", body
+    # Exact equality, not a prefix: the reason a probe failed is logged, never
+    # returned, and this is the assertion that notices it coming back.
+    assert body["checks"]["ollama"] == "error", body
+    assert body["status"] == "degraded", body
     assert body["checks"]["sqlite"] == "ok"
     assert body["checks"]["qdrant"] == "ok"
     assert body["checks"]["embedder"] == "ok"
+
+    # The half nothing pinned before: a degraded server is still a working one.
+    assert index(client, project, RUST_V1).status_code == 200
+    assert search(client, project, "process records in batches").status_code == 200

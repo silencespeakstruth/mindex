@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { ActiveResearchRun, MindexApi } from "./api";
 import { say } from "./brand";
+import { humanize, logError, reportError } from "./errors";
 import { describeActiveRun } from "./shared/activeRuns";
 
 interface ActiveRunItem extends vscode.QuickPickItem {
@@ -47,7 +48,8 @@ export async function showActiveResearchRuns(api: MindexApi): Promise<void> {
             });
         } catch (e) {
             pick.title = "Active research — unavailable";
-            pick.placeholder = e instanceof Error ? e.message : String(e);
+            logError("Listing active research runs", e);
+            pick.placeholder = humanize(e).text;
             pick.items = [];
         } finally {
             pick.busy = false;
@@ -66,9 +68,7 @@ export async function showActiveResearchRuns(api: MindexApi): Promise<void> {
         try {
             await api.cancelActiveResearch(item.run.run_id);
         } catch (e) {
-            void vscode.window.showErrorMessage(
-                say(`cancel failed — ${e instanceof Error ? e.message : String(e)}`)
-            );
+            await reportError(say("cancel failed"), e);
         }
         // Re-fetch rather than splice: the 204 is idempotent and says nothing;
         // the list is the server's answer. A cancelled run may linger a moment

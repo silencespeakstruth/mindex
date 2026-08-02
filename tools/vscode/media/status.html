@@ -7,8 +7,13 @@
             </h3>
             <div class="row">
                 <span class="checked dim" id="checked"></span>
-                <button id="refresh" class="ghost" title="Re-check the server">
-                    <span class="codicon codicon-refresh"></span>
+                <button
+                    id="refresh"
+                    class="ghost"
+                    data-busy-key="refresh"
+                    title="Re-check the server"
+                >
+                    <span class="codicon codicon-refresh" data-busy-icon></span>
                 </button>
                 <button id="settings" class="ghost" title="Open MINDex settings">
                     <span class="codicon codicon-gear"></span>
@@ -35,6 +40,21 @@
     <section class="card" id="health-card">
         <h4 class="card-title">
             <span class="codicon codicon-pulse codicon-sm"></span>Health
+            <!--
+                The same key as the head refresh: they run the same re-check, so
+                they grey together. Both exist because they answer different
+                moments — the head one sits beside the "checked HH:MM" stamp it
+                explains, and this one is where the eye already is when a row
+                below has gone red.
+            -->
+            <button
+                id="health-refresh"
+                class="ghost"
+                data-busy-key="refresh"
+                title="Re-check every dependency now"
+            >
+                <span class="codicon codicon-refresh codicon-sm" data-busy-icon></span>
+            </button>
         </h4>
         <div class="checks" id="checks"></div>
     </section>

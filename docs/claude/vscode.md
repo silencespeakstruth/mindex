@@ -25,7 +25,14 @@ modifying `tools/vscode`.
   a `QuickPick` (`researchContextPick.ts`) opened from an `Add…` button
   visible in Research mode **whether or not anything is picked**
   (hidden-until-populated made the feature undiscoverable);
-  `browseResearchRuns` is the single-select twin for reading. The picker
+  There used to be a read-only single-select twin, `browseResearchRuns` /
+  `mindex.browseResearch`; it is **gone**. One line per report was too little
+  to choose from, so every use of it ended in the History panel anyway, and two
+  reading surfaces meant two places for the challenge and trust wording to
+  drift apart. The cost is real and worth recording against the popup-first
+  rule above: *reading* a stored report now always costs a panel.
+  `ctrl+alt+,` opens the panel instead.
+  The picker
   offers **valid runs only** (the server 400s an invalid context id; listing
   one defers the refusal to submit time), tracks selection in
   `onDidChangeSelection` rather than `onDidAccept`'s *visible* selection (a
@@ -51,9 +58,51 @@ modifying `tools/vscode`.
   would then sit in the tab bar, away from the filters it re-runs; it
   supersedes any pending keystroke (`search.cancel()`) and re-fetches the
   open preview, whose staleness and trust are exactly the numbers that move
-  under the panel. The `kind` filter select is backed by the server-side
-  `kind` query param — filtered inside the cursor-bounded subquery like the
-  rest, so a full page still means "there may be more".
+  under the panel. The `kind` and `completeness` filter selects are backed by
+  server-side query params — filtered inside the cursor-bounded subquery like
+  the rest, so a full page still means "there may be more". That is not a
+  detail: `Select all` and `Collect garbage` both page this list **to
+  exhaustion** and stop on a short page, so a filter applied after the cut
+  would advance the cursor while returning fewer rows and quietly truncate the
+  selection. It is why `completeness` was added to the server rather than
+  tested on `done_reason` in the client.
+  **Bulk selection is defined by the filters that built it**, which is why any
+  filter change or refresh clears it *wholesale* rather than pruning it row by
+  row: a pruned bulk selection is several hundred ids the user can no longer
+  see, chosen by a query no longer on screen, still offered to the delete
+  button. It is capped by the published `max_delete_ids` (selecting more than
+  one call accepts would hand the user a number the delete cannot honour) with
+  `MAX_PAGES` as a runaway backstop, and the footer says when it stopped short.
+  The confirmation resolves ids through `summaries` — every row the panel has
+  ever *fetched*, including ones never rendered — and not through `rows`, the
+  rendered page: resolving a bulk selection through `rows` would report `0`
+  dependants for everything off screen, which is exactly the under-reporting
+  the rule above forbids.
+  **`Collect garbage`** proposes the union of invalid / stale / partial /
+  inconclusive-challenge runs, with pinned excluded by the **server's**
+  `pinned=false` rather than a client test, so the exemption cannot leak and
+  the button's count equals the proposal. The review lives in the **right
+  pane**. Not a second webview: that is a second copy of the CSP page
+  assembly, the state protocol, the `AbortController` discipline and the
+  delete path, for one screen. Not a multi-select QuickPick either: it can
+  pre-select items but cannot show *why* each row is proposed or that four
+  later reports were built on it — the two things a reviewer unchecks a row
+  over — and the right pane leaves the list visible so a proposed report can
+  be opened and read before the decision. Each run appears in **one** group
+  (its most serious reason) with the others as labels; three checkboxes for
+  one report would let an uncheck in one group not stick. The classification
+  is client-side, which is safe *here specifically* because that pass runs to
+  exhaustion — no inference is drawn from a page's length.
+  The counts line is the corpus `totals`: a **fixed denominator** that no
+  filter moves, because the number the filters would give is `runs.length`,
+  already on screen. An older server sends no totals and it renders "—"
+  rather than a guess.
+  **Head chrome**: the magnifier is inside the search field (two controls in a
+  row where one is decoration reads as two), and the refresh button and spinner
+  sit in the search row rather than among the filters — the filter row wraps,
+  and a fixed-size icon button on its right edge was clipped past the panel's
+  260px grid minimum, which is what "the refresh icon runs off the edge"
+  actually was.
   **Challenge flow** (`challengeFlow.ts` + `startChallenge` in
   `extension.ts`): launching a challenge is a **QuickPick chain** (effort →
   optional model → optional max-seconds), not a form and not an Ask mode —
@@ -83,12 +132,34 @@ modifying `tools/vscode`.
   lie); the unions and narrowing guards live behind that seam, and every
   consumer of the *meaning* goes through them. Inconclusive is never an
   acquittal; unchallenged is silent (a badge on every row is a badge on
-  none); a challenge row links its subject (resolved from the loaded page,
-  else a link the host resolves by id). The challenges-against list in the
-  preview is a client query (`kind=challenge` + filter on
-  `challenged_run_id`), fired only when `trust !== "unchallenged"` — derived
-  trust already proves the absence of valid challenges, and the stale ones
-  it then misses no longer count.
+  none); a challenge row links its subject from the **server-resolved**
+  `challenged_seq`/`challenged_title`, so a `null` now means the subject is
+  genuinely deleted rather than merely off the loaded page.
+  **The preview always states what was said about a report**
+  (`challengeStateLine`). The old version rendered a trust badge and a list,
+  and fired the lookup only when `trust !== "unchallenged"` — reasoning that
+  derived trust already proves the absence of *valid* challenges. Both halves
+  were wrong in the same direction. Trust is correctly silent about an
+  inconclusive challenge and about one whose own evidence has moved, so a
+  report that had been challenged and **refuted** could show nothing at all
+  about having been challenged; and the list was filtered client-side out of
+  one unfiltered `kind=challenge` page, so anything past that page was simply
+  never found. It is now one indexed `challenged_run_id` query per preview,
+  fired for every research run, and every state — including "never
+  challenged" — gets a sentence. `limit: 2` is deliberate: the server's
+  replace rule is verdict-gated, so an inconclusive re-check leaves the
+  standing verdict in place and two rows is a real state the line must name
+  rather than silently pick from.
+  **Re-check, not a second Challenge.** With a challenge standing,
+  `challengeGuard` returns `mode: "recheck"` and the button says so — a second
+  "Challenge" would misdescribe what pressing it does, because a fresh run now
+  *replaces* the standing verdict when it reaches one. The fork
+  (`recheckOptions`) offers both and runs neither automatically: "Links only"
+  is `GET …/{challenge_id}/verification` on the **challenge** run, captioned as
+  such — reading a challenge's provenance as its subject's would be a worse
+  confusion than the one this surface exists to fix — and "Fresh run" goes
+  through a modal naming the verdict at risk and the fact that an inconclusive
+  result leaves it standing.
   **Verification renders two halves separately** (`verificationView`):
   provenance is immutable — `provenance_matches: false` impeaches the
   journal, never the code — while staleness is computed against the index
@@ -119,14 +190,35 @@ modifying `tools/vscode`.
   **The form is also gated on what the server can currently do, and that
   gate needs a clock.** `fetchStatus` publishes one `Availability {ask,
   research, reason}`, split because a *required* dependency takes everything
-  down (server reports `degraded`) while Ollama takes only Research and
-  leaves health `"ok"` deliberately — one flag would either kill Search
-  whenever no local model runs, or keep offering Research against a server
-  that cannot serve it. The reason names the *required* checks, never
-  Ollama. `!research` disables the Research **tab**; `!ask` disables every
-  control (Stop excepted — a live run still has a connection to drop),
-  leaving the half-typed question visible and inert; the mode is never
-  switched out from under the user. A degradation also aborts what is
+  down (server reports `unhealthy`) while Ollama takes only Research
+  (`degraded`) — one flag would either kill Search whenever no local model
+  runs, or keep offering Research against a server that cannot serve it. The
+  reason names the *required* checks, never Ollama. **The verdict is read
+  from `status` AND `checks` together** (`readHealth`): a server older than
+  the tri-state vocabulary says `degraded` for the *required* case, so
+  keying on `status` alone would paint yellow and leave the form armed
+  against a server with no vector store. Two flags stay two: a third would
+  need a control that is live under `unhealthy` and dead under
+  Ollama-degradation, and there is none.
+
+  **What a degradation disables is only what it costs**, which is a reversal
+  of the old rule. `!ask` used to disable *every* control, defensible while
+  the only question the form answered was "can this be submitted" and wrong
+  for a form the user *composes* in: the notice already says the server is
+  down, and freezing the textarea takes away the one thing still working
+  along with whatever was half-typed in it. Now the split is by what a
+  control **reaches** — the question box, the `ASK_FIELDS` controls, the
+  three scope buttons and the disclosures reach nothing and stay live (the
+  form is not dimmed either, for the same reason: dimming something the user
+  can still type into says "this does nothing"); `#submit` and the context
+  picker need `ask`; the Research tab and `#submit`-in-research-mode need
+  `research`; Stop is exempt always. `canSubmit()` reads the button's own
+  `disabled` and is asked at **both** entry points — the click *and* the
+  Enter keydown, which used to call `submit()` blind and fire research at a
+  dead Ollama. `#scope-folder` posts its own `scopeFolder` message rather
+  than a `submit` the host early-returns on: a control that fills in a text
+  field has no business on the channel that launches runs, and while it was
+  there it was the one unguarded way in. A degradation also aborts what is
   running (via `RunRegistry`), resetting handles **before** reporting (a
   notification's thenable resolves only on dismissal — the trap that once
   left Research disabled behind an un-clicked toast), and reports it as a
@@ -202,6 +294,75 @@ modifying `tools/vscode`.
   The Drift view keeps the **claims** row (other clients' work) and nothing
   else — the re-entry guard moved to a `reindexRunning` flag in `activate()`
   (`isBusy` was derived from the deleted progress state).
+  **Every button that reaches the server goes inert until its result lands,
+  and the refusal is host-side.** `BusyKeys` (`src/busy.ts`, `vscode`-free,
+  `busy.test.ts`) is one single-flight per key; `applyBusy`/`setEnabled`
+  (`webview/ui/busy.ts`) paint it onto `[data-busy-key]` elements. Two rules
+  it exists to enforce. **Supersede reads, refuse writes**: aborting and
+  restarting is right for a keystroke-driven list load, where the newer
+  query is the wanted one, and wrong everywhere else — a superseded `more`
+  aborted the page it had just asked for and returned early without
+  advancing the cursor, so holding the key made paging stop dead, and a
+  superseded delete is still a delete. **A disabled button is a courtesy,
+  not a guarantee** — a restored panel, a keyboard race or a message already
+  in flight can still post — so the greyed state is the *echo* of the host's
+  decision, never its cause; two confirmation modals for one row is what the
+  other way round allows. `setEnabled` layers busy over a control's **own**
+  verdict in a `WeakMap` (and seeds from the authored `disabled` on first
+  touch): `#runs-delete` is disabled because nothing is selected, and an
+  unrelated key clearing must not enable it. `{type:"loading"}` is retired —
+  the runs spinner rides the same `list` key as the buttons, so the two can
+  no longer disagree. Keys in use: `list`/`more`/`gc`/`delete`/`preview`/
+  `verify`/`row:<id>` (history), `refresh`/`retry`/`row:<path>` (status),
+  `submit` (Ask — shared by the form and the `mindex.search` palette
+  command, so five fast clicks are one search rather than five quick picks
+  racing to open). The status panel's `refresh` key is fed by
+  `StatusMonitor.onDidChangeRefreshing`, not by the press, so a *background*
+  poll greys it too — otherwise the panel visibly re-renders while the
+  button that supposedly caused it sits idle and clickable.
+  **No raw error text reaches the user, anywhere.** `humanize(e)`
+  (`problem.ts`, table-documented and pinned by `problem.test.ts`) returns
+  `{text, retryable, cancelled, code}`; `text` is a sentence and **never
+  contains the machine `code`**, which survives on its own field for a
+  tooltip and the log. `reportError` and every panel funnel through it, and
+  the raw stack goes to a lazily created `MINDex` output channel via
+  `logError` — that is what makes the rule affordable rather than
+  destructive, since otherwise a bug report contains no error at all. The
+  shortcut it replaces is `e.message`, which for a `ProblemError` is
+  `code (status): detail`: eight catch sites in the history panel rendered
+  `research.not_found (404)` and `connect ECONNREFUSED 127.0.0.1:11111` at
+  users. `retryable` decides both the Retry button and the banner's colour
+  (yellow "press it again" vs red "this will not work"), and the banner
+  survives **exactly until something renders successfully** — a rule in the
+  webview's message handler rather than an `ok()` at eight host call sites,
+  because forgetting one is how a transient failure came to sit over a list
+  that had since loaded. `noteIfLegacy` had to stop reading the rendered
+  message and became a shape test (`ProblemError`, 400, `detail` matching):
+  matching English for a version check breaks the day the wording improves.
+  **Requests have deadlines, and the stream's is idle-only.**
+  `mindex.requestTimeoutSeconds` (15, `0` = off) arms **two** clocks per
+  request — `req.setTimeout` for socket inactivity, plus a total deadline at
+  2×, because a peer dribbling one byte at a time resets the first forever.
+  Health polls clamp to `HEALTH_TIMEOUT_MS` (5 s): a poll that outlives its
+  own interval stacks, and the busy interval is 3 s. `MindexApi.withTimeout`
+  is an `Object.create` view sharing the agent — the poll calls five
+  endpoints and all five must be bounded by the *poll's* clock. A timeout is
+  its own `TimeoutError`, matched **before** the `UnreachableError` wrap, or
+  it reaches the user as "is the server running?" — wrong, and the first
+  thing they have already checked. A 2xx body that will not parse is
+  `MalformedResponseError`, also not "unreachable": something answered.
+  `mindex.streamIdleTimeoutSeconds` (180, `0` = off) is **idle-only, never
+  total** — a legitimate `high` run lives up to the server's 70-minute
+  ceiling, so any total deadline would eventually kill a working run; the
+  number is derived from the server's own 120 s `first_token_timeout_ms` /
+  `report_timeout_ms` plus slack. It must not take the `abortResolves` path:
+  a silent stream is a failure, the user's Stop is not. The legacy non-SSE
+  fallback disarms the clock entirely (a buffered synchronous index over a
+  large repo is legitimately minutes of silence). `StatusMonitor` gains a
+  single-flight guard, a 20 s backstop deadline and an abort on `dispose` —
+  the bug being that `reschedule` re-arms in a `.finally()`, so one
+  never-settling poll ended health polling for the life of the window and
+  froze the indicator at whatever colour it had.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, one tool —
 - VS Code (`tools/vscode`): `npm run check` = prettier + eslint + `tsc` + the
   `node --test` suite (`src/*.test.ts`, compiled to `dist/`).

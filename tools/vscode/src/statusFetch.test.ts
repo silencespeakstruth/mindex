@@ -1,6 +1,7 @@
 import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import type { MindexApi } from "./api";
+import { ProblemError, UnreachableError } from "./problem";
 import { failedCount, StatusSnapshot, UNAVAILABLE } from "./shared/status";
 import { Availability, fetchStatus } from "./statusFetch";
 
@@ -111,41 +112,49 @@ describe("fetchStatus", () => {
 
     it("reports an unreachable server without blanking the pickers", async () => {
         const { snapshot, fan } = await run(
-            fakeApi({ health: () => Promise.reject(new Error("ECONNREFUSED")) }),
+            fakeApi({
+                health: () =>
+                    Promise.reject(
+                        new UnreachableError(new Error("connect ECONNREFUSED 127.0.0.1:11111"))
+                    ),
+            }),
             "guid"
         );
         strictEqual(snapshot.state, "unreachable");
-        // Both flags down, and the reason is the transport error — that string is what
-        // the form shows, so "unreachable" must not reach the user as a bare word.
         strictEqual(gate(fan).ask, false);
         strictEqual(gate(fan).research, false);
-        match(gate(fan).reason ?? "", /ECONNREFUSED/);
+        // The reason is shown to the user, so it is a sentence naming what to
+        // check — never the socket error, which says nothing actionable and
+        // used to be pasted through verbatim.
+        const reason = gate(fan).reason ?? "";
+        ok(!reason.includes("ECONNREFUSED"), reason);
+        match(reason, /mindex\.serverUrl/);
+        strictEqual(snapshot.detail, reason);
         // `undefined`, never `[]`: unknown falls back to the full supported list,
         // whereas empty would leave a dead picker.
         deepStrictEqual(fan.inventory, [undefined]);
         strictEqual(fan.configs, 0, "a failed health check must not push a config");
     });
 
-    it("keeps a dead Ollama out of the server's state", async () => {
+    it("reads a dead Ollama as degraded, not as a broken server", async () => {
         const { snapshot, fan } = await run(
             fakeApi({
                 health: () =>
                     Promise.resolve({
-                        status: "ok",
+                        status: "degraded",
                         version: "1.0.0",
                         checks: {
                             sqlite: "ok",
                             qdrant: "ok",
                             embedder: "ok",
-                            ollama: "error: refused",
+                            ollama: "error",
                         },
                     }),
             }),
             "guid"
         );
-        // Ollama is optional: it costs Research and nothing else, so the state stays
-        // "ok" and only `researchAvailable` moves.
-        strictEqual(snapshot.state, "ok");
+        // Yellow, and yellow means exactly this: an optional dependency is down.
+        strictEqual(snapshot.state, "degraded");
         strictEqual(snapshot.researchAvailable, false);
         // The half of the gate that matters most: Search must stay available. Gating
         // both on one flag would take the whole view down for a missing local model.
@@ -162,19 +171,19 @@ describe("fetchStatus", () => {
             fakeApi({
                 health: () =>
                     Promise.resolve({
-                        status: "degraded",
+                        status: "unhealthy",
                         version: "1.0.0",
                         checks: {
                             sqlite: "ok",
                             qdrant: "ok",
-                            embedder: "error: connection refused",
+                            embedder: "error",
                             ollama: "ok",
                         },
                     }),
             }),
             "guid"
         );
-        strictEqual(snapshot.state, "degraded");
+        strictEqual(snapshot.state, "unhealthy");
         strictEqual(gate(fan).ask, false);
         strictEqual(gate(fan).research, false);
         // Names the process to go and start. "The server is degraded" would send the
@@ -183,22 +192,69 @@ describe("fetchStatus", () => {
     });
 
     /**
-     * Ollama must never be blamed for degradation. It cannot cause it — the server
-     * keeps health at "ok" without it — so naming it in the reason would point at the
-     * one dependency that is not the problem.
+     * Version skew, in the direction that would hurt. A server older than the
+     * tri-state verdict says `degraded` for the case the new vocabulary calls
+     * `unhealthy` — so keying on `status` alone would paint yellow and leave the
+     * form armed against a server with no vector store. The failing *check* is
+     * therefore authoritative on its own.
      */
-    it("names only required dependencies as the cause of degradation", async () => {
-        const { fan } = await run(
+    it("does not trust an old server's 'degraded' when a required check is down", async () => {
+        const { snapshot, fan } = await run(
             fakeApi({
                 health: () =>
                     Promise.resolve({
                         status: "degraded",
+                        version: "0.9.0",
+                        checks: {
+                            sqlite: "ok",
+                            qdrant: "error: connection refused",
+                            embedder: "ok",
+                            ollama: "ok",
+                        },
+                    }),
+            }),
+            "guid"
+        );
+        strictEqual(snapshot.state, "unhealthy");
+        strictEqual(gate(fan).ask, false);
+    });
+
+    /**
+     * A wedged research run is the one thing that makes a server unusable with
+     * every check green, so the verdict has to be believed on its own too.
+     */
+    it("believes an unhealthy verdict with no failing check behind it", async () => {
+        const { snapshot } = await run(
+            fakeApi({
+                health: () =>
+                    Promise.resolve({
+                        status: "unhealthy",
+                        version: "1.0.0",
+                        checks: { sqlite: "ok", qdrant: "ok", embedder: "ok", ollama: "ok" },
+                    }),
+            }),
+            "guid"
+        );
+        strictEqual(snapshot.state, "unhealthy");
+    });
+
+    /**
+     * Ollama must never be blamed for a required dependency's failure: the fix is
+     * different, and pointing at the one process that is not the problem is worse
+     * than saying nothing.
+     */
+    it("names only required dependencies as the cause", async () => {
+        const { fan } = await run(
+            fakeApi({
+                health: () =>
+                    Promise.resolve({
+                        status: "unhealthy",
                         version: "1.0.0",
                         checks: {
                             sqlite: "ok",
-                            qdrant: "error: refused",
+                            qdrant: "error",
                             embedder: "ok",
-                            ollama: "error: refused",
+                            ollama: "error",
                         },
                     }),
             }),
@@ -265,6 +321,31 @@ describe("fetchStatus", () => {
         strictEqual(snapshot.runtime, UNAVAILABLE);
         strictEqual(snapshot.failed, UNAVAILABLE);
         strictEqual(failedCount(snapshot), 0);
+        // And says so. These used to be bare `catch {}`, which is how a section
+        // could be blank for a week with nothing anywhere admitting why.
+        ok((snapshot.sectionErrors?.runtime ?? "").length > 0);
+        ok((snapshot.sectionErrors?.failed ?? "").length > 0);
+    });
+
+    /**
+     * The reason a section failed is a sentence, never the error's own words —
+     * the same rule the notifications follow, and the reason `humanize` is shared
+     * rather than each surface formatting for itself.
+     */
+    it("records a section failure as prose, not as an exception message", async () => {
+        const { snapshot } = await run(
+            fakeApi({
+                status: () =>
+                    Promise.reject(
+                        new ProblemError(500, "internal.error", "thread 'x' panicked")
+                    ),
+            }),
+            "guid"
+        );
+        const reason = snapshot.sectionErrors?.runtime ?? "";
+        ok(!reason.includes("internal.error"), reason);
+        ok(!reason.includes("panicked"), reason);
+        ok(reason.length > 0);
     });
 
     it("publishes a snapshot subscribers can read after the fact", async () => {

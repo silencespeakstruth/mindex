@@ -5,6 +5,86 @@
 Indexing becomes something you can watch, and Research becomes a first-class
 surface rather than a panel you have to know about.
 
+- **Research History can be pruned in one action.** `Select all` selects every
+  report matching the current filters — not just the loaded page — by paging the
+  server to exhaustion, capped by the limit one batch delete accepts and saying so
+  when it stops short. Two one-click presets (`Outdated`, `Partial`) and a fourth
+  filter (finished vs. stopped-by-a-budget) reach the common cases. A selection
+  built by a filter is cleared whenever the filter changes: it is defined by that
+  query, and keeping it would leave hundreds of ids selected that are no longer on
+  screen.
+- **`Collect garbage`** proposes every out-of-date, stale, partial and
+  inconclusive-challenge report in one review — grouped by what is wrong with each,
+  every row pre-checked, reports other work was built on flagged loudly, and one
+  confirmation for the lot. Pinned reports are never proposed.
+- **A corpus counter** in the panel head: how many reports are stored and how many
+  are still valid. Deliberately unaffected by the filters — it is a denominator,
+  not a second view of the list.
+- **A report now says outright what was said about it.** The preview used to show a
+  trust badge and nothing else, and trust is silent about a challenge that came
+  back inconclusive and about one whose own evidence has since moved — so a report
+  that had been challenged and **refuted** could read as untouched. Every state now
+  gets a sentence, including "never challenged", and a challenge names its subject
+  by number and title wherever it is shown (the server resolves it, so an
+  off-screen subject is no longer an anonymous link).
+- **Re-check replaces the second Challenge button.** A report that already carries
+  a challenge offers a re-check with two options and runs neither on its own: check
+  the existing challenge's citations offline (instant, no GPU, changes nothing), or
+  spend a slot on a fresh run — with a warning naming the verdict at risk.
+- **Search chrome**: the magnifier moved inside the field, and the refresh button
+  no longer runs off the right edge of a narrow panel.
+- **Three colours, no words.** The status-bar indicator is green, yellow or red and
+  says nothing else: yellow now means exactly one thing — the server's optional
+  Ollama is down, so Research is unavailable and everything else works — which is
+  what the old `⏹ research` suffix spent status-bar width spelling out. Red covers
+  both a required dependency failing and the server not answering at all. The
+  sentence and the remedy live in the tooltip and the Server Status panel.
+- **A degradation now disables only what it costs.** The question box, the filters,
+  the budget and the scope buttons stay live and editable while the server is down
+  — they compose a query, they do not send one — and the form is no longer dimmed.
+  What goes inert is Submit, the Research tab and the context picker. Pressing
+  Enter in the question box goes through the same gate as the button, which it did
+  not before: with Ollama down it still fired a research run.
+- **A `Health` refresh button**, beside the card it re-checks. It and the one in
+  the panel head grey out together, including while a *background* poll is running.
+- **Every button that talks to the server disables itself until its answer lands.**
+  Holding `Load more` no longer stalls paging (each press used to cancel the page
+  the one before it had asked for); double-clicking `Delete` no longer opens two
+  confirmations; the review dialog's own Delete no longer stays pressable; and five
+  fast clicks on Search are one search instead of five quick picks racing to open.
+
+### Fixed
+
+- **No raw error text is shown anywhere.** Failures used to reach the user as
+  `research.not_found (404): …` and `connect ECONNREFUSED 127.0.0.1:11111`. Every
+  surface now shows one sentence — what went wrong and, where there is one, what to
+  do — and the full error goes to a `MINDex` output channel. Errors you can retry
+  are drawn in yellow and offer a Retry; errors you cannot are red and do not.
+  The Research History banner also clears itself once anything loads successfully,
+  instead of sitting over a list that has since worked.
+- **Requests have deadlines.** Nothing in the extension had a timeout: one
+  half-open connection left the health poll pending forever, which stopped health
+  polling for the rest of the session and froze the indicator at whatever colour it
+  happened to be. Ordinary requests are bounded by `mindex.requestTimeoutSeconds`
+  (15 s) and health polls by a shorter clock of their own. Streaming research is
+  bounded only by *silence* (`mindex.streamIdleTimeoutSeconds`, 180 s) — a long run
+  that keeps reporting progress is never cut off.
+- **A split query embedder reads as the outage it is.** It rendered as a soft
+  yellow "optional" row while every search was failing.
+
+### Changed
+
+- **One challenge per report, newest verdict wins** (server behaviour). Challenging
+  a report again now **replaces** its standing challenge instead of adding to it,
+  so trust reflects exactly one verdict. A challenge that reaches no verdict
+  replaces nothing — an inconclusive re-run cannot erase a refutation.
+
+### Removed
+
+- **`MINDex: Browse Stored Research`** and its `ctrl+alt+,` binding. One line per
+  report was too little to choose from, and every use of it ended in Research
+  History anyway. `ctrl+alt+,` now opens Research History directly.
+
 - **A live Indexing panel** (`mindex.openIndexing`, opened by itself when a reindex
   starts — `mindex.indexingPanel` says where, or `manual` to never). A reindex used
   to report itself through two surfaces that are each structurally one line: a

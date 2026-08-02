@@ -184,6 +184,14 @@ button.ghost:hover:not(:disabled) {
     background: var(--vscode-toolbar-hoverBackground);
 }
 
+/* A control whose work is in flight. Deliberately no colour of its own: three
+ * states already need one, and "working" resolves by itself — the spinning glyph
+ * the busy layer swaps in is the whole signal, plus the cursor saying the click
+ * would go nowhere. */
+[aria-busy="true"] {
+    cursor: progress;
+}
+
 /* ── segmented control ───────────────────────────────────────────────────── */
 /* Used for the Search/Research mode switch and for the effort ladder — the same
  * component twice, because they are the same act: pick one of a short closed set. */

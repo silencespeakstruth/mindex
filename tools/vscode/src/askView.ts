@@ -36,11 +36,6 @@ export interface AskSubmission {
     include?: SearchFilter;
     exclude?: SearchFilter;
     /**
-     * The user asked to scope to the folder of the file they are looking at. Resolved
-     * by the extension, which has the editor API this webview does not.
-     */
-    scopeCurrentFolder?: boolean;
-    /**
      * Research only: stored runs whose reports the server hands the model as
      * background before it plans. Picked in Research History.
      *
@@ -118,7 +113,16 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
          * client and the project guid, neither of which a view provider owns — and
          * because the same picker is reachable from a command.
          */
-        private readonly onPickContext: () => void
+        private readonly onPickContext: () => void,
+        /**
+         * Resolve "this folder" and write it back into the Scope fields. In the
+         * extension because it needs the editor API; a pure form edit, so it is
+         * live even while the server is down.
+         */
+        private readonly onScopeFolder: (current: {
+            include?: SearchFilter;
+            exclude?: SearchFilter;
+        }) => void
     ) {}
 
     resolveWebviewView(view: vscode.WebviewView): void {
@@ -167,6 +171,16 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
                 case "openStatus":
                     this.onOpenStatus();
                     break;
+                case "scopeFolder":
+                    // Its own message, not a `submit` carrying a flag. It fills the
+                    // form in and runs nothing, so routing it through the channel
+                    // that launches research runs made it the one unguarded way in
+                    // — live during a run, and against a server that was down.
+                    // It still carries the current scope, which it edits rather
+                    // than replaces: the language filter beside the globs is the
+                    // user's and must survive narrowing to a folder.
+                    this.onScopeFolder(readScope(msg));
+                    break;
                 case "scopeDefaults":
                     this.postScopeDefaults();
                     break;
@@ -190,9 +204,7 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
     private handleSubmit(msg: Record<string, unknown>): void {
         const mode: AskMode = msg.mode === "search" ? "search" : "research";
         const text = asString(msg.text).trim();
-        // "Folder" is a scope action, not a query, so it must work with an empty box —
-        // it fills the form in rather than running anything.
-        if (text === "" && msg.scopeCurrentFolder !== true) {
+        if (text === "") {
             void vscode.window.showInformationMessage(
                 mode === "search"
                     ? say("enter a search query first.")
@@ -212,7 +224,6 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
             model: asString(msg.model).trim(),
             budget: readBudget(msg),
             ...readScope(msg),
-            scopeCurrentFolder: msg.scopeCurrentFolder === true,
             contextRunIds:
                 this.contextRuns.length > 0 ? this.contextRuns.map((r) => r.id) : undefined,
         });
@@ -293,6 +304,18 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
     setAvailability(availability: Availability): void {
         this.availability = availability;
         this.postAvailability();
+    }
+
+    /**
+     * A keyed round trip started or finished. Currently one key, `submit`, which
+     * is Search's in-flight state — Research has `setRunning`, which does more.
+     *
+     * Not replayed on resolve, unlike availability and the config: a webview that
+     * was torn down and rebuilt cannot be mid-press, and the host's own
+     * single-flight is what actually refuses a second search.
+     */
+    setBusy(key: string, busy: boolean): void {
+        void this.view?.webview.postMessage({ type: "busy", key, busy });
     }
 
     private postAvailability(): void {

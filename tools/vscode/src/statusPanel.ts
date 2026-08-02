@@ -2,10 +2,17 @@ import * as vscode from "vscode";
 import { BRAND } from "./brand";
 import { asString, mediaRoots, readMedia, renderPage } from "./webview";
 import { StatusMonitor } from "./statusMonitor";
+import { BusyKeys } from "./busy";
 
 /** What the panel's buttons ask the extension to do. */
 export interface StatusActions {
-    refresh(): void;
+    /**
+     * Returns when the re-check has finished — the panel greys its refresh
+     * buttons until it does, and a `void` here would grey them for one frame.
+     * The monitor's own `refreshing` signal covers a *background* poll; this
+     * covers the press.
+     */
+    refresh(): void | Promise<void>;
     retryAll(): void;
     retryFile(path: string): void;
     openFile(path: string): void;
@@ -72,25 +79,39 @@ export class StatusPanel {
 
         this.disposables.push(
             monitor.onDidChangeSnapshot(() => this.post()),
+            // The refresh buttons echo the *monitor*, not the press, so a
+            // background poll greys them too. Otherwise the panel visibly
+            // re-renders while the button that supposedly caused it sits idle and
+            // clickable, inviting exactly the second press this prevents.
+            monitor.onDidChangeRefreshing((busy) => this.postBusy("refresh", busy)),
             this.panel.onDidChangeViewState((e) => {
                 if (e.webviewPanel.visible) {
                     this.post();
+                    this.postBusy("refresh", monitor.refreshing);
                 }
             }),
             this.panel.webview.onDidReceiveMessage((msg: Record<string, unknown>) => {
                 switch (msg.type) {
                     case "ready":
                         this.post();
+                        this.postBusy("refresh", monitor.refreshing);
                         break;
                     case "refresh":
-                        actions.refresh();
+                        // No guard here: the monitor refuses a concurrent refresh
+                        // itself, and its `refreshing` signal is what disables the
+                        // buttons — one authority, not two that can disagree.
+                        void actions.refresh();
                         break;
                     case "retryAll":
-                        actions.retryAll();
+                        void this.busy("retry", () => Promise.resolve(actions.retryAll()));
                         break;
-                    case "retryFile":
-                        actions.retryFile(asString(msg.path));
+                    case "retryFile": {
+                        const path = asString(msg.path);
+                        void this.busy(`row:${path}`, () =>
+                            Promise.resolve(actions.retryFile(path))
+                        );
                         break;
+                    }
                     case "openFile":
                         actions.openFile(asString(msg.path));
                         break;
@@ -103,6 +124,7 @@ export class StatusPanel {
 
         this.panel.onDidDispose(() => {
             StatusPanel.current = undefined;
+            this.keys.reset();
             for (const d of this.disposables) {
                 d.dispose();
             }
@@ -112,5 +134,15 @@ export class StatusPanel {
 
     private post(): void {
         void this.panel.webview.postMessage({ snapshot: this.monitor.latest });
+    }
+
+    private postBusy(key: string, busy: boolean): void {
+        void this.panel.webview.postMessage({ type: "busy", key, busy });
+    }
+
+    private readonly keys = new BusyKeys((m) => void this.panel.webview.postMessage(m));
+
+    private busy(key: string, run: () => Promise<void>): Promise<void | undefined> {
+        return this.keys.run(key, run);
     }
 }

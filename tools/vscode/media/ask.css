@@ -219,14 +219,14 @@ body {
     height: 34px;
 }
 
-/* A disabled form is left visible and inert rather than hidden — the half-typed
- * question is the thing least worth throwing away. Dimmed enough to read as
- * unavailable, not so dim that the text in it becomes unreadable. */
-#form:has(#degraded-notice:not([hidden])) .options,
-#form:has(#degraded-notice:not([hidden])) .panel,
-#form:has(#degraded-notice:not([hidden])) #group-query {
-    opacity: 0.55;
-}
+/* The form is NOT dimmed when the server is down, and that is a reversal worth
+ * recording. It used to grey out the question box, the filters and the budget —
+ * which was honest while those controls were also disabled, and became a lie the
+ * moment they stopped being: dimming a control the user can still type into says
+ * "this does nothing", about the one part of the view that still does.
+ *
+ * What is unavailable is the *act*, and that is where the signal lives now: the
+ * red notice above says so, and Submit is disabled and says why. */
 
 /* A button that reads as a link, for the one inside the Ollama notice. */
 .linky {

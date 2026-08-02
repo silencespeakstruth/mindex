@@ -11,6 +11,13 @@ import { failedCount, ServerState, StatusSnapshot } from "./statusMonitor";
  * invisibly. Now the colour is the whole message, and the click opens the panel that
  * explains it.
  *
+ * **Three colours and no words.** Yellow used to mean nothing on its own — the
+ * indicator carried a `$(stop) research` suffix to say what was actually wrong —
+ * and now it means exactly one thing: an optional dependency is down, which
+ * costs Research and nothing else. That is what the suffix was spending
+ * status-bar width spelling out, so it is gone; the sentence and the remedy live
+ * in the tooltip, which is where someone goes once the colour has told them to.
+ *
  * The colour comes from `StatusBarItem.color` and **not** from `backgroundColor`.
  * That is not a style preference: `backgroundColor` accepts only
  * `statusBarItem.errorBackground` and `statusBarItem.warningBackground`, and setting
@@ -26,20 +33,21 @@ export function paintStatusBar(item: vscode.StatusBarItem, snapshot?: StatusSnap
     const glyph = {
         ok: themeIconRef("stateOk"),
         degraded: themeIconRef("stateDegraded"),
+        unhealthy: themeIconRef("stateUnhealthy"),
         unreachable: themeIconRef("stateUnreachable"),
     }[state];
+    // Red covers both ways of being unusable. They differ in remedy, not in what
+    // the user can currently do, and a fourth hue would claim otherwise.
     const hue = {
         ok: "charts.green",
         degraded: "charts.yellow",
+        unhealthy: "charts.red",
         unreachable: "charts.red",
     }[state];
 
-    // A dead Ollama is *not* a degraded server, so it never changes the state or the
-    // colour — it only annotates what is unavailable.
     const researchDown = snapshot !== undefined && !snapshot.researchAvailable;
-    const suffix = researchDown ? ` ${themeIconRef("stop")} research` : "";
 
-    item.text = `${glyph} ${BRAND}${suffix}`;
+    item.text = `${glyph} ${BRAND}`;
     item.color = new vscode.ThemeColor(hue);
     // Deliberately never set: it would override `color` and cost the third state.
     item.backgroundColor = undefined;
@@ -61,7 +69,8 @@ function tooltipFor(
 
     const headline = {
         ok: "every dependency answering",
-        degraded: "a required dependency is failing",
+        degraded: "an optional dependency is failing",
+        unhealthy: "a required dependency is failing, or a run is wedged",
         unreachable: snapshot.detail ?? "the server is not answering",
     }[state];
     md.appendMarkdown(`**${BRAND}** — ${state}: ${headline}\n\n`);

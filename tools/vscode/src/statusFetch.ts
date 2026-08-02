@@ -1,6 +1,6 @@
 import { ConfigResponse, HealthResponse, MindexApi } from "./api";
-import { UnreachableError } from "./problem";
-import { StatusSnapshot, UNAVAILABLE } from "./shared/status";
+import { humanize } from "./problem";
+import { SectionErrors, ServerState, StatusSnapshot, UNAVAILABLE } from "./shared/status";
 
 /**
  * Who a refresh tells what, besides producing a snapshot.
@@ -67,29 +67,69 @@ export interface StatusFanOut {
  *
  * Names them rather than saying "the server is degraded": the fix is different for
  * each, and the one thing the user needs from this message is which process to go and
- * start. Ollama is excluded — it never causes degradation, so listing it here would
- * blame the optional dependency for the required one's failure.
+ * start. Ollama is excluded — it never makes the server unusable, so listing it here
+ * would blame the optional dependency for the required one's failure.
  */
-function describeDegradation(checks: Record<string, string | undefined>): string {
-    const down = Object.entries(checks)
-        .filter(([name, state]) => name !== "ollama" && state !== "ok")
+function describeDegradation(requiredDown: string[]): string {
+    return requiredDown.length === 0
+        ? "the server reports itself unhealthy"
+        : `${requiredDown.join(" and ")} ${requiredDown.length === 1 ? "is" : "are"} not answering`;
+}
+
+/**
+ * The client's reading of `/health`, from `status` **and** `checks` together.
+ *
+ * Reading `status` alone would be wrong across versions, and wrong in the
+ * dangerous direction: a server older than the tri-state verdict says `degraded`
+ * when a *required* dependency is down, which under the new vocabulary paints
+ * yellow and leaves the form armed against a server that cannot answer it. So a
+ * failing required check is authoritative on its own, and `unhealthy` covers the
+ * one failure with no failing check behind it — a wedged research slot.
+ *
+ * The complement of `ollama` is not "a second list of check names in the client":
+ * it is one name, the only optional one, and it was already hard-coded here and
+ * in the panel's `CHECK_META` before this.
+ */
+export function readHealth(health: HealthResponse): {
+    state: Exclude<ServerState, "unreachable">;
+    requiredDown: string[];
+    researchAvailable: boolean;
+} {
+    const requiredDown = Object.entries(health.checks)
+        .filter(([name, state]) => name !== "ollama" && state !== undefined && state !== "ok")
         .map(([name]) => name);
-    return down.length === 0
-        ? "the server reports itself degraded"
-        : `${down.join(" and ")} ${down.length === 1 ? "is" : "are"} not answering`;
+    // Absent is not down: an older server omits the check entirely, and that
+    // must not read as a failure anywhere.
+    const ollama = health.checks.ollama;
+    const researchAvailable = ollama === undefined || ollama === "ok";
+
+    const state =
+        requiredDown.length > 0 || health.status === "unhealthy"
+            ? "unhealthy"
+            : health.status === "degraded" || !researchAvailable
+              ? "degraded"
+              : "ok";
+    return { state, requiredDown, researchAvailable };
 }
 
 export async function fetchStatus(
     api: MindexApi,
     guid: string | undefined,
     serverUrl: string,
-    fan: StatusFanOut
+    fan: StatusFanOut,
+    signal?: AbortSignal
 ): Promise<StatusSnapshot> {
     let health: HealthResponse;
     try {
-        health = await api.health();
+        health = await api.health(signal);
     } catch (e) {
-        const detail = e instanceof UnreachableError ? e.cause_.message : String(e);
+        // A cancellation is silent everywhere else, but here it is the refresh
+        // deadline firing and the snapshot must still say something: an empty
+        // reason renders as a red indicator whose tooltip explains nothing.
+        const humanized = humanize(e);
+        const detail = humanized.cancelled
+            ? "The health check did not finish in time."
+            : humanized.text;
         fan.onAvailability({ ask: false, research: false, reason: detail });
         // Unknown, not empty: an unreachable server must leave the pickers at their
         // last known contents rather than blanking them. The config is simply not
@@ -104,46 +144,47 @@ export async function fetchStatus(
         };
     }
 
-    // Ollama is the server's *optional* dependency: `status` stays "ok" without it,
-    // and only Research stops working. Older servers omit the check entirely — absent
-    // is not down, so it must not read as a failure anywhere.
-    const ollama = health.checks.ollama;
-    const researchAvailable = ollama === undefined || ollama === "ok";
-    // A required dependency is down. The server is the authority on which checks are
-    // required — that is exactly what `status` reports — so this reads its verdict
-    // rather than keeping a second list of check names in the client.
-    const degraded = health.status !== "ok";
+    const { state, requiredDown, researchAvailable } = readHealth(health);
+    // Two flags, not three: a third would need a control that is live under
+    // `unhealthy` and dead under Ollama-degradation, and there is none.
     fan.onAvailability({
-        ask: !degraded,
-        research: !degraded && researchAvailable,
-        ...(degraded
-            ? { reason: describeDegradation(health.checks) }
+        ask: state !== "unhealthy",
+        research: state !== "unhealthy" && researchAvailable,
+        ...(state === "unhealthy"
+            ? { reason: describeDegradation(requiredDown) }
             : researchAvailable
               ? {}
               : { reason: "the server's Ollama is not answering" }),
     });
 
+    const sectionErrors: SectionErrors = {};
     const next: StatusSnapshot = {
         at: Date.now(),
         serverUrl,
-        state: health.status === "ok" ? "ok" : "degraded",
+        state,
         version: health.version,
         checks: Object.fromEntries(
             Object.entries(health.checks).map(([k, v]) => [k, v ?? "unknown"])
         ),
         researchAvailable,
+        sectionErrors,
     };
 
     try {
-        next.runtime = await api.status();
-    } catch {
+        next.runtime = await api.status(signal);
+    } catch (e) {
         next.runtime = UNAVAILABLE;
+        sectionErrors.runtime = humanize(e).text;
     }
 
     try {
-        fan.onServerConfig(await api.config());
-    } catch {
-        // Decoration on the way in; the server validates on the way out.
+        fan.onServerConfig(await api.config(signal));
+    } catch (e) {
+        // Decoration on the way in; the server validates on the way out — so this
+        // never fails the refresh. It is still recorded: a stale model list that
+        // nothing admits is stale is how a picker comes to offer a model the
+        // server would refuse.
+        sectionErrors.config = humanize(e).text;
     }
 
     if (guid === undefined) {
@@ -152,7 +193,7 @@ export async function fetchStatus(
     }
 
     try {
-        const languages = (await api.projectStats(guid)).languages;
+        const languages = (await api.projectStats(guid, signal)).languages;
         if (languages === undefined) {
             fan.onInventory(undefined); // a server too old to publish one
         } else {
@@ -167,17 +208,19 @@ export async function fetchStatus(
                     .sort()
             );
         }
-    } catch {
+    } catch (e) {
         // Includes the 404 of a project that has never been indexed — which is
-        // unknown, not empty.
+        // unknown, not empty, and not worth a reason line either.
         fan.onInventory(undefined);
         next.inventory = UNAVAILABLE;
+        sectionErrors.inventory = humanize(e).text;
     }
 
     try {
-        next.failed = (await api.listFiles(guid, { status: "failed" })).files;
-    } catch {
+        next.failed = (await api.listFiles(guid, { status: "failed" }, signal)).files;
+    } catch (e) {
         next.failed = UNAVAILABLE;
+        sectionErrors.failed = humanize(e).text;
     }
 
     return next;

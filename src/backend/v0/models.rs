@@ -1259,6 +1259,23 @@ pub struct ResearchListQuery {
     /// Restrict to ordinary `research` runs or to `challenge` runs. Filtered before
     /// the page is cut, like the rest.
     pub kind: Option<ResearchKind>,
+    /// Restrict to challenges aimed at this run id — "what was said about *that*
+    /// report". Served by `idx_research_runs_challenged`.
+    ///
+    /// The inverse direction of `challenged_seq`/`challenged_title`, and needed
+    /// separately because it is an id lookup that must answer regardless of which
+    /// page a client holds, and must include the stale and inconclusive
+    /// challenges that `trust` deliberately stops counting.
+    pub challenged_run_id: Option<String>,
+    /// `all` (default), `finalized`, or `partial` — whether the run reached its
+    /// own conclusion or was stopped by a budget. Filtered before the page is
+    /// cut, like the rest.
+    ///
+    /// Server-side rather than a client-side test on `done_reason` because a
+    /// client that pages this list to exhaustion (to select or prune everything
+    /// matching a filter) can only trust "a full page means there may be more" if
+    /// every filter applied before the `LIMIT`.
+    pub completeness: Option<ResearchCompleteness>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
@@ -1274,6 +1291,20 @@ pub enum ResearchFreshness {
 pub enum ResearchKind {
     Research,
     Challenge,
+}
+
+/// Whether a run reached its own conclusion or was stopped by a budget.
+///
+/// `Partial` is `done_reason <> 'finalized'` — every stop reason at once, rather
+/// than a filter per reason: to a reader pruning a corpus the distinction between
+/// running out of time and running out of tokens is not one they act on, and a
+/// per-reason filter would have to grow a variant every time `DoneReason` does.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchCompleteness {
+    All,
+    Finalized,
+    Partial,
 }
 
 /// One stored run, without its report. The list is a separate endpoint precisely so
@@ -1353,6 +1384,18 @@ pub struct ResearchRunSummary {
     /// stale challenge stops counting automatically; an inconclusive one counts
     /// toward none). Derived at read time like `valid` — nothing is stored.
     pub trust: String,
+    /// For a challenge: the **subject's** per-project ordinal, resolved
+    /// server-side. `null` on a research run, and on a challenge whose subject
+    /// has since been deleted — which is the only thing that null now means.
+    ///
+    /// Here because a challenge row has to name what it attacked wherever it is
+    /// rendered, and a client cannot resolve it: `challenged_run_id` is a uuid,
+    /// and the subject is very often not on the page the client happens to hold.
+    pub challenged_seq: Option<i64>,
+    /// For a challenge: the subject's title, built by the same stored-heading-else
+    /// -derived-from-question rule as `title`, so the two spellings of one report
+    /// cannot disagree. `null` under the same conditions as `challenged_seq`.
+    pub challenged_title: Option<String>,
 }
 
 /// One run in another run's context chain (direct or transitive).
@@ -1375,6 +1418,46 @@ pub struct ResearchRunListResponse {
     /// Pass as `before_seq` for the next page. `null` when the page came back short,
     /// which is how a client knows to stop without spending a request to find out.
     pub next_before_seq: Option<i64>,
+    /// Corpus-wide counts for the project — see [`ResearchCorpusTotals`].
+    pub totals: ResearchCorpusTotals,
+}
+
+/// How big this project's stored-research corpus is, and how much of it is worth
+/// keeping.
+///
+/// **Deliberately unaffected by every filter on the request** — `q`, `freshness`,
+/// `valid`, `pinned`, `kind`, `completeness` and `before_seq` all move `runs` and
+/// none of them move these. They are a fixed denominator: "74 of 128 current"
+/// answers a question the page in front of the reader cannot, and a count that
+/// shrank as the reader typed into the search box would be a worse rendering of
+/// `runs.len()`.
+///
+/// One extra `SELECT` inside the transaction the page already runs, reusing the
+/// same recursive validity CTE — so this costs the CTE nothing and the report
+/// bodies nothing (none is selected here either).
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchCorpusTotals {
+    /// Every stored run of this project, of either kind.
+    pub total: i64,
+    /// How many are **valid** — the same transitive predicate `ResearchRunSummary
+    /// .valid` reports and the same one the server enforces on `context_run_ids`.
+    /// So this is literally "how many of these could be handed to the next
+    /// question", not a softer notion of freshness.
+    pub current: i64,
+    /// The union of the four buckets below: how many **unpinned** runs a
+    /// garbage-collection pass would propose deleting. A run in several buckets is
+    /// counted once here, so this is never the sum of the four.
+    pub gc_candidates: i64,
+    /// Unpinned and invalid — the server already refuses these as context.
+    pub gc_invalid: i64,
+    /// Unpinned, with at least one baseline file changed or gone.
+    pub gc_stale: i64,
+    /// Unpinned, stopped by a budget rather than finished (`done_reason` is not
+    /// `finalized`), so the report rests on partial evidence.
+    pub gc_partial: i64,
+    /// Unpinned challenges whose verdict turn produced nothing parseable. They
+    /// count toward no trust verdict and carry no finding.
+    pub gc_inconclusive: i64,
 }
 
 /// What became of one file the run read.
@@ -1516,23 +1599,82 @@ pub struct VersionResponse {
     pub db_schema_version: i32,
 }
 
-/// One dependency's liveness: `"ok"` or `"error: <reason>"`.
+/// One dependency's liveness. Two values and no third.
+///
+/// The **reason** a probe failed is deliberately not here. This response is
+/// readable by anything that can reach the port, and a driver's error string
+/// carries file paths, URLs, ports and version strings; it is also the wrong
+/// thing to render at a user, who can act on "Qdrant is not answering" and
+/// cannot act on a tonic transport chain. The reason goes to a `warn!` at the
+/// probe site, with a sysadmin hint — the one place it can be acted on.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckState {
+    Ok,
+    Error,
+}
+
+/// The health verdict.
+///
+/// Tri-state because "one optional dependency is down" and "the service cannot
+/// do its job" used to be the same word, which made the word useless: every
+/// client had to decide for itself whether `degraded` was worth disabling
+/// anything over, and to do that it needed its own copy of which check is
+/// required. Now the server answers that, since it is the only party that knows.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    Ok,
+    Degraded,
+    Unhealthy,
+}
+
+/// Per-dependency liveness. Names, never reasons — see [`CheckState`].
 #[derive(Serialize, Debug, ToSchema)]
 pub struct HealthChecks {
-    pub sqlite: String,
-    pub qdrant: String,
-    pub embedder: String,
+    pub sqlite: CheckState,
+    pub qdrant: CheckState,
+    pub embedder: CheckState,
     /// The **separate** query-path embedder, present only when
     /// `[model].query_server_url` splits the workloads. Absent means one instance
     /// serves both and `embedder` already covers it. Counted in `status` when
     /// present: a dead query instance is every search failing, not a degradation
     /// of something optional.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub query_embedder: Option<String>,
-    /// The local Ollama behind `/research`. **Optional dependency**: reported
-    /// here but never counted in `status` — an error means research is
-    /// unavailable while indexing and search keep working.
-    pub ollama: String,
+    pub query_embedder: Option<CheckState>,
+    /// The local Ollama behind `/research`. **The one optional dependency**, and
+    /// therefore the sole producer of `degraded`: an error means research is
+    /// unavailable while indexing and search keep working. It can never produce
+    /// `unhealthy`.
+    pub ollama: CheckState,
+}
+
+impl HealthChecks {
+    /// The verdict, computed next to the data so nothing can compute it a second
+    /// way and disagree.
+    ///
+    /// `unhealthy` beats `degraded`: a caller acting on the milder word while a
+    /// required dependency is dead is the whole failure this vocabulary exists to
+    /// prevent, so severity wins over recency and over count.
+    pub fn verdict(&self, wedged: bool) -> HealthStatus {
+        let required_failed = [
+            Some(self.sqlite),
+            Some(self.qdrant),
+            Some(self.embedder),
+            self.query_embedder,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|c| c == CheckState::Error);
+
+        if required_failed || wedged {
+            HealthStatus::Unhealthy
+        } else if self.ollama == CheckState::Error {
+            HealthStatus::Degraded
+        } else {
+            HealthStatus::Ok
+        }
+    }
 }
 
 /// Research admission, as `GET /health` reports it.
@@ -1556,15 +1698,16 @@ pub struct ResearchHealth {
 
 #[derive(Serialize, Debug, ToSchema)]
 pub struct HealthResponse {
-    /// `"ok"` only when the required checks pass (SQLite, Qdrant, embedder, and
-    /// the query embedder when deployed separately), else `"degraded"`.
-    /// `checks.ollama` never affects it.
+    /// `ok` when every check passes; `degraded` when only the optional Ollama is
+    /// failing (indexing and search still work, `/research` does not);
+    /// `unhealthy` when a required check failed — SQLite, Qdrant, the embedder,
+    /// or the query embedder when deployed separately.
     ///
-    /// Research affects it in exactly one narrow case: a run that has outlived
+    /// Research reaches this in exactly one narrow case: a run that has outlived
     /// `max_seconds + report_timeout_ms` is holding a slot no deadline of its own
-    /// will free. A merely *busy* slot never degrades the verdict — that is the
-    /// service working.
-    pub status: &'static str,
+    /// will free, and that is `unhealthy`. A merely *busy* slot never moves the
+    /// verdict — that is the service working.
+    pub status: HealthStatus,
     pub version: &'static str,
     /// Files in `status='indexing'` across *all* projects right now.
     pub indexing_files: i64,
@@ -1793,6 +1936,17 @@ pub struct ResearchConfigInfo {
     /// grants — a harness comparing coverage across runs has to know how many of
     /// those steps went to writing rather than looking.
     pub checkpoint_every_steps: usize,
+    /// `[research].list_page_limit` — the default and maximum page size of
+    /// `GET /projects/{guid}/research`. Published so a client paging the corpus
+    /// can size its loop instead of guessing: guessing 50 against a real 100
+    /// doubles the request count for no reason, and guessing high is a 400.
+    pub list_page_limit: usize,
+    /// `[limits].max_research_delete_ids` — how many run ids one
+    /// `DELETE /projects/{guid}/research` accepts. From `[limits]`, not
+    /// `[research]`, but published here because the endpoint it bounds is a
+    /// research one and a client offering "select everything matching this
+    /// filter" has to know where to stop and say so.
+    pub max_delete_ids: usize,
     /// The sampling every research turn runs at.
     pub sampling: ResearchSamplingInfo,
     /// What runs at each `(model, effort)` have actually cost on this server
@@ -1921,6 +2075,124 @@ mod tests {
 
     fn lang() -> ProgrammingLanguage {
         ProgrammingLanguage::Rust
+    }
+
+    /// Every check passing, with the optional query embedder absent.
+    fn healthy() -> HealthChecks {
+        HealthChecks {
+            sqlite: CheckState::Ok,
+            qdrant: CheckState::Ok,
+            embedder: CheckState::Ok,
+            query_embedder: None,
+            ollama: CheckState::Ok,
+        }
+    }
+
+    /// The verdict is the one thing every client keys its behaviour on, and the
+    /// distinction it draws — "a feature is unavailable" vs "the service cannot
+    /// work" — is only useful if severity always wins. These pin that, including
+    /// the case that makes it a fold rather than a chain of `if`s: Ollama down
+    /// *and* a required check down is `unhealthy`, not `degraded`.
+    #[test]
+    fn the_health_verdict_lets_severity_win() {
+        assert_eq!(healthy().verdict(false), HealthStatus::Ok);
+
+        let ollama_down = HealthChecks {
+            ollama: CheckState::Error,
+            ..healthy()
+        };
+        assert_eq!(ollama_down.verdict(false), HealthStatus::Degraded);
+
+        let sqlite_down = HealthChecks {
+            sqlite: CheckState::Error,
+            ..healthy()
+        };
+        assert_eq!(sqlite_down.verdict(false), HealthStatus::Unhealthy);
+
+        let both_down = HealthChecks {
+            sqlite: CheckState::Error,
+            ollama: CheckState::Error,
+            ..healthy()
+        };
+        assert_eq!(both_down.verdict(false), HealthStatus::Unhealthy);
+
+        for down in [
+            HealthChecks {
+                qdrant: CheckState::Error,
+                ..healthy()
+            },
+            HealthChecks {
+                embedder: CheckState::Error,
+                ..healthy()
+            },
+        ] {
+            assert_eq!(down.verdict(false), HealthStatus::Unhealthy);
+        }
+    }
+
+    /// The split query embedder is required *when it exists* and must not be
+    /// counted when it does not — `None` is "one instance serves both", which
+    /// `embedder` has already reported on.
+    #[test]
+    fn an_absent_query_embedder_is_not_a_failing_one() {
+        assert_eq!(healthy().verdict(false), HealthStatus::Ok);
+
+        let split_ok = HealthChecks {
+            query_embedder: Some(CheckState::Ok),
+            ..healthy()
+        };
+        assert_eq!(split_ok.verdict(false), HealthStatus::Ok);
+
+        let split_down = HealthChecks {
+            query_embedder: Some(CheckState::Error),
+            ..healthy()
+        };
+        assert_eq!(split_down.verdict(false), HealthStatus::Unhealthy);
+    }
+
+    /// A wedged run has no failing *dependency* behind it — every check is green
+    /// and the slot is still unusable — so it is the one input to the verdict
+    /// that the checks cannot express.
+    #[test]
+    fn a_wedged_run_is_unhealthy_with_every_check_green() {
+        assert_eq!(healthy().verdict(true), HealthStatus::Unhealthy);
+    }
+
+    /// The wire words. Three verdicts and two check states, all lowercase; a
+    /// client dispatches on these strings and an older one has to keep reading
+    /// `"ok"`.
+    #[test]
+    fn health_wire_values_are_stable() {
+        for (status, wire) in [
+            (HealthStatus::Ok, "\"ok\""),
+            (HealthStatus::Degraded, "\"degraded\""),
+            (HealthStatus::Unhealthy, "\"unhealthy\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+        }
+        assert_eq!(serde_json::to_string(&CheckState::Ok).unwrap(), "\"ok\"");
+        assert_eq!(
+            serde_json::to_string(&CheckState::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    /// The reason must not travel. Serialising a failing set produces the bare
+    /// word and nothing else — this is the regression guard for the whole
+    /// change, and it is cheap enough to be worth pinning here as well as in the
+    /// integration suite.
+    #[test]
+    fn a_failing_check_carries_no_reason_on_the_wire() {
+        let checks = HealthChecks {
+            qdrant: CheckState::Error,
+            ..healthy()
+        };
+        let json = serde_json::to_string(&checks).unwrap();
+        assert!(json.contains("\"qdrant\":\"error\""), "{json}");
+        assert!(!json.contains("error:"), "a reason leaked: {json}");
+        // Absent, not null: a caller distinguishes "no split deployment" from
+        // "the split instance failed".
+        assert!(!json.contains("query_embedder"), "{json}");
     }
 
     /// The `/index` SSE event names are a wire contract, exactly like `ApiError`

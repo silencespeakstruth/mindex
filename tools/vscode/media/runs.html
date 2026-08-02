@@ -1,16 +1,35 @@
 <main class="runs-page">
     <aside class="runs-list">
         <header class="runs-head">
-            <div class="row">
-                <span class="codicon codicon-search dim"></span>
-                <input
-                    id="runs-search"
-                    type="search"
-                    class="runs-search"
-                    placeholder="Search titles, questions and reports…"
-                    autocomplete="off"
-                    spellcheck="false"
-                />
+            <!--
+                The refresh button and the spinner live in THIS row, not among the
+                filters. The filter row wraps, and an icon button riding its right
+                edge was clipped past the panel's 260px minimum width — the one
+                place a fixed-size control cannot go.
+            -->
+            <div class="row runs-search-row">
+                <div class="runs-search-field">
+                    <span class="codicon codicon-search dim" aria-hidden="true"></span>
+                    <input
+                        id="runs-search"
+                        type="search"
+                        class="runs-search"
+                        placeholder="Search titles, questions and reports…"
+                        autocomplete="off"
+                        spellcheck="false"
+                    />
+                </div>
+                <span class="runs-spinner dim" id="runs-loading" hidden>
+                    <span class="codicon codicon-loading codicon-modifier-spin"></span>
+                </span>
+                <button
+                    id="runs-refresh"
+                    class="ghost"
+                    data-busy-key="list"
+                    title="Re-run this query and refresh the open report"
+                >
+                    <span class="codicon codicon-refresh" data-busy-icon></span>
+                </button>
             </div>
             <div class="row runs-filters">
                 <label class="dim" for="runs-freshness">Show</label>
@@ -37,16 +56,56 @@
                     <option value="research">Research</option>
                     <option value="challenge">Challenges</option>
                 </select>
-                <button
-                    id="runs-refresh"
-                    class="ghost"
-                    title="Re-run this query and refresh the open report"
+                <select
+                    id="runs-completeness"
+                    class="runs-select"
+                    title="Partial = a budget stopped the run before it finished, so its report rests on partial evidence"
                 >
-                    <span class="codicon codicon-refresh"></span>
+                    <option value="all">Any run</option>
+                    <option value="finalized">Finished</option>
+                    <option value="partial">Partial</option>
+                </select>
+            </div>
+            <!--
+                The corpus line is a FIXED denominator: no filter above moves it.
+                A count that shrank as the user typed would be a worse rendering of
+                the list length they can already see.
+            -->
+            <div class="row runs-tools">
+                <span id="runs-counts" class="dim runs-counts"></span>
+                <button
+                    id="runs-select-all"
+                    class="ghost"
+                    data-busy-key="list"
+                    title="Select every report matching the filters above, not just the loaded page"
+                >
+                    Select all
                 </button>
-                <span class="runs-spinner dim" id="runs-loading" hidden>
-                    <span class="codicon codicon-loading codicon-modifier-spin"></span>
-                </span>
+                <button
+                    id="runs-preset-outdated"
+                    class="ghost"
+                    data-busy-key="list"
+                    title="Show only reports whose files have moved since"
+                >
+                    Outdated
+                </button>
+                <button
+                    id="runs-preset-partial"
+                    class="ghost"
+                    data-busy-key="list"
+                    title="Show only runs a budget stopped before they finished"
+                >
+                    Partial
+                </button>
+                <button
+                    id="runs-gc"
+                    class="secondary runs-gc-button"
+                    data-busy-key="gc"
+                    disabled
+                >
+                    <span class="codicon codicon-trash" data-busy-icon></span>
+                    <span id="runs-gc-label">Collect garbage</span>
+                </button>
             </div>
         </header>
 
@@ -60,9 +119,9 @@
         </p>
 
         <footer class="runs-foot">
-            <button id="runs-more" class="ghost" hidden>Load more</button>
-            <button id="runs-delete" class="secondary" disabled>
-                <span class="codicon codicon-trash"></span>
+            <button id="runs-more" class="ghost" data-busy-key="more" hidden>Load more</button>
+            <button id="runs-delete" class="secondary" data-busy-key="delete" disabled>
+                <span class="codicon codicon-trash" data-busy-icon></span>
                 <span id="runs-delete-label">Delete</span>
             </button>
             <button id="runs-use" class="primary" disabled>

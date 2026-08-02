@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { MindexApi, ResearchRunDetail, ResearchRunSummary } from "./api";
-import { ProblemError } from "./errors";
+import { humanize, logError, ProblemError } from "./errors";
 import { provenanceExtras } from "./shared/runsFormat";
 
 /**
@@ -179,7 +179,8 @@ export class ResearchDocumentProvider implements vscode.TextDocumentContentProvi
             if (e instanceof ProblemError && e.code === "research.run_not_found") {
                 return "# Report deleted\n\nThis report is no longer stored.\n";
             }
-            return `# Report unavailable\n\n${e instanceof Error ? e.message : String(e)}\n`;
+            logError("Opening a stored report", e);
+            return `# Report unavailable\n\n${humanize(e).text}\n`;
         }
     }
 

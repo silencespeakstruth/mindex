@@ -31,15 +31,44 @@
     border-bottom: 1px solid var(--vscode-panel-border);
 }
 
+.runs-search-row {
+    gap: 0.3rem;
+    align-items: center;
+}
+
+/*
+ * The magnifier sits INSIDE the field rather than beside it: two controls in a row
+ * where one is decoration reads as two, and the icon then competes with the
+ * refresh button at the other end for what a click might do.
+ */
+.runs-search-field {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
+}
+
+.runs-search-field .codicon {
+    position: absolute;
+    top: 50%;
+    left: 0.45rem;
+    transform: translateY(-50%);
+    pointer-events: none;
+}
+
 .runs-search {
     flex: 1;
     min-width: 0;
-    padding: 0.3rem 0.4rem;
+    padding: 0.3rem 0.4rem 0.3rem 1.7rem;
     color: var(--vscode-input-foreground);
     background: var(--vscode-input-background);
     border: 1px solid var(--vscode-input-border, transparent);
-    border-radius: 2px;
+    border-radius: 3px;
     font: inherit;
+}
+
+.runs-search::placeholder {
+    color: var(--vscode-input-placeholderForeground);
 }
 
 .runs-search:focus {
@@ -48,6 +77,7 @@
 }
 
 .runs-select {
+    min-width: 0;
     padding: 0.2rem 0.3rem;
     color: var(--vscode-dropdown-foreground);
     background: var(--vscode-dropdown-background);
@@ -55,12 +85,25 @@
     font: inherit;
 }
 
-.runs-filters {
+/*
+ * Both head rows wrap. The list column is `minmax(260px, …)`, and four selects do
+ * not fit that minimum on one line — without this they overflow the column and the
+ * last control is clipped past the panel edge rather than moving to a second line.
+ */
+.runs-filters,
+.runs-tools {
+    flex-wrap: wrap;
     gap: 0.4rem;
     align-items: center;
 }
 
-.runs-spinner {
+.runs-counts {
+    margin-right: auto;
+    font-size: 0.9em;
+    white-space: nowrap;
+}
+
+.runs-gc-button {
     margin-left: auto;
 }
 
@@ -69,6 +112,14 @@
     color: var(--vscode-inputValidation-errorForeground, inherit);
     background: var(--vscode-inputValidation-errorBackground);
     border-bottom: 1px solid var(--vscode-inputValidation-errorBorder);
+}
+/* A failure a second press could survive — a timeout, a busy server, a
+ * dependency that is coming back. Red for those says "this will not work",
+ * which is the opposite of what the user should do about them. */
+.runs-error.warn {
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+    background: var(--vscode-inputValidation-warningBackground);
+    border-bottom-color: var(--vscode-inputValidation-warningBorder);
 }
 
 .runs-items {
@@ -320,6 +371,87 @@
 .runs-dep .verdict-disputed,
 .runs-dep .verdict-inconclusive {
     color: var(--vscode-inputValidation-warningForeground, inherit);
+}
+
+/* ── The garbage-collection review ────────────────────────────────────────── */
+
+/*
+ * Lives in the right pane rather than in a second webview or a QuickPick: a
+ * QuickPick cannot show why each row is proposed or that other reports depend on
+ * it, and a second webview would be a second copy of this panel's CSP assembly,
+ * state protocol and delete path for one screen.
+ */
+.runs-gc-head {
+    padding-bottom: 0.6rem;
+    margin-bottom: 0.6rem;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.runs-gc-note {
+    margin: 0.3rem 0 0;
+}
+
+.runs-gc-group {
+    margin-top: 1rem;
+}
+
+.runs-gc-group-head {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+}
+
+.runs-gc-group-title {
+    font-weight: 600;
+}
+
+.runs-gc-why {
+    margin: 0.15rem 0 0.4rem;
+    font-size: 0.9em;
+}
+
+.runs-gc-rows {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.runs-gc-row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    min-width: 0;
+    padding: 0.15rem 0;
+}
+
+.runs-gc-row-title {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/*
+ * Dependants are the one thing on this screen that can make a proposed delete the
+ * wrong call, so they get the warning palette rather than one more quiet badge.
+ */
+.runs-gc-dependants {
+    padding: 0 0.3rem;
+    font-size: 0.85em;
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+    background: var(--vscode-inputValidation-warningBackground);
+    border: 1px solid var(--vscode-inputValidation-warningBorder);
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.runs-gc-foot {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    padding-top: 0.8rem;
+    margin-top: 1rem;
+    border-top: 1px solid var(--vscode-panel-border);
 }
 
 /* Wide content must scroll inside itself; the page must never scroll sideways. */

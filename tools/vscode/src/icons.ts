@@ -20,13 +20,19 @@ export const ICON = {
     search: "search",
     /** Research mode, the research command, the submit button in Research. */
     research: "beaker",
-    /** Stop an in-flight research run. */
-    stop: "close",
-
-    /** Server reachable and every required dependency answering. */
+    /** Server reachable and every dependency answering. */
     stateOk: "circle-filled",
-    /** Server reachable, a required dependency failing. */
+    /** Server reachable, the *optional* dependency failing — Research is off. */
     stateDegraded: "warning",
+    /**
+     * Server reachable, a *required* dependency failing (or a run wedged).
+     *
+     * The same glyph as `stateUnreachable` today, and two names on purpose:
+     * "the server told us it is broken" and "the server told us nothing" are
+     * different facts that currently happen to look alike, and a future
+     * divergence should be one line rather than an archaeology exercise.
+     */
+    stateUnhealthy: "error",
     /** Server not answering at all. */
     stateUnreachable: "error",
 
@@ -39,7 +45,6 @@ export const ICON = {
     /** Open one stored report in its own tab. */
     openReport: "go-to-file",
     /** Browse the stored corpus and read one. */
-    browseResearch: "book",
     /** Ask this question again, with the same scope and settings. */
     reAsk: "debug-restart",
     /** Exempt a run from the retention sweep. */

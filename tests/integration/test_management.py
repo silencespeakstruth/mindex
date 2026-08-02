@@ -318,7 +318,12 @@ def test_health_checks_all_dependencies(client: httpx.Client) -> None:
     body = resp.json()
     # Every dependency is up in the test stack (SQLite, Qdrant, mock embedder,
     # mock ollama).
+    # One of three: "ok", "degraded" (only the optional Ollama is down) or
+    # "unhealthy" (a required check failed, or a research run is wedged).
     assert body["status"] == "ok", body
+    # Exact equality on purpose, and it is the regression guard for the rule that
+    # a check value carries no reason: a probe that started appending one — or a
+    # new dependency appearing unannounced — fails here rather than shipping.
     assert body["checks"] == {
         "sqlite": "ok",
         "qdrant": "ok",

@@ -357,6 +357,17 @@ pub struct ResearchMetrics {
     /// `research_challenges_total`, so the same rule applies twice over:
     /// `increase()`, never `rate()`.
     pub challenge_verdict_caps: Counter,
+    /// Earlier challenges evicted because a newer challenge of the same report
+    /// reached a verdict (the "one challenge per report, newest verdict wins"
+    /// rule in `db::research::insert_run`).
+    ///
+    /// The eviction is destructive and leaves no other trace: the deleted row and
+    /// its verdict are gone, and a subject that was `refuted` and is now
+    /// `confirmed` looks exactly like one challenged once. This is the only answer
+    /// to "how often is a standing verdict being overwritten here". Unlabelled —
+    /// the subject id would be unbounded cardinality, and the question is a rate,
+    /// not a list. Rare: `increase()`, never `rate()`.
+    pub challenges_replaced: Counter,
     pub revalidations: Counter,
     /// Reports the *server* wrote because the report window expired before the model
     /// produced one. The operational symptom of `[research].report_timeout_ms` set too
@@ -749,6 +760,7 @@ impl Metrics {
             citations: Family::default(),
             challenges: Family::default(),
             challenge_verdict_caps: Counter::default(),
+            challenges_replaced: Counter::default(),
             revalidations: Counter::default(),
             forced_syntheses: Counter::default(),
             parse_retries: Counter::default(),
@@ -836,6 +848,12 @@ impl Metrics {
             // No trailing period: the encoder appends one.
             "Challenge verdicts downgraded because the challenge's own report was ungrounded",
             research.challenge_verdict_caps.clone(),
+        );
+        registry.register(
+            "research_challenges_replaced",
+            // No trailing period: the encoder appends one.
+            "Standing challenges deleted because a newer challenge of the same report reached a verdict",
+            research.challenges_replaced.clone(),
         );
         registry.register(
             "research_revalidations",
@@ -1536,6 +1554,7 @@ mod tests {
             ("mindex_research_citations_total", "counter"),
             ("mindex_research_challenges_total", "counter"),
             ("mindex_research_challenge_verdict_caps_total", "counter"),
+            ("mindex_research_challenges_replaced_total", "counter"),
             ("mindex_research_context_used_ratio", "histogram"),
             ("mindex_research_duration_seconds", "histogram"),
             ("mindex_research_inflight_oldest_age_seconds", "gauge"),

@@ -18,6 +18,7 @@ use crate::backend::v0::models::CallersResponse;
 use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChallengeRequest;
+use crate::backend::v0::models::CheckState;
 use crate::backend::v0::models::ChunkExcerpt;
 use crate::backend::v0::models::CitationCounts;
 use crate::backend::v0::models::Code;
@@ -49,6 +50,8 @@ use crate::backend::v0::models::ProjectListResponse;
 use crate::backend::v0::models::ProjectStats;
 use crate::backend::v0::models::ProjectSummary;
 use crate::backend::v0::models::ReadChunksResponse;
+use crate::backend::v0::models::ResearchCompleteness;
+use crate::backend::v0::models::ResearchCorpusTotals;
 use crate::backend::v0::models::ResearchEffortInfo;
 use crate::backend::v0::models::ResearchFreshness;
 use crate::backend::v0::models::ResearchHealth;
@@ -4868,9 +4871,19 @@ pub async fn post_research(
 /// changed" must not be spendable as "the report was wrong" — 400
 /// `research.challenge_subject_invalid`. Challenging a challenge is refused
 /// (400 `research.challenge_subject_is_challenge`): trust aggregation is
-/// single-level; contest a bad challenge by challenging the original again, or
-/// delete it. The verdict lands on the *subject* as a derived trust status in
+/// single-level. The verdict lands on the *subject* as a derived trust status in
 /// the list/detail endpoints — nothing on the subject's row is written.
+///
+/// **One challenge per report, newest verdict wins.** Challenging the same
+/// report again is how a standing verdict is contested, and it *replaces* rather
+/// than accumulates: when this run is journalled with a parseable verdict, every
+/// earlier challenge of the same subject is deleted in the same transaction (see
+/// `db::research::insert_run`). A run that reaches **no** verdict evicts nothing
+/// — an inconclusive re-check must not be able to erase a refutation. So the
+/// caller's contract is: a fresh challenge is a bet that costs the current
+/// verdict if it wins and leaves it standing if it comes back inconclusive.
+/// `mindex_research_challenges_replaced_total` counts the evictions, which is
+/// the only trace one leaves.
 ///
 /// **Concurrency:** read-only against the index, like `POST /research`; shares
 /// its semaphore, so a busy slot answers 429 `research.busy`.
@@ -4884,7 +4897,7 @@ pub async fn post_research(
     ),
     request_body = ChallengeRequest,
     responses(
-        (status = 200, description = "SSE stream of research events, exactly as `POST /v0/{project_guid}/research` emits them, plus one `verdict` event on this stream only — `{challenged_run_id, overall, grounded, claims}` after `excerpts` and before `done`. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`.", content_type = "text/event-stream"),
+        (status = 200, description = "SSE stream of research events, exactly as `POST /v0/{project_guid}/research` emits them, plus one `verdict` event on this stream only — `{challenged_run_id, overall, grounded, claims}` after `excerpts` and before `done`. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`. On success with a parseable verdict this run **replaces** any existing challenge of the same subject — there is at most one standing challenge per report. An inconclusive run replaces nothing.", content_type = "text/event-stream"),
         (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`), or a model Ollama reports cannot call tools (`research.model_lacks_tools`).", body = ProblemDetails),
         (status = 404, description = "This project has no such run.", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
@@ -6176,6 +6189,8 @@ async fn config_snapshot(s: &RouterState) -> ConfigResponse {
             max_context_chars: s.research_max_context_chars,
             report_timeout_ms: s.research_report_timeout_ms,
             checkpoint_every_steps: s.research_checkpoint_every_steps,
+            list_page_limit: s.research_list_page_limit,
+            max_delete_ids: s.max_research_delete_ids,
             sampling: ResearchSamplingInfo {
                 temperature: s.research_sampling.temperature,
                 top_p: s.research_sampling.top_p,
@@ -6379,6 +6394,14 @@ fn render_llms_live_section(c: &ConfigResponse) -> String {
 /// can never describe the same run differently. `?2` is the embedding model id.
 /// Any query selecting these must prepend [`research_validity_ctes`] — `invalid` is
 /// one of its CTEs, not a table.
+///
+/// The last three resolve a challenge's **subject** — its `seq`, and enough to
+/// build its title by the same rule the row's own title uses. Three correlated
+/// primary-key lookups, returning no row (and so NULL) for an ordinary research
+/// run or a subject that has since been deleted. They exist because a challenge
+/// row must be able to name what it attacked wherever it is rendered, and the
+/// client used to guess: it looked for the subject among the rows it happened to
+/// have loaded and degraded to a bare "open subject" link otherwise.
 /// How many columns [`research_summary_columns`] selects, i.e. the index the
 /// *next* column a caller appends will land on.
 ///
@@ -6387,7 +6410,7 @@ fn render_llms_live_section(c: &ConfigResponse) -> String {
 /// shifted `report` into `invalid_flag`'s place and the run's own report became
 /// whatever the next column held. Naming the boundary is what stops the two from
 /// drifting; `research_summary_columns_are_counted_correctly` pins it.
-const RESEARCH_SUMMARY_COLUMNS: usize = 23;
+const RESEARCH_SUMMARY_COLUMNS: usize = 26;
 
 /// The derived trust status of run `r` — the challenge channel's verdict,
 /// aggregated at read time exactly as validity is (nothing is ever written to
@@ -6421,10 +6444,71 @@ fn research_summary_columns() -> String {
          COALESCE((SELECT n FROM refs WHERE refs.run_id = r.id), 0) AS references_count,
          COALESCE((SELECT n FROM refd WHERE refd.run_id = r.id), 0) AS referenced_by_count,
          r.kind, r.challenged_run_id, r.challenge_verdict,
-         {trust}",
+         {trust},
+         (SELECT s.seq FROM research_runs s WHERE s.id = r.challenged_run_id)
+             AS challenged_seq,
+         (SELECT s.title FROM research_runs s WHERE s.id = r.challenged_run_id)
+             AS challenged_title,
+         (SELECT s.question FROM research_runs s WHERE s.id = r.challenged_run_id)
+             AS challenged_question",
         research_staleness_columns("?2"),
         trust = research_trust_column(),
     )
+}
+
+/// The corpus totals for one project: `?1` the guid, `?2` the embedding model id.
+///
+/// **No filter from the request is applied here, ever** — see
+/// [`ResearchCorpusTotals`]. They are a fixed denominator; a count that shrank as
+/// the reader typed into the search box would be a worse rendering of the page
+/// length they can already see.
+///
+/// `gc_candidates` is a SUM over the **union** of the four buckets, not their
+/// sum: a run that is both stale and partial is one report to delete, and a
+/// button labelled with the sum would promise more than the pass then proposes.
+/// The buckets are all `unpinned` — pinning is the one thing that takes a run off
+/// the table, so the number and the proposal built from it cannot disagree.
+///
+/// Selects no report body, and reuses the `invalid`/`moved` CTEs the page query
+/// already built, so this costs one more scan of one project's retained runs.
+fn research_totals_sql() -> String {
+    format!(
+        "{ctes}
+         SELECT COUNT(*),
+                SUM(inv = 0),
+                SUM(unpinned AND (inv = 1 OR m.files_moved > 0
+                                  OR r.done_reason <> 'finalized'
+                                  OR (r.kind = 'challenge'
+                                      AND r.challenge_verdict IS NULL))),
+                SUM(unpinned AND inv = 1),
+                SUM(unpinned AND m.files_moved > 0),
+                SUM(unpinned AND r.done_reason <> 'finalized'),
+                SUM(unpinned AND r.kind = 'challenge'
+                             AND r.challenge_verdict IS NULL)
+           FROM (
+               SELECT r.*,
+                      EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS inv,
+                      (r.expires_at IS NOT NULL) AS unpinned
+                 FROM research_runs r
+                WHERE r.project_guid = ?1
+           ) r
+           JOIN moved m ON m.run_id = r.id",
+        ctes = research_validity_ctes("?1", "?2"),
+    )
+}
+
+fn research_totals_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResearchCorpusTotals> {
+    // Every SUM is NULL over an empty corpus; COUNT is not.
+    let n = |i: usize| -> rusqlite::Result<i64> { Ok(row.get::<_, Option<i64>>(i)?.unwrap_or(0)) };
+    Ok(ResearchCorpusTotals {
+        total: row.get(0)?,
+        current: n(1)?,
+        gc_candidates: n(2)?,
+        gc_invalid: n(3)?,
+        gc_stale: n(4)?,
+        gc_partial: n(5)?,
+        gc_inconclusive: n(6)?,
+    })
 }
 
 /// Build a summary from a row selected with [`research_summary_columns`].
@@ -6437,6 +6521,13 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
     let files_moved: i64 = row.get(14)?;
     let stored_title: Option<String> = row.get(15)?;
     let invalid_flag: bool = row.get(16)?;
+    // The subject's title by the *same* rule the row's own title uses below —
+    // stored heading first, derived from the question otherwise — so a challenge
+    // names its subject exactly as the subject's own row does. NULL for an
+    // ordinary run, and for a subject that has been deleted since.
+    let subject_title: Option<String> = row.get(24)?;
+    let subject_question: Option<String> = row.get(25)?;
+    let challenged_title = subject_title.or_else(|| subject_question.map(|q| research_title(&q)));
     Ok(ResearchRunSummary {
         id: row.get(0)?,
         seq: row.get(1)?,
@@ -6469,6 +6560,8 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
         challenged_run_id: row.get(20)?,
         challenge_verdict: row.get(21)?,
         trust: row.get(22)?,
+        challenged_seq: row.get(23)?,
+        challenged_title,
     })
 }
 
@@ -6487,7 +6580,17 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
 /// on it, orthogonally to `freshness`, which stays the run's *own* staleness.
 /// `kind=research|challenge` restricts by the stored `kind` column — the browse
 /// half of the challenge feature; like every filter here it applies before the
-/// page is cut.
+/// page is cut. So do `completeness=finalized|partial` (whether the run reached
+/// its own conclusion or a budget stopped it) and `challenged_run_id=<id>`, which
+/// answers "what was said about *that* report" — the one query that finds a
+/// challenge whose verdict was inconclusive or whose own evidence has since
+/// moved, both of which `trust` correctly stops counting.
+///
+/// **Every filter applies before the `LIMIT`, and that is a contract, not an
+/// implementation detail.** A client pruning a corpus pages this list to
+/// exhaustion and stops when a page comes back short; a filter applied after the
+/// cut would advance the cursor while returning fewer rows, and "short page means
+/// no more" — the only inference on offer — would be wrong.
 ///
 /// `q` is a `LIKE` over the title, the question and the report body, with
 /// [`like_escape`], for the reason `grep` needs it: `_` is a
@@ -6507,7 +6610,7 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
         ResearchListQuery,
     ),
     responses(
-        (status = 200, description = "One keyset page of stored runs, newest first, without their reports.", body = ResearchRunListResponse),
+        (status = 200, description = "One keyset page of stored runs, newest first, without their reports, plus `totals` — corpus-wide counts for the project that no filter on this request affects.", body = ResearchRunListResponse),
         (status = 400, description = "Malformed query parameter, or `limit` above `[research].list_page_limit`.", body = ProblemDetails),
         (status = 404, description = "The project has never been seen.", body = ProblemDetails),
         (status = 500, description = "SQLite read failure.", body = ProblemDetails),
@@ -6579,6 +6682,23 @@ pub async fn get_research_runs(
                     .to_string(),
                 );
             }
+            match q.completeness.unwrap_or(ResearchCompleteness::All) {
+                ResearchCompleteness::All => {}
+                ResearchCompleteness::Finalized => {
+                    where_parts.push("r.done_reason = 'finalized'".to_string());
+                }
+                ResearchCompleteness::Partial => {
+                    where_parts.push("r.done_reason <> 'finalized'".to_string());
+                }
+            }
+            if let Some(subject) = q.challenged_run_id.as_deref() {
+                // Served by `idx_research_runs_challenged`, which had no reader
+                // until this filter — it was built for the trust subquery and is
+                // exactly the index this wants.
+                where_parts.push(format!("r.challenged_run_id = ?{n}"));
+                binds.push(Bind::Path(subject.to_string()));
+                n += 1;
+            }
 
             // The freshness and validity filters are applied INSIDE, against the
             // derived columns, and before the LIMIT. Filtering a page after cutting
@@ -6630,7 +6750,24 @@ pub async fn get_research_runs(
             for run in &mut runs {
                 fill_validity(run, deps.remove(&run.id).unwrap_or_default());
             }
-            Ok(Some(runs))
+
+            // The corpus totals: NONE of the request's filters are applied here,
+            // deliberately (see `ResearchCorpusTotals`). Same transaction, same
+            // validity CTE the page above already built and paid for, and no
+            // report body — so the whole thing is one extra scan of one project's
+            // retained runs.
+            //
+            // `gc_candidates` is a SUM over the *union* rather than the sum of the
+            // four buckets: a run that is both stale and partial is one report to
+            // delete, and a button labelled with the sum would promise more than
+            // the pass then proposes.
+            let totals = tx.query_row(
+                &research_totals_sql(),
+                rusqlite::params![pg, model_id],
+                research_totals_from_row,
+            )?;
+
+            Ok(Some((runs, totals)))
         })
         .await
         .map_err(|e| {
@@ -6642,7 +6779,7 @@ pub async fn get_research_runs(
             ApiError::from(e)
         })?;
 
-    let runs = result.ok_or(ApiError::ProjectNotFound)?;
+    let (runs, totals) = result.ok_or(ApiError::ProjectNotFound)?;
     // Only a full page can have more behind it. Saying so here costs nothing and
     // saves the client a request whose only answer is "no".
     let next_before_seq = (runs.len() == limit)
@@ -6651,6 +6788,7 @@ pub async fn get_research_runs(
     Ok(Json(ResearchRunListResponse {
         runs,
         next_before_seq,
+        totals,
     }))
 }
 
@@ -7418,72 +7556,117 @@ pub async fn get_metrics(State(s): State<RouterState>) -> Result<Response, ApiEr
         .into_response())
 }
 
+/// One dependency probe: the verdict for the wire, the reason for the log.
+///
+/// The raw error deliberately does not travel — see [`CheckState`]. Every probe
+/// therefore looks identical from outside and different in the journal, which is
+/// the only place it can be acted on, and the only place a hint about *which
+/// process to go and start* is worth the bytes.
+fn probe<T, E: std::fmt::Debug>(
+    dependency: &'static str,
+    hint: &'static str,
+    result: Result<T, E>,
+) -> (CheckState, Option<T>) {
+    match result {
+        Ok(v) => (CheckState::Ok, Some(v)),
+        Err(e) => {
+            warn!(
+                dependency,
+                error = ?e,
+                "GET /health: a dependency liveness probe failed; reporting \
+                 \"error\" with no detail on the wire. Sysadmin: {hint}"
+            );
+            (CheckState::Error, None)
+        }
+    }
+}
+
 /// `GET /health` — a *smart* readiness check: confirms both stores (SQLite +
 /// Qdrant) and the embedder are reachable, pings the local Ollama behind
-/// `/research`, and reports how many files are indexing globally. `status` is
-/// `"ok"` only if the three *required* checks pass; Ollama is an **optional**
-/// dependency, so `checks.ollama` is reported but never degrades the verdict —
-/// without it only `/research` stops working. Each check is best-effort and
-/// independent, so one dead dependency is pinpointed rather than collapsing the
-/// whole response.
+/// `/research`, and reports how many files are indexing globally.
+///
+/// `status` is tri-state and the server, not the caller, decides it: `ok` when
+/// everything answers, `degraded` when only the **optional** Ollama is down
+/// (indexing and search keep working, `/research` does not), `unhealthy` when a
+/// required check failed or a research run is wedged. Two rules that are easy to
+/// get backwards: a merely *busy* research slot is the service working and never
+/// moves the verdict, and `checks.*` is only ever `"ok"` or `"error"` — the
+/// reason a probe failed goes to a `warn!` at the probe site, never on the wire.
+///
+/// Each check is best-effort and independent, so one dead dependency is
+/// pinpointed rather than collapsing the whole response.
 ///
 /// **Concurrency:** safe — read-only probes. Always returns **200** at the HTTP level;
-/// inspect the `status` field (`"ok"` vs `"degraded"`) and per-dependency `checks`.
+/// inspect the `status` field and per-dependency `checks`.
 #[utoipa::path(
     get,
     path = "/health",
     tag = "Observability",
-    responses((status = 200, description = "Dependency liveness; `status` is `ok` only if the three required checks pass (the optional `ollama` check never degrades it).", body = HealthResponse)),
+    responses((status = 200, description = "Dependency liveness. `ok` = every check passes; `degraded` = only the optional `ollama` is failing; `unhealthy` = a required check failed or a research run is wedged. Each `checks.*` value is exactly `ok` or `error` — the reason is logged server-side, never returned.", body = HealthResponse)),
 )]
 #[debug_handler]
 pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
     let guard = http3::CancellationGuard(CancellationToken::new());
 
     // SQLite: the global indexing-file count doubles as the liveness query.
-    let (sqlite, indexing_files) = match s
-        .db_pool
-        .transaction(guard.0.child_token(), |tx| {
-            tx.query_row(
-                "SELECT COUNT(*) FROM project_files WHERE status = 'indexing'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(SQLite3PoolError::from)
-        })
-        .await
-    {
-        Ok(n) => ("ok".to_string(), n),
-        Err(e) => (format!("error: {e}"), -1),
-    };
+    let (sqlite, count) = probe(
+        "sqlite",
+        "the database file must exist, be writable and have disk behind it; see \
+         [database].path.",
+        s.db_pool
+            .transaction(guard.0.child_token(), |tx| {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM project_files WHERE status = 'indexing'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .await,
+    );
+    // `-1` is "not known", which is a different answer from `0` and the reason
+    // the count rides on a probe that may have failed.
+    let indexing_files = count.unwrap_or(-1);
 
-    let qdrant = match s.qdrant.health().await {
-        Ok(()) => "ok".to_string(),
-        Err(e) => format!("error: {e}"),
-    };
+    let (qdrant, _) = probe(
+        "qdrant",
+        "check Qdrant is running and that [qdrant].url resolves from this process.",
+        s.qdrant.health().await,
+    );
 
     let EmbeddingModel::BGEm3 { client, .. } = &s.model;
-    let embedder = match client.health().await {
-        Ok(()) => "ok".to_string(),
-        Err(e) => format!("error: {e:?}"),
-    };
+    let (embedder, _) = probe(
+        "embedder",
+        "check the BGE-M3 server is up and reachable from here — a 0.0.0.0 bind \
+         there is not 127.0.0.1 from this process.",
+        client.health().await,
+    );
     // Pinged separately only when it *is* separate: a split deployment can have a
     // healthy indexer and a dead query instance, which would otherwise show as a
     // green health check and every search failing.
     let query_embedder = if Arc::ptr_eq(client, &s.query_model) {
         None
     } else {
-        Some(match s.query_model.health().await {
-            Ok(()) => "ok".to_string(),
-            Err(e) => format!("error: {e:?}"),
-        })
+        Some(
+            probe(
+                "query_embedder",
+                "check [model].query_server_url — the query instance fails \
+                 independently of the indexing one, and every search embeds \
+                 through it.",
+                s.query_model.health().await,
+            )
+            .0,
+        )
     };
 
-    // Optional dependency: only `/research` needs it, so its state is reported
-    // but deliberately kept out of the `status` verdict below.
-    let ollama = match s.research_ollama.health().await {
-        Ok(()) => "ok".to_string(),
-        Err(e) => format!("error: {e}"),
-    };
+    // The one optional dependency: only `/research` needs it, so it is the sole
+    // producer of `degraded` and can never produce `unhealthy`.
+    let (ollama, _) = probe(
+        "ollama",
+        "optional — only /research needs it; check `ollama serve` and \
+         [research].url.",
+        s.research_ollama.health().await,
+    );
 
     // Research slots. Free reads off in-process state, so they cost nothing and are
     // reported even when Ollama is down — the slots are mindex's own.
@@ -7501,33 +7684,25 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
             oldest_run_id = %oldest.run_id,
             oldest_age_ms = oldest.age_ms(),
             "Research runs are holding slots past their own worst case; reporting \
-             degraded. Sysadmin: see GET /research/active, and the watchdog will \
+             unhealthy. Sysadmin: see GET /research/active, and the watchdog will \
              cancel them on its next sweep."
         );
     }
 
-    let status = if sqlite == "ok"
-        && qdrant == "ok"
-        && embedder == "ok"
-        && query_embedder.as_deref().unwrap_or("ok") == "ok"
-        && wedged.is_empty()
-    {
-        "ok"
-    } else {
-        "degraded"
+    let checks = HealthChecks {
+        sqlite,
+        qdrant,
+        embedder,
+        query_embedder,
+        ollama,
     };
+    let status = checks.verdict(!wedged.is_empty());
 
     Json(HealthResponse {
         status,
         version: env!("CARGO_PKG_VERSION"),
         indexing_files,
-        checks: HealthChecks {
-            sqlite,
-            qdrant,
-            embedder,
-            query_embedder,
-            ollama,
-        },
+        checks,
         research: ResearchHealth {
             slots_total: s.research_max_concurrent,
             slots_busy,
@@ -7867,6 +8042,314 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// One `research_runs` row with every NOT NULL column filled and nothing
+    /// interesting in it, for the tests that only care about the columns they set.
+    /// Project `p1`, `done_reason = 'finalized'`, unpinned (`expires_at` set).
+    fn insert_bare_run(
+        tx: &rusqlite::Transaction<'_>,
+        id: &str,
+        seq: i64,
+        kind: &str,
+        challenged: Option<&str>,
+        verdict: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        tx.execute(
+            "INSERT INTO research_runs (
+                 id, project_guid, seq, expires_at, question, model, prompt_version, effort,
+                 kind, challenged_run_id, challenge_verdict,
+                 granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
+                 done_reason, steps, turns, elapsed_ms,
+                 prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx,
+                 citations_total, citations_verified, citations_path_only,
+                 citations_unverified, cited_paths_json, unverified_paths_json,
+                 changed_files, removed_files, stale_citations, stale_paths_json,
+                 notes_written, notes_rejected, plan_revisions, grep_calls, grep_hits,
+                 out_of_scope_refusals, out_of_scope_rows, scoped,
+                 forced_synthesis, report_window_ms, report_elapsed_ms, report
+             ) VALUES (
+                 ?1, 'p1', ?2, 9999999999, 'q', 'm', '2.2', 'medium',
+                 ?3, ?4, ?5,
+                 1, 1, 1, 1,
+                 'finalized', 1, 1, 1,
+                 1, 1, 1, 1,
+                 0, 0, 0,
+                 0, '[]', '[]',
+                 0, 0, 0, '[]',
+                 0, 0, 0, 0, 0,
+                 0, 0, 0,
+                 0, 0, 0, 'report'
+             )",
+            params![id, seq, kind, challenged, verdict],
+        )?;
+        Ok(())
+    }
+
+    /// One page of summaries, built exactly the way the list handler builds it:
+    /// the validity CTEs, the shared column list, and the extra predicates inside
+    /// the cursor-bounded subquery — which is the property most of these tests are
+    /// really about.
+    fn summary_page(
+        tx: &rusqlite::Transaction<'_>,
+        extra_where: &[String],
+    ) -> rusqlite::Result<Vec<ResearchRunSummary>> {
+        let mut where_parts = vec!["r.project_guid = ?1".to_string()];
+        where_parts.extend(extra_where.iter().cloned());
+        let sql = format!(
+            "{ctes}
+             SELECT * FROM (
+                 SELECT {cols}
+                   FROM research_runs r
+                  WHERE {where_clause}
+             )
+             ORDER BY seq DESC
+             LIMIT 100",
+            ctes = research_validity_ctes("?1", "?2"),
+            cols = research_summary_columns(),
+            where_clause = where_parts.join(" AND "),
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params!["p1", "BAAI/bge-m3"], research_summary_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A challenge must be able to name what it attacked wherever it is rendered,
+    /// so the subject's `seq` and title are resolved server-side. The client used
+    /// to look for the subject among the rows it happened to hold and degrade to
+    /// an anonymous "open subject" link when it was not there — which, on a list
+    /// filtered to challenges, was always.
+    ///
+    /// The title follows the row's own rule: stored heading first, derived from
+    /// the question otherwise. A deleted subject is the one thing NULL now means.
+    #[tokio::test]
+    async fn a_challenge_summary_names_its_subject() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            insert_bare_run(tx, "subj", 1, "research", None, None)?;
+            tx.execute(
+                "UPDATE research_runs SET question = 'How does GC work?' WHERE id = 'subj'",
+                [],
+            )?;
+            insert_bare_run(tx, "titled", 2, "research", None, None)?;
+            tx.execute(
+                "UPDATE research_runs SET title = 'The sweep' WHERE id = 'titled'",
+                [],
+            )?;
+            insert_bare_run(tx, "c1", 3, "challenge", Some("subj"), Some("refuted"))?;
+            insert_bare_run(tx, "c2", 4, "challenge", Some("titled"), Some("confirmed"))?;
+            // A challenge whose subject was deleted: both columns must read NULL.
+            insert_bare_run(tx, "c3", 5, "challenge", Some("gone"), Some("disputed"))?;
+
+            let rows = summary_page(tx, &[])?;
+            let by_id = |id: &str| rows.iter().find(|r| r.id == id).expect("row");
+
+            // A research run names no subject at all.
+            let subj = by_id("subj");
+            assert_eq!(
+                (subj.challenged_seq, subj.challenged_title.as_deref()),
+                (None, None)
+            );
+
+            // Derived from the subject's question, exactly as the subject's own
+            // row derives its title.
+            let c1 = by_id("c1");
+            assert_eq!(c1.challenged_seq, Some(1));
+            assert_eq!(c1.challenged_title.as_deref(), Some("How does GC work?"));
+
+            // The subject's stored heading wins, again exactly as it does there.
+            let c2 = by_id("c2");
+            assert_eq!(c2.challenged_seq, Some(2));
+            assert_eq!(c2.challenged_title.as_deref(), Some("The sweep"));
+
+            // Deleted subject.
+            let c3 = by_id("c3");
+            assert_eq!(
+                (c3.challenged_seq, c3.challenged_title.as_deref()),
+                (None, None)
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `challenged_run_id` answers "what was said about *that* report", and must
+    /// find the challenges `trust` deliberately stops counting — an inconclusive
+    /// verdict among them. That is the whole reason it exists: the panel used to
+    /// skip the lookup entirely whenever trust read `unchallenged`, so a report
+    /// challenged inconclusively showed nothing at all about having been
+    /// challenged.
+    #[tokio::test]
+    async fn the_challenged_run_id_filter_finds_every_challenge_of_one_subject() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            insert_bare_run(tx, "a", 1, "research", None, None)?;
+            insert_bare_run(tx, "b", 2, "research", None, None)?;
+            insert_bare_run(tx, "ca", 3, "challenge", Some("a"), None)?;
+            insert_bare_run(tx, "cb", 4, "challenge", Some("b"), Some("refuted"))?;
+
+            let ids = |subject: &str| -> rusqlite::Result<Vec<String>> {
+                let clause = format!("r.challenged_run_id = '{subject}'");
+                Ok(summary_page(tx, &[clause])?
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect())
+            };
+            // Found despite the NULL verdict, which contributes to no trust value.
+            assert_eq!(ids("a")?, vec!["ca".to_string()]);
+            assert_eq!(ids("b")?, vec!["cb".to_string()]);
+            assert!(ids("nobody")?.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `completeness` is server-side precisely so a client can page to exhaustion
+    /// and trust "a short page means no more": the predicate lands inside the
+    /// cursor-bounded subquery, before the `LIMIT`, like every other filter here.
+    #[tokio::test]
+    async fn the_completeness_filter_splits_finished_from_budget_stopped_runs() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            insert_bare_run(tx, "done", 1, "research", None, None)?;
+            insert_bare_run(tx, "outoftime", 2, "research", None, None)?;
+            insert_bare_run(tx, "outoftokens", 3, "research", None, None)?;
+            tx.execute(
+                "UPDATE research_runs SET done_reason = 'time_exhausted' WHERE id = 'outoftime'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE research_runs SET done_reason = 'tokens_exhausted' \
+                  WHERE id = 'outoftokens'",
+                [],
+            )?;
+
+            let seqs = |clause: &str| -> rusqlite::Result<Vec<i64>> {
+                Ok(summary_page(tx, &[clause.to_string()])?
+                    .into_iter()
+                    .map(|r| r.seq)
+                    .collect())
+            };
+            assert_eq!(seqs("r.done_reason = 'finalized'")?, vec![1]);
+            // Every stop reason at once, deliberately — a reader pruning a corpus
+            // does not act on which budget ran out.
+            assert_eq!(seqs("r.done_reason <> 'finalized'")?, vec![3, 2]);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The corpus totals: `current` is the transitive validity verdict (the same
+    /// one that decides whether a run may be handed to the next question), the
+    /// four GC buckets are unpinned-only, and `gc_candidates` is their **union** —
+    /// a run that is both stale and partial is one report to delete, and a button
+    /// labelled with the sum would promise more than the pass then proposes.
+    #[tokio::test]
+    async fn the_corpus_totals_count_the_union_and_never_the_pinned() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            // Clean and finished: neither a candidate nor a problem.
+            insert_bare_run(tx, "clean", 1, "research", None, None)?;
+            // Both stale and partial — the union must count it once.
+            insert_bare_run(tx, "both", 2, "research", None, None)?;
+            tx.execute(
+                "UPDATE research_runs SET done_reason = 'time_exhausted' WHERE id = 'both'",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO research_run_files (run_id, path, sha256) \
+                 VALUES ('both', 'src/gone.rs', ?1)",
+                // No `project_files` row for it, so the LEFT JOIN finds NULL and
+                // the baseline counts as moved — the "removed" half of stale.
+                params!["de".repeat(32)],
+            )?;
+            // An inconclusive challenge: its own bucket, and no trust verdict.
+            insert_bare_run(tx, "incon", 3, "challenge", Some("clean"), None)?;
+            // Pinned AND partial: pinning takes it off the table entirely.
+            insert_bare_run(tx, "kept", 4, "research", None, None)?;
+            tx.execute(
+                "UPDATE research_runs SET expires_at = NULL, done_reason = 'time_exhausted' \
+                  WHERE id = 'kept'",
+                [],
+            )?;
+
+            let t = tx.query_row(
+                &research_totals_sql(),
+                params!["p1", "BAAI/bge-m3"],
+                research_totals_from_row,
+            )?;
+
+            assert_eq!(t.total, 4, "every run of the project, of either kind");
+            // `both` has a moved baseline file, so it is the only invalid one.
+            assert_eq!(t.current, 3);
+            assert_eq!(t.gc_invalid, 1, "only `both`");
+            assert_eq!(t.gc_stale, 1, "only `both`");
+            assert_eq!(t.gc_partial, 1, "`both`; `kept` is pinned");
+            assert_eq!(t.gc_inconclusive, 1, "only `incon`");
+            // Two reports, not four: `both` is in three buckets at once.
+            assert_eq!(
+                t.gc_candidates, 2,
+                "the union, never the sum of the buckets"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A totals query that took the page's filters would just be a second, worse
+    /// rendering of `runs.len()`. The SQL is the guard: it binds only the guid and
+    /// the model id, and holds no placeholder any filter could reach.
+    #[test]
+    fn the_corpus_totals_query_takes_no_filter() {
+        let sql = research_totals_sql();
+        for filter in ["LIKE", "before_seq", "r.seq <", "invalid_flag =", "?3"] {
+            assert!(
+                !sql.contains(filter),
+                "the totals query must be corpus-wide, but it mentions {filter}: {sql}"
+            );
+        }
+        assert!(
+            !sql.contains("r.report"),
+            "the report body is never selected"
+        );
+    }
+
+    /// The `completeness` wire spellings are a contract with the extension's
+    /// filter select, like `kind`'s.
+    #[test]
+    fn research_completeness_wire_spellings_are_stable() {
+        assert!(matches!(
+            serde_json::from_str::<ResearchCompleteness>("\"all\""),
+            Ok(ResearchCompleteness::All)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ResearchCompleteness>("\"finalized\""),
+            Ok(ResearchCompleteness::Finalized)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ResearchCompleteness>("\"partial\""),
+            Ok(ResearchCompleteness::Partial)
+        ));
+        assert!(serde_json::from_str::<ResearchCompleteness>("\"stopped\"").is_err());
+        assert!(serde_json::from_str::<ResearchCompleteness>("\"Partial\"").is_err());
     }
 
     /// The `kind` wire spellings are a contract with the extension's filter
@@ -10221,6 +10704,8 @@ mod tests {
                 max_context_chars: 24_000,
                 report_timeout_ms: 120_000,
                 checkpoint_every_steps: 6,
+                list_page_limit: 50,
+                max_delete_ids: 500,
                 sampling: ResearchSamplingInfo {
                     temperature: None,
                     top_p: None,

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { MindexApi, ResearchRunSummary } from "./api";
+import { humanize, logError } from "./errors";
 import { ICON } from "./icons";
 import { openResearchReport } from "./researchDocs";
 import { debounce } from "./shared/debounce";
@@ -102,7 +103,8 @@ export async function pickContextRuns(
             // here on every search. It is not a failure.
             if (!isAbort(e) && !disposed) {
                 pick.items = [];
-                pick.placeholder = `Could not list stored reports: ${messageOf(e)}`;
+                logError("Listing stored reports for the context picker", e);
+                pick.placeholder = `Could not list stored reports: ${humanize(e).text}`;
             }
         } finally {
             if (inFlight === controller) {
@@ -151,96 +153,6 @@ export async function pickContextRuns(
             resolve(accepted);
         });
 
-        pick.show();
-        void load("");
-    });
-}
-
-/**
- * Browse the stored corpus and open one report.
- *
- * The read-only twin of [`pickContextRuns`]: same rows, same server-side search,
- * single select, and accepting opens the report in a tab rather than attaching it
- * to a question. It exists so *reading* past research is a popup away too — the
- * two-pane History panel stays for comparing and pruning, which is what two panes
- * are actually for.
- *
- * Unlike the context picker this offers **every** run, valid or not: an
- * out-of-date report is still worth reading (it is how you learn the names), and
- * nothing here will be submitted anywhere.
- */
-export async function browseResearchRuns(
-    api: MindexApi,
-    guid: string,
-    openHistory: () => void
-): Promise<void> {
-    const pick = vscode.window.createQuickPick<RunItem>();
-    pick.title = "Stored research";
-    pick.placeholder = "Search stored reports by title, question or body…";
-    pick.matchOnDescription = false;
-    pick.matchOnDetail = false;
-
-    const historyButton: vscode.QuickInputButton = {
-        iconPath: new vscode.ThemeIcon(ICON.researchHistory),
-        tooltip: "Open Research History (two panes, multi-select, delete)",
-    };
-    pick.buttons = [historyButton];
-
-    let inFlight: AbortController | undefined;
-    let disposed = false;
-
-    const load = async (q: string): Promise<void> => {
-        inFlight?.abort();
-        const controller = new AbortController();
-        inFlight = controller;
-        pick.busy = true;
-        try {
-            const page = await api.listResearchRuns(
-                guid,
-                { q: q || undefined, limit: PAGE },
-                controller.signal
-            );
-            if (!controller.signal.aborted && !disposed) {
-                pick.items = page.runs.map(toItem);
-            }
-        } catch (e) {
-            if (!isAbort(e) && !disposed) {
-                pick.items = [];
-                pick.placeholder = `Could not list stored reports: ${messageOf(e)}`;
-            }
-        } finally {
-            if (inFlight === controller) {
-                inFlight = undefined;
-                pick.busy = false;
-            }
-        }
-    };
-
-    const search = debounce(SEARCH_DEBOUNCE_MS, (q: string) => void load(q));
-
-    await new Promise<void>((resolve) => {
-        pick.onDidChangeValue((q) => search(q));
-        pick.onDidTriggerButton((b) => {
-            if (b === historyButton) {
-                openHistory();
-                pick.hide();
-            }
-        });
-        pick.onDidTriggerItemButton(({ item }) => void openResearchReport(guid, item.run));
-        pick.onDidAccept(() => {
-            const chosen = pick.selectedItems[0];
-            if (chosen !== undefined) {
-                void openResearchReport(guid, chosen.run);
-            }
-            pick.hide();
-        });
-        pick.onDidHide(() => {
-            disposed = true;
-            search.cancel();
-            inFlight?.abort();
-            pick.dispose();
-            resolve();
-        });
         pick.show();
         void load("");
     });
@@ -309,8 +221,4 @@ function describeAge(createdAt: number): string {
 
 function isAbort(e: unknown): boolean {
     return e instanceof Error && e.name === "AbortError";
-}
-
-function messageOf(e: unknown): string {
-    return e instanceof Error ? e.message : String(e);
 }

@@ -520,10 +520,19 @@ def health() -> dict:
     Call this if a previous tool failed with a connection error, or before a batch
     of work, to confirm mindex is up. Returns the server's health report
     (sqlite/qdrant/embedder/ollama checks, status, files currently indexing).
-    `ollama` is optional — only /research needs it, so it may read `error: …`
-    while `status` is still `ok`. If mindex
-    itself is unreachable, this raises a clear error — treat that as "mindex is
-    down": stop calling the other tools and tell the user.
+
+    `status` is one of three words and they mean different things to you:
+    `ok` — everything works. `degraded` — only the optional Ollama is down, so
+    search and indexing still work and `/research` does not; keep using the other
+    tools. `unhealthy` — a required dependency failed (or a research run is
+    wedged) and nothing will work; tell the user which check reads `error`.
+
+    Each check is exactly `"ok"` or `"error"`. The *reason* is deliberately not
+    returned — it is in the server's own log — so do not speculate about the
+    cause and do not paste the check value at the user as if it were one.
+
+    If mindex itself is unreachable, this raises a clear error — treat that as
+    "mindex is down": stop calling the other tools and tell the user.
     """
     resp = _request("GET", "/health", timeout=10.0)
     resp.raise_for_status()

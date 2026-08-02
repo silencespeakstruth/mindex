@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
-import { ConfigResponse, MindexApi, ResearchRunSummary } from "./api";
+import { ConfigResponse, MindexApi, ResearchRunSummary, SearchFilter } from "./api";
+import { BusyKeys } from "./busy";
 import { pickChallengeOptions } from "./challengeFlow";
 import { showActiveResearchRuns } from "./activeRunsPick";
 import { challengeGuard } from "./shared/runsFormat";
@@ -12,7 +13,7 @@ import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
 import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
 import { StatusPanel } from "./statusPanel";
 import { ResearchRunsPanel } from "./researchRunsPanel";
-import { browseResearchRuns, pickContextRuns } from "./researchContextPick";
+import { pickContextRuns } from "./researchContextPick";
 import {
     openResearchReport,
     RESEARCH_SCHEME,
@@ -27,7 +28,14 @@ import { runSearch } from "./search";
 import { ResearchPanel, ResearchSubmission } from "./researchView";
 import { AskSubmission, AskViewProvider } from "./askView";
 import { createProjectFile } from "./createProject";
-import { isCancellation, ProblemError, reportError } from "./errors";
+import {
+    disposeErrorLog,
+    humanize,
+    isCancellation,
+    logError,
+    ProblemError,
+    reportError,
+} from "./errors";
 import { BRAND, say } from "./brand";
 
 interface Project {
@@ -350,7 +358,8 @@ export function activate(context: vscode.ExtensionContext): void {
             );
         } catch (e) {
             if (!isCancellation(e)) {
-                panel.error(e instanceof Error ? e.message : String(e));
+                logError("Research run", e);
+                panel.error(humanize(e).text);
                 failure = e;
             }
         } finally {
@@ -441,7 +450,8 @@ export function activate(context: vscode.ExtensionContext): void {
             );
         } catch (e) {
             if (!isCancellation(e)) {
-                panel.error(e instanceof Error ? e.message : String(e));
+                logError("Research run", e);
+                panel.error(humanize(e).text);
                 failure = e;
             }
         } finally {
@@ -478,7 +488,10 @@ export function activate(context: vscode.ExtensionContext): void {
      * or the file lies outside the project — silently narrowing to the wrong subtree
      * would be worse than not narrowing.
      */
-    const scopeToCurrentFolder = (s: AskSubmission): AskSubmission => {
+    const scopeToCurrentFolder = (s: {
+        include?: SearchFilter;
+        exclude?: SearchFilter;
+    }): { include?: SearchFilter; exclude?: SearchFilter } => {
         const doc = vscode.window.activeTextEditor?.document;
         if (doc === undefined || project === undefined || doc.uri.scheme !== "file") {
             void vscode.window.showInformationMessage(
@@ -499,48 +512,51 @@ export function activate(context: vscode.ExtensionContext): void {
         return { ...s, include: { ...s.include, paths: [`${rel}/*`] } };
     };
 
-    const onAsk = async (s: AskSubmission): Promise<void> => {
-        // "Folder" is resolved here, not in the webview: the webview has no editor
-        // API, and mirroring the active editor into it would be a second channel to
-        // keep fresh for one button. It is checked before the mode split because the
-        // Scope panel now serves both modes — it fills the form in and runs nothing.
-        if (s.scopeCurrentFolder === true) {
-            const scoped = scopeToCurrentFolder(s);
-            askProvider.setScope(scoped.include, scoped.exclude);
-            return;
+    /**
+     * One search at a time, refused rather than queued.
+     *
+     * The button greys itself the moment this takes the key, but the refusal has
+     * to live here: five fast clicks used to be five concurrent requests, five
+     * entries in `liveSearches` and five quick picks racing to be the one on
+     * screen. Shared with the palette command, so the form and the palette cannot
+     * start two either.
+     */
+    const askKeys = new BusyKeys((m) => {
+        const msg = m as { key?: string; busy?: boolean };
+        if (typeof msg.key === "string") {
+            askProvider.setBusy(msg.key, msg.busy === true);
         }
+    });
+
+    const onAsk = async (s: AskSubmission): Promise<void> => {
         if (s.mode === "research") {
             // Spread the whole submission minus the fields a research run has no
             // use for, rather than naming the ones it does: `ResearchSubmission` is
-            // `AskSubmission` less exactly these four, so a field the form grows
+            // `AskSubmission` less exactly these three, so a field the form grows
             // arrives here by construction. Copied field by field, `contextRunIds`
             // was simply never listed — the picked reports reached the panel header
             // and the request went out without them, so every run the user gave
             // context to ran with none and said so in its report.
-            const {
-                mode: _mode,
-                text,
-                topK: _topK,
-                scopeCurrentFolder: _folder,
-                ...research
-            } = s;
+            const { mode: _mode, text, topK: _topK, ...research } = s;
             await startResearch({ question: text, ...research });
             return;
         }
-        try {
-            const proj = await loadProject();
-            await runSearch(api, proj.mindex.guid, proj.root, {
-                topK: s.topK,
-                query: s.text,
-                include: s.include,
-                exclude: s.exclude,
-                registry: liveSearches,
-            });
-        } catch (e) {
-            if (!isCancellation(e)) {
-                await reportError("Search failed", e);
+        await askKeys.run("submit", async () => {
+            try {
+                const proj = await loadProject();
+                await runSearch(api, proj.mindex.guid, proj.root, {
+                    topK: s.topK,
+                    query: s.text,
+                    include: s.include,
+                    exclude: s.exclude,
+                    registry: liveSearches,
+                });
+            } catch (e) {
+                if (!isCancellation(e)) {
+                    await reportError("Search failed", e);
+                }
             }
-        }
+        });
     };
 
     const askProvider = new AskViewProvider(
@@ -558,7 +574,11 @@ export function activate(context: vscode.ExtensionContext): void {
         (s: AskSubmission) => void onAsk(s),
         cancelResearch,
         () => void vscode.commands.executeCommand("mindex.openStatus"),
-        () => void vscode.commands.executeCommand("mindex.pickResearchContext")
+        () => void vscode.commands.executeCommand("mindex.pickResearchContext"),
+        (current) => {
+            const scoped = scopeToCurrentFolder(current);
+            askProvider.setScope(scoped.include, scoped.exclude);
+        }
     );
     // Stored reports are served as read-only Markdown documents, so a report can be
     // opened in a tab from anywhere that knows its id — the picker, the History
@@ -923,7 +943,12 @@ export function activate(context: vscode.ExtensionContext): void {
                             );
                         }
                     },
-                }
+                },
+                // The panel needs the server's own page ceiling and batch-delete
+                // cap to size its paging loops, and reads it live: `/config` is
+                // re-read on every status poll, so a restart with new limits
+                // reaches the panel without one here.
+                () => serverConfig
             );
         }),
 
@@ -947,19 +972,6 @@ export function activate(context: vscode.ExtensionContext): void {
                 askProvider.setContextRuns(picked);
                 askProvider.focus("research");
             }
-        }),
-
-        vscode.commands.registerCommand("mindex.browseResearch", async () => {
-            const guid = project?.mindex.guid;
-            if (guid === undefined) {
-                await vscode.window.showInformationMessage(
-                    say("no project here yet — create a .mindex file first.")
-                );
-                return;
-            }
-            await browseResearchRuns(api, guid, () => {
-                void vscode.commands.executeCommand("mindex.openResearchHistory");
-            });
         }),
 
         vscode.commands.registerCommand("mindex.openResearchReport", async (arg: unknown) => {
@@ -1065,17 +1077,22 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand("mindex.ask", () => askProvider.focus()),
 
         vscode.commands.registerCommand("mindex.search", async () => {
-            try {
-                const proj = await loadProject();
-                // The palette entry point stays deliberately scope-free: it prompts
-                // for a query and has no form to read a scope from.
-                const topK = config().get<number>("topK", 10);
-                await runSearch(api, proj.mindex.guid, proj.root, { topK });
-            } catch (e) {
-                if (!isCancellation(e)) {
-                    await reportError("Search failed", e);
+            // The same key the form's Submit takes: the palette and the form are
+            // two doors into one search, and a keybinding pressed while the form's
+            // search is in flight must not open a second quick pick.
+            await askKeys.run("submit", async () => {
+                try {
+                    const proj = await loadProject();
+                    // The palette entry point stays deliberately scope-free: it
+                    // prompts for a query and has no form to read a scope from.
+                    const topK = config().get<number>("topK", 10);
+                    await runSearch(api, proj.mindex.guid, proj.root, { topK });
+                } catch (e) {
+                    if (!isCancellation(e)) {
+                        await reportError("Search failed", e);
+                    }
                 }
-            }
+            });
         })
     );
 
@@ -1135,7 +1152,12 @@ export function activate(context: vscode.ExtensionContext): void {
     void reloadProject().then(() => statusProvider.refresh());
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+    // Everything else is a `context.subscriptions` entry; the error log is not,
+    // because it is created lazily by the first failure and most sessions never
+    // have one.
+    disposeErrorLog();
+}
 
 function config(): vscode.WorkspaceConfiguration {
     return vscode.workspace.getConfiguration("mindex");
@@ -1193,5 +1215,7 @@ function createApi(): MindexApi {
         noVerify,
         ca,
         apiKey: apiKey === "" ? undefined : apiKey,
+        timeoutMs: cfg.get<number>("requestTimeoutSeconds", 15) * 1000,
+        streamIdleMs: cfg.get<number>("streamIdleTimeoutSeconds", 180) * 1000,
     });
 }

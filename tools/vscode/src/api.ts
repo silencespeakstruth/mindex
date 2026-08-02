@@ -1,6 +1,12 @@
 import * as https from "node:https";
 import * as http from "node:http";
-import { ProblemDetails, ProblemError, UnreachableError } from "./problem";
+import {
+    MalformedResponseError,
+    ProblemDetails,
+    ProblemError,
+    TimeoutError,
+    UnreachableError,
+} from "./problem";
 
 // ---- wire types (src/backend/v0/models.rs) ----
 
@@ -70,16 +76,24 @@ export interface Selector {
 }
 
 export interface HealthResponse {
-    /** Required dependencies only (SQLite, Qdrant, embedder); `checks.ollama` never
-     *  degrades it — see below. */
-    status: "ok" | "degraded";
+    /**
+     * The server's own verdict. `degraded` = only the optional Ollama is down,
+     * so search and indexing still work; `unhealthy` = a required dependency
+     * failed, or a research run is wedged.
+     *
+     * A server older than this vocabulary says `degraded` for the *required*
+     * case, which is why nothing may key behaviour on this field alone — see
+     * `readHealth` in `statusFetch.ts`, which reads it together with `checks`.
+     */
+    status: "ok" | "degraded" | "unhealthy";
     version: string;
     indexing_files: number;
     /**
-     * Per-dependency liveness, `"ok"` or `"error: <reason>"`. Rendered generically,
-     * so a check added server-side shows up without a client change. `ollama` is
-     * optional (only `/research` needs it) and absent on servers before it existed —
-     * hence the `| undefined`.
+     * Per-dependency liveness: `"ok"` or `"error"` — and `"error: <reason>"` from
+     * an older server, which is why a reader must test `=== "ok"` and never
+     * `startsWith("error")`. Rendered generically, so a check added server-side
+     * shows up without a client change. `ollama` is optional (only `/research`
+     * needs it) and absent on servers before it existed — hence `| undefined`.
      */
     checks: Record<string, string | undefined> & { ollama?: string };
     /**
@@ -193,6 +207,18 @@ export interface ResearchConfigInfo {
     /** Caps on `context_run_ids` and the injected prior-report block. */
     max_context_runs?: number;
     max_context_chars?: number;
+    /**
+     * Default and maximum page size of the research list. Published so a client
+     * paging the corpus sizes its loop instead of guessing — guessing low doubles
+     * the request count, guessing high is a 400. Absent on older servers.
+     */
+    list_page_limit?: number;
+    /**
+     * How many run ids one batch delete accepts (`[limits]`, not `[research]`).
+     * What bounds "select everything matching this filter" — and what lets the
+     * panel say honestly that it stopped short. Absent on older servers.
+     */
+    max_delete_ids?: number;
     sampling?: ResearchSamplingInfo;
     /**
      * Measured cost per `(model, effort)`, as opposed to what the ladder *grants*.
@@ -481,6 +507,37 @@ export interface ResearchRunSummary {
      * stops counting automatically; an inconclusive one counts toward none.
      */
     trust: string;
+    /**
+     * For a challenge: the SUBJECT's `seq`, resolved server-side. `null` on a
+     * research run, and on a challenge whose subject has been deleted — which is
+     * now the only thing null means.
+     *
+     * Optional on the type because a 1.0.1 server does not send it: `undefined`
+     * is "this server cannot say", `null` is "there is nothing to say".
+     */
+    challenged_seq?: number | null;
+    /** For a challenge: the subject's title, by the same rule as `title`. */
+    challenged_title?: string | null;
+}
+
+/**
+ * Corpus-wide counts for one project, from the list endpoint.
+ *
+ * **No filter on the request affects these** — they are a fixed denominator, so
+ * "74 of 128 current" keeps answering a question the visible page cannot while
+ * the user types into the search box.
+ */
+export interface ResearchCorpusTotals {
+    /** Every stored run of the project, of either kind. */
+    total: number;
+    /** How many are valid — the same predicate the server enforces on context. */
+    current: number;
+    /** The UNION of the four buckets below, unpinned only. Never their sum. */
+    gc_candidates: number;
+    gc_invalid: number;
+    gc_stale: number;
+    gc_partial: number;
+    gc_inconclusive: number;
 }
 
 /** One run in another run's context chain (direct or transitive). */
@@ -501,6 +558,11 @@ export interface ResearchRunListResponse {
      * which is how the client knows to hide "Load more" without another request.
      */
     next_before_seq: number | null;
+    /**
+     * Corpus-wide counts. Optional: a 1.0.1 server omits the field entirely, and
+     * the panel renders the counts line as "—" rather than inventing numbers.
+     */
+    totals?: ResearchCorpusTotals;
 }
 
 /** What became of one file a run read. */
@@ -772,7 +834,37 @@ export interface ApiOptions {
      * what a direct `https://127.0.0.1:11111` connection wants.
      */
     apiKey?: string;
+    /**
+     * Deadline for an ordinary request, in ms. `0` disables it.
+     *
+     * Not optional decoration: without a deadline a half-open socket leaves the
+     * promise pending forever, and since the status poll re-arms itself in a
+     * `.finally()`, one such socket stopped health polling for the rest of the
+     * session and froze the indicator at whatever colour it happened to be.
+     */
+    timeoutMs?: number;
+    /**
+     * How long a stream may say nothing before it is treated as dead, in ms.
+     * `0` disables it. See `streamRequest` for why this is an *idle* clock and
+     * never a total one.
+     */
+    streamIdleMs?: number;
 }
+
+/** A request that has answered nothing at all. */
+export const DEFAULT_TIMEOUT_MS = 15_000;
+/**
+ * The status poll's own, deliberately under every poll interval — a poll that
+ * outlives its period stacks, and the shortest period is the 3 s busy poll.
+ */
+export const HEALTH_TIMEOUT_MS = 5_000;
+/**
+ * A stream that has gone quiet. Derived, not guessed: the longest *legitimate*
+ * silence on the research path is a turn that produces nothing, which the server
+ * already bounds at `[research].first_token_timeout_ms` and `report_timeout_ms`
+ * (120 s each), plus a minute of slack for a model being loaded on busy hardware.
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 180_000;
 
 function asString(v: unknown, fallback = ""): string {
     return typeof v === "string" ? v : fallback;
@@ -910,11 +1002,16 @@ export class MindexApi {
      * behind a corporate proxy.
      */
     private readonly tls: { rejectUnauthorized: boolean; ca?: Buffer };
+    /** Not `readonly`: `withTimeout` shadows it on a derived view. */
+    private timeoutMs: number;
+    private readonly streamIdleMs: number;
 
     constructor(opts: ApiOptions) {
         this.base = opts.serverUrl.replace(/\/+$/, "");
         this.protocol = opts.protocol ?? "v0";
         this.apiKey = opts.apiKey && opts.apiKey !== "" ? opts.apiKey : undefined;
+        this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+        this.streamIdleMs = opts.streamIdleMs ?? STREAM_IDLE_TIMEOUT_MS;
         // `noVerify` wins over `ca`: with verification off the extra CA can only
         // confuse the picture, and a user who turned it on is asking to connect
         // regardless of what the certificate says.
@@ -927,6 +1024,23 @@ export class MindexApi {
 
     dispose(): void {
         this.agent.destroy();
+    }
+
+    /**
+     * The same client with a stricter clock.
+     *
+     * Shares the agent, the TLS settings and the key — it is the same connection
+     * pool, differing only in how long it will wait. That is what the status
+     * poll needs and what a per-call `timeoutMs` parameter on nine methods would
+     * have cost: the poll calls five different endpoints and every one of them
+     * must be bounded by the *poll's* deadline rather than by the default.
+     *
+     * A view must not be disposed — it would destroy the parent's agent.
+     */
+    withTimeout(timeoutMs: number): MindexApi {
+        const view = Object.create(this) as MindexApi;
+        view.timeoutMs = timeoutMs;
+        return view;
     }
 
     // ---- data plane ----
@@ -985,7 +1099,8 @@ export class MindexApi {
 
     listFiles(
         guid: string,
-        filter?: { status?: string; language?: string }
+        filter?: { status?: string; language?: string },
+        signal?: AbortSignal
     ): Promise<{ files: FileEntry[] }> {
         const params = new URLSearchParams();
         if (filter?.status) {
@@ -995,9 +1110,12 @@ export class MindexApi {
             params.set("language", filter.language);
         }
         const qs = params.size > 0 ? `?${params.toString()}` : "";
-        return this.request("GET", `/projects/${guid}/files${qs}`) as Promise<{
-            files: FileEntry[];
-        }>;
+        return this.request(
+            "GET",
+            `/projects/${guid}/files${qs}`,
+            undefined,
+            signal
+        ) as Promise<{ files: FileEntry[] }>;
     }
 
     /**
@@ -1024,6 +1142,15 @@ export class MindexApi {
             valid?: boolean;
             /** Restrict to ordinary research runs or to challenges. */
             kind?: "research" | "challenge";
+            /**
+             * Restrict to challenges aimed at this run — "what was said about
+             * *that* report". Finds the stale and inconclusive challenges that
+             * `trust` deliberately stops counting, which is why the panel can no
+             * longer skip the lookup when trust reads `unchallenged`.
+             */
+            challengedRunId?: string;
+            /** Whether the run reached its own conclusion or a budget stopped it. */
+            completeness?: "all" | "finalized" | "partial";
         },
         signal?: AbortSignal
     ): Promise<ResearchRunListResponse> {
@@ -1048,6 +1175,12 @@ export class MindexApi {
         }
         if (query?.kind !== undefined) {
             params.set("kind", query.kind);
+        }
+        if (query?.challengedRunId !== undefined) {
+            params.set("challenged_run_id", query.challengedRunId);
+        }
+        if (query?.completeness && query.completeness !== "all") {
+            params.set("completeness", query.completeness);
         }
         const qs = params.size > 0 ? `?${params.toString()}` : "";
         return this.request(
@@ -1287,6 +1420,18 @@ export class MindexApi {
      * resolves (a cancel is not a failure), index rejects (its caller tells a
      * cancel apart from an empty result) — both callers depend on their side, so
      * this cannot be unified further.
+     *
+     * **The clock here is idle-only, never total.** A legitimate `high` research
+     * run lives up to the server's 70-minute ceiling, so any total deadline the
+     * client could pick would eventually kill a run that was working. What is
+     * *not* legitimate is silence: the server bounds every turn's silent prefix
+     * itself, so nothing arriving for `streamIdleMs` means the far end is gone.
+     * The clock starts at the ordinary response timeout — before any frame there
+     * is nothing to be patient about, admission being immediate or a 429 — and
+     * relaxes to `streamIdleMs` once the stream is live.
+     *
+     * A timeout must not take the `abortResolves` path: a silent stream is a
+     * failure and has to be reported as one, where the user's Stop is not.
      */
     private streamRequest(
         path: string,
@@ -1300,8 +1445,33 @@ export class MindexApi {
     ): Promise<void> {
         const url = new URL(this.base + path);
         const payload = Buffer.from(JSON.stringify(body), "utf8");
+        const firstFrameMs = this.timeoutMs;
+        const idleMs = this.streamIdleMs;
 
         return new Promise((resolve, reject) => {
+            let clock: NodeJS.Timeout | undefined;
+            const disarm = (): void => {
+                if (clock !== undefined) {
+                    clearTimeout(clock);
+                    clock = undefined;
+                }
+            };
+            /** Re-arm at `ms`; `0` disarms for good (see the legacy path below). */
+            const arm = (ms: number, phase: "response" | "idle"): void => {
+                disarm();
+                if (ms > 0) {
+                    clock = setTimeout(() => request.destroy(new TimeoutError(ms, phase)), ms);
+                }
+            };
+            const ok = (): void => {
+                disarm();
+                resolve();
+            };
+            const fail = (e: Error): void => {
+                disarm();
+                reject(e);
+            };
+
             const request = https.request(
                 url,
                 {
@@ -1329,7 +1499,7 @@ export class MindexApi {
                             } catch {
                                 // non-problem+json body — keep the raw text
                             }
-                            reject(
+                            fail(
                                 new ProblemError(
                                     status,
                                     problem.code ?? `http.${status}`,
@@ -1345,19 +1515,27 @@ export class MindexApi {
                         handlers.onJson !== undefined &&
                         !contentType.startsWith("text/event-stream")
                     ) {
+                        // The legacy degradation: an older server ignored
+                        // `?stream=yes` and is buffering a whole synchronous
+                        // index. There is no progress to measure and no bound to
+                        // pick — a full pass over a large repo is legitimately
+                        // minutes of silence — so this path keeps its historical
+                        // behaviour of waiting.
+                        disarm();
                         const chunks: Buffer[] = [];
                         res.on("data", (c: Buffer) => chunks.push(c));
                         res.on("end", () => {
                             handlers.onJson?.(Buffer.concat(chunks).toString("utf8"));
-                            resolve();
+                            ok();
                         });
-                        res.on("error", (e) => reject(new UnreachableError(e)));
+                        res.on("error", (e) => fail(new UnreachableError(e)));
                         return;
                     }
 
                     res.setEncoding("utf8");
                     let buf = "";
                     res.on("data", (chunk: string) => {
+                        arm(idleMs, "idle");
                         buf += chunk;
                         // SSE frames are separated by a blank line.
                         let sep;
@@ -1367,17 +1545,23 @@ export class MindexApi {
                             handlers.onFrame(frame);
                         }
                     });
-                    res.on("end", () => resolve());
-                    res.on("error", (e) => reject(new UnreachableError(e)));
+                    res.on("end", () => ok());
+                    res.on("error", (e) => fail(new UnreachableError(e)));
                 }
             );
+            arm(firstFrameMs, "response");
             request.on("error", (e) => {
-                if (e.name === "AbortError" && handlers.abortResolves) {
-                    resolve();
+                // A timeout is a failure even on the paths where an abort is
+                // not: the run stopped answering, which the caller has to be
+                // told, where a cancel is something the caller asked for.
+                if (e instanceof TimeoutError) {
+                    fail(e);
+                } else if (e.name === "AbortError" && handlers.abortResolves) {
+                    ok();
                 } else if (e.name === "AbortError") {
-                    reject(e);
+                    fail(e);
                 } else {
-                    reject(new UnreachableError(e));
+                    fail(new UnreachableError(e));
                 }
             });
             request.write(payload);
@@ -1387,8 +1571,18 @@ export class MindexApi {
 
     // ---- observability ----
 
+    /**
+     * Bounded tighter than everything else, and unconditionally: this is the
+     * call the poll loop makes, and the poll re-arms only after it settles.
+     */
     health(signal?: AbortSignal): Promise<HealthResponse> {
-        return this.request("GET", "/health", undefined, signal) as Promise<HealthResponse>;
+        const clock = Math.min(this.timeoutMs || HEALTH_TIMEOUT_MS, HEALTH_TIMEOUT_MS);
+        return this.withTimeout(clock).request(
+            "GET",
+            "/health",
+            undefined,
+            signal
+        ) as Promise<HealthResponse>;
     }
 
     status(signal?: AbortSignal): Promise<StatusResponse> {
@@ -1411,6 +1605,8 @@ export class MindexApi {
         const payload =
             body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
 
+        const timeoutMs = this.timeoutMs;
+
         return new Promise((resolve, reject) => {
             const headers: http.OutgoingHttpHeaders = { Accept: "application/json" };
             if (this.apiKey) {
@@ -1420,6 +1616,26 @@ export class MindexApi {
                 headers["Content-Type"] = "application/json";
                 headers["Content-Length"] = payload.length;
             }
+            /**
+             * The second clock. `req.setTimeout` below only measures socket
+             * *inactivity*, which a peer dribbling one byte at a time resets
+             * forever — so the deadline that actually bounds the call is this
+             * one. Twice the budget, because a slow-but-progressing transfer is
+             * a different (and legitimate) thing from a stalled one.
+             */
+            let total: NodeJS.Timeout | undefined;
+            const done = <T>(settle: (v: T) => void) => {
+                return (v: T) => {
+                    if (total !== undefined) {
+                        clearTimeout(total);
+                        total = undefined;
+                    }
+                    settle(v);
+                };
+            };
+            const ok = done(resolve);
+            const fail = done(reject);
+
             const req = https.request(
                 url,
                 { method, headers, agent: this.agent, ...this.tls, signal },
@@ -1430,14 +1646,17 @@ export class MindexApi {
                         const status = res.statusCode ?? 0;
                         const text = Buffer.concat(chunks).toString("utf8");
                         if (status === 204) {
-                            resolve(null);
+                            ok(null);
                             return;
                         }
                         if (status >= 200 && status < 300) {
                             try {
-                                resolve(JSON.parse(text));
+                                ok(JSON.parse(text));
                             } catch (e) {
-                                reject(new UnreachableError(e as Error));
+                                // Something answered and it was not JSON. Not
+                                // "unreachable": the remedy is about what is
+                                // listening on that URL, not about starting it.
+                                fail(new MalformedResponseError(e));
                             }
                             return;
                         }
@@ -1447,7 +1666,7 @@ export class MindexApi {
                         } catch {
                             // non-problem+json body (proxy, hard crash) — keep the raw text
                         }
-                        reject(
+                        fail(
                             new ProblemError(
                                 status,
                                 problem.code ?? `http.${status}`,
@@ -1455,14 +1674,26 @@ export class MindexApi {
                             )
                         );
                     });
-                    res.on("error", (e) => reject(new UnreachableError(e)));
+                    res.on("error", (e) => fail(new UnreachableError(e)));
                 }
             );
+            if (timeoutMs > 0) {
+                req.setTimeout(timeoutMs, () =>
+                    req.destroy(new TimeoutError(timeoutMs, "response"))
+                );
+                total = setTimeout(
+                    () => req.destroy(new TimeoutError(timeoutMs, "response")),
+                    timeoutMs * 2
+                );
+            }
             req.on("error", (e) => {
-                if (e.name === "AbortError") {
-                    reject(e);
+                // Order matters: a timeout wrapped as `UnreachableError` reaches
+                // the user as "is the server running?", which is both wrong and
+                // the first thing they have already checked.
+                if (e instanceof TimeoutError || e.name === "AbortError") {
+                    fail(e);
                 } else {
-                    reject(new UnreachableError(e));
+                    fail(new UnreachableError(e));
                 }
             });
             if (payload) {

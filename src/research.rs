@@ -3502,6 +3502,16 @@ pub trait ResearchJournal: Send + Sync {
 pub struct RecordedRun {
     pub id: String,
     pub seq: i64,
+    /// How many earlier challenges of the same subject this run evicted (see
+    /// `db::research::insert_run`'s replace rule). Zero for every ordinary
+    /// research run, and for a challenge that reached no verdict.
+    ///
+    /// Deliberately **not** on the wire: the `done` frame builds its JSON from
+    /// `recorded.id` and `recorded.seq` by name, and "it deleted the previous
+    /// verdict" is an operator's fact, counted by
+    /// `mindex_research_challenges_replaced_total`, not a field a reader of one
+    /// report needs.
+    pub replaced: u64,
 }
 
 /// A file the run read, and the index's hash for it at the moment the run first
@@ -9149,6 +9159,7 @@ mod tests {
                 Some(RecordedRun {
                     id: "run-uuid".into(),
                     seq: 1,
+                    replaced: 0,
                 })
             }
         }
@@ -14043,6 +14054,7 @@ mod tests {
             recorded: Some(RecordedRun {
                 id: "run-uuid".into(),
                 seq: 12,
+                replaced: 0,
             }),
         };
         let d = ev.data();

@@ -38,6 +38,9 @@
 .state-degraded {
     color: var(--mx-warn);
 }
+/* Both ways of being unusable share the colour: they differ in remedy, not in
+ * what the user can currently do. The card below says which. */
+.state-unhealthy,
 .state-unreachable {
     color: var(--mx-bad);
 }

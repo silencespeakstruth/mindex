@@ -9,13 +9,26 @@
 
 import { marked } from "marked";
 import {
+    bulkSelectionNote,
     challengeBadge,
     challengeGuard,
+    challengeStateLine,
+    corpusCountsLine,
+    gcBucketLabel,
+    gcButtonLabel,
+    gcProposalNote,
+    standingChallenge,
+    subjectLabel,
     trustBadge,
     verificationView,
+    ChallengeState,
+    CorpusTotalsLike,
+    GcBucket,
+    GC_BUCKETS,
     VerificationLike,
 } from "../shared/runsFormat.js";
 import { el, icon, vscodeApi } from "./host.js";
+import { applyBusy, paintBusy, setEnabled } from "./ui/busy.js";
 
 interface RunSummary {
     id: string;
@@ -45,6 +58,18 @@ interface RunSummary {
     challenged_run_id: string | null;
     challenge_verdict: string | null;
     trust: string;
+    /** Server-resolved subject of a challenge; absent on an older server. */
+    challenged_seq?: number | null;
+    challenged_title?: string | null;
+}
+
+/** One row the garbage-collection pass proposes deleting, and why. */
+interface GcRow {
+    id: string;
+    seq: number;
+    title: string;
+    referenced_by_count: number;
+    buckets: GcBucket[];
 }
 
 interface RunDependency {
@@ -69,15 +94,6 @@ interface RunDetail extends RunSummary {
     files: RunFile[];
 }
 
-/** One valid challenge aimed at the previewed run, as the host resolves them. */
-interface ChallengeAgainst {
-    id: string;
-    seq: number;
-    title: string;
-    verdict: string | null;
-    valid: boolean;
-}
-
 /** Survives a hidden tab; restored on reload so a half-built selection is not lost. */
 interface State {
     v: string;
@@ -85,6 +101,7 @@ interface State {
     freshness: string;
     validity: string;
     kind: string;
+    completeness: string;
     selected: string[];
     /**
      * The report currently in the right pane. Persisted with the rest: the query
@@ -101,10 +118,23 @@ const searchBox = el<HTMLInputElement>("runs-search");
 const freshnessBox = el<HTMLSelectElement>("runs-freshness");
 const validityBox = el<HTMLSelectElement>("runs-validity");
 const kindBox = el<HTMLSelectElement>("runs-kind");
+const completenessBox = el<HTMLSelectElement>("runs-completeness");
 const refreshBtn = el<HTMLButtonElement>("runs-refresh");
+const countsBox = el("runs-counts");
+const selectAllBtn = el<HTMLButtonElement>("runs-select-all");
+const presetOutdatedBtn = el<HTMLButtonElement>("runs-preset-outdated");
+const presetPartialBtn = el<HTMLButtonElement>("runs-preset-partial");
+const gcBtn = el<HTMLButtonElement>("runs-gc");
+const gcLabel = el("runs-gc-label");
 const list = el<HTMLUListElement>("runs-items");
 const empty = el("runs-empty");
 const errorBox = el("runs-error");
+
+function clearError(): void {
+    errorBox.textContent = "";
+    errorBox.className = "runs-error";
+    errorBox.hidden = true;
+}
 const loading = el("runs-loading");
 const moreBtn = el<HTMLButtonElement>("runs-more");
 const useBtn = el<HTMLButtonElement>("runs-use");
@@ -118,6 +148,16 @@ const PREVIEW_PLACEHOLDER = "Select a run to read its report.";
 
 let selected = new Set<string>();
 let activeId: string | undefined;
+/** Whether the current selection was built by a filter rather than by clicking. */
+let bulkSelection = false;
+/** The truncation sentence the footer appends while a bulk selection stands. */
+let bulkNote: string | undefined;
+/**
+ * The GC review currently open in the right pane, if any. Held so `Cancel` can
+ * restore whatever the user was reading, rather than dropping them on the
+ * placeholder as though the report had been deleted.
+ */
+let gcOpen = false;
 /**
  * The rows currently rendered, by id. The host keeps the authoritative copy; this
  * one exists so the footer can say *why* a selection cannot be used as context
@@ -125,12 +165,16 @@ let activeId: string | undefined;
  */
 const rows = new Map<string, RunSummary>();
 
+// Version bumped with the `completeness` filter: an older blob is discarded
+// wholesale rather than restored half-populated, which would leave the fourth
+// select disagreeing with the query the host is about to run.
 const restored = api.getState();
-if (restored?.v === "4") {
+if (restored?.v === "5") {
     searchBox.value = restored.query;
     freshnessBox.value = restored.freshness;
     validityBox.value = restored.validity;
     kindBox.value = restored.kind;
+    completenessBox.value = restored.completeness;
     selected = new Set(restored.selected);
     activeId = restored.activeId;
     if (activeId !== undefined) {
@@ -140,11 +184,12 @@ if (restored?.v === "4") {
 
 function save(): void {
     api.setState({
-        v: "4",
+        v: "5",
         query: searchBox.value,
         freshness: freshnessBox.value,
         validity: validityBox.value,
         kind: kindBox.value,
+        completeness: completenessBox.value,
         selected: [...selected],
         activeId,
     });
@@ -158,6 +203,7 @@ function sendSearch(): void {
         freshness: freshnessBox.value,
         validity: validityBox.value,
         kind: kindBox.value,
+        completeness: completenessBox.value,
     });
 }
 
@@ -167,9 +213,18 @@ searchBox.addEventListener("input", sendSearch);
 freshnessBox.addEventListener("change", sendSearch);
 validityBox.addEventListener("change", sendSearch);
 kindBox.addEventListener("change", sendSearch);
+completenessBox.addEventListener("change", sendSearch);
 // Not debounced — a button press is deliberate. `activeId` rides along because
 // the webview owns it and the host needs to know which preview to re-fetch.
 refreshBtn.addEventListener("click", () => api.postMessage({ type: "refresh", activeId }));
+selectAllBtn.addEventListener("click", () => api.postMessage({ type: "selectAllMatching" }));
+presetOutdatedBtn.addEventListener("click", () =>
+    api.postMessage({ type: "preset", preset: "outdated" })
+);
+presetPartialBtn.addEventListener("click", () =>
+    api.postMessage({ type: "preset", preset: "partial" })
+);
+gcBtn.addEventListener("click", () => api.postMessage({ type: "gcPropose" }));
 moreBtn.addEventListener("click", () => api.postMessage({ type: "more" }));
 useBtn.addEventListener("click", () => api.postMessage({ type: "useAsContext" }));
 deleteBtn.addEventListener("click", () => api.postMessage({ type: "deleteSelected" }));
@@ -222,11 +277,23 @@ function subjectLink(label: string, subjectId: string): HTMLButtonElement {
     return b;
 }
 
-function ghostButton(glyph: string, title: string, onClick: () => void): HTMLButtonElement {
+function ghostButton(
+    glyph: string,
+    title: string,
+    onClick: () => void,
+    busyKey?: string
+): HTMLButtonElement {
     const b = document.createElement("button");
     b.className = "ghost";
     b.title = title;
-    b.appendChild(icon(glyph));
+    if (busyKey !== undefined) {
+        b.dataset.busyKey = busyKey;
+    }
+    const mark = icon(glyph);
+    if (busyKey !== undefined) {
+        mark.dataset.busyIcon = "";
+    }
+    b.appendChild(mark);
     b.addEventListener("click", (e) => {
         // The row itself opens the report; an action button must not also do that.
         e.stopPropagation();
@@ -348,16 +415,11 @@ function renderRow(run: RunSummary): HTMLLIElement {
         meta.appendChild(badge(chBadge.label, chBadge.kind, chBadge.title));
     }
     if (run.kind === "challenge" && run.challenged_run_id !== null) {
-        // The subject may not be on this page — its seq is then unknowable
-        // client-side, and the link says so. Selecting still works either way:
-        // the host fetches the detail by id.
-        const subject = rows.get(run.challenged_run_id);
-        meta.appendChild(
-            subjectLink(
-                subject === undefined ? "⚔ open subject" : `⚔ challenges #${subject.seq}`,
-                run.challenged_run_id
-            )
-        );
+        // The subject's seq and title come from the SERVER now. This used to hunt
+        // for the subject among the loaded rows and degrade to an anonymous "open
+        // subject" when it was not there — which, on a list filtered to
+        // challenges, was every row.
+        meta.appendChild(subjectLink(subjectLabel(run), run.challenged_run_id));
     }
     const tBadge = trustBadge(run);
     if (tBadge !== undefined) {
@@ -400,17 +462,24 @@ function renderRow(run: RunSummary): HTMLLIElement {
             run.pinned
                 ? "Pinned — never reaped. Click to let it age normally."
                 : "Pin: keep this report past the retention window.",
-            () => api.postMessage({ type: "pin", id: run.id, pinned: !run.pinned })
+            () => api.postMessage({ type: "pin", id: run.id, pinned: !run.pinned }),
+            // Per row: pinning one report must not freeze the pin button on
+            // every other row on screen.
+            `row:${run.id}`
         )
     );
     actions.appendChild(
+        // No key — opening a tab is local and instant.
         ghostButton("go-to-file", "Open this report in its own tab", () =>
             api.postMessage({ type: "openRun", id: run.id })
         )
     );
     actions.appendChild(
-        ghostButton("trash", "Delete this report", () =>
-            api.postMessage({ type: "delete", id: run.id })
+        ghostButton(
+            "trash",
+            "Delete this report",
+            () => api.postMessage({ type: "delete", id: run.id }),
+            "delete"
         )
     );
 
@@ -440,7 +509,7 @@ function refreshFooter(): void {
     const picked = [...selected].map((id) => rows.get(id));
     const invalid = picked.filter((r) => r !== undefined && !r.valid).length;
 
-    useBtn.disabled = selected.size === 0 || invalid > 0;
+    setEnabled(useBtn, selected.size > 0 && invalid === 0);
     useLabel.textContent =
         selected.size === 0 ? "Use as context" : `Use ${selected.size} as context`;
     useBtn.title =
@@ -449,8 +518,34 @@ function refreshFooter(): void {
               "them as context. Unselect them, or delete them."
             : "Hand the selected reports to the next question as background.";
 
-    deleteBtn.disabled = selected.size === 0;
+    setEnabled(deleteBtn, selected.size > 0);
     deleteLabel.textContent = selected.size === 0 ? "Delete" : `Delete ${selected.size}`;
+    // A bulk selection is mostly off-screen by design, so the button says how much
+    // of it the user can actually see. Deleting what you have not looked at is the
+    // one hazard of selecting by filter, and it must not be silent.
+    deleteBtn.title = bulkNote ?? "Delete the selected reports. They cannot be recovered.";
+}
+
+/** The corpus line and the Collect-garbage button, both from the same totals. */
+function renderCounts(totals: CorpusTotalsLike | undefined, legacy: boolean): void {
+    countsBox.textContent = corpusCountsLine(totals);
+    countsBox.title = legacy
+        ? "This server is too old to report corpus totals."
+        : "Every stored report for this project, and how many are still valid — " +
+          "unaffected by the filters above.";
+    gcLabel.textContent = gcButtonLabel(totals);
+    const collectable = (totals?.gc_candidates ?? 0) > 0;
+    setEnabled(gcBtn, collectable);
+    // From the totals, not from `gcBtn.disabled`: while the busy layer holds the
+    // button the two disagree, and the tooltip would claim there is nothing to
+    // collect about a pass that is collecting it.
+    gcBtn.title = collectable
+        ? "Review out-of-date, stale, partial and inconclusive reports, then delete " +
+          "the ones you confirm. Pinned reports are never proposed."
+        : "Nothing to collect — every unpinned report is current and finished.";
+    // Select-all pages the server with the current filters, which an older server
+    // cannot answer for `completeness`; it stays usable, just less precise.
+    setEnabled(selectAllBtn, (totals?.total ?? 0) > 0 || legacy);
 }
 
 /** Return the right pane to its placeholder. */
@@ -484,6 +579,7 @@ function renderDetail(run: RunDetail): void {
     reAsk.title =
         "Put this question back in the form with its scope and settings, and this " +
         "report as context — the usual way to follow one up.";
+    reAsk.dataset.busyKey = "preview";
     reAsk.addEventListener("click", () => api.postMessage({ type: "reAsk", id: run.id }));
     const headActions = document.createElement("div");
     headActions.className = "row";
@@ -609,13 +705,11 @@ function challengeSection(run: RunDetail): HTMLElement {
 
     if (run.kind === "challenge") {
         const p = document.createElement("p");
-        const subject = rows.get(run.challenged_run_id ?? "");
-        const link = subjectLink(
-            subject === undefined
-                ? "open the challenged report"
-                : `#${subject.seq} ${subject.title}`,
-            run.challenged_run_id ?? ""
-        );
+        const label =
+            run.challenged_seq === undefined || run.challenged_seq === null
+                ? "the challenged report"
+                : `#${run.challenged_seq} ${run.challenged_title ?? ""}`.trim();
+        const link = subjectLink(label, run.challenged_run_id ?? "");
         const verdict =
             run.challenge_verdict === null
                 ? "inconclusive — its verdict turn produced nothing parseable, which is not an acquittal"
@@ -633,8 +727,12 @@ function challengeSection(run: RunDetail): HTMLElement {
             p.textContent = tBadge.title;
             section.appendChild(p);
         }
-        // Filled by the host once it has resolved the challenges aimed at this
-        // run — a separate request, so the preview never waits on it.
+        // Filled by the host once it has resolved what was said about this run.
+        // A separate request, so the preview never waits on it — but it now always
+        // arrives and always says something, including for the two cases `trust`
+        // is correctly silent about (an inconclusive challenge, and one whose own
+        // evidence has moved). Those were exactly the reports that showed nothing
+        // at all about having been challenged.
         const holder = document.createElement("div");
         holder.id = "runs-challenges";
         section.appendChild(holder);
@@ -649,25 +747,17 @@ function challengeSection(run: RunDetail): HTMLElement {
         "Re-check this report offline against the journalled evidence — provenance " +
         "and staleness, no model involved. Staleness is measured against the index " +
         "now, so re-running it after a reindex is the point.";
+    verify.dataset.busyKey = "verify";
     verify.addEventListener("click", () => api.postMessage({ type: "verify", id: run.id }));
     actions.appendChild(verify);
 
-    const guard = challengeGuard(run);
-    const challenge = document.createElement("button");
-    challenge.className = "secondary";
-    challenge.append(icon("shield", true), document.createTextNode(" Challenge"));
-    if (guard.ok) {
-        challenge.title =
-            "Launch a challenge run: it re-derives this report's claims through the " +
-            "tools, on the report's own scope, and scores each claim.";
-    } else {
-        challenge.disabled = true;
-        challenge.title = guard.reason;
-    }
-    challenge.addEventListener("click", () =>
-        api.postMessage({ type: "challenge", id: run.id })
-    );
-    actions.appendChild(challenge);
+    // Rebuilt in place once the host reports the challenge state, so the button
+    // reads `Challenge` or `Re-check` according to what actually exists rather
+    // than to what the preview could guess when it was drawn.
+    const challengeHolder = document.createElement("span");
+    challengeHolder.id = "runs-challenge-action";
+    challengeHolder.appendChild(challengeButton(run, undefined));
+    actions.appendChild(challengeHolder);
     section.appendChild(actions);
 
     // Filled by the host's `verification` message after a Verify click.
@@ -678,40 +768,235 @@ function challengeSection(run: RunDetail): HTMLElement {
     return section;
 }
 
-/** Render the list of challenges aimed at the previewed run. */
-function renderChallenges(holder: HTMLElement, challenges: ChallengeAgainst[]): void {
+/**
+ * `Challenge` for a report with none, `Re-check` for one that already carries a
+ * verdict — the wording, including the refusals, from the shared module.
+ *
+ * A second Challenge button would be a lie about what pressing it does: a fresh
+ * run now *replaces* the standing verdict (when it reaches one), and the guard's
+ * `recheck` mode is what says so.
+ */
+function challengeButton(
+    run: RunSummary,
+    state: ChallengeState | undefined
+): HTMLButtonElement {
+    const guard = challengeGuard(run, state);
+    const b = document.createElement("button");
+    b.className = "secondary";
+    b.dataset.busyKey = "preview";
+    if (!guard.ok) {
+        b.append(icon("shield", true), document.createTextNode(" Challenge"));
+        b.disabled = true;
+        b.title = guard.reason;
+        return b;
+    }
+    if (guard.mode === "recheck") {
+        b.append(icon("sync", true), document.createTextNode(" Re-check"));
+        b.title =
+            `Standing challenge: ${guard.current}. Re-check it offline (free) or ` +
+            "with a fresh run on the GPU.";
+        b.addEventListener("click", () => api.postMessage({ type: "recheck", id: run.id }));
+        return b;
+    }
+    b.append(icon("shield", true), document.createTextNode(" Challenge"));
+    b.title =
+        "Launch a challenge run: it re-derives this report's claims through the " +
+        "tools, on the report's own scope, and scores each claim.";
+    b.addEventListener("click", () => api.postMessage({ type: "challenge", id: run.id }));
+    return b;
+}
+
+/**
+ * What was said about the previewed run — **always a sentence**, including
+ * "never challenged".
+ *
+ * The old version rendered a list and nothing else, so it was silent in exactly
+ * the cases a reader needs told: no list meant "not challenged", "challenged
+ * inconclusively" and "challenged, but that challenge has gone stale" all at
+ * once. The wording lives in `runsFormat.ts` where `node --test` reaches it.
+ */
+function renderChallengeState(holder: HTMLElement, state: ChallengeState): void {
     holder.replaceChildren();
-    if (challenges.length === 0) {
+    const p = document.createElement("p");
+    p.textContent = challengeStateLine(state);
+    const standing = standingChallenge(state);
+    if (standing !== undefined) {
+        p.classList.add(`verdict-${standing.verdict ?? "inconclusive"}`);
+    }
+    holder.appendChild(p);
+    if (standing === undefined) {
         return;
     }
-    const p = document.createElement("p");
-    p.textContent = `Challenged ${challenges.length} time(s):`;
-    holder.appendChild(p);
-    const ul = document.createElement("ul");
-    ul.className = "runs-deps";
-    for (const c of challenges) {
-        const li = document.createElement("li");
-        li.className = "runs-dep";
-        const state = document.createElement("span");
-        const verdict = c.verdict ?? "inconclusive";
-        state.className = `dim verdict-${verdict}`;
-        state.textContent = c.valid ? verdict : `${verdict} (stale)`;
-        state.title = c.valid
-            ? "This challenge's own evidence still stands."
-            : "This challenge's own evidence has moved; it no longer counts toward trust.";
-        const link = document.createElement("button");
-        link.textContent = `#${c.seq} ${c.title}`;
-        link.title = "Open this challenge's report";
-        link.addEventListener("click", () => selectRun(c.id));
-        li.append(state, link);
-        ul.appendChild(li);
+    // The challenge itself is a report, so it opens like one — reading the
+    // argument is the whole reason a verdict is worth showing.
+    const open = document.createElement("button");
+    open.className = "runs-subject-link";
+    open.textContent = `Open challenge #${standing.seq} — ${standing.title}`;
+    open.addEventListener("click", () => selectRun(standing.id));
+    holder.appendChild(open);
+}
+
+/**
+ * The garbage-collection review: everything proposed for deletion, grouped by
+ * what is wrong with it, every row pre-checked, one confirm at the end.
+ *
+ * In the right pane rather than a QuickPick because a QuickPick cannot show *why*
+ * a row is proposed or that four later reports were built on it — and those are
+ * the two things a reviewer unchecks a row over. `Cancel` restores whatever was
+ * being read; it is a review, not a mode.
+ */
+function renderGc(proposed: GcRow[], expected: number | null): void {
+    gcOpen = true;
+    preview.replaceChildren();
+    const checks = new Map<string, HTMLInputElement>();
+
+    const head = document.createElement("div");
+    head.className = "runs-gc-head";
+    const h = document.createElement("h3");
+    h.textContent = "Collect garbage";
+    const note = document.createElement("p");
+    note.className = "runs-gc-note";
+    note.textContent = gcProposalNote(proposed.length, expected ?? undefined);
+    head.append(h, note);
+    preview.appendChild(head);
+
+    const deleteBtnGc = document.createElement("button");
+    const updateCount = (): void => {
+        const n = [...checks.values()].filter((c) => c.checked).length;
+        setEnabled(deleteBtnGc, n > 0);
+        deleteBtnGc.textContent = n === 0 ? "Delete" : `Delete ${n}`;
+    };
+
+    // Each run appears in ONE group — its most serious reason, `GC_BUCKETS` being
+    // in that order — and carries the rest as labels. A run listed in three groups
+    // would be three checkboxes for one report, and unchecking one of them would
+    // not stop the other two from deleting it.
+    for (const bucket of GC_BUCKETS) {
+        const inBucket = proposed.filter((r) => r.buckets[0] === bucket);
+        if (inBucket.length === 0) {
+            continue;
+        }
+        const { title, why } = gcBucketLabel(bucket);
+        const group = document.createElement("div");
+        group.className = "runs-gc-group";
+
+        const groupHead = document.createElement("div");
+        groupHead.className = "runs-gc-group-head";
+        const groupTitle = document.createElement("span");
+        groupTitle.className = "runs-gc-group-title";
+        groupTitle.textContent = `${title} (${inBucket.length})`;
+        const toggle = document.createElement("button");
+        toggle.className = "runs-subject-link";
+        toggle.textContent = "uncheck all";
+        toggle.addEventListener("click", () => {
+            const turningOff = toggle.textContent === "uncheck all";
+            for (const r of inBucket) {
+                const c = checks.get(r.id);
+                if (c !== undefined) {
+                    c.checked = !turningOff;
+                }
+            }
+            toggle.textContent = turningOff ? "check all" : "uncheck all";
+            updateCount();
+        });
+        groupHead.append(groupTitle, toggle);
+        group.appendChild(groupHead);
+
+        const whyP = document.createElement("p");
+        whyP.className = "dim runs-gc-why";
+        whyP.textContent = why;
+        group.appendChild(whyP);
+
+        const ul = document.createElement("ul");
+        ul.className = "runs-gc-rows";
+        for (const r of inBucket) {
+            const li = document.createElement("li");
+            li.className = "runs-gc-row";
+            const check = document.createElement("input");
+            check.type = "checkbox";
+            check.checked = true;
+            check.addEventListener("change", updateCount);
+            checks.set(r.id, check);
+
+            const rowTitle = document.createElement("span");
+            rowTitle.className = "runs-gc-row-title";
+            rowTitle.textContent = `#${r.seq} — ${r.title}`;
+            // Every reason, not just the group it was filed under: a report can be
+            // both out of date and half-written, and the reviewer is deciding on
+            // the whole of it.
+            rowTitle.title = r.buckets.map((b) => gcBucketLabel(b).title).join(" · ");
+            li.append(check, rowTitle);
+            if (r.buckets.length > 1) {
+                const also = document.createElement("span");
+                also.className = "dim";
+                also.textContent = `+${r.buckets.length - 1}`;
+                also.title = rowTitle.title;
+                li.appendChild(also);
+            }
+            if (r.referenced_by_count > 0) {
+                const dep = document.createElement("span");
+                dep.className = "runs-gc-dependants";
+                dep.textContent = `↩${r.referenced_by_count}`;
+                dep.title =
+                    `${r.referenced_by_count} later report(s) were built on this one. ` +
+                    "Deleting it invalidates every one of them.";
+                li.appendChild(dep);
+            }
+            const open = document.createElement("button");
+            open.className = "runs-subject-link";
+            open.textContent = "read";
+            open.title = "Open this report before deciding";
+            open.addEventListener("click", () => selectRun(r.id));
+            li.appendChild(open);
+            ul.appendChild(li);
+        }
+        group.appendChild(ul);
+        preview.appendChild(group);
     }
-    holder.appendChild(ul);
+
+    const foot = document.createElement("div");
+    foot.className = "runs-gc-foot";
+    deleteBtnGc.className = "primary";
+    // The same `delete` key as the row and footer buttons. It stayed live after
+    // being pressed, which for the one button that deletes a reviewed batch is
+    // the worst place to leave a second press possible.
+    deleteBtnGc.dataset.busyKey = "delete";
+    deleteBtnGc.addEventListener("click", () => {
+        const ids = [...checks.entries()].filter(([, c]) => c.checked).map(([id]) => id);
+        api.postMessage({ type: "gcDelete", ids });
+    });
+    const cancel = document.createElement("button");
+    cancel.className = "secondary";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => {
+        gcOpen = false;
+        if (activeId === undefined) {
+            clearPreview();
+        } else {
+            api.postMessage({ type: "select", id: activeId });
+        }
+    });
+    foot.append(deleteBtnGc, cancel);
+    preview.appendChild(foot);
+    updateCount();
 }
 
 /** Render one offline re-verification result under the Verify button. */
-function renderVerification(holder: HTMLElement, v: VerificationLike): void {
+function renderVerification(
+    holder: HTMLElement,
+    v: VerificationLike,
+    of: "self" | "challenge"
+): void {
     holder.replaceChildren();
+    if (of === "challenge") {
+        // Without this the challenge's provenance reads as the subject's, which is
+        // a worse confusion than the one this whole surface exists to fix.
+        const caption = document.createElement("p");
+        caption.className = "runs-verify-line dim";
+        caption.textContent =
+            "Re-checked the CHALLENGE run's own citations — not this report's.";
+        holder.appendChild(caption);
+    }
     const view = verificationView(v);
     for (const [text, cls] of [
         [view.provenanceLine, "runs-verify-line"],
@@ -730,6 +1015,20 @@ function renderVerification(holder: HTMLElement, v: VerificationLike): void {
 
 window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>) => {
     const msg = event.data;
+    // A banner survives exactly until something renders successfully.
+    //
+    // That rule, rather than a host-side `ok()` at eight call sites, is what
+    // makes it impossible to forget one — and forgetting one is how a transient
+    // failure came to sit over a list that had since loaded perfectly well.
+    if (
+        msg.type === "runs" ||
+        msg.type === "preview" ||
+        msg.type === "removed" ||
+        msg.type === "gc"
+    ) {
+        clearError();
+    }
+
     switch (msg.type) {
         case "runs": {
             const runs = (msg.runs ?? []) as RunSummary[];
@@ -739,9 +1038,16 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             if (Array.isArray(msg.selected)) {
                 selected = new Set(msg.selected as string[]);
             }
+            bulkSelection = msg.bulk === true;
+            if (!bulkSelection) {
+                bulkNote = undefined;
+            }
             for (const run of runs) {
                 list.appendChild(renderRow(run));
             }
+            // Rows are rebuilt constantly; without this a row rendered during an
+            // in-flight delete is the one live button on a frozen page.
+            paintBusy(list);
             const total = list.childElementCount;
             empty.hidden = total > 0;
             moreBtn.hidden = msg.nextBeforeSeq === null || msg.nextBeforeSeq === undefined;
@@ -749,28 +1055,63 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             save();
             break;
         }
-        case "preview":
-            renderDetail(msg.run as RunDetail);
+        case "totals":
+            renderCounts(
+                (msg.totals ?? undefined) as CorpusTotalsLike | undefined,
+                msg.legacy === true
+            );
             break;
-        case "challenges": {
+        case "filters":
+            // The host echoes a preset back so the four selects move with it. A
+            // shortcut that left the controls disagreeing with the list would be a
+            // second, invisible filter.
+            freshnessBox.value = String(msg.freshness);
+            validityBox.value = String(msg.validity);
+            kindBox.value = String(msg.kind);
+            completenessBox.value = String(msg.completeness);
+            save();
+            break;
+        case "gc":
+            renderGc((msg.rows ?? []) as GcRow[], (msg.expected ?? null) as number | null);
+            paintBusy(preview);
+            break;
+        case "preview":
+            gcOpen = false;
+            renderDetail(msg.run as RunDetail);
+            paintBusy(preview);
+            break;
+        case "challengeState": {
             // Async enrichment of the open preview. A stale answer (the user has
             // already clicked another row) must not paint over the newer pane.
-            if (msg.runId !== activeId) {
+            if (msg.runId !== activeId || gcOpen) {
                 break;
             }
+            const state = msg.state as ChallengeState;
             const holder = document.getElementById("runs-challenges");
             if (holder !== null) {
-                renderChallenges(holder, (msg.list ?? []) as ChallengeAgainst[]);
+                renderChallengeState(holder, state);
+            }
+            // The button only now knows whether it is a first challenge or a
+            // re-check, so it is rebuilt rather than drawn hopefully up front.
+            const action = document.getElementById("runs-challenge-action");
+            const run = rows.get(String(msg.runId));
+            if (action !== null && run !== undefined) {
+                action.replaceChildren(challengeButton(run, state));
+                paintBusy(action);
             }
             break;
         }
         case "verification": {
-            if (msg.runId !== activeId) {
+            if (msg.runId !== activeId || gcOpen) {
                 break;
             }
             const holder = document.getElementById("runs-verify-out");
             if (holder !== null) {
-                renderVerification(holder, msg.v as VerificationLike);
+                renderVerification(
+                    holder,
+                    msg.v as VerificationLike,
+                    msg.of === "challenge" ? "challenge" : "self"
+                );
             }
             break;
         }
@@ -805,16 +1146,49 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             save();
             break;
         }
-        case "selected":
+        case "selected": {
             selected = new Set((msg.selected ?? []) as string[]);
+            bulkSelection = msg.bulk === true;
+            const onScreen = [...selected].filter((id) => rows.has(id)).length;
+            bulkNote = bulkSelection ? bulkSelectionNote(selected.size, onScreen) : undefined;
+            if (bulkSelection && msg.truncated === true) {
+                // Saying "500 selected" without saying "and more match" would let a
+                // user believe one delete clears the filter when it does not.
+                const cap = typeof msg.cap === "number" ? msg.cap : selected.size;
+                bulkNote =
+                    `${bulkNote ?? ""} ${cap} is the most one delete accepts; ` +
+                    "more reports match this filter.";
+            }
+            // Re-tick the boxes the host just selected for us.
+            for (const [id, row] of rows) {
+                const box = list.querySelector<HTMLInputElement>(
+                    `[data-id="${CSS.escape(id)}"] input[type=checkbox]`
+                );
+                if (box !== null) {
+                    box.checked = selected.has(row.id);
+                }
+            }
             refreshFooter();
             save();
             break;
-        case "loading":
-            loading.hidden = msg.loading !== true;
+        }
+        case "busy":
+            if (typeof msg.key === "string") {
+                applyBusy(msg.key, msg.busy === true);
+                // The spinner is driven by the same key as the buttons, so the
+                // two can no longer disagree about whether the list is loading —
+                // which the old separate `loading` channel allowed.
+                if (msg.key === "list") {
+                    loading.hidden = msg.busy !== true;
+                }
+            }
             break;
         case "error":
             errorBox.textContent = typeof msg.message === "string" ? msg.message : "";
+            // Yellow when pressing the same thing again could work, red when it
+            // could not: `retryable` is the only thing that tells the user which
+            // of those they are looking at.
+            errorBox.className = msg.retryable === true ? "runs-error warn" : "runs-error";
             errorBox.hidden = errorBox.textContent === "";
             break;
     }

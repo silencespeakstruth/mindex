@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::backend::metrics::{
     ClassLabels, Metrics, ModelEffortLabels, ModelKindLabels, ModelLabels, ModelReasonLabels,
@@ -100,6 +100,11 @@ pub async fn insert_run(
     token: CancellationToken,
 ) -> Option<RecordedRun> {
     let id = ctx.id.clone();
+    // Read out before `ctx`/`record` move into the closure. The verdict is what
+    // gates the replace rule below; the subject id is only for the log line, which
+    // runs after the transaction has already consumed both.
+    let challenge_verdict = record.challenge.as_ref().and_then(|c| c.verdict);
+    let subject_for_log = ctx.challenged_run_id.clone();
     let retention_secs = (ctx.retention_days as i64).saturating_mul(SECONDS_PER_DAY);
     let context_run_ids =
         serde_json::to_string(&record.context_run_ids).unwrap_or_else(|_| "[]".to_string());
@@ -243,7 +248,7 @@ pub async fn insert_run(
                     ctx.scope_spec_json,
                     ctx.kind,
                     ctx.challenged_run_id,
-                    record.challenge.as_ref().and_then(|c| c.verdict),
+                    challenge_verdict,
                     record.challenge.as_ref().map(|c| c.claims.len() as i64),
                     record.challenge.as_ref().map(|c| c.count_of("confirmed")),
                     record.challenge.as_ref().map(|c| c.count_of("disputed")),
@@ -318,11 +323,67 @@ pub async fn insert_run(
                     ])?;
                 }
             }
-            Ok(RecordedRun { id, seq })
+            // **One challenge per report, newest verdict wins.** A challenge that
+            // reached a verdict evicts every earlier challenge of the same subject,
+            // so `research_trust_column`'s severity fold has a single row to fold
+            // and a reader is never asked to reconcile a pile of verdicts.
+            //
+            // Four things here are load-bearing:
+            //
+            // * **In this transaction, not after it.** The journal is best-effort by
+            //   contract — a failure logs and returns `None`. A follow-up DELETE
+            //   could therefore destroy the standing verdict on behalf of a run that
+            //   left no trace at all. Here, a failed insert rolls the eviction back
+            //   with it.
+            // * **`challenge_verdict IS NOT NULL` gates it.** An inconclusive run is
+            //   journalled normally and evicts nothing: it produced no finding, and
+            //   letting it erase a `refuted` would spend the mechanism's most
+            //   valuable output on its least informative outcome. The cost is that a
+            //   subject can carry an old verdict plus a new inconclusive row; the
+            //   fold already handles that, and the UI says so.
+            // * **`id <> ?3`.** The new row is already inserted and matches the same
+            //   predicate — without this the challenge deletes itself.
+            // * **The predicate is exactly `kind='challenge'` + this subject + this
+            //   project.** It can never reach a research run, another subject's
+            //   challenge, or another project.
+            //
+            // The four `research_run_*` children are `ON DELETE CASCADE`, and the
+            // pool sets `foreign_keys = ON` on every non-migration connection, so
+            // the evicted run's baselines, evidence, citations and trace go with it.
+            //
+            // Not backed by a unique index on purpose: a partial unique index would
+            // make the *insert* fail rather than evict — the opposite of "newest
+            // wins" — and would refuse to build on a database that already holds two
+            // challenges of one subject.
+            let replaced = match (ctx.kind, ctx.challenged_run_id.as_deref()) {
+                ("challenge", Some(subject)) if challenge_verdict.is_some() => tx.execute(
+                    "DELETE FROM research_runs \
+                     WHERE project_guid = ?1 AND kind = 'challenge' \
+                       AND challenged_run_id = ?2 AND id <> ?3",
+                    rusqlite::params![ctx.project_guid, subject, id],
+                )?
+                    as u64,
+                _ => 0,
+            };
+
+            Ok(RecordedRun { id, seq, replaced })
         })
         .await;
     match res {
-        Ok(recorded) => Some(recorded),
+        Ok(recorded) => {
+            // Logged after the commit, never inside the closure: an uncommitted
+            // eviction is not a fact. The counter is the other half — the override
+            // is destructive and otherwise leaves no trace anywhere.
+            if recorded.replaced > 0 {
+                info!(
+                    run_id = %recorded.id,
+                    subject_run_id = ?subject_for_log,
+                    replaced = recorded.replaced,
+                    "This challenge replaced the standing challenge of the same report."
+                );
+            }
+            Some(recorded)
+        }
         Err(e) => {
             warn!(
                 error = ?e,
@@ -467,7 +528,16 @@ impl ResearchJournal for MeteredJournal {
             r.forced_syntheses.inc();
         }
 
-        self.inner.record(record).await
+        // The eviction count comes back from the write, not from `record` — only
+        // the journal knows how many rows the replace rule actually took, and a
+        // run whose insert failed took none.
+        let recorded = self.inner.record(record).await;
+        if let Some(rec) = &recorded
+            && rec.replaced > 0
+        {
+            r.challenges_replaced.inc_by(rec.replaced);
+        }
+        recorded
     }
 }
 
@@ -926,5 +996,188 @@ mod tests {
         let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
         // No migration applied: the table does not exist.
         insert_run(&pool, ctx(), record(), CancellationToken::new()).await;
+    }
+
+    // ── The replace rule: one challenge per report, newest verdict wins ────────
+
+    /// A challenge run aimed at `subject`, with the given overall verdict.
+    fn challenge_of(subject: &str, verdict: Option<&'static str>) -> (RunContext, RunRecord) {
+        let mut c = ctx();
+        c.kind = "challenge";
+        c.challenged_run_id = Some(subject.to_string());
+        let mut r = record();
+        r.challenge = Some(crate::research::ChallengeOutcome {
+            verdict,
+            grounded: true,
+            capped: false,
+            claims: vec![crate::research::ClaimVerdict {
+                claim: "It sweeps.".into(),
+                verdict: verdict.unwrap_or("confirmed"),
+            }],
+        });
+        (c, r)
+    }
+
+    /// Every `kind='challenge'` row aimed at `subject`, oldest first.
+    async fn challenges_of(pool: &SQLite3Pool, subject: &str) -> Vec<(String, Option<String>)> {
+        let subject = subject.to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            let mut stmt = tx.prepare(
+                "SELECT id, challenge_verdict FROM research_runs \
+                 WHERE kind = 'challenge' AND challenged_run_id = ?1 ORDER BY seq",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![subject], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("query")
+    }
+
+    #[tokio::test]
+    async fn a_verdict_bearing_challenge_replaces_the_previous_one() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(first.replaced, 0, "the first challenge evicts nothing");
+
+        let (c2, r2) = challenge_of("subject-1", Some("confirmed"));
+        let second = insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(second.replaced, 1);
+
+        let rows = challenges_of(&pool, "subject-1").await;
+        assert_eq!(rows.len(), 1, "exactly one challenge stands");
+        assert_eq!(rows[0].0, second.id);
+        assert_eq!(rows[0].1.as_deref(), Some("confirmed"));
+    }
+
+    /// The whole point of gating the rule on a verdict: a re-check that parsed to
+    /// nothing must not be able to erase a refutation. If this ever flips, the
+    /// mechanism's most valuable output is spendable by its least informative one.
+    #[tokio::test]
+    async fn an_inconclusive_challenge_does_not_evict_a_refuted_one() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let (c2, r2) = challenge_of("subject-1", None);
+        let second = insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(second.replaced, 0);
+
+        let rows = challenges_of(&pool, "subject-1").await;
+        assert_eq!(rows.len(), 2, "both rows stand: {rows:?}");
+        assert!(rows.iter().any(|(id, _)| *id == first.id));
+    }
+
+    /// The children are `ON DELETE CASCADE`, and `foreign_keys = ON` on every
+    /// non-migration connection is what makes that fire. An orphaned baseline set
+    /// would keep feeding the staleness join for a run nothing can name.
+    #[tokio::test]
+    async fn replacing_a_challenge_takes_its_child_rows() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("disputed"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let (c2, r2) = challenge_of("subject-1", Some("refuted"));
+        insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let dead = first.id.clone();
+        let counts: (i64, i64, i64, i64) = pool
+            .transaction(CancellationToken::new(), move |tx| {
+                let one = |table: &str| -> rusqlite::Result<i64> {
+                    tx.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                        rusqlite::params![dead],
+                        |r| r.get(0),
+                    )
+                };
+                Ok((
+                    one("research_run_files")?,
+                    one("research_run_evidence")?,
+                    one("research_run_citations")?,
+                    one("research_run_steps")?,
+                ))
+            })
+            .await
+            .expect("counts");
+        assert_eq!(counts, (0, 0, 0, 0), "child rows survived the eviction");
+    }
+
+    #[tokio::test]
+    async fn a_challenge_of_another_subject_is_untouched() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+        let (c2, r2) = challenge_of("subject-2", Some("confirmed"));
+        let other = insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(other.replaced, 0);
+
+        assert_eq!(challenges_of(&pool, "subject-1").await.len(), 1);
+        assert_eq!(challenges_of(&pool, "subject-2").await.len(), 1);
+    }
+
+    /// A research run never evicts anything, whatever else is on its context.
+    #[tokio::test]
+    async fn an_ordinary_run_evicts_nothing() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let plain = insert_run(&pool, ctx(), record(), CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(plain.replaced, 0);
+        assert_eq!(challenges_of(&pool, "subject-1").await.len(), 1);
+    }
+
+    /// **This is why the DELETE lives inside `insert_run`'s transaction.** The
+    /// journal is best-effort: a failed write logs and returns `None`. If the
+    /// eviction were a follow-up statement, a run that left no trace at all could
+    /// still have destroyed the standing verdict.
+    #[tokio::test]
+    async fn a_failed_journal_leaves_the_old_challenge_alone() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        // Same id as a row that already exists: the INSERT violates the primary
+        // key and the whole transaction — eviction included — rolls back.
+        let (mut c2, r2) = challenge_of("subject-1", Some("confirmed"));
+        c2.id = first.id.clone();
+        assert!(
+            insert_run(&pool, c2, r2, CancellationToken::new())
+                .await
+                .is_none(),
+            "the duplicate insert must fail"
+        );
+
+        let rows = challenges_of(&pool, "subject-1").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("refuted"),
+            "the verdict survived"
+        );
     }
 }
