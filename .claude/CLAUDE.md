@@ -1956,6 +1956,26 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   trigger-level illegal transitions, `sweep_candidates` selection rules. No
   server/Docker; some slicer tests need the BGE-M3 tokenizer in the HF cache
   (a fake-`Tokenizing` test avoids it).
+- **Three seams exist only so an untestable thing became testable**, each
+  because the code it guards had regressed *without failing anything*. Reach for
+  them rather than inventing a fourth. `router_state()` (handlers tests) builds
+  a whole `RouterState` from `Config::default()` + refusing fakes — the eight
+  `*_core` functions take one, so their real SQL was previously reachable only
+  through the research fakes that replace them; its one hard field, the
+  tokenizer, is the trivial `WordLevel` one `fixture()` already uses.
+  `ResponseSink` (`http3.rs`) is the three-method seam under the h3 frame pump,
+  which could otherwise be driven only by a live QUIC stream — and buffering the
+  body raised no error and broke no test while removing streaming from both SSE
+  endpoints. `apply_migrations_from` takes the migration list because the real
+  one passes `pragma_foreign_key_check` by construction, so the rollback guard
+  had nothing to refuse.
+- **A test that pins a claim about a failure should be checked against that
+  failure**, not merely written — reintroduce the bug, watch it go red, restore.
+  Several tests here assert something true for the wrong reason otherwise: a
+  pre-cancelled token drives a perfectly normal research run (the fakes do not
+  observe it — a *closed channel* is what a disconnect looks like), and under a
+  token cancelled up front no GC phase can fail, so `error` outranking
+  `cancelled` needs a store that fails *and then* cancels.
 - **Integration** (`tests/integration/`, pytest in Docker): mock embedder
   returns deterministic vectors seeded by text hash (stable ranking
   assertions). Fresh project GUID per test. Suites map by filename

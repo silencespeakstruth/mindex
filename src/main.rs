@@ -116,8 +116,21 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
 pub(crate) fn apply_pending_migrations(
     tx: &rusqlite::Transaction,
 ) -> Result<(i32, bool), db::sqlite3::SQLite3PoolError> {
+    apply_migrations_from(tx, MIGRATIONS)
+}
+
+/// [`apply_pending_migrations`] over a given list.
+///
+/// The list is a parameter for one reason: the `pragma_foreign_key_check` below is
+/// the guard that stops a migration which orphaned a row from reaching a running
+/// server, where the damage is silent — and there is no way to exercise a *failing*
+/// migration while the only list is the real one, which by construction passes.
+fn apply_migrations_from(
+    tx: &rusqlite::Transaction,
+    migrations: &[(i32, &str)],
+) -> Result<(i32, bool), db::sqlite3::SQLite3PoolError> {
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let pending: Vec<_> = MIGRATIONS.iter().filter(|(v, _)| *v > current).collect();
+    let pending: Vec<_> = migrations.iter().filter(|(v, _)| *v > current).collect();
     for (_, sql) in &pending {
         tx.execute_batch(sql)?;
     }
@@ -1156,5 +1169,98 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The payback for suspending foreign keys during a rebuild. A migration that
+    /// orphaned a chunk or a symbol row must **roll the whole batch back** and leave
+    /// `user_version` alone, so the next start retries it — reaching a running
+    /// server, the damage is silent: the FK is `RESTRICT` precisely because nothing
+    /// else notices a chunk whose file is gone.
+    ///
+    /// There is no way to exercise this with the real list, which by construction
+    /// passes, so `apply_migrations_from` takes the list.
+    #[tokio::test]
+    async fn a_migration_that_orphans_a_row_is_rolled_back_and_not_stamped() {
+        let pool = pool();
+
+        // A first migration builds a parent/child pair; a second deletes the parent
+        // out from under the child. With enforcement suspended the DELETE succeeds,
+        // and only the check at the end can catch it.
+        const BROKEN: &[(i32, &str)] = &[
+            (
+                1,
+                "CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS child (
+                     id        INTEGER PRIMARY KEY,
+                     parent_id INTEGER NOT NULL
+                         REFERENCES parent(id) ON DELETE RESTRICT
+                 );
+                 INSERT INTO parent (id) SELECT 1 WHERE NOT EXISTS
+                     (SELECT 1 FROM parent WHERE id = 1);
+                 INSERT INTO child (id, parent_id) SELECT 1, 1 WHERE NOT EXISTS
+                     (SELECT 1 FROM child WHERE id = 1);",
+            ),
+            (2, "DELETE FROM parent WHERE id = 1;"),
+        ];
+
+        let res = pool
+            .migration_transaction(CancellationToken::new(), |tx| {
+                apply_migrations_from(tx, BROKEN).map(|_| ())
+            })
+            .await;
+
+        assert!(
+            res.is_err(),
+            "a migration that orphaned a row was allowed to commit"
+        );
+        assert_eq!(
+            user_version(&pool).await,
+            0,
+            "the schema version was stamped for a batch that rolled back, so the \
+             next start would skip the migration that never applied"
+        );
+        // The rollback is total: not even the first migration's tables survive.
+        let tables: i64 = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'table' AND name IN ('parent', 'child')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .expect("read");
+        assert_eq!(tables, 0, "the batch did not roll back as one");
+    }
+
+    /// The same list, without the migration that breaks it, must commit and stamp —
+    /// so the test above is showing a refusal rather than a batch that could never
+    /// have worked.
+    #[tokio::test]
+    async fn the_same_batch_without_the_breaking_step_commits_and_stamps() {
+        let pool = pool();
+        const SOUND: &[(i32, &str)] = &[(
+            1,
+            "CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS child (
+                 id        INTEGER PRIMARY KEY,
+                 parent_id INTEGER NOT NULL
+                     REFERENCES parent(id) ON DELETE RESTRICT
+             );
+             INSERT INTO parent (id) SELECT 1 WHERE NOT EXISTS
+                 (SELECT 1 FROM parent WHERE id = 1);
+             INSERT INTO child (id, parent_id) SELECT 1, 1 WHERE NOT EXISTS
+                 (SELECT 1 FROM child WHERE id = 1);",
+        )];
+
+        pool.migration_transaction(CancellationToken::new(), |tx| {
+            apply_migrations_from(tx, SOUND).map(|_| ())
+        })
+        .await
+        .expect("a sound migration commits");
+
+        assert_eq!(user_version(&pool).await, 1);
     }
 }
