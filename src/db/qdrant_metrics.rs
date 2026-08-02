@@ -209,6 +209,138 @@ mod tests {
         assert!(text.contains(r#"mindex_qdrant_op_duration_seconds_count{op="insert_batch"} 1"#));
     }
 
+    /// A store that answers every method, so the decorator can be asked to forward
+    /// each one.
+    struct Answering;
+
+    #[async_trait]
+    impl VectorStore for Answering {
+        async fn ensure_project(&self, _: &str) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn insert_batch(
+            &self,
+            _: &str,
+            _: Vec<ChunkAsVector>,
+        ) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn delete_batch(&self, _: &str, _: Vec<String>) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn delete_collection(&self, _: &str) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn count_points(&self, _: &str) -> Result<Option<u64>, VectorStoreError> {
+            Ok(Some(7))
+        }
+        async fn search(
+            &self,
+            _: &str,
+            _: Vec<UUIDv4>,
+            _: Vec<f32>,
+            _: Vec<u32>,
+            _: Vec<f32>,
+            _: Vec<Vec<f32>>,
+            _: u64,
+        ) -> Result<Vec<SearchHit>, VectorStoreError> {
+            Ok(vec![])
+        }
+    }
+
+    /// `count_points` is the one trait method with a **provided default**, and the
+    /// default declines (`Ok(None)`) so the seven test fakes need no change. That
+    /// makes forgetting the override here uniquely dangerous: production always
+    /// wraps the real store in this decorator, so a missing forward would answer
+    /// `None` for every project, `probe_vector_counts` would publish nothing, and
+    /// the only detector for a lost Qdrant volume would be silently switched off —
+    /// no error, no empty family to notice, just a panel that never has data.
+    #[tokio::test]
+    async fn the_decorator_forwards_the_count_rather_than_taking_the_declining_default() {
+        let metrics = Arc::new(Metrics::new());
+        let store = MeteredVectorStore::new(Arc::new(Answering), Arc::clone(&metrics));
+
+        assert_eq!(
+            store.count_points("c").await.expect("the fake answers"),
+            Some(7),
+            "the decorator swallowed the count and answered the trait's declining \
+             default; the vector-count probe is dead in every real deployment"
+        );
+        assert!(
+            metrics
+                .render()
+                .expect("renders")
+                .contains(r#"mindex_qdrant_ops_total{op="count_points",outcome="ok"} 1"#),
+            "the forwarded call was not measured"
+        );
+    }
+
+    /// The decorator exists so no caller can be missed, which only holds while every
+    /// method is wrapped. This walks all seven and checks each left its own `op`
+    /// label — a method added to the trait and forwarded without instrumentation
+    /// makes that op invisible to the dashboard while looking perfectly healthy.
+    #[tokio::test]
+    async fn every_store_operation_records_its_own_op_label() {
+        let metrics = Arc::new(Metrics::new());
+        let store = MeteredVectorStore::new(Arc::new(Answering), Arc::clone(&metrics));
+
+        store.ensure_project("c").await.expect("ok");
+        store.insert_batch("c", vec![]).await.expect("ok");
+        store.delete_batch("c", vec![]).await.expect("ok");
+        store.delete_collection("c").await.expect("ok");
+        store.health().await.expect("ok");
+        store.count_points("c").await.expect("ok");
+        store
+            .search("c", vec![], vec![], vec![], vec![], vec![], 5)
+            .await
+            .expect("ok");
+
+        let text = metrics.render().expect("renders");
+        for op in [
+            "ensure_project",
+            "insert_batch",
+            "delete_batch",
+            "delete_collection",
+            "health",
+            "count_points",
+            "search",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    r#"mindex_qdrant_ops_total{{op="{op}",outcome="ok"}} 1"#
+                )),
+                "{op} was not counted: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    r#"mindex_qdrant_op_duration_seconds_count{{op="{op}"}} 1"#
+                )),
+                "{op} was not timed: {text}"
+            );
+        }
+    }
+
+    /// An empty upsert is a legitimate call (a file that sliced to nothing) and must
+    /// not manufacture a points sample — `mindex_qdrant_points_total` is what a
+    /// reader compares against the collection's own size.
+    #[tokio::test]
+    async fn an_empty_batch_records_the_op_but_no_points() {
+        let metrics = Arc::new(Metrics::new());
+        let store = MeteredVectorStore::new(Arc::new(Answering), Arc::clone(&metrics));
+
+        store.insert_batch("c", vec![]).await.expect("ok");
+
+        let text = metrics.render().expect("renders");
+        assert!(text.contains(r#"mindex_qdrant_ops_total{op="insert_batch",outcome="ok"} 1"#));
+        assert!(
+            text.contains(r#"mindex_qdrant_points_total{op="insert_batch"} 0"#),
+            "an empty batch must record zero points, not a phantom count: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn a_successful_delete_counts_its_points() {
         let metrics = Arc::new(Metrics::new());

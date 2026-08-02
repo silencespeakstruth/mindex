@@ -1598,8 +1598,130 @@ mod tests {
             },
         );
         assert_eq!(client.supports_tools("m").await, None);
-        // And the ceiling still applies, from the same cached all-`None` answer.
+        // And the ceiling still applies, from the same all-`None` answer.
         assert_eq!(client.effective_num_ctx("m").await, 4096);
+    }
+
+    /// `show_facts` caches **successes only**. Caching the failure made one blip
+    /// permanent for the life of the process: every later run of that model silently
+    /// used the configured ceiling instead of the model's own window — so a 32k model
+    /// was asked for 65k, which llama.cpp allocates and the model degrades past,
+    /// silently — and `supports_tools` stayed unknown, disarming the pre-flight check
+    /// for good. One unlucky restart of Ollama poisoned mindex until mindex restarted
+    /// too, with nothing after the first `warn!` to say so.
+    #[tokio::test]
+    async fn a_transient_show_failure_is_not_cached_for_the_life_of_the_process() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let calls = Arc::clone(&calls);
+            Router::new().route(
+                "/api/show",
+                post(move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        // The first ask fails; every one after it answers properly.
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            "not json at all — a truncated or proxied reply"
+                        } else {
+                            r#"{"capabilities":["completion","tools"],
+                                "model_info":{"testarch.context_length":2048}}"#
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 65536,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        // The blip: no claim either way. Nothing is written to the cache.
+        assert_eq!(client.supports_tools("m").await, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The very next ask must reach Ollama again and get the real answers — both
+        // of them, since one request answers both questions.
+        assert_eq!(
+            client.supports_tools("m").await,
+            Some(true),
+            "a transient /api/show failure was cached; this model's tool support is \
+             now permanently unknown and the pre-flight check is disarmed for good"
+        );
+        assert_eq!(
+            client.effective_num_ctx("m").await,
+            2048,
+            "a transient /api/show failure was cached; every later run of this model \
+             asks for the ceiling instead of its own window"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the retry happened, and the success that followed it was cached"
+        );
+    }
+
+    /// The other half: a *successful* answer is cached, so `/api/show` is asked once
+    /// per model per process. Both facts come from one request and are cached
+    /// together — two caches could disagree about a model re-pulled between them.
+    #[tokio::test]
+    async fn a_successful_show_is_asked_once_and_answers_both_questions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let calls = Arc::clone(&calls);
+            Router::new().route(
+                "/api/show",
+                post(move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        r#"{"capabilities":["completion","tools"],
+                            "model_info":{"testarch.context_length":2048}}"#
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 65536,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        for _ in 0..5 {
+            assert_eq!(client.supports_tools("m").await, Some(true));
+            assert_eq!(client.effective_num_ctx("m").await, 2048);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "/api/show was asked more than once per model per process"
+        );
+
+        // A different model is a different cache entry, and asks again.
+        assert_eq!(client.supports_tools("other").await, Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
