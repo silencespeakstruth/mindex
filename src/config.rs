@@ -2314,6 +2314,95 @@ mod tests {
         );
     }
 
+    /// The realistic mis-set: an operator raises `[search].max_top_k` and touches
+    /// nothing else. The reranker only ever sees `fusion_limit` candidates, so a
+    /// request asking for the documented maximum comes back silently short — no
+    /// warning at startup, none at query time, and a correct-looking 200. The check
+    /// was against `default_top_k`, which a raised maximum does not move, so this
+    /// whole configuration passed validation.
+    #[test]
+    fn raising_max_top_k_past_the_fusion_limit_is_refused_at_startup() {
+        let cfg = parse("[search]\nmax_top_k = 500\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("fusion_limit") && m.contains("max_top_k")),
+            "{err:?}"
+        );
+
+        // Raising both together is the correct fix, and must be accepted.
+        let cfg = parse("[search]\nmax_top_k = 500\n\n[qdrant]\nfusion_limit = 500\ndense_prefetch_limit = 500\nsparse_prefetch_limit = 500\n")
+            .expect("parses");
+        cfg.validate().expect("a consistently raised set is valid");
+    }
+
+    /// `max_top_k` exactly equal to `fusion_limit` is the boundary the rule is
+    /// written on, and the one an operator sizing the two together will land on.
+    #[test]
+    fn max_top_k_equal_to_the_fusion_limit_is_accepted() {
+        let cfg = parse("[search]\nmax_top_k = 200\n").expect("parses");
+        cfg.validate()
+            .expect("max_top_k == the default fusion_limit must be valid");
+    }
+
+    /// The prefetch → fusion → top_k chain has to hold end to end. A prefetch below
+    /// fusion starves the reranker in exactly the same silent way, and the three rules
+    /// must all fire rather than the first one masking the rest — `validate` collects
+    /// every problem precisely so one startup tells the operator the whole story.
+    #[test]
+    fn every_broken_link_in_the_retrieval_chain_is_named_at_once() {
+        let cfg = parse(
+            "[search]\nmax_top_k = 300\n\n\
+             [qdrant]\nfusion_limit = 200\ndense_prefetch_limit = 10\nsparse_prefetch_limit = 10\n",
+        )
+        .expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+
+        assert!(
+            err.iter().any(|m| m.contains("fusion_limit = 200")
+                && m.contains("[search].max_top_k = 300")),
+            "the top_k link was not reported: {err:?}"
+        );
+        assert!(
+            err.iter().any(|m| m.contains("dense_prefetch_limit = 10")),
+            "the dense prefetch link was not reported: {err:?}"
+        );
+        assert!(
+            err.iter().any(|m| m.contains("sparse_prefetch_limit = 10")),
+            "the sparse prefetch link was not reported: {err:?}"
+        );
+    }
+
+    /// The Qdrant client's own default is 5 s and no key reached it, so a project
+    /// whose fusion + ColBERT rerank ran past that failed **every** search with
+    /// `qdrant.unavailable` and there was nothing to tune. Now there is — and a zero,
+    /// which would fail every call instantly, must not be spellable.
+    #[test]
+    fn a_zero_qdrant_timeout_is_rejected() {
+        let cfg = parse("[qdrant]\ntimeout_ms = 0\nconnect_timeout_ms = 0\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter().any(|m| m.contains("[qdrant].timeout_ms")),
+            "{err:?}"
+        );
+        assert!(
+            err.iter()
+                .any(|m| m.contains("[qdrant].connect_timeout_ms")),
+            "{err:?}"
+        );
+    }
+
+    /// A long call timeout with a short connect timeout is the *correct* shape —
+    /// reaching an unreachable host must fail fast even when a reached one is allowed
+    /// to think — so the two must not be validated against each other.
+    #[test]
+    fn a_connect_timeout_shorter_than_the_call_timeout_is_the_normal_case() {
+        let cfg =
+            parse("[qdrant]\ntimeout_ms = 120000\nconnect_timeout_ms = 1000\n").expect("parses");
+        cfg.validate()
+            .expect("a short connect timeout under a long call timeout is valid");
+    }
+
     #[test]
     fn out_of_range_sampling_is_rejected() {
         let cfg = parse("[research]\ntemperature = 5.0\ntop_p = 0.0\n").expect("parses");

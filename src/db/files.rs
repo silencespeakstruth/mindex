@@ -542,4 +542,186 @@ mod tests {
         .await;
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
     }
+
+    /// `set_file_status` is `#[must_use]` and returns `bool` because a status write
+    /// can be *refused*. The retry worker reported `"indexed"` to its own metric on
+    /// the strength of a write it never checked, so a database that had stopped
+    /// accepting writes kept a clean success rate while every file stayed stuck.
+    /// Each of the three ways it can fail must return `false`.
+    #[tokio::test]
+    async fn a_write_the_triggers_reject_returns_false() {
+        let pool = pool_with_file("indexing").await;
+        let _ = set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "indexed",
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+
+        // `indexed → failed` is not a legal move; the trigger raises.
+        let moved = set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "failed",
+            true,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(!moved, "a rejected transition was reported as a move");
+        assert_eq!(
+            current(&pool).await,
+            ("indexed".to_string(), 0),
+            "the refused write must leave the row exactly as it was"
+        );
+    }
+
+    /// The 0-row case: the file was deleted while this attempt was in flight. Not a
+    /// database error and not a success — every caller here believes it is moving a
+    /// file it just read, and "the file stopped existing" is a third answer.
+    #[tokio::test]
+    async fn a_write_that_matches_no_row_returns_false() {
+        let pool = pool_with_file("indexing").await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "DELETE FROM project_files WHERE project_guid = ?1 AND path = ?2",
+                params![PG, PATH],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("delete");
+
+        let moved = set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "indexed",
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(!moved, "a write matching no row was reported as a move");
+    }
+
+    /// A cancelled token short-circuits before the database is touched, which is a
+    /// failure to write like any other — the caller must not read it as done.
+    #[tokio::test]
+    async fn a_write_under_a_cancelled_token_returns_false() {
+        let pool = pool_with_file("indexing").await;
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let moved = set_file_status(&pool, PG, PATH, MODEL, "indexed", false, token).await;
+
+        assert!(!moved, "a cancelled write was reported as a move");
+        assert_eq!(current(&pool).await, ("indexing".to_string(), 0));
+    }
+
+    /// Two writers racing for the same file — a live `/index` finishing and the retry
+    /// worker sweeping it — is the shape `IndexClaim` exists to prevent, and the
+    /// triggers are the backstop underneath it. Exactly one may win, and the loser
+    /// must be told it lost rather than silently agreeing.
+    #[tokio::test]
+    async fn only_one_of_two_racing_terminal_writes_can_win() {
+        let pool = std::sync::Arc::new(pool_with_file("indexing").await);
+
+        let a = {
+            let p = std::sync::Arc::clone(&pool);
+            tokio::spawn(async move {
+                set_file_status(
+                    &p,
+                    PG,
+                    PATH,
+                    MODEL,
+                    "indexed",
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        let b = {
+            let p = std::sync::Arc::clone(&pool);
+            tokio::spawn(async move {
+                set_file_status(
+                    &p,
+                    PG,
+                    PATH,
+                    MODEL,
+                    "cancelled",
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!(
+            usize::from(a) + usize::from(b),
+            1,
+            "both writers claimed the same `indexing` file (a={a}, b={b}); one of them \
+             is reporting a terminal state it never reached"
+        );
+
+        // And the row really is in one of the two terminal states, not somewhere else.
+        let (status, _) = current(&pool).await;
+        assert!(
+            status == "indexed" || status == "cancelled",
+            "unexpected resting state {status}"
+        );
+    }
+
+    /// `status_updated_at` is what the retry worker's failed-branch cooldown reads
+    /// (`status_updated_at < now - 60`), so a write that moved the file but left the
+    /// stamp alone would make the sweep re-pick it immediately, for ever.
+    #[tokio::test]
+    async fn a_successful_write_stamps_the_time() {
+        let pool = pool_with_file("indexing").await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "UPDATE project_files SET status_updated_at = 0
+                  WHERE project_guid = ?1 AND path = ?2",
+                params![PG, PATH],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("backdate");
+
+        let moved = set_file_status(
+            &pool,
+            PG,
+            PATH,
+            MODEL,
+            "failed",
+            true,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(moved);
+
+        let at: i64 = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.query_row(
+                    "SELECT status_updated_at FROM project_files
+                      WHERE project_guid = ?1 AND path = ?2",
+                    params![PG, PATH],
+                    |r| r.get(0),
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .expect("read");
+        assert!(at > 0, "status_updated_at was not stamped");
+    }
 }

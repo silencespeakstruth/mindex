@@ -9363,6 +9363,137 @@ mod tests {
         );
     }
 
+    /// The handler and the retry worker share **one** lock table, so a claim only
+    /// works if they spell the key identically — and they build it from different
+    /// sources. `post_index` converts a `UUIDv4` with `.as_simple()`; the worker uses
+    /// the raw `project_guid` column its sweep read back. The two agree only because
+    /// `UUIDv4`'s `ToSql` writes the 32-char hyphen-less form.
+    ///
+    /// A divergence here is silent in the worst way: the keys never collide, both
+    /// claims succeed, and a live `/index` and the retry worker index the same file at
+    /// once — the second `prepare` marks the first's fresh chunks `deleted`, the first
+    /// embeds orphans, and `sha256` ends up describing a chunk set that is not the
+    /// active one. No error is raised anywhere; the symptom is a file that hash-skips
+    /// for ever while search cannot find it.
+    #[tokio::test]
+    async fn the_handler_and_the_retry_worker_spell_the_same_lock_key() {
+        let guid = UUIDv4(Uuid::new_v4());
+        const MODEL_ID: &str = "BAAI/bge-m3";
+        const PATH: &str = "src/a.rs";
+
+        // What the worker gets: whatever SQLite hands back for a stored `UUIDv4`.
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                rusqlite::params![guid, MODEL_ID],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("migrations and seed");
+
+        let from_db: String = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.query_row("SELECT guid FROM projects", [], |r| r.get(0))
+                    .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .expect("read the guid back");
+
+        let handler_key = indexing_lock_key(&guid.0.as_simple().to_string(), MODEL_ID, PATH);
+        let worker_key = indexing_lock_key(&from_db, MODEL_ID, PATH);
+
+        assert_eq!(
+            handler_key, worker_key,
+            "the handler and the retry worker are claiming different keys for the same \
+             file, so neither can ever see the other's claim"
+        );
+
+        // And prove it in the table itself: one holder, the other refused.
+        let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let _held = IndexClaim::try_acquire(&locks, handler_key).expect("the handler claims it");
+        assert!(
+            IndexClaim::try_acquire(&locks, worker_key).is_none(),
+            "the retry worker was allowed to index a file a live request holds"
+        );
+    }
+
+    /// The NUL separators are what make the three components unambiguous: no guid,
+    /// model id or path can contain one, so two different files can never collide on
+    /// one key and one file can never produce two. A separator that *can* appear in a
+    /// component (a `/`, say) would let `a/b` + `c` and `a` + `b/c` share a claim.
+    #[test]
+    fn distinct_files_never_share_a_lock_key() {
+        let keys = [
+            indexing_lock_key("g", "m", "a/b.rs"),
+            indexing_lock_key("g", "m", "a/c.rs"),
+            indexing_lock_key("g", "m2", "a/b.rs"),
+            indexing_lock_key("g2", "m", "a/b.rs"),
+            // The classic ambiguity: components that would run together under a
+            // separator any of them could contain.
+            indexing_lock_key("g", "m/x", "b.rs"),
+            indexing_lock_key("g", "m", "x/b.rs"),
+        ];
+        let unique: HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "two distinct files share a claim");
+
+        // ...and the same file always produces the same key.
+        assert_eq!(
+            indexing_lock_key("g", "m", "a/b.rs"),
+            indexing_lock_key("g", "m", "a/b.rs")
+        );
+    }
+
+    /// Under real contention exactly one caller may hold a file's slot, and the slot
+    /// must be free again once every holder has let go — a claim leaked by a panicking
+    /// or forgotten path would make that file permanently un-indexable, with `/index`
+    /// answering 200 and the file never moving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_of_many_racing_claimants_wins_and_the_slot_frees_afterwards() {
+        let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let key = indexing_lock_key("g", "m", "hot.rs");
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let (locks, key) = (Arc::clone(&locks), key.clone());
+            let (winners, gate) = (Arc::clone(&winners), Arc::clone(&gate));
+            tasks.push(tokio::spawn(async move {
+                if let Some(_claim) = IndexClaim::try_acquire(&locks, key) {
+                    winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Hold it until everyone has had their turn to try.
+                    gate.notified().await;
+                }
+            }));
+        }
+
+        // Let the losers finish, then release the winner.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            winners.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "more than one caller holds the same file's indexing claim"
+        );
+        gate.notify_waiters();
+        for t in tasks {
+            t.await.expect("claimant finishes");
+        }
+
+        assert!(
+            IndexClaim::try_acquire(&locks, key).is_some(),
+            "the slot was never released — this file can no longer be indexed at all"
+        );
+        assert!(
+            locks.lock().unwrap().is_empty(),
+            "the lock table leaked a key; it grows without bound over the process's life"
+        );
+    }
+
     // ── retry requeue ────────────────────────────────────────────────────────
 
     /// `post_retry`'s UPDATE resets `retry_count` on a `failed` file and — critically

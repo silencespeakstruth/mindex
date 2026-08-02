@@ -361,6 +361,165 @@ mod tests {
         );
     }
 
+    /// The registry and the semaphore describe the same thing from two sides, and the
+    /// only reason they cannot disagree is that the guard and the permit ride in the
+    /// *same* spawned future. A guard living in the SSE stream instead would free the
+    /// listing on disconnect while the permit stayed held — a slot the list says is
+    /// free and the semaphore refuses to give out, which with `max_concurrent = 1` is
+    /// an unattributable total outage of `/research`.
+    #[tokio::test]
+    async fn the_listing_and_the_permit_are_taken_and_freed_together() {
+        let reg = ResearchRegistry::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let job = {
+            let (reg, sem) = (reg.clone(), Arc::clone(&sem));
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            tokio::spawn(async move {
+                // The shape `launch_research_job` builds: permit and guard in one future.
+                let _permit = sem.acquire_owned().await.expect("a free slot");
+                let _guard = register(&reg, "live", CancellationToken::new());
+                started.notify_one();
+                release.notified().await;
+            })
+        };
+
+        started.notified().await;
+        assert_eq!(
+            reg.len(),
+            1,
+            "the run must be listed while it holds the slot"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the slot must be taken while the run is listed"
+        );
+
+        release.notify_one();
+        job.await.expect("the job completes");
+
+        assert_eq!(reg.len(), 0, "a finished run must leave the listing");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "a run that left the listing is still holding its slot"
+        );
+    }
+
+    /// A run that has been cancelled but is still unwinding keeps both its listing and
+    /// its permit — the pair that makes `GET /research/active` honest about a slot
+    /// nothing has freed yet.
+    #[tokio::test]
+    async fn a_cancelled_run_holds_its_slot_and_its_listing_until_it_actually_lets_go() {
+        let reg = ResearchRegistry::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let token = CancellationToken::new();
+
+        let job = {
+            let (reg, sem) = (reg.clone(), Arc::clone(&sem));
+            let (started, token) = (Arc::clone(&started), token.clone());
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("a free slot");
+                let _guard = register(&reg, "live", token.clone());
+                started.notify_one();
+                token.cancelled().await;
+                // Unwinding takes a moment; the slot is not free yet.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            })
+        };
+
+        started.notified().await;
+        assert!(reg.cancel("live"), "the run must be cancellable by id");
+        assert_eq!(
+            reg.len(),
+            1,
+            "a cancelled-but-unwinding run vanished from the listing while still \
+             holding its permit"
+        );
+        assert_eq!(sem.available_permits(), 0);
+
+        job.await.expect("the job completes");
+        assert_eq!(reg.len(), 0);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    /// `snapshot` is documented oldest-first — the order an operator hunting a stuck
+    /// slot wants, and the order the watchdog would act in. Reversed, the first row
+    /// of `GET /research/active` would be the run least likely to be the problem.
+    #[test]
+    fn the_listing_is_ordered_oldest_first() {
+        let reg = ResearchRegistry::new();
+        let _a = register(&reg, "young", CancellationToken::new());
+        let _b = register(&reg, "middle", CancellationToken::new());
+        let _c = register(&reg, "old", CancellationToken::new());
+        reg.backdate("middle", Duration::from_secs(60));
+        reg.backdate("old", Duration::from_secs(600));
+
+        let ids: Vec<String> = reg.snapshot().into_iter().map(|r| r.run_id).collect();
+        assert_eq!(ids, vec!["old", "middle", "young"]);
+        assert!(reg.oldest_age_ms().expect("something is running") >= 600_000);
+    }
+
+    /// The map is shared across the research runtime and the request threads. Guards
+    /// dropping concurrently with registrations must leave exactly the runs still
+    /// held — a lost entry is a slot nothing can find or cancel, and a leaked one is
+    /// a slot `GET /health` reports as wedged for ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_registrations_and_drops_leave_exactly_what_is_held() {
+        let reg = ResearchRegistry::new();
+        let keep = Arc::new(tokio::sync::Notify::new());
+
+        let mut transient = Vec::new();
+        for i in 0..64 {
+            let reg = reg.clone();
+            transient.push(tokio::spawn(async move {
+                let _g = register(&reg, &format!("t{i}"), CancellationToken::new());
+                tokio::task::yield_now().await;
+            }));
+        }
+
+        let mut held = Vec::new();
+        for i in 0..16 {
+            let reg = reg.clone();
+            let keep = Arc::clone(&keep);
+            held.push(tokio::spawn(async move {
+                let _g = register(&reg, &format!("h{i}"), CancellationToken::new());
+                keep.notified().await;
+            }));
+        }
+
+        for t in transient {
+            t.await.expect("transient run finishes");
+        }
+        // Every transient guard has dropped; the sixteen held ones have not.
+        for _ in 0..200 {
+            if reg.len() == 16 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            reg.len(),
+            16,
+            "the registry lost or leaked entries under concurrent register/drop"
+        );
+        let ids: std::collections::HashSet<String> =
+            reg.snapshot().into_iter().map(|r| r.run_id).collect();
+        for i in 0..16 {
+            assert!(ids.contains(&format!("h{i}")), "run h{i} went missing");
+        }
+
+        keep.notify_waiters();
+        for h in held {
+            h.await.expect("held run finishes");
+        }
+        assert!(reg.is_empty(), "guards left entries behind on drop");
+    }
+
     /// A question is arbitrary UTF-8; the preview must never split a character.
     #[test]
     fn the_question_preview_cuts_on_a_character_boundary() {
