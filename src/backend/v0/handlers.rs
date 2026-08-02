@@ -12797,4 +12797,338 @@ mod tests {
         assert!(d.stale.is_empty(), "done.rs matches its stored hash");
         assert!(d.orphaned.is_empty());
     }
+
+    // ── search: the candidate set is the isolation mechanism ─────────────────
+
+    /// Records the chunk ids the candidate query handed to Qdrant, and scores each
+    /// of them so the winners come back.
+    struct RecordingStore {
+        asked: std::sync::Mutex<Vec<Vec<UUIDv4>>>,
+    }
+
+    #[async_trait]
+    impl VectorStore for RecordingStore {
+        async fn search(
+            &self,
+            _collection: &str,
+            chunk_ids: Vec<UUIDv4>,
+            _dense: Vec<f32>,
+            _sparse_indices: Vec<u32>,
+            _sparse_values: Vec<f32>,
+            _colbert: Vec<Vec<f32>>,
+            _top_k: u64,
+        ) -> Result<Vec<SearchHit>, VectorStoreError> {
+            self.asked.lock().unwrap().push(chunk_ids.clone());
+            Ok(chunk_ids
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| SearchHit {
+                    id: qdrant_client::qdrant::PointId::from(id.0.to_string()),
+                    score: 1.0 - (i as f32) / 100.0,
+                })
+                .collect())
+        }
+        async fn ensure_project(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn insert_batch(
+            &self,
+            _c: &str,
+            _v: Vec<ChunkAsVector>,
+        ) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_batch(&self, _c: &str, _g: Vec<String>) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn delete_collection(&self, _c: &str) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+        async fn health(&self) -> Result<(), VectorStoreError> {
+            unreachable!()
+        }
+    }
+
+    /// One vector per head for a single query — the shape `search_core` requires.
+    struct OneVectorEmbedder;
+
+    #[async_trait]
+    impl crate::models::bge_m3::BGEm3Model for OneVectorEmbedder {
+        async fn encode(
+            &self,
+            req: BGEm3EmbedRequest,
+            _token: CancellationToken,
+        ) -> Result<BGEm3EmbedResponse, EncodeError> {
+            let n = req.texts.len();
+            Ok(BGEm3EmbedResponse {
+                dense_vecs: vec![vec![0.1; 4]; n],
+                sparse_vecs: vec![std::collections::HashMap::from([(1u32, 0.5f32)]); n],
+                colbert_vecs: vec![vec![vec![0.1; 4]]; n],
+            })
+        }
+        async fn health(&self) -> Result<(), EncodeError> {
+            Ok(())
+        }
+    }
+
+    /// A state whose store records what it was asked, and whose embedder answers.
+    fn searchable_state(pool: SQLite3Pool) -> (RouterState, Arc<RecordingStore>) {
+        let store = Arc::new(RecordingStore {
+            asked: std::sync::Mutex::new(vec![]),
+        });
+        let mut s = router_state(pool);
+        s.qdrant = Arc::clone(&store) as Arc<dyn VectorStore>;
+        let embedder: Arc<dyn crate::models::bge_m3::BGEm3Model> = Arc::new(OneVectorEmbedder);
+        s.model = EmbeddingModel::BGEm3 {
+            model_id: MODEL.to_string(),
+            client: Arc::clone(&embedder),
+        };
+        s.query_model = embedder;
+        (s, store)
+    }
+
+    fn query(q: &str) -> SearchRequest {
+        SearchRequest {
+            query: q.to_string(),
+            top_k: None,
+            include: None,
+            exclude: None,
+        }
+    }
+
+    /// **Project isolation is the candidate set and nothing else.** One Qdrant
+    /// collection per project makes it hard to cross projects by accident, but
+    /// within a collection the `has_id` filter built from this query is the *sole*
+    /// mechanism — and it is also what excludes soft-deleted vectors, which are
+    /// still physically present in Qdrant until GC runs.
+    ///
+    /// So the ids handed to the store are the invariant: a soft-deleted chunk in
+    /// that list is a deleted file answering searches, and a foreign project's chunk
+    /// in it is a data leak between projects.
+    #[tokio::test]
+    async fn only_active_chunks_of_this_project_reach_the_vector_store() {
+        let pool = pool_with_chunks(&[("src/a.rs", "alpha"), ("src/b.rs", "beta")]).await;
+
+        // A second project in the same database, and a soft-deleted chunk in this one.
+        let other = UUIDv4(Uuid::from_u128(7));
+        pool.transaction(CancellationToken::new(), move |tx| {
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                params![other, MODEL],
+            )?;
+            tx.execute(
+                "INSERT INTO project_files
+                     (project_guid, model_id, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, 'src/theirs.rs', ?3, 'rust', 'indexing')",
+                params![other, MODEL, "0".repeat(64)],
+            )?;
+            tx.execute(
+                "INSERT INTO project_file_chunks
+                     (project_guid, file_path, model_id, code, qdrant_guid,
+                      start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'src/theirs.rs', ?2, 'secret', ?3, 1, 2, 0, 1, 'active')",
+                params![other, MODEL, Uuid::new_v4().simple().to_string()],
+            )?;
+            // And soft-delete one of ours.
+            tx.execute(
+                "UPDATE project_file_chunks SET status = 'deleted'
+                  WHERE project_guid = ?1 AND file_path = 'src/b.rs'",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+        let (s, store) = searchable_state(pool);
+        let out = search_core(&s, guid(), &query("anything"), &CancellationToken::new())
+            .await
+            .expect("search runs");
+
+        let asked = store.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "the store was called once");
+        assert_eq!(
+            asked[0].len(),
+            1,
+            "the candidate set must hold exactly this project's one active chunk"
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "src/a.rs");
+        assert_eq!(out[0].code, "alpha");
+    }
+
+    /// An empty candidate set is answered **before** Qdrant is called at all. That
+    /// is not an optimisation: a project whose collection does not exist yet would
+    /// make the store raise, and a 503 `qdrant.unavailable` is the wrong answer to
+    /// "your filter matched nothing".
+    #[tokio::test]
+    async fn an_empty_candidate_set_is_a_404_and_never_reaches_qdrant() {
+        let pool = pool_with_chunks(&[("src/a.rs", "alpha")]).await;
+        let (s, store) = searchable_state(pool);
+
+        // A filter that admits nothing.
+        let mut req = query("anything");
+        req.include = Some(SearchFilter {
+            paths: Some(vec![glob("nowhere/**")]),
+            programming_languages: None,
+        });
+
+        let err = search_core(&s, guid(), &req, &CancellationToken::new())
+            .await
+            .expect_err("an empty candidate set is a NoMatch");
+        assert_eq!(err.code(), "search.no_match");
+        assert!(
+            store.asked.lock().unwrap().is_empty(),
+            "Qdrant was asked about a project whose candidate set was empty; if its \
+             collection did not exist the caller would get a 503 instead of a 404"
+        );
+    }
+
+    /// A project that has never been indexed is the same answer, by the same route —
+    /// and must not be a 503 either.
+    #[tokio::test]
+    async fn an_unknown_project_is_a_404_not_a_dependency_failure() {
+        let pool = pool_with_chunks(&[("src/a.rs", "alpha")]).await;
+        let (s, store) = searchable_state(pool);
+
+        let err = search_core(
+            &s,
+            UUIDv4(Uuid::from_u128(99)),
+            &query("anything"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("an unknown project matches nothing");
+        assert_eq!(err.code(), "search.no_match");
+        assert!(store.asked.lock().unwrap().is_empty());
+    }
+
+    /// The request's own `include`/`exclude` narrow the candidate set, with exclude
+    /// winning — the same rule as a research scope, applied by a different builder,
+    /// so the two must agree.
+    #[tokio::test]
+    async fn a_search_selector_narrows_the_candidate_set_with_exclude_winning() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "alpha"),
+            ("src/gen/b.rs", "generated"),
+            ("docs/c.md", "prose"),
+        ])
+        .await;
+        let (s, store) = searchable_state(pool);
+
+        let mut req = query("anything");
+        req.include = Some(SearchFilter {
+            paths: Some(vec![glob("src/**")]),
+            programming_languages: None,
+        });
+        req.exclude = Some(SearchFilter {
+            paths: Some(vec![glob("src/gen/**")]),
+            programming_languages: None,
+        });
+
+        let out = search_core(&s, guid(), &req, &CancellationToken::new())
+            .await
+            .expect("search runs");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "src/a.rs");
+        assert_eq!(
+            store.asked.lock().unwrap()[0].len(),
+            1,
+            "the excluded chunk was still offered to the reranker"
+        );
+    }
+
+    /// A language filter narrows the same way — and reads the *file's* language, not
+    /// anything stored on the chunk.
+    #[tokio::test]
+    async fn a_language_filter_narrows_the_candidate_set() {
+        let pool = pool_with_chunks(&[("src/a.rs", "alpha"), ("docs/c.md", "prose")]).await;
+        let (s, _store) = searchable_state(pool);
+
+        let mut req = query("anything");
+        req.include = Some(SearchFilter {
+            paths: None,
+            programming_languages: Some(vec![ProgrammingLanguage::Markdown]),
+        });
+
+        let out = search_core(&s, guid(), &req, &CancellationToken::new())
+            .await
+            .expect("search runs");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "docs/c.md");
+    }
+
+    /// Winners Qdrant scored whose SQLite row is gone are dropped **and counted**,
+    /// and when *every* winner is one the caller gets a 404 rather than a 200 with
+    /// an empty list. The reassuring spelling must not be the one that means the two
+    /// stores have diverged.
+    #[tokio::test]
+    async fn winners_with_no_row_left_are_counted_and_all_of_them_is_a_404() {
+        let pool = pool_with_chunks(&[("src/a.rs", "alpha")]).await;
+
+        /// Scores a point id that belongs to no chunk row at all.
+        struct GhostStore;
+        #[async_trait]
+        impl VectorStore for GhostStore {
+            async fn search(
+                &self,
+                _c: &str,
+                _ids: Vec<UUIDv4>,
+                _d: Vec<f32>,
+                _si: Vec<u32>,
+                _sv: Vec<f32>,
+                _cb: Vec<Vec<f32>>,
+                _k: u64,
+            ) -> Result<Vec<SearchHit>, VectorStoreError> {
+                Ok(vec![SearchHit {
+                    id: qdrant_client::qdrant::PointId::from(Uuid::from_u128(1234).to_string()),
+                    score: 0.9,
+                }])
+            }
+            async fn ensure_project(&self, _c: &str) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn insert_batch(
+                &self,
+                _c: &str,
+                _v: Vec<ChunkAsVector>,
+            ) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn delete_batch(
+                &self,
+                _c: &str,
+                _g: Vec<String>,
+            ) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn delete_collection(&self, _c: &str) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+            async fn health(&self) -> Result<(), VectorStoreError> {
+                unreachable!()
+            }
+        }
+
+        let (mut s, _) = searchable_state(pool);
+        s.qdrant = Arc::new(GhostStore);
+
+        let err = search_core(&s, guid(), &query("anything"), &CancellationToken::new())
+            .await
+            .expect_err("every winner was an orphan");
+        assert_eq!(
+            err.code(),
+            "search.no_match",
+            "an all-orphaned result set answered 200 with an empty list — the \
+             reassuring spelling for the case that means the stores disagree"
+        );
+        assert!(
+            s.metrics
+                .render()
+                .expect("renders")
+                .contains("mindex_search_orphaned_winners_total 1"),
+            "the orphaned winner was dropped silently"
+        );
+    }
 }
