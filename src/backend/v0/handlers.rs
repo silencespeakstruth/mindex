@@ -12018,4 +12018,370 @@ mod tests {
             "the file itself is still indexed; only its chunks are gone"
         );
     }
+
+    /// Add symbol rows for `path`. Each is `(name, kind, role, start_line, parent)`.
+    async fn add_symbols(
+        pool: &SQLite3Pool,
+        path: &'static str,
+        rows: &[(
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            Option<&'static str>,
+        )],
+    ) {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(n, k, r, l, p)| {
+                (
+                    (*n).to_string(),
+                    (*k).to_string(),
+                    (*r).to_string(),
+                    *l,
+                    p.map(str::to_string),
+                )
+            })
+            .collect();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            for (name, kind, role, line, parent) in &rows {
+                tx.execute(
+                    "INSERT INTO project_file_symbols
+                         (project_guid, model_id, file_path, name, kind, role,
+                          start_line, end_line, start_column, end_column, parent_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0, 1, ?8)",
+                    params![guid(), MODEL, path, name, kind, role, line, parent],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed symbols");
+    }
+
+    /// `outline` reports three states, and the reason is the same one `read_chunks`
+    /// has: a refusal that reads as an empty outline tells the caller the file has
+    /// no definitions, which is a different and wrong fact. `indexed` separates
+    /// "no such file" from "indexed with nothing tagged" — the case every language
+    /// without a tags query is permanently in.
+    #[tokio::test]
+    async fn outline_separates_unindexed_from_untagged_from_refused() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "fn alpha() {}"),
+            ("src/quiet.rs", "// nothing tagged here"),
+            ("tests/b.rs", "fn beta() {}"),
+        ])
+        .await;
+        add_symbols(
+            &pool,
+            "src/a.rs",
+            &[("alpha", "function", "definition", 1, None)],
+        )
+        .await;
+        let s = router_state(pool);
+
+        let found = outline_core(
+            &s,
+            guid(),
+            "src/a.rs",
+            &unscoped(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("outline runs");
+        assert!(found.indexed && found.in_scope);
+        assert_eq!(found.symbols.len(), 1);
+        assert_eq!(found.total_definitions, 1);
+        assert_eq!(
+            found.programming_language,
+            Some(ProgrammingLanguage::Rust),
+            "the language must be named — the `kind` labels are not uniform across \
+             languages and a caller inferring from them needs to know which one"
+        );
+
+        // Indexed, nothing tagged. Every language with no tags query lives here, so
+        // this must not read as "no such file".
+        let quiet = outline_core(
+            &s,
+            guid(),
+            "src/quiet.rs",
+            &unscoped(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("outline runs");
+        assert!(
+            quiet.indexed,
+            "an indexed but untagged file read as unknown"
+        );
+        assert!(quiet.symbols.is_empty());
+
+        // Never indexed.
+        let unknown = outline_core(
+            &s,
+            guid(),
+            "src/nope.rs",
+            &unscoped(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("outline runs");
+        assert!(!unknown.indexed);
+
+        // Refused: indexed, tagged, and deliberately not shown.
+        add_symbols(
+            &s.db_pool,
+            "tests/b.rs",
+            &[("beta", "function", "definition", 1, None)],
+        )
+        .await;
+        let refused = outline_core(
+            &s,
+            guid(),
+            "tests/b.rs",
+            &scoped_to(&["src/**"]),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("outline runs");
+        assert!(
+            !refused.in_scope,
+            "a refused path read as an empty outline, i.e. as a file with no definitions"
+        );
+        assert!(refused.symbols.is_empty());
+    }
+
+    /// `callers` answers two different questions and must not collapse them:
+    /// `defined` is deliberately **unscoped**, so "there is no such name" stays
+    /// distinguishable from "it exists, outside your scope" — the second being the
+    /// more useful of the two, and the one a scoped `defined: false` would hide.
+    #[tokio::test]
+    async fn callers_keeps_existence_unscoped_while_scoping_the_sites() {
+        let pool =
+            pool_with_chunks(&[("src/a.rs", "fn caller() {}"), ("tests/b.rs", "fn t() {}")]).await;
+        add_symbols(
+            &pool,
+            "src/a.rs",
+            &[
+                ("target", "function", "definition", 1, None),
+                ("target", "call", "reference", 5, Some("caller")),
+            ],
+        )
+        .await;
+        add_symbols(
+            &pool,
+            "tests/b.rs",
+            &[("target", "call", "reference", 3, Some("t"))],
+        )
+        .await;
+        let s = router_state(pool);
+
+        let all = callers_core(
+            &s,
+            guid(),
+            "target",
+            CallDirection::In,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("callers runs");
+        assert!(all.defined);
+        assert_eq!(all.total_sites, 2);
+        assert_eq!(all.out_of_scope_sites, 0);
+
+        let scoped = callers_core(
+            &s,
+            guid(),
+            "target",
+            CallDirection::In,
+            &scoped_to(&["src/**"]),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("callers runs");
+        assert!(
+            scoped.defined,
+            "the definition is outside the scope, but its *existence* must not be"
+        );
+        assert_eq!(scoped.total_sites, 1);
+        assert_eq!(
+            scoped.out_of_scope_sites, 1,
+            "the run was not told a call site had been hidden from it"
+        );
+
+        // A name nothing ever references, in a project that has symbols: `defined`
+        // is what separates "never referenced" from "no such name".
+        let unknown = callers_core(
+            &s,
+            guid(),
+            "no_such_symbol",
+            CallDirection::In,
+            &unscoped(),
+            8,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("callers runs");
+        assert!(!unknown.defined);
+        assert_eq!(unknown.total_sites, 0);
+    }
+
+    /// `list_files` is navigation, and its glob is SQLite `GLOB` — where `*` crosses
+    /// `/`, unlike the `.mindex` dialect. The scope applies underneath it, so a run
+    /// cannot widen its own walls by asking for `**`.
+    #[tokio::test]
+    async fn list_files_globs_over_the_scope_never_around_it() {
+        let pool = pool_with_chunks(&[
+            ("src/a.rs", "a"),
+            ("src/deep/b.rs", "b"),
+            ("tests/c.rs", "c"),
+            ("README.md", "d"),
+        ])
+        .await;
+        let s = router_state(pool);
+
+        let all = list_files_core(&s, guid(), "*", &unscoped(), &CancellationToken::new())
+            .await
+            .expect("list runs");
+        assert_eq!(all.total, 4, "SQLite GLOB `*` crosses `/`");
+
+        let rust_only =
+            list_files_core(&s, guid(), "src/*", &unscoped(), &CancellationToken::new())
+                .await
+                .expect("list runs");
+        assert_eq!(
+            rust_only.total, 2,
+            "both src files, including the nested one"
+        );
+
+        // The widest possible glob cannot reach past the scope.
+        let scoped = list_files_core(
+            &s,
+            guid(),
+            "*",
+            &scoped_to(&["src/**"]),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("list runs");
+        assert_eq!(
+            scoped.total, 2,
+            "a run widened its own scope by asking for everything"
+        );
+        for f in &scoped.files {
+            assert!(f.path.starts_with("src/"), "{} escaped the scope", f.path);
+        }
+    }
+
+    /// A soft-deleted *file* must leave the listing at once. `list_files` is how a
+    /// run decides what exists, so a deleted file offered here sends every later
+    /// tool after something that is not there.
+    #[tokio::test]
+    async fn list_files_never_offers_a_soft_deleted_file() {
+        let pool = pool_with_chunks(&[("src/a.rs", "a"), ("src/gone.rs", "b")]).await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "UPDATE project_files SET status = 'deleted'
+                  WHERE project_guid = ?1 AND path = 'src/gone.rs'",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("soft delete");
+        let s = router_state(pool);
+
+        let out = list_files_core(&s, guid(), "*", &unscoped(), &CancellationToken::new())
+            .await
+            .expect("list runs");
+        assert_eq!(out.total, 1);
+        assert_eq!(out.files[0].path, "src/a.rs");
+    }
+
+    /// `/symbols` is contractually **definitive** — an empty answer means "no such
+    /// symbol" — so it must return ranked candidates rather than one "the" answer
+    /// when a name collides, and its full totals must survive the limit.
+    #[tokio::test]
+    async fn symbols_returns_ranked_candidates_with_honest_totals() {
+        let pool = pool_with_chunks(&[
+            ("src/anchor.rs", "a"),
+            ("src/sibling.rs", "b"),
+            ("other/far.rs", "c"),
+        ])
+        .await;
+        for path in ["src/anchor.rs", "src/sibling.rs", "other/far.rs"] {
+            add_symbols(
+                &pool,
+                match path {
+                    "src/anchor.rs" => "src/anchor.rs",
+                    "src/sibling.rs" => "src/sibling.rs",
+                    _ => "other/far.rs",
+                },
+                &[("collide", "function", "definition", 1, None)],
+            )
+            .await;
+        }
+        let s = router_state(pool);
+
+        let req = SymbolsRequest {
+            name: "collide".to_string(),
+            role: None,
+            kind: None,
+            anchor_path: Some("src/anchor.rs".to_string()),
+            limit: Some(2),
+            include: None,
+            exclude: None,
+        };
+        let out = symbols_core(&s, guid(), &req, &CancellationToken::new())
+            .await
+            .expect("symbols runs");
+
+        assert_eq!(
+            out.total_definitions, 3,
+            "the total must survive the limit, or truncation is invisible"
+        );
+        assert_eq!(out.definitions.len(), 2, "the limit was not applied");
+        assert_eq!(
+            out.definitions[0].path, "src/anchor.rs",
+            "ranking is path-based: the anchor file comes first"
+        );
+        assert_eq!(
+            out.definitions[1].path, "src/sibling.rs",
+            "then its exact directory, then everything else"
+        );
+    }
+
+    /// An empty `/symbols` answer is a 200, not a 404 — the endpoint's whole
+    /// contract is that "no such symbol" is a *fact it asserts*, and an error would
+    /// make it indistinguishable from a failed lookup.
+    #[tokio::test]
+    async fn an_unknown_symbol_is_an_empty_answer_not_a_failure() {
+        let pool = pool_with_chunks(&[("src/a.rs", "a")]).await;
+        add_symbols(
+            &pool,
+            "src/a.rs",
+            &[("known", "function", "definition", 1, None)],
+        )
+        .await;
+        let s = router_state(pool);
+
+        let req = SymbolsRequest {
+            name: "nonexistent".to_string(),
+            role: None,
+            kind: None,
+            anchor_path: None,
+            limit: None,
+            include: None,
+            exclude: None,
+        };
+        let out = symbols_core(&s, guid(), &req, &CancellationToken::new())
+            .await
+            .expect("an unknown symbol is not an error");
+        assert_eq!(out.total_definitions, 0);
+        assert!(out.definitions.is_empty());
+        assert!(out.references.is_empty());
+    }
 }
