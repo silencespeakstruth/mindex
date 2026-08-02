@@ -182,7 +182,7 @@ current consts; both nullable, and NULL never matches. `post_search` returns
 the *way* something is produced changed; MAJOR = its *shape* did. All compared
 by plain equality, never ordered — both halves trigger the identical rebuild.
 The set: `CHUNKS_DERIVATION_VERSION`, `SYMBOLS_DERIVATION_VERSION` (both
-`"1.0"`), `PROMPT_VERSION` (`"2.3"`). Deliberately outside it:
+`"1.0"`), `PROMPT_VERSION` (`"2.5"`). Deliberately outside it:
 `COLLECTION_SCHEMA_VERSION` (`"v1"`, a collection-*name* component) and the
 migration `i32` in `PRAGMA user_version`.
 
@@ -414,7 +414,8 @@ is the `research_runs` table.) The hard invariants:
   match it by prefix, `PLAN_REQUEST_PREFIX`), `SUFFICIENCY_REQUEST`,
   `REVALIDATION_SYSTEM_PROMPT`, `format_citation_complaint`,
   `format_ungrounded_complaint`, `format_hearsay_complaint`,
-  `REPORT_ROLE`/`report_system_prompt`, either report turn's user message, the
+  `REPORT_ROLE`/`report_system_prompt`, either report turn's user message,
+  `section_system_prompt`/`section_request`, `CHECKPOINT_REQUEST`, the
   budget nudges or `tool_specs`. Sampling (`temperature/top_p/seed`) is
   `Option` — absent = model default; a request's `seed` overrides config.
 - **A report of 3+ plan items is written one section at a time.** The report used
@@ -444,6 +445,23 @@ is the `research_runs` table.) The hard invariants:
   tool returned bears on it" — sections were arriving titled after a step of the
   plan (`## 1. File discovery bypassed`) and spending the whole allowance
   explaining a shortcut, which costs a section the reader can use.
+- **A section body may carry only its own `## N.`** — a reply whose numbered
+  headings are all *other* items is not this section written badly, it is
+  somebody else's section reproduced, and the server refuses it inside the
+  attempt loop rather than wrapping it. The wrap at the end
+  (`## N. {item.text}` over the raw text) exists for a reply with **no**
+  numbered heading; handed a copy it pasted a whole second document under a
+  heading of its own — measured, six headings for four plan items, sections 1-2
+  shipped twice. Salvage first: the prose before the first foreign heading
+  (`prefix_before_first_numbered_heading`, reading `section_heading_number` so
+  the cut and the parse cannot disagree about what a heading is) when it clears
+  `MIN_TRUNCATED_SECTION_CHARS`; otherwise the attempt is spent and the existing
+  `fallback` ships this item's banked draft. The prompt half moves with it: the
+  headings quoted back as "must not repeat" are **titles**
+  (`heading_line_of`, bounded by `MAX_HEADING_REMINDER_CHARS`) — `#3` named
+  nothing a model could recognise in its own prose — the banked draft is
+  injected **without** its heading line (material to expand, not a document to
+  copy), and the tail says the item's heading is the reply's only numbered one.
 - **Citation repair regenerates one section, not the document.** The
   whole-document rewrite says "repeat everything that should survive" — a second
   full-volume generation of what just failed, when the run has least budget left.
@@ -464,7 +482,15 @@ is the `research_runs` table.) The hard invariants:
   interval eating a run. It emits **no `step` event** — no tool call, and a
   `step` frame with no argument key breaks
   `each_action_names_its_argument_on_the_wire`; a step invisible on the wire is
-  sanctioned (a rejected duplicate already is one) and pinned by a test. Payoff:
+  sanctioned (a rejected duplicate already is one) and pinned by a test. Its
+  reply is **replaced by a stub** in the transcript (`shed_for_report`'s
+  technique, a different reason) naming the numbers it banked: the text lives in
+  `draft_sections`, whose three readers are the section fallback,
+  `section_request`'s draft and `forced_synthesis`, so a verbatim copy informs
+  nobody while sitting in the prompt of every later turn as a finished report —
+  including each section turn, which `write_sectioned_report` otherwise keeps
+  free of other sections' prose by popping its own request. One duly copied it.
+  Payoff:
   a section that cannot be written now ships its banked version, and
   `forced_synthesis` assembles real findings instead of "No report was
   produced." Cost: ~15% of `medium`'s lookups become writing turns — **measure

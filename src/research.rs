@@ -102,7 +102,7 @@ use crate::models::ollama::{
 /// files, and [`format_hearsay_complaint`] is new: a run whose tools returned
 /// nothing while it held prior reports is now sent back rather than allowed to pass
 /// their prose off as findings. MINOR: the job is unchanged.
-pub const PROMPT_VERSION: &str = "2.4";
+pub const PROMPT_VERSION: &str = "2.5";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -2449,6 +2449,11 @@ fn section_request(
         s.push_str(&format!("Your own verdict on it: {v}\n"));
     }
     if let Some(d) = draft {
+        // Without its heading line: it is material to expand, and a `## N.` heading
+        // shown inside the request reads as a document to copy.
+        let d = d.strip_prefix('#').map_or(d, |_| {
+            d.split_once('\n').map_or("", |(_, rest)| rest).trim_start()
+        });
         s.push_str(&format!(
             "\nHere is what you wrote about this item earlier in the run, when you had \
              less evidence. Expand or correct it — do not simply repeat it:\n\n{d}\n"
@@ -2456,7 +2461,8 @@ fn section_request(
     }
     if !written.is_empty() {
         s.push_str(&format!(
-            "\nSections already written, which you must not repeat: {}\n",
+            "\nSections already written, which you must not repeat and must not \
+             reproduce even in part: {}\n",
             written.join("; ")
         ));
     }
@@ -2466,7 +2472,11 @@ fn section_request(
         s.push('\n');
     }
     s.push_str(&format!(
-        "Begin with `## {}. ` and a short title. Do not write an introduction, do not \
+        "Begin with `## {}. ` and a short title. That must be the ONLY numbered heading \
+         in your reply: text belonging to another numbered item — including anything \
+         you banked at a checkpoint earlier in this conversation — must not be \
+         reproduced here, and a reply that carries somebody else's section instead of \
+         this one is discarded. Do not write an introduction, do not \
          summarise the other sections, and do not restate the question. Cite as \
          `path:start-end`, only locations a tool returned this run, and write the path \
          the way the tool did — repo-relative, directory included. Where a claim rests \
@@ -2709,6 +2719,10 @@ const MIN_TRUNCATED_SECTION_CHARS: usize = 200;
 /// Bounds a loop that is otherwise driven by how many sections had a bad citation.
 const MAX_SECTION_REWRITES: usize = 3;
 
+/// How much of a written section's heading is quoted back to the next section as
+/// something it must not repeat. A reminder, not a table of contents.
+const MAX_HEADING_REMINDER_CHARS: usize = 80;
+
 /// Report window that must remain for a section to be *started*.
 ///
 /// Starting one with less buys a cancelled turn and a stub; stubbing it directly
@@ -2810,6 +2824,45 @@ fn section_heading_number(line: &str) -> Option<usize> {
         Some('.') | Some(')') => digits.parse().ok(),
         _ => None,
     }
+}
+
+/// A written section's heading line, for the list of what a later section may not
+/// repeat.
+///
+/// Its own first line when that is a heading (the model titled it), the plan item
+/// otherwise; stripped of the leading hashes and bounded, since this is a reminder in
+/// a prompt, not a document.
+fn heading_line_of(section: &str, item: &PlanItem) -> String {
+    let first = section
+        .lines()
+        .next()
+        .filter(|l| section_heading_number(l).is_some())
+        .map(|l| l.trim_start().trim_start_matches('#').trim().to_string())
+        .unwrap_or_else(|| format!("{}. {}", item.number, item.text));
+    match first.char_indices().nth(MAX_HEADING_REMINDER_CHARS) {
+        Some((at, _)) => format!("{}…", first[..at].trim_end()),
+        None => first,
+    }
+}
+
+/// The prose before the first `## N.` heading, if there is any.
+///
+/// The salvage half of "a section may carry only its own heading": a reply that opens
+/// with real prose and then reproduces somebody else's sections keeps the prose. It
+/// reads the same scanner [`parse_numbered_sections`] does, so the two can never
+/// disagree about what a heading is.
+fn prefix_before_first_numbered_heading(text: &str) -> Option<&str> {
+    let mut offset = 0usize;
+    for line in text.lines() {
+        if section_heading_number(line).is_some() {
+            let prefix = text[..offset].trim();
+            return (!prefix.is_empty()).then_some(prefix);
+        }
+        // `lines()` strips the terminator; a `\r\n` file would leave the `\r` inside
+        // the prefix, which `trim` removes anyway.
+        offset += line.len() + 1;
+    }
+    None
 }
 
 impl RunState {
@@ -6494,14 +6547,34 @@ async fn research_inner(
                     // in the transcript, exactly as the sufficiency turn does.
                     messages.pop();
                 } else {
-                    messages.push(ChatMessage::assistant(text.clone()));
                     let parsed = parse_numbered_sections(&text);
                     let banked_now = parsed.len();
+                    let numbers: Vec<String> =
+                        parsed.keys().map(|n| n.to_string()).collect::<Vec<_>>();
                     // Replaced, not merged: a later checkpoint saw more evidence, so
                     // its version of a section supersedes the earlier one.
                     for (number, body) in parsed {
                         state.draft_sections.insert(number, body);
                     }
+                    // The banked text is **replaced by a stub** in the transcript, never
+                    // kept whole — the `shed_for_report` technique, for a different
+                    // reason. `draft_sections` is the only reader that matters (the
+                    // section fallback, `section_request`'s draft, `forced_synthesis`),
+                    // so a verbatim copy here informs nobody and tempts everybody: it is
+                    // a finished report sitting in the prompt of every later turn,
+                    // including each section turn, which `write_sectioned_report`
+                    // otherwise keeps free of other sections' prose by popping its own
+                    // request. Measured: a section turn reproduced two banked sections
+                    // instead of writing its own, and the document shipped them twice.
+                    messages.push(ChatMessage::assistant(if numbers.is_empty() {
+                        "CHECKPOINT: nothing was ready to bank.".to_string()
+                    } else {
+                        format!(
+                            "CHECKPOINT: banked section(s) {} for the report. The server \
+                             kept the text; do not repeat it in later turns.",
+                            numbers.join(", ")
+                        )
+                    }));
                     info!(
                         steps,
                         checkpoints,
@@ -7974,6 +8047,23 @@ async fn write_sectioned_report(
             if !validate_markdown_body(&text).is_empty() {
                 continue;
             }
+            // A reply carrying numbered sections, none of them this one, is not this
+            // section written badly — it is somebody else's section reproduced, the
+            // shape a banked checkpoint takes when it leaks into a section turn. Taking
+            // it would hand the assembled document a second copy of an item it already
+            // has, under a heading the server supplies below. Keep only the prose before
+            // the first foreign heading, on the same "substantial remainder" rule the
+            // fake-tool-call salvage uses, and otherwise spend the attempt.
+            let parsed = parse_numbered_sections(&text);
+            if !parsed.is_empty() && !parsed.contains_key(&item.number) {
+                match prefix_before_first_numbered_heading(&text) {
+                    Some(p) if p.chars().count() >= MIN_TRUNCATED_SECTION_CHARS => {
+                        body = Some(p.to_string());
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
             body = Some(text);
             break;
         }
@@ -7989,7 +8079,10 @@ async fn write_sectioned_report(
                 let section = parsed.get(&item.number).cloned().unwrap_or_else(|| {
                     format!("## {}. {}\n\n{}", item.number, item.text, text.trim())
                 });
-                written_headings.push(format!("#{}", item.number));
+                // The heading line itself, not `#N`: the next section is told what it
+                // must not repeat, and a bare number names nothing a model can
+                // recognise in its own prose.
+                written_headings.push(heading_line_of(&section, item));
                 sections.push((item.number, section, "written"));
             }
             None => {
@@ -11445,6 +11538,115 @@ mod tests {
         assert!(summary.contains("What does GC delete?"), "{summary}");
     }
 
+    /// A section turn that reproduces other sections instead of writing its own is
+    /// refused, not wrapped. Measured: with a checkpoint in the transcript the last
+    /// section turn copied the banked items 1-2 and never wrote its own heading, so
+    /// the server's wrap path pasted the copy under a heading of its own and the
+    /// document shipped six headings for four plan items.
+    #[tokio::test]
+    async fn a_section_that_reproduces_another_is_refused() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                "## 1. The loop\n\nIt ends on counters — src/worker/gc.rs:10-40.",
+                "## 2. Deletes\n\nSoft first — src/worker/gc.rs:10-40.",
+                // Section three: both attempts hand back the first two sections.
+                "## 1. The loop\n\nIt ends on counters — src/worker/gc.rs:10-40.\n\n\
+                 ## 2. Deletes\n\nSoft first — src/worker/gc.rs:10-40.",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let summary = summary_of(&events);
+
+        assert_eq!(
+            summary.matches("## 1.").count(),
+            1,
+            "the copy must not ship a second time: {summary}"
+        );
+        assert_eq!(summary.matches("## 2.").count(), 1, "{summary}");
+        // The refusal spends the section's attempts and lands on the stub, which
+        // names the item rather than losing it.
+        assert!(summary.contains("could not be written"), "{summary}");
+        assert!(summary.contains("What stops an orphan?"), "{summary}");
+    }
+
+    /// The salvage half: prose the model did write before it started copying is the
+    /// section, on the same "substantial remainder" rule the fake-tool-call salvage
+    /// uses. Losing it would cost an answer that exists over a formatting slip.
+    #[tokio::test]
+    async fn the_prose_before_a_reproduced_section_survives() {
+        let ollama = Arc::new(sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec![
+                "## 1. The loop\n\nIt ends on counters — src/worker/gc.rs:10-40.",
+                "## 2. Deletes\n\nSoft first — src/worker/gc.rs:10-40.",
+                "An orphan is a vector whose SQLite row is already marked deleted, and \
+                 nothing stops it existing: the sweep is what reclaims it, and it \
+                 hard-deletes only the chunks whose Qdrant delete actually succeeded — \
+                 src/worker/gc.rs:10-40.\n\n\
+                 ## 1. The loop\n\nIt ends on counters — src/worker/gc.rs:10-40.",
+            ],
+        ));
+        let events = run_native_shared(ollama.clone(), params(8)).await;
+        let summary = summary_of(&events);
+
+        assert!(summary.contains("An orphan is a vector"), "{summary}");
+        assert_eq!(
+            summary.matches("## 1.").count(),
+            1,
+            "only the prefix survives, not what followed it: {summary}"
+        );
+        // Kept under the heading the server supplies for *this* item.
+        assert!(summary.contains("## 3. What stops an orphan?"), "{summary}");
+    }
+
+    /// The helper both halves read, in isolation: a heading is the same thing to the
+    /// salvage and to the parser, or a body could be refused for a heading the
+    /// prefix scan cannot find.
+    #[test]
+    fn the_prefix_ends_at_the_first_numbered_heading() {
+        assert_eq!(
+            prefix_before_first_numbered_heading("prose\n\n## 2. Later\n\nmore"),
+            Some("prose")
+        );
+        // No numbered heading at all, and a non-numbered one, are both "no prefix":
+        // there is nothing to cut the body at.
+        assert_eq!(prefix_before_first_numbered_heading("just prose"), None);
+        assert_eq!(
+            prefix_before_first_numbered_heading("prose\n## Notes\nmore"),
+            None
+        );
+        // A reply that opens with the heading has no prose before it.
+        assert_eq!(prefix_before_first_numbered_heading("## 1. A\n\nx"), None);
+    }
+
+    /// What a later section is told not to repeat is a title it can recognise, not a
+    /// bare `#3`. The reminder is bounded — it is one line of a prompt.
+    #[test]
+    fn a_written_sections_heading_is_quoted_back_by_title() {
+        let item = PlanItem {
+            number: 3,
+            text: "What stops an orphan?".into(),
+        };
+        assert_eq!(
+            heading_line_of("## 3. Orphans and the sweep\n\nprose", &item),
+            "3. Orphans and the sweep"
+        );
+        // A server-supplied heading is not in the body, so the plan item stands in.
+        assert_eq!(
+            heading_line_of("just prose", &item),
+            "3. What stops an orphan?"
+        );
+        let long = format!("## 3. {}", "word ".repeat(40));
+        assert!(heading_line_of(&long, &item).chars().count() <= MAX_HEADING_REMINDER_CHARS + 1);
+    }
+
     /// The plan turn's upper bound is the run's own section grant, not a literal:
     /// the model is asked for exactly as many sub-questions as the server will
     /// write sections for. At the default the text is byte-for-byte the 2.0 const.
@@ -11706,6 +11908,41 @@ mod tests {
         assert!(
             !summary.contains("No report was produced"),
             "a run with banked findings is not a blank stub: {summary}"
+        );
+    }
+
+    /// The banked text lives in `draft_sections`, and only there. Left whole in the
+    /// transcript it is a finished report in the prompt of every later turn —
+    /// including each section turn, which `write_sectioned_report` otherwise keeps
+    /// free of other sections' prose by popping its own request — and a section turn
+    /// duly copied it. The stub keeps the turn well-formed and names what was banked.
+    #[tokio::test]
+    async fn a_checkpoints_text_is_replaced_by_a_stub_in_the_transcript() {
+        let mut fake = sectioned_fake(
+            vec![
+                vec![call("search", json!({"query": "gc sweep"}))],
+                vec![call("search", json!({"query": "qdrant delete_batch"}))],
+                vec![call("finalize", json!({}))],
+            ],
+            vec!["## 1. A\n\nsrc/worker/gc.rs:10-40"],
+        );
+        fake.checkpoint = "## 2. Banked\n\nDeletes are soft — src/worker/gc.rs:10-40.";
+        let ollama = Arc::new(fake);
+        let mut p = params(8);
+        p.checkpoint_every_steps = 2;
+        let _ = run_native_shared(ollama.clone(), p).await;
+
+        let transcripts = ollama.transcripts.lock().unwrap();
+        let after = transcripts.last().expect("a turn after the checkpoint");
+        assert!(
+            after
+                .iter()
+                .any(|m| m.content.contains("CHECKPOINT: banked section(s) 2")),
+            "the checkpoint must leave a stub naming what it banked: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|m| m.content.contains("Deletes are soft")),
+            "the banked text must not stay in the transcript: {after:?}"
         );
     }
 
