@@ -12694,4 +12694,107 @@ mod tests {
         assert_eq!(d.orphaned, vec!["m.rs"]);
         assert_eq!(d.indexing, vec!["k.rs"]);
     }
+
+    /// The status → bucket mapping, read against the real SQL. Its consequence is
+    /// what a client does next, and the two directions fail differently:
+    ///
+    /// A `failed` file must fall to `missing`, so `--check` reports it and the
+    /// client re-posts it. Read as `indexing` it would mean "leave it alone",
+    /// and a permanently-failed file would never be re-offered by any client —
+    /// the server's own retry worker gives up after `MAX_RETRIES`, so nothing
+    /// else would ever try either.
+    ///
+    /// A `just_uploaded` or `indexing` file must fall to `indexing`, because its
+    /// stored hash describes content whose vectors do not exist yet. Read as
+    /// `indexed` it would report "in sync" for a file with nothing behind it.
+    #[tokio::test]
+    async fn the_drift_baseline_puts_each_status_where_its_client_will_act_on_it() {
+        let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
+                params![guid(), MODEL],
+            )?;
+            // One file per status, each reaching it the legal way.
+            for (path, target) in [
+                ("done.rs", "indexed"),
+                ("busy.rs", "indexing"),
+                ("fresh.rs", "just_uploaded"),
+                ("broken.rs", "failed"),
+                ("stopped.rs", "cancelled"),
+                ("removed.rs", "deleted"),
+            ] {
+                let entry = if target == "just_uploaded" {
+                    "just_uploaded"
+                } else {
+                    "indexing"
+                };
+                tx.execute(
+                    "INSERT INTO project_files
+                         (project_guid, model_id, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, ?4, 'rust', ?5)",
+                    params![guid(), MODEL, path, "a".repeat(64), entry],
+                )?;
+                if target != entry {
+                    tx.execute(
+                        "UPDATE project_files SET status = ?4
+                          WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
+                        params![guid(), MODEL, path, target],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed");
+        let s = router_state(pool);
+
+        let (indexed, in_flight) = read_drift_baseline(&s, &CancellationToken::new(), guid())
+            .await
+            .expect("baseline reads");
+
+        assert_eq!(
+            indexed.keys().collect::<Vec<_>>(),
+            vec!["done.rs"],
+            "only an `indexed` file carries a hash worth comparing"
+        );
+        let mut flight: Vec<&String> = in_flight.iter().collect();
+        flight.sort();
+        assert_eq!(
+            flight,
+            vec!["busy.rs", "fresh.rs"],
+            "a file whose vectors are not ready yet must read as in flight"
+        );
+
+        // The three terminal-but-not-indexed statuses are in neither map, so
+        // `compute_drift` sorts them into `missing` — work the client will do.
+        for path in ["broken.rs", "stopped.rs", "removed.rs"] {
+            assert!(!indexed.contains_key(path), "{path} claimed to be in sync");
+            assert!(!in_flight.contains(path), "{path} claimed to be in flight");
+        }
+
+        // End to end, that is what the client is told.
+        let posted = map(&[
+            ("done.rs", &"a".repeat(64)),
+            ("busy.rs", &"a".repeat(64)),
+            ("fresh.rs", &"a".repeat(64)),
+            ("broken.rs", &"a".repeat(64)),
+            ("stopped.rs", &"a".repeat(64)),
+            ("removed.rs", &"a".repeat(64)),
+        ]
+        .map(|(p, h)| (p, h.as_str())));
+        let d = compute_drift(&indexed, &in_flight, &posted);
+
+        assert_eq!(
+            d.missing,
+            vec!["broken.rs", "removed.rs", "stopped.rs"],
+            "a failed, cancelled or deleted file must be offered back for indexing"
+        );
+        assert_eq!(d.indexing, vec!["busy.rs", "fresh.rs"]);
+        assert!(d.stale.is_empty(), "done.rs matches its stored hash");
+        assert!(d.orphaned.is_empty());
+    }
 }
