@@ -1771,6 +1771,103 @@ mod tests {
         );
     }
 
+    /// Every `mindex_*{...}` sample line in the exposition, as a set.
+    fn rendered_series(text: &str) -> std::collections::HashSet<&str> {
+        text.lines()
+            .filter(|l| l.starts_with("mindex_"))
+            .map(|l| l.split_whitespace().next().unwrap_or(l))
+            .collect()
+    }
+
+    /// **The clear-and-repopulate rule, enforced rather than described.**
+    ///
+    /// The metrics collector rebuilds `StateMetrics` from scratch every tick, and
+    /// two structural guards keep that safe: only `StateMetrics` is ever cleared,
+    /// and `StateMetrics` holds gauges only. The second is the one with teeth —
+    /// clearing a *counter* makes its series disappear and reappear at zero, which
+    /// Prometheus reads as a process restart and which permanently re-baselines
+    /// every `rate()` and `increase()` over it. A counter accidentally placed in
+    /// `StateMetrics` (or a `clear()` added to the wrong family) would produce a
+    /// dashboard that is quietly, unfixably wrong rather than blank.
+    ///
+    /// This checks it without a hardcoded list of what the collector clears: touch
+    /// every family, run a real tick against an empty database, and see what stopped
+    /// being reported. Gauges legitimately vanish that way; counters must not.
+    #[tokio::test]
+    async fn a_collector_tick_never_clears_a_counter() {
+        let metrics = touched();
+        let before = metrics.render().expect("registry renders");
+        let types: std::collections::HashMap<&str, &str> = before
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                Some((it.next()?, it.next()?))
+            })
+            .collect();
+        let series_before = rendered_series(&before);
+
+        // An empty, migrated database: every state aggregate reads back as nothing,
+        // so a tick clears each family it owns and repopulates none of it — the
+        // harshest version of the real thing.
+        let pool = crate::db::sqlite3::SQLite3Pool::new(
+            std::path::Path::new(":memory:"),
+            1,
+            16384,
+            "NORMAL",
+        );
+        pool.transaction(tokio_util::sync::CancellationToken::new(), |tx| {
+            crate::apply_pending_migrations(tx).map(|_| ())
+        })
+        .await
+        .expect("migrations apply");
+
+        crate::worker::metrics::collect_once(
+            &pool,
+            &metrics,
+            &crate::worker::metrics::MetricsTuning {
+                refresh_interval_seconds: 60,
+                probe_dependencies: false,
+                max_retries: 3,
+                model_id: "BAAI/bge-m3".to_string(),
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        let after = metrics.render().expect("registry renders");
+        let series_after = rendered_series(&after);
+
+        let mut lost_counters: Vec<&str> = series_before
+            .difference(&series_after)
+            .filter(|s| {
+                // Map a sample line back to its family: OpenMetrics puts `_total` on a
+                // counter's samples but not on its `# TYPE` line, and histograms
+                // suffix `_bucket`/`_sum`/`_count`.
+                let family = s.split('{').next().unwrap_or(s);
+                let base = family.strip_suffix("_total").unwrap_or(family);
+                types.get(base).is_some_and(|t| *t == "counter")
+            })
+            .copied()
+            .collect();
+        lost_counters.sort_unstable();
+
+        assert!(
+            lost_counters.is_empty(),
+            "a collector tick cleared these counter series: {lost_counters:?}. \
+             Prometheus reads a counter that disappears and returns at zero as a \
+             process restart, which permanently re-baselines every rate() over it — \
+             move them out of StateMetrics, or stop clearing their family."
+        );
+
+        // And the rule has to be worth enforcing: the tick must genuinely clear
+        // something, or this test would pass on a collector that does nothing.
+        assert!(
+            series_before.len() > series_after.len(),
+            "the tick cleared no series at all, so this test proved nothing"
+        );
+    }
+
     /// Mirrors the config convention that a key carries its unit. A metric whose
     /// name does not say what it measures is a panel someone will mislabel.
     #[test]
