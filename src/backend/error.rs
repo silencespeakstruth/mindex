@@ -686,12 +686,11 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
 
-    /// Every variant's `code`, in sorted order. This is the public error-code
-    /// contract: a failing assertion means a code was renamed, added, or removed —
-    /// update intentionally (and any client catalogue / docs) rather than silently.
-    #[test]
-    fn codes_are_stable() {
-        let all = [
+    /// One of every variant. Shared by `codes_are_stable` (which pins the exact
+    /// list) and the property tests below (which check what must hold of *all* of
+    /// them), so a new variant is added here once and both sets see it.
+    fn every_variant() -> Vec<ApiError> {
+        vec![
             ApiError::Cancelled,
             ApiError::Internal,
             ApiError::EmbedderUnavailable,
@@ -772,7 +771,15 @@ mod tests {
             ApiError::ResearchModelLacksTools {
                 model: String::new(),
             },
-        ];
+        ]
+    }
+
+    /// Every variant's `code`, in sorted order. This is the public error-code
+    /// contract: a failing assertion means a code was renamed, added, or removed —
+    /// update intentionally (and any client catalogue / docs) rather than silently.
+    #[test]
+    fn codes_are_stable() {
+        let all = every_variant();
         let mut codes: Vec<&str> = all.iter().map(ApiError::code).collect();
         codes.sort_unstable();
 
@@ -824,6 +831,129 @@ mod tests {
             codes, expected,
             "error-code contract changed — update intentionally"
         );
+    }
+
+    /// Two errors sharing a code are indistinguishable to every client, and the
+    /// sorted snapshot above cannot catch it: a duplicate simply appears twice in
+    /// both lists and matches. The `code` is the localization key, so a collision
+    /// means one of the two is permanently mis-worded in every client.
+    #[test]
+    fn no_two_errors_share_a_code() {
+        let all = every_variant();
+        let mut seen = std::collections::HashMap::new();
+        for e in &all {
+            if let Some(previous) = seen.insert(e.code(), format!("{e:?}")) {
+                panic!("code {:?} is used by both {previous} and {e:?}", e.code());
+            }
+        }
+        assert_eq!(seen.len(), all.len());
+    }
+
+    /// The codes are a namespaced vocabulary a client switches on, and the shape is
+    /// the half of that contract the snapshot does not state: `namespace.name`,
+    /// lowercase, no spaces. A code that broke the convention would still pass the
+    /// snapshot the moment it was added to the expected list.
+    #[test]
+    fn every_code_is_a_lowercase_dotted_pair() {
+        for e in every_variant() {
+            let code = e.code();
+            let (ns, name) = code
+                .split_once('.')
+                .unwrap_or_else(|| panic!("{code:?} is not namespaced"));
+            assert!(!ns.is_empty() && !name.is_empty(), "{code:?}");
+            assert!(
+                !name.contains('.'),
+                "{code:?} has more than one namespace level"
+            );
+            // Digits are legitimate (`validation.sha256_invalid`); uppercase and
+            // spaces are not.
+            assert!(
+                code.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'),
+                "{code:?} is not lowercase snake_case"
+            );
+        }
+    }
+
+    /// Every variant must render a complete envelope. An empty `title` or `detail`
+    /// leaves an RFC 7807 client — one not already keying on `code` — with a status
+    /// and nothing else, which is the plain-text 400 this module exists to replace.
+    /// The `type` URI is derived from the code, so it cannot drift from it either.
+    #[test]
+    fn every_variant_renders_a_complete_envelope() {
+        for e in every_variant() {
+            let code = e.code();
+            let pd = ProblemDetails::from(&e);
+
+            assert!(pd.status >= 400, "{code} renders a non-error status");
+            assert!(!pd.title.is_empty(), "{code} has no title");
+            assert!(!pd.detail.is_empty(), "{code} has no detail");
+            assert!(
+                pd.r#type.ends_with(code),
+                "{code}'s type URI {:?} does not name it",
+                pd.r#type
+            );
+
+            let v = serde_json::to_value(&pd).expect("serializes");
+            assert_eq!(v["code"], code);
+            assert_eq!(v["status"], pd.status);
+        }
+    }
+
+    /// A `field` points at something in the *client's* request. A 5xx is the server
+    /// failing, so pointing at a request field there tells the caller to go and fix
+    /// input that was never the problem — and clients do surface `field` next to the
+    /// control it names.
+    #[test]
+    fn a_server_side_failure_never_blames_a_request_field() {
+        for e in every_variant() {
+            let pd = ProblemDetails::from(&e);
+            if pd.status >= 500 {
+                assert!(
+                    pd.field.is_none(),
+                    "{} is a server fault but points at the request field {:?}",
+                    e.code(),
+                    pd.field
+                );
+            }
+        }
+    }
+
+    /// The metrics middleware labels by the response extension rather than by
+    /// re-parsing the body, so a variant whose response lost it becomes an
+    /// *unlabelled* series — the request is counted, under nothing. One
+    /// `IntoResponse` impl makes that structurally hard; this is the check that it
+    /// stays that way for every variant, not just the one spot-checked below.
+    #[tokio::test]
+    async fn every_error_response_carries_its_code_and_its_content_type() {
+        for e in every_variant() {
+            let code = e.code();
+            let resp = e.into_response();
+
+            assert_eq!(
+                resp.extensions()
+                    .get::<ErrorCode>()
+                    .map(|c| c.0)
+                    .unwrap_or("<missing>"),
+                code,
+                "{code} lost its ErrorCode extension; the metrics layer cannot label it"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(CONTENT_TYPE)
+                    .map(|v| v.to_str().unwrap()),
+                Some("application/problem+json"),
+                "{code} did not render as problem+json"
+            );
+
+            let status = resp.status().as_u16();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(
+                v["status"], status,
+                "{code}'s body disagrees with its HTTP status"
+            );
+        }
     }
 
     /// The metrics middleware labels by this extension rather than by re-parsing
