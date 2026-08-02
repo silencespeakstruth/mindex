@@ -139,6 +139,21 @@ first_token_timeout_ms = 120000       # abandon ONE turn if Ollama produces NO t
                                       # turn_timeout_ms or it can never fire; startup refuses a
                                       # value that would, and one small enough to preempt a merely
                                       # slow first token.
+slow_turn_tokens_per_second = 0       # log ONE turn as contention when it generated slower than
+                                      # this (tokens per second of Ollama's own eval_duration);
+                                      # 0 disables. The third per-turn guard, and the only one that
+                                      # stops nothing — it names a diagnosis. A run inching along at
+                                      # a token a second looks identical whether the model is bad,
+                                      # the prompt is bad or another process is holding the GPU, and
+                                      # on a shared card the last is the usual answer (measured: one
+                                      # run spent 985 s at ~1.5 tok/s with nothing able to say why).
+                                      # DEFAULT 0 ON PURPOSE: a healthy rate is a fact about one
+                                      # model on one host — 15 tok/s is fine for a 30B and alarming
+                                      # for a 7B — so watch mindex_research_turn_tokens_per_second
+                                      # for a few runs and set this under the healthy low end.
+                                      # Read it beside mindex_research_turn_load_seconds: a non-zero
+                                      # load after the first turn means Ollama evicted and reloaded
+                                      # the model, i.e. something else wanted the device.
 max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking channel has streamed
                                       # this many characters; 0 disables. Catches the pathology
                                       # turn_timeout_ms structurally cannot see: a model that

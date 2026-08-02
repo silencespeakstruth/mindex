@@ -40,7 +40,8 @@ use crate::models::ollama::{
 /// **Bump on any edit to** `system_prompt`, [`plan_request`],
 /// [`SUFFICIENCY_REQUEST`], the re-open nudge that follows it,
 /// [`REVALIDATION_SYSTEM_PROMPT`], [`format_citation_complaint`],
-/// [`format_ungrounded_complaint`], [`format_markdown_complaint`],
+/// [`format_ungrounded_complaint`], [`format_hearsay_complaint`],
+/// [`format_markdown_complaint`],
 /// [`REPORT_ROLE`], [`report_system_prompt`], [`section_system_prompt`] or
 /// [`section_request`], either report turn's
 /// user message, the
@@ -91,7 +92,17 @@ use crate::models::ollama::{
 /// the route is not a finding, and narrows the escape hatch: "not answered" now
 /// means nothing a tool returned bears on it, not that the plan was not followed.
 /// MINOR: the job is unchanged.
-pub const PROMPT_VERSION: &str = "2.3";
+///
+/// 2.3 → 2.4: how a path is spelled, and what a run that looked at nothing is told.
+/// [`REPORT_ROLE`] and [`section_request`] now say the cited path is the
+/// repo-relative one a tool returned — a measured run wrote `research.rs:5068-5291`
+/// for a file every tool called `src/research.rs`, five times out of twenty-seven,
+/// and repeated it inside the section the citation repair had just made it rewrite.
+/// [`format_citation_complaint`] gained the bucket for a name that fits two shown
+/// files, and [`format_hearsay_complaint`] is new: a run whose tools returned
+/// nothing while it held prior reports is now sent back rather than allowed to pass
+/// their prose off as findings. MINOR: the job is unchanged.
+pub const PROMPT_VERSION: &str = "2.4";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -376,6 +387,23 @@ pub struct RunProgress {
     /// Model turns completed, including the report turn once it happens. Diverges
     /// from `steps` on purpose — see [`Budget`].
     pub turns: usize,
+    /// Where the elapsed time went, in milliseconds, so far.
+    ///
+    /// These four ship together, and the reason is the same one that put `shares`
+    /// beside `binding`: publish the numbers a claim rests on, then the claim. A
+    /// bare `eval_tokens_per_second` with no denominator on the wire cannot be
+    /// checked, and it is precisely the number a reader will use to decide the
+    /// model is broken.
+    ///
+    /// `model_load_ms` is the one to keep if this set is ever cut down: non-zero
+    /// after the run's first turn means Ollama evicted and reloaded the model
+    /// mid-run, which is the tell that something else wanted the device.
+    pub generation_ms: u64,
+    pub model_load_ms: u64,
+    /// Wall clock Ollama did not account for — dominated by queueing when large.
+    pub unaccounted_ms: u64,
+    /// `eval_tokens / generation_ms`, or 0.0 when nothing reported a duration.
+    pub eval_tokens_per_second: f64,
 }
 
 impl RunProgress {
@@ -450,6 +478,12 @@ impl RunProgress {
             "num_ctx": self.num_ctx,
             "context_pct": (self.context_pct() * 10.0).round() / 10.0,
             "turns": self.turns,
+            // Where the time went, then the rate derived from it. A slow run and a
+            // queued run are the same elapsed_ms and opposite diagnoses.
+            "generation_ms": self.generation_ms,
+            "model_load_ms": self.model_load_ms,
+            "unaccounted_ms": self.unaccounted_ms,
+            "eval_tokens_per_second": (self.eval_tokens_per_second * 10.0).round() / 10.0,
             "binding": self.binding(context_fraction).as_str(),
             "shares": {
                 "time": pct(shares[0].1),
@@ -539,11 +573,22 @@ pub enum ResearchEvent {
     /// `verified` citation could have landed in. Counting every path a tool
     /// mentioned would let one `list_files("**")` report the whole project as read,
     /// inflating the denominator precisely where `verified: 0` needs explaining.
+    ///
+    /// `hearsay_only` is the third member of that family, and where the other two
+    /// *explain* a `verified: 0` this one **refuses** it: no tool returned a single
+    /// path this run, and the run was holding somebody else's report — prior context
+    /// or a challenge subject. `shown_paths: 0` is the honest "nothing in this scope
+    /// was shown to me" only while this is false; with it true the same zero means
+    /// the run had an earlier answer to paraphrase and no evidence of its own, which
+    /// is not a scoping problem and must not be re-asked wider. Note the two are not
+    /// equivalent in the other direction either: a run that called only `list_files`
+    /// reports `shown_paths: 0` and `hearsay_only: false`.
     Citations {
         report: CitationReport,
         revalidation: Option<Revalidation>,
         server_written: bool,
         shown_paths: usize,
+        hearsay_only: bool,
     },
     /// The indexed code at every **verified** citation, verbatim. Emitted once,
     /// after `citations` and before `done`.
@@ -784,16 +829,23 @@ impl ResearchEvent {
                 revalidation,
                 server_written,
                 shown_paths,
+                hearsay_only,
             } => json!({
                 "server_written": server_written,
                 // What the run was shown, beside what it cited: the two together are
                 // what make "cited nothing" readable without the report.
                 "shown_paths": shown_paths,
+                // …and the case where that zero is not honest: nothing shown, but an
+                // earlier report to hand. Refuses the report rather than explaining it.
+                "hearsay_only": hearsay_only,
                 "total": report.total,
                 "verified": report.verified,
                 "path_only": report.path_only,
                 "unverified": report.unverified,
                 "unverified_paths": report.unverified_paths,
+                // How many citations were scored against a path they did not spell —
+                // resolved to exactly one shown file. Keeps `verified` honest.
+                "path_resolved": report.path_resolved,
                 // Freshness, beside provenance: how many of the report's citations
                 // point into a file the index rewrote (or dropped) after this run
                 // read it. A reader that spot-checks nothing else should check these.
@@ -2202,8 +2254,9 @@ const REPORT_ROLE: &str = "You are a technical writer. Below is a research \
     code excerpts, symbol locations and file outlines. Your only job now is to write \
     the report. You have NO tools: there is nothing left to call, and any JSON you \
     emit would be discarded. Write Markdown prose, grounded in the evidence, citing \
-    locations as `path:start-end`. Begin with a single `# heading` that names the \
-    finding.";
+    locations as `path:start-end`, where the path is the repo-relative one a tool \
+    returned, directory included (`src/research.rs:10-20`, never `research.rs:10-20`). \
+    Begin with a single `# heading` that names the finding.";
 
 /// [`REPORT_ROLE`] plus the length ceiling, when the effort level sets one.
 ///
@@ -2415,7 +2468,8 @@ fn section_request(
     s.push_str(&format!(
         "Begin with `## {}. ` and a short title. Do not write an introduction, do not \
          summarise the other sections, and do not restate the question. Cite as \
-         `path:start-end`, only locations a tool returned this run. Where a claim rests \
+         `path:start-end`, only locations a tool returned this run, and write the path \
+         the way the tool did — repo-relative, directory included. Where a claim rests \
          on inference rather than on something a tool returned, say so in the sentence \
          that makes it.\n\nWRITE ABOUT THE CODE, NOT ABOUT THE INVESTIGATION. Which \
          tools you called, which planned step you skipped, shortcut or found \
@@ -3209,6 +3263,15 @@ struct TokenTally {
     peak_prompt_tokens: u64,
     /// The window actually available (`num_ctx` after per-model clamping).
     num_ctx: u64,
+    /// Where the run's wall clock went, in **nanoseconds**, summed over the turns
+    /// that reported it. Time is the axis these runs actually die on, and until
+    /// these existed the only thing the service could say about a slow one was how
+    /// long it took — not whether the model was slow or the device was busy.
+    generation_nanos: u64,
+    load_nanos: u64,
+    /// Wall clock the turns took that Ollama did not account for; see
+    /// [`ChatOutcome::unaccounted_ms`]. Large means the requests were queueing.
+    unaccounted_nanos: u64,
 }
 
 impl TokenTally {
@@ -3230,7 +3293,37 @@ impl TokenTally {
                 self.peak_prompt_tokens = self.peak_prompt_tokens.max(p.unwrap_or(0));
             }
         }
+        // Timings are folded independently of the counts: an Ollama old enough to
+        // omit the durations still reports the counts, and vice versa, so gating
+        // one on the other would lose whichever half did arrive. Saturating for the
+        // same reason every other total here is — a wrong number must not be a panic.
+        self.generation_nanos = self
+            .generation_nanos
+            .saturating_add(outcome.eval_nanos.unwrap_or(0));
+        self.load_nanos = self
+            .load_nanos
+            .saturating_add(outcome.load_nanos.unwrap_or(0));
+        self.unaccounted_nanos = self.unaccounted_nanos.saturating_add(
+            outcome
+                .unaccounted_ms()
+                .unwrap_or(0)
+                .saturating_mul(1_000_000),
+        );
         outcome
+    }
+
+    /// Tokens generated per second of generation time over the whole run, or `0.0`
+    /// when no turn reported a generation time.
+    ///
+    /// Zero rather than `None` because this rides on the wire beside the numbers it
+    /// is derived from, exactly as `context_pct` does: a reader that has
+    /// `generation_ms: 0` beside it can see why, and an absent field would have to
+    /// be taught to four consumers as a fourth state.
+    fn tokens_per_second(&self) -> f64 {
+        if self.generation_nanos == 0 {
+            return 0.0;
+        }
+        self.eval_tokens as f64 * 1e9 / self.generation_nanos as f64
     }
 }
 
@@ -3258,6 +3351,16 @@ struct ResearchOutcome {
     /// watches every path a tool named, while the admission check may only count the
     /// ones a citation could have landed in. See `Evidence::content_path_count`.
     content_paths: usize,
+    /// No tool returned a single path this run, and the run was holding somebody
+    /// else's prose — prior reports, or a challenge subject.
+    ///
+    /// Computed here rather than one level up because the gate and the wire must
+    /// key on the *same* predicate, and the two levels see different sets:
+    /// `run_research` has only `content_paths` (paths with spans) while the gate
+    /// asks whether any path was named at all. Distinct from `content_paths == 0`
+    /// for that reason — a run that called only `list_files` shows nothing inside
+    /// and is not hearsay.
+    hearsay_only: bool,
     /// The finished report. Streamed already — carried back only so the run can
     /// be journalled; nothing re-sends it.
     report: String,
@@ -3581,9 +3684,24 @@ struct PathEvidence {
 /// writer is external and blocking it would make `mindex-watch` drop the debounced
 /// change for the very file the user just edited. So the run does not try to hold
 /// the corpus still; it keeps a baseline per path and reports what moved.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Evidence {
     by_path: std::collections::HashMap<String, PathEvidence>,
+    /// Whether a cited path that misses the map may be identified by its last
+    /// segments — see [`Evidence::match_path`]. On for every live run; the offline
+    /// re-check turns it off to reproduce a run journalled before it existed.
+    resolve_paths: bool,
+}
+
+impl Default for Evidence {
+    /// Resolution **on**: every live run gets it, and a default that silently
+    /// scored differently from the loop would be the worst kind of flag.
+    fn default() -> Self {
+        Self {
+            by_path: std::collections::HashMap::new(),
+            resolve_paths: true,
+        }
+    }
 }
 
 impl Evidence {
@@ -3708,9 +3826,19 @@ impl Evidence {
     /// Whether a citation into this path describes code the index no longer holds.
     /// A reindex merely *in flight* is not staleness — nothing the run read has
     /// been contradicted yet.
+    ///
+    /// Takes the path **as the report spelled it** and resolves it, so a citation
+    /// that reached `Verified` through [`Self::match_path`] is still measured for
+    /// freshness. Without that, resolution would admit exactly the citations whose
+    /// staleness then went unreported.
     fn is_stale(&self, path: &str) -> bool {
+        self.resolved_key(path).is_some_and(|k| self.is_stale_at(k))
+    }
+
+    /// [`Self::is_stale`] for a key already known to be the map's own spelling.
+    fn is_stale_at(&self, key: &str) -> bool {
         self.by_path
-            .get(path)
+            .get(key)
             .is_some_and(|e| e.changed || e.removed)
     }
 
@@ -3745,8 +3873,67 @@ impl Evidence {
         }
     }
 
+    /// Which shown path a cited one names, if any.
+    ///
+    /// Exact first, always. Otherwise the cited path may be the **tail** of exactly
+    /// one shown path: the observed failure is a model writing `research.rs:10-20`
+    /// for a file every tool called `src/research.rs`, which scored `Unverified` —
+    /// the verdict reserved for a path no tool ever returned, i.e. the report was
+    /// told it had invented a file it had just read. That is a spelling of an
+    /// unambiguous reference, not a fabrication, and treating it as one taught the
+    /// model nothing: it repeated the mistake inside the section the repair had
+    /// just made it rewrite.
+    ///
+    /// The `/` in the suffix **is** the segment-boundary rule — `esearch.rs` cannot
+    /// name `src/research.rs`. Two or more candidates stay unresolved: a reference
+    /// that names two files names neither, and the complaint asks for the directory.
+    /// Candidates are sorted because `by_path` is a `HashMap`, and an unsorted list
+    /// would make both the ambiguity message and its tests order-dependent.
+    ///
+    /// Runs on the miss path only, `O(paths)` per missed citation against a set one
+    /// `list_files("**")` can push into the hundreds — still nothing next to a turn.
+    fn match_path(&self, cited: &str) -> PathMatch<'_> {
+        if self.by_path.contains_key(cited) {
+            return PathMatch::Exact;
+        }
+        if !self.resolve_paths {
+            return PathMatch::None;
+        }
+        let suffix = format!("/{cited}");
+        let mut candidates: Vec<&str> = self
+            .by_path
+            .keys()
+            .filter(|k| k.ends_with(&suffix))
+            .map(String::as_str)
+            .collect();
+        candidates.sort_unstable();
+        match candidates.len() {
+            0 => PathMatch::None,
+            1 => PathMatch::Resolved(candidates[0]),
+            _ => PathMatch::Ambiguous(candidates),
+        }
+    }
+
+    /// The map's own spelling of a cited path, or `None` when it names no shown
+    /// file (or more than one).
+    fn resolved_key<'a>(&'a self, cited: &'a str) -> Option<&'a str> {
+        match self.match_path(cited) {
+            PathMatch::Exact => Some(cited),
+            PathMatch::Resolved(k) => Some(k),
+            PathMatch::Ambiguous(_) | PathMatch::None => None,
+        }
+    }
+
     fn verdict(&self, c: &Citation) -> Verdict {
-        let Some(spans) = self.by_path.get(&c.path).map(|e| &e.spans) else {
+        match self.resolved_key(&c.path) {
+            Some(key) => self.verdict_at(key, c),
+            None => Verdict::Unverified,
+        }
+    }
+
+    /// [`Self::verdict`] against a key already known to be the map's own spelling.
+    fn verdict_at(&self, key: &str, c: &Citation) -> Verdict {
+        let Some(spans) = self.by_path.get(key).map(|e| &e.spans) else {
             return Verdict::Unverified;
         };
         // Overlap, not containment: the model legitimately cites a range it read
@@ -3758,6 +3945,19 @@ impl Evidence {
             Verdict::PathOnly
         }
     }
+}
+
+/// What a cited path turned out to name among the paths the run was shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathMatch<'a> {
+    /// Spelled exactly as a tool returned it.
+    Exact,
+    /// Named exactly one shown path by its tail; this is that path.
+    Resolved(&'a str),
+    /// Named more than one, so it names none of them.
+    Ambiguous(Vec<&'a str>),
+    /// No shown path, by either route.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3829,6 +4029,15 @@ pub struct CitationReport {
     pub verified: usize,
     pub path_only: usize,
     pub unverified: usize,
+    /// How many citations were scored against a path they did not spell — see
+    /// [`Evidence::match_path`]. Counted per occurrence, like `total`.
+    ///
+    /// This is what keeps `verified` honest after resolution: the number no longer
+    /// means "the exact path a tool returned" but "a path a tool returned,
+    /// identified unambiguously from what the report wrote", and a reader is
+    /// entitled to know how many leaned on the second half. Expected to sit at
+    /// zero for a model that spells paths the way its tools do.
+    pub path_resolved: usize,
     /// Citations whose file the index changed (or dropped) *after* this run read
     /// it. Orthogonal to the three verdicts above: provenance says whether the
     /// model was ever shown the location, staleness says whether what it was shown
@@ -3861,6 +4070,11 @@ pub struct CitationReport {
 /// Distinct `unverified_paths` (and `stale_paths`) reported. Enough to act on,
 /// small enough that a pathological run cannot bloat the event.
 const MAX_UNVERIFIED_PATHS_REPORTED: usize = 10;
+
+/// Shown paths named beside one ambiguous citation. The message is "you have to
+/// say which", not a directory listing — past a handful the line stops being
+/// readable and the bucket is capped by `STATE_NOTE_MAX_ITEMS` anyway.
+const MAX_AMBIGUOUS_CANDIDATES_NAMED: usize = 4;
 
 /// Below this length an uncited report is taken at its word rather than sent back.
 ///
@@ -4016,7 +4230,27 @@ pub struct StoredEvidence {
 /// stands NOW, so `stale` here answers "does this report still describe the
 /// tree" — the number that moves over time and the reason to re-verify at all.
 pub fn recheck_citations(report: &str, stored: &[StoredEvidence]) -> CitationReport {
-    let mut evidence = Evidence::default();
+    recheck_with(report, stored, true)
+}
+
+/// [`recheck_citations`] with path resolution off — the scoring a run journalled
+/// before [`Evidence::match_path`] existed would have recorded.
+///
+/// It exists for one caller, the verification endpoint, and for one reason:
+/// resolution changes `verified`/`unverified` for a report containing a bare
+/// filename, so recomputing an *old* row the new way makes `provenance_matches`
+/// false for a run that was journalled perfectly correctly. That field means "the
+/// journal or this reconstruction is wrong" and must never fire on healthy history.
+/// Retire this the day the resolved path is stored per citation.
+pub fn recheck_citations_exact(report: &str, stored: &[StoredEvidence]) -> CitationReport {
+    recheck_with(report, stored, false)
+}
+
+fn recheck_with(report: &str, stored: &[StoredEvidence], resolve: bool) -> CitationReport {
+    let mut evidence = Evidence {
+        resolve_paths: resolve,
+        ..Default::default()
+    };
     for row in stored {
         let e = evidence.by_path.entry(row.path.clone()).or_default();
         e.spans = row
@@ -4038,19 +4272,38 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
         ..Default::default()
     };
     for c in &citations {
-        let verdict = match evidence.verdict(c) {
-            Verdict::Verified => {
+        // Resolved once, then reused: the two spellings answer different questions,
+        // and asking the map twice is how they drift apart. The cited spelling is
+        // what quotes the report (`details`, `unverified_paths`, every complaint
+        // line — the model has to find the string it wrote); the resolved one is
+        // what makes a claim about a *file* (`cited_paths`, `stale_paths`, and
+        // above all `verified_locations`, which the excerpt channel reads code
+        // from — the report's own spelling would find nothing there and a resolved
+        // citation would silently ship no code).
+        let key = evidence.resolved_key(&c.path);
+        let resolved = key.unwrap_or(c.path.as_str()).to_string();
+        if key.is_some_and(|k| k != c.path) {
+            r.path_resolved += 1;
+        }
+        let stale = key.is_some_and(|k| evidence.is_stale_at(k));
+        let verdict = match key.map(|k| evidence.verdict_at(k, c)) {
+            Some(Verdict::Verified) => {
                 r.verified += 1;
-                if !r.verified_locations.contains(c) {
-                    r.verified_locations.push(c.clone());
+                let at = Citation {
+                    path: resolved.clone(),
+                    start: c.start,
+                    end: c.end,
+                };
+                if !r.verified_locations.contains(&at) {
+                    r.verified_locations.push(at);
                 }
                 "verified"
             }
-            Verdict::PathOnly => {
+            Some(Verdict::PathOnly) => {
                 r.path_only += 1;
                 "path_only"
             }
-            Verdict::Unverified => {
+            Some(Verdict::Unverified) | None => {
                 r.unverified += 1;
                 if !r.unverified_paths.contains(&c.path)
                     && r.unverified_paths.len() < MAX_UNVERIFIED_PATHS_REPORTED
@@ -4065,20 +4318,20 @@ fn check_citations(report: &str, evidence: &Evidence) -> CitationReport {
             start: c.start,
             end: c.end,
             verdict,
-            stale: evidence.is_stale(&c.path),
+            stale,
         });
         // Independent of the verdict: a location the model really was shown can
         // still describe code that has since been reindexed away.
-        if evidence.is_stale(&c.path) {
+        if stale {
             r.stale += 1;
-            if !r.stale_paths.contains(&c.path)
+            if !r.stale_paths.contains(&resolved)
                 && r.stale_paths.len() < MAX_UNVERIFIED_PATHS_REPORTED
             {
-                r.stale_paths.push(c.path.clone());
+                r.stale_paths.push(resolved.clone());
             }
         }
-        if !r.cited_paths.contains(&c.path) {
-            r.cited_paths.push(c.path.clone());
+        if !r.cited_paths.contains(&resolved) {
+            r.cited_paths.push(resolved);
         }
     }
     r
@@ -4846,6 +5099,10 @@ fn snapshot(budget: Budget, steps: usize, elapsed: Duration, tally: &TokenTally)
         peak_prompt_tokens: tally.peak_prompt_tokens,
         num_ctx: tally.num_ctx,
         turns: tally.turns,
+        generation_ms: tally.generation_nanos / 1_000_000,
+        model_load_ms: tally.load_nanos / 1_000_000,
+        unaccounted_ms: tally.unaccounted_nanos / 1_000_000,
+        eval_tokens_per_second: tally.tokens_per_second(),
     }
 }
 
@@ -5238,6 +5495,7 @@ pub async fn run_research(
         tools: run_tools,
         file_baselines,
         content_paths,
+        hearsay_only,
         mut report,
         evidence_spans,
         trace,
@@ -5330,6 +5588,9 @@ pub async fn run_research(
         // `list_files("**")` names the whole project, and counting those made the
         // denominator largest exactly when `verified: 0` was least excusable.
         shown_paths: content_paths,
+        // …and the one case where a zero denominator is not the honest answer it
+        // looks like: nothing shown, but an earlier report on the table.
+        hearsay_only,
     });
     // The code behind the citations, verbatim. Under the **job** token, not the
     // report window: that window bounds what the *model* is given to write in, and
@@ -6597,11 +6858,21 @@ async fn research_inner(
     // form (`(lines N-M)`) that widening `parse_citations` could have caught, so the
     // defect is the missing route into this gate rather than the parser.
     //
+    // A run holding somebody else's prose — prior reports, or a challenge subject —
+    // that was shown nothing at all. Both injections are hearsay by contract and
+    // neither may seed `Evidence`, so such a run has, literally, nothing of its own
+    // to say; what it ships is the earlier prose restated as findings. Keyed on
+    // `paths()` rather than the span-bearing set so the gate below and the wire flag
+    // are the same predicate.
+    let hearsay_only = evidence.paths().is_empty()
+        && (!params.prior_reports.is_empty() || params.challenge.is_some());
     // Two exemptions, both of which would otherwise turn the gate into a demand for
     // a fabrication:
     //  - a run no tool showed a single file **cannot** cite anything, and its "the
     //    question cannot be answered from this scope" report is the correct outcome,
-    //    not a defect;
+    //    not a defect — **unless** it was handed prior work to paraphrase, which is
+    //    the one shape of that report that is not honest: the exemption exists for a
+    //    run with nothing to say, not for one with somebody else's answer to hand;
     //  - a report under `MIN_GROUNDED_REPORT_CHARS` is the short honest version of
     //    the same answer — but only from a run the budget stopped. A run that
     //    *finalized* declared its own evidence sufficient; a short uncited report
@@ -6609,7 +6880,7 @@ async fn research_inner(
     //    exempting it is how a run that read a dozen files ships prose citing none.
     let ungrounded = !forced
         && citations.total == 0
-        && !evidence.paths().is_empty()
+        && (!evidence.paths().is_empty() || hearsay_only)
         && (summary.chars().count() >= MIN_GROUNDED_REPORT_CHARS
             || reason == DoneReason::Finalized);
     // Staleness joins the two provenance defects in the gate: a claim cited to a
@@ -6622,6 +6893,8 @@ async fn research_inner(
             info!(
                 report_chars = summary.chars().count(),
                 shown_paths = evidence.paths().len(),
+                prior_reports = params.prior_reports.len(),
+                hearsay_only,
                 "The draft report cites nothing checkable; sending it back to be grounded."
             );
         }
@@ -6661,6 +6934,7 @@ async fn research_inner(
                 &summary,
                 &evidence,
                 tools_reopen,
+                params.prior_reports.len(),
             ));
         }
         if !md_problems.is_empty() {
@@ -7056,6 +7330,7 @@ async fn research_inner(
         tools: run_tools,
         file_baselines: evidence.baselines(),
         content_paths: evidence.content_path_count(),
+        hearsay_only,
         report: summary,
         evidence_spans: evidence.spans_snapshot(),
         trace,
@@ -7217,19 +7492,54 @@ fn format_prior_reports(reports: &[PriorReport], max_chars: usize) -> (String, b
 /// complaint of its own: there is no failing location to name, so the message has to
 /// say what a citation *is* and which files this run may cite. Same function, so
 /// there is one place a complaint is composed and one unit under [`PROMPT_VERSION`].
-fn format_citation_complaint(report: &str, evidence: &Evidence, tools_open: bool) -> String {
+fn format_citation_complaint(
+    report: &str,
+    evidence: &Evidence,
+    tools_open: bool,
+    prior_reports: usize,
+) -> String {
     let parsed = parse_citations(report);
     if parsed.is_empty() {
-        return format_ungrounded_complaint(evidence, tools_open);
+        // Two shapes of "nothing checkable", and they need opposite messages. With
+        // files on the table the defect is usually the citation *form* over evidence
+        // the transcript already holds. With none, there is no list to offer and the
+        // defect is that the run never looked — see `format_hearsay_complaint`.
+        return if evidence.by_path.is_empty() {
+            format_hearsay_complaint(prior_reports, tools_open)
+        } else {
+            format_ungrounded_complaint(evidence, tools_open)
+        };
     }
     let mut unverified = Vec::new();
+    let mut ambiguous = Vec::new();
     let mut path_only = Vec::new();
     let mut stale = Vec::new();
     for c in parsed {
+        // The cited spelling, always: the model has to find the string it wrote.
         let entry = format!("{}:{}-{}", c.path, c.start, c.end);
         // Provenance first, then freshness: a citation that fails both is listed
         // once, under the defect that came first in the run. Listing it twice would
         // read as two separate problems with one claim.
+        //
+        // Keyed on `match_path` rather than the verdict alone, because a path
+        // naming two shown files fails for a reason of its own and has a remedy of
+        // its own — name the directory. Told only "no tool returned this path" the
+        // model looks for a file it did read, and finds it twice.
+        let ambiguity = match evidence.match_path(&c.path) {
+            PathMatch::Ambiguous(candidates) => Some(candidates),
+            _ => None,
+        };
+        if let Some(candidates) = ambiguity {
+            let named: Vec<&str> = candidates
+                .into_iter()
+                .take(MAX_AMBIGUOUS_CANDIDATES_NAMED)
+                .collect();
+            let line = format!("{entry} — shown as: {}", named.join(", "));
+            if !ambiguous.contains(&line) {
+                ambiguous.push(line);
+            }
+            continue;
+        }
         match evidence.verdict(&c) {
             Verdict::Verified => {
                 if evidence.is_stale(&c.path) && !stale.contains(&entry) {
@@ -7258,6 +7568,13 @@ fn format_citation_complaint(report: &str, evidence: &Evidence, tools_open: bool
         "No tool this run returned this path at all — check whether the file exists \
          (list_files) and whether the claim is real",
         &unverified,
+        STATE_NOTE_MAX_ITEMS,
+    );
+    state_note_line(
+        &mut out,
+        "This names more than one file you were shown, so it names none of them — \
+         cite the repo-relative path, directory included",
+        &ambiguous,
         STATE_NOTE_MAX_ITEMS,
     );
     state_note_line(
@@ -7327,6 +7644,51 @@ fn format_ungrounded_complaint(evidence: &Evidence, tools_open: bool) -> String 
          rewrite the report, attach the `path:START-END` you were actually shown to \
          each claim, and drop any claim you cannot ground that way rather than \
          inventing a location for it.\n"
+    });
+    out
+}
+
+/// The message that sends back a draft written by a run that looked at nothing
+/// while holding somebody else's report.
+///
+/// Separate from [`format_ungrounded_complaint`] rather than a branch of it because
+/// that message is, in its entirety, a list of the files some tool showed the run —
+/// which here is **empty**. Reusing it would emit a heading over nothing and then
+/// instruct the model to cite from a set with no members.
+///
+/// The remedy offered is deliberately two-sided. "This run added nothing to what
+/// run N already said" is a legitimate and useful report, and a run that says so is
+/// doing its job; what may not happen is the earlier prose arriving as this run's
+/// findings, cited to nothing, in the one field a caller is told to trust.
+fn format_hearsay_complaint(prior_reports: usize, tools_open: bool) -> String {
+    let source = if prior_reports == 0 {
+        "the report you were asked to examine".to_string()
+    } else if prior_reports == 1 {
+        "the earlier report you were handed".to_string()
+    } else {
+        format!("the {prior_reports} earlier reports you were handed")
+    };
+    let mut out = format!(
+        "Your draft is not published yet. No tool returned a single location this \
+         run, so everything in it comes from {source} — prose written by another \
+         model about an earlier state of this tree. That is hearsay: it was never \
+         citable, and a claim taken from it is not evidence about the code, however \
+         confident it reads.\n"
+    );
+    out.push_str(if tools_open {
+        "\nYou have a few calls left, for this purpose only. Either look up what you \
+         are about to state and cite it as `path/to/file.rs:START-END` — the \
+         repo-relative path a tool returned, a colon, and the line range — or write \
+         plainly that this run added nothing and that the answer rests on the earlier \
+         work, naming it. The second is a real answer and an acceptable one. Passing \
+         the earlier prose off as this run's findings is not.\n"
+    } else {
+        "\nThe budget is spent, so there is nothing left to look anything up with. \
+         When you are asked to rewrite the report, say plainly that this run \
+         established nothing of its own and that the answer rests on the earlier \
+         work, naming it — that is a real answer and an acceptable one. Do not \
+         present what you were handed as something this run found, and do not attach \
+         a location to a claim you were not shown.\n"
     });
     out
 }
@@ -8112,15 +8474,18 @@ async fn chat_turn(
             if let Some(m) = &params.metrics {
                 m.research.runaway_thinking_turns.inc();
             }
-            // No counts and no window: Ollama's `done` line never arrived. `num_ctx`
-            // of zero is why `TokenTally::record` refuses to overwrite a known window
-            // with nothing.
+            // No counts, no timings and no window: Ollama's `done` line never
+            // arrived. `num_ctx` of zero is why `TokenTally::record` refuses to
+            // overwrite a known window with nothing, and the `None` timings are why
+            // this turn's GPU time lands in `turns_unreported` rather than dragging
+            // the run's measured rate down with a duration nobody measured.
             ChatOutcome {
                 content: String::new(),
                 tool_calls: Vec::new(),
                 prompt_tokens: None,
                 eval_tokens: None,
                 num_ctx: 0,
+                ..Default::default()
             }
         }
         Err(e) => return Err(e.into()),
@@ -9184,6 +9549,7 @@ mod tests {
                         prompt_tokens: Some(100),
                         eval_tokens: Some(7),
                         num_ctx: 8192,
+                        ..Default::default()
                     });
                 }
             }
@@ -9204,6 +9570,7 @@ mod tests {
                 prompt_tokens: Some(100),
                 eval_tokens: Some(7),
                 num_ctx: 8192,
+                ..Default::default()
             })
         }
 
@@ -9794,6 +10161,7 @@ mod tests {
                     prompt_tokens: None,
                     eval_tokens: None,
                     num_ctx: 8192,
+                    ..Default::default()
                 });
             }
             Ok(ChatOutcome {
@@ -9802,6 +10170,7 @@ mod tests {
                 prompt_tokens: None,
                 eval_tokens: None,
                 num_ctx: 8192,
+                ..Default::default()
             })
         }
 
@@ -10096,6 +10465,7 @@ mod tests {
                     prompt_tokens: Some(10),
                     eval_tokens: Some(2),
                     num_ctx: 8192,
+                    ..Default::default()
                 });
             }
             self.transcripts.lock().unwrap().push(messages.to_vec());
@@ -10131,6 +10501,7 @@ mod tests {
                     prompt_tokens: Some(self.prompt_tokens),
                     eval_tokens: Some(2),
                     num_ctx: 8192,
+                    ..Default::default()
                 });
             }
             if !self.turn_delay.is_zero() {
@@ -10142,6 +10513,7 @@ mod tests {
                 prompt_tokens: Some(self.prompt_tokens),
                 eval_tokens: Some(2),
                 num_ctx: 8192,
+                ..Default::default()
             })
         }
 
@@ -10674,6 +11046,7 @@ mod tests {
                 prompt_tokens: Some(10),
                 eval_tokens: Some(2),
                 num_ctx: 8192,
+                ..Default::default()
             })
         }
 
@@ -11600,6 +11973,93 @@ mod tests {
         );
     }
 
+    /// The exemption above exists for a run with nothing to say. A run holding prior
+    /// reports has somebody else's answer to hand, and the same uncited prose is then
+    /// that answer restated as this run's findings — cited to nothing, in the one
+    /// field a caller is told to trust, and indistinguishable on the wire from the
+    /// honest "nothing in this scope was shown to me".
+    #[tokio::test]
+    async fn a_run_that_looked_at_nothing_but_had_prior_reports_is_sent_back() {
+        let mut p = params(4);
+        p.prior_reports = vec![prior(1, "# GC sweep\n\nThe sweep is ordered.", 0, 3)];
+        // No tool call at all: prose on the first turn finalizes the loop.
+        let ollama = Arc::new(NativeOllama::new(
+            vec![],
+            vec!["# GC sweep\n\nThe sweep is ordered, deleting only confirmed rows."],
+        ));
+        let events = run_native_shared(ollama.clone(), p).await;
+
+        let (revalidation, hearsay, shown) = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Citations {
+                    revalidation,
+                    hearsay_only,
+                    shown_paths,
+                    ..
+                } => Some((*revalidation, *hearsay_only, *shown_paths)),
+                _ => None,
+            })
+            .expect("a citations event");
+        assert!(hearsay, "nothing shown, and a prior report on the table");
+        assert_eq!(shown, 0);
+        assert!(
+            revalidation.is_some(),
+            "restating a prior report must be sent back: {events:?}"
+        );
+    }
+
+    /// And the exemption itself survives, which is the point of narrowing it rather
+    /// than removing it: a scoped run that genuinely reached nothing must still be
+    /// able to say so without being asked for a citation it cannot have.
+    #[tokio::test]
+    async fn a_run_that_looked_at_nothing_and_had_no_prior_reports_still_ships() {
+        let ollama = Arc::new(NativeOllama::new(
+            vec![],
+            vec!["# Not answerable\n\nNothing in this scope bears on the question."],
+        ));
+        let events = run_native_shared(ollama.clone(), params(4)).await;
+
+        let (revalidation, hearsay) = events
+            .iter()
+            .find_map(|e| match e {
+                ResearchEvent::Citations {
+                    revalidation,
+                    hearsay_only,
+                    ..
+                } => Some((*revalidation, *hearsay_only)),
+                _ => None,
+            })
+            .expect("a citations event");
+        assert!(!hearsay, "there was no earlier answer to restate");
+        assert!(
+            revalidation.is_none(),
+            "the honest unanswerable report ships as it stands: {revalidation:?}"
+        );
+    }
+
+    /// The hearsay complaint cannot be a branch of the ungrounded one: that message
+    /// is, in its entirety, a list of the files some tool showed the run — which here
+    /// is empty. Reusing it would print a heading over nothing and then tell the model
+    /// to cite from a set with no members.
+    #[test]
+    fn the_hearsay_complaint_says_the_run_added_nothing_rather_than_listing_no_files() {
+        let complaint = format_citation_complaint(
+            "# Report\n\nThe sweep is ordered.",
+            &Evidence::default(),
+            true,
+            2,
+        );
+        assert!(complaint.contains("2 earlier reports"), "{complaint}");
+        assert!(complaint.contains("hearsay"), "{complaint}");
+        // The other half of the remedy: saying so is a real answer, not a failure.
+        assert!(complaint.contains("added nothing"), "{complaint}");
+        assert!(
+            !complaint.contains("Shown to you this run"),
+            "there is no file list to offer: {complaint}"
+        );
+    }
+
     /// The same report from a run that *finalized* is a different thing, and the
     /// length exemption must not cover it. Finalizing is the model declaring its own
     /// evidence sufficient; following that with prose that cites none of it is a
@@ -11641,7 +12101,7 @@ mod tests {
         let mut evidence = Evidence::default();
         evidence.record("src/worker/gc.rs", Some(Span { start: 10, end: 20 }));
         let complaint =
-            format_citation_complaint("# Report\n\nSee src/worker/gc.rs.", &evidence, true);
+            format_citation_complaint("# Report\n\nSee src/worker/gc.rs.", &evidence, true, 0);
 
         assert!(complaint.contains("path/to/file.rs:START-END"));
         assert!(complaint.contains("src/worker/gc.rs"));
@@ -12845,6 +13305,175 @@ mod tests {
         assert_eq!(r.cited_paths, vec!["src/invented.rs".to_string()]);
     }
 
+    /// The measured failure: a model writes the file's name where the tools wrote
+    /// its path. `Unverified` is the verdict for a path no tool ever returned — so
+    /// the report was being told it had invented a file it had just read, five
+    /// citations out of twenty-seven, and it repeated the mistake inside the section
+    /// the repair had made it rewrite.
+    #[test]
+    fn a_bare_filename_that_names_exactly_one_shown_file_is_resolved_and_verified() {
+        let ev = evidence_of(&[("src/research.rs", Some((5000, 5300)))]);
+        let r = check_citations("the loop breaks at research.rs:5068-5291", &ev);
+        assert_eq!((r.total, r.verified, r.unverified), (1, 1, 0), "{r:?}");
+        // The claim is about a file, so `cited_paths` carries the file's real path…
+        assert_eq!(r.cited_paths, vec!["src/research.rs".to_string()]);
+        // …and so does the location the excerpt channel will read code from. With
+        // the report's own spelling here, `read_chunks_core` finds nothing and a
+        // resolved citation silently ships no code.
+        assert_eq!(r.verified_locations[0].path, "src/research.rs");
+        // But the per-occurrence record quotes the report, which wrote what it wrote.
+        assert_eq!(r.details[0].path, "research.rs");
+    }
+
+    /// `verified` no longer means "spelled the way a tool spelled it", so something
+    /// has to say how many leaned on that. Without this counter the change would
+    /// quietly improve every score in the corpus.
+    #[test]
+    fn a_resolution_is_counted_so_the_verified_number_stays_honest() {
+        let ev = evidence_of(&[("src/research.rs", Some((1, 100)))]);
+        let r = check_citations("research.rs:10-20 and src/research.rs:30-40", &ev);
+        assert_eq!((r.verified, r.path_resolved), (2, 1), "{r:?}");
+    }
+
+    /// A name that fits two shown files identifies neither.
+    #[test]
+    fn a_bare_filename_that_names_two_shown_files_stays_unverified() {
+        let ev = evidence_of(&[
+            ("src/db/research.rs", Some((1, 100))),
+            ("src/research.rs", Some((1, 100))),
+        ]);
+        let r = check_citations("see research.rs:10-20", &ev);
+        assert_eq!(
+            (r.verified, r.unverified, r.path_resolved),
+            (0, 1, 0),
+            "{r:?}"
+        );
+        assert_eq!(r.unverified_paths, vec!["research.rs".to_string()]);
+    }
+
+    /// The `/` in the suffix is the whole segment-boundary rule; without it any
+    /// path ending in the cited characters would match.
+    #[test]
+    fn a_suffix_match_only_counts_on_a_path_boundary() {
+        let ev = evidence_of(&[("src/research.rs", Some((1, 100)))]);
+        let r = check_citations("esearch.rs:10-20", &ev);
+        assert_eq!((r.verified, r.unverified), (0, 1), "{r:?}");
+    }
+
+    /// Exact wins, and costs nothing: a report that spells its paths correctly must
+    /// score identically to one written before resolution existed.
+    #[test]
+    fn an_exact_path_is_never_resolved_against_another_file() {
+        let ev = evidence_of(&[
+            ("research.rs", Some((1, 100))),
+            ("src/research.rs", Some((1, 100))),
+        ]);
+        let r = check_citations("research.rs:10-20", &ev);
+        assert_eq!((r.verified, r.path_resolved), (1, 0), "{r:?}");
+        assert_eq!(r.cited_paths, vec!["research.rs".to_string()]);
+    }
+
+    /// Resolution admits a citation into the freshness check as well as the
+    /// provenance one. Score it against the resolved path for provenance and against
+    /// the cited spelling for staleness and it lands `verified` while its file's
+    /// reindex goes unreported — resolution would admit exactly the citations whose
+    /// staleness then disappeared.
+    #[test]
+    fn a_resolved_citation_is_stale_when_the_file_it_names_moved() {
+        let mut ev = evidence_of(&[("src/gc.rs", Some((100, 140)))]);
+        ev.by_path.get_mut("src/gc.rs").expect("recorded").changed = true;
+        let r = check_citations("gc.rs:110-120", &ev);
+        assert_eq!((r.verified, r.stale), (1, 1), "{r:?}");
+        assert_eq!(r.stale_paths, vec!["src/gc.rs".to_string()]);
+        assert!(r.details[0].stale);
+    }
+
+    /// `by_path` is a `HashMap`, so an unsorted candidate list would make the
+    /// ambiguity message — and any test of it — depend on iteration order.
+    #[test]
+    fn resolution_is_deterministic_when_several_paths_could_match() {
+        let ev = evidence_of(&[
+            ("z/research.rs", None),
+            ("a/research.rs", None),
+            ("m/research.rs", None),
+        ]);
+        match ev.match_path("research.rs") {
+            PathMatch::Ambiguous(c) => {
+                assert_eq!(c, vec!["a/research.rs", "m/research.rs", "z/research.rs"]);
+            }
+            other => panic!("expected ambiguity, got {other:?}"),
+        }
+    }
+
+    /// An ambiguous name has a defect of its own and a remedy of its own. Told only
+    /// "no tool returned this path" the model goes looking for a file it did read,
+    /// and finds it twice.
+    #[test]
+    fn an_ambiguous_citation_is_answered_with_every_candidate_and_the_fix() {
+        let ev = evidence_of(&[
+            ("src/db/research.rs", Some((1, 100))),
+            ("src/research.rs", Some((1, 100))),
+        ]);
+        let complaint = format_citation_complaint("see research.rs:10-20", &ev, true, 0);
+        assert!(
+            complaint.contains("names more than one file"),
+            "{complaint}"
+        );
+        assert!(complaint.contains("research.rs:10-20"), "{complaint}");
+        assert!(complaint.contains("src/db/research.rs"), "{complaint}");
+        assert!(complaint.contains("src/research.rs"), "{complaint}");
+        assert!(
+            !complaint.contains("No tool this run returned this path"),
+            "an ambiguous name is not an invented one: {complaint}"
+        );
+    }
+
+    /// The repair must agree with the counts: a citation the `citations` event just
+    /// scored `verified` cannot also be the reason its section is rewritten.
+    #[test]
+    fn a_resolved_citation_is_no_longer_a_reason_to_rewrite_its_section() {
+        let ev = evidence_of(&[("src/research.rs", Some((5000, 5300)))]);
+        let report = "# Title\n\n## 1. One\n\nSee research.rs:5068-5291.\n";
+        let sectioned = SectionedReport {
+            text: report.to_string(),
+            ranges: vec![(1, 0..report.chars().count())],
+            outcomes: vec!["written"],
+        };
+        assert!(
+            defective_sections(report, &ev, &sectioned).is_empty(),
+            "a resolved citation is not a defect"
+        );
+    }
+
+    /// The scoring a run journalled *before* resolution existed, still available.
+    ///
+    /// `/verification` compares a re-check against counters written when the run
+    /// finished, and renders a mismatch as "the journal or this reconstruction is
+    /// wrong, report a bug". Score an old row the new way and every report carrying
+    /// a bare filename reports a correct journal as broken — an alarm firing on
+    /// healthy history. The endpoint scores both ways and accepts either.
+    #[test]
+    fn the_exact_recheck_reproduces_the_scoring_of_a_run_journalled_before_resolution() {
+        let report = "the loop breaks at research.rs:5068-5291";
+        let stored = vec![StoredEvidence {
+            path: "src/research.rs".into(),
+            spans: vec![(5000, 5300)],
+            changed: false,
+            removed: false,
+        }];
+        let resolved = recheck_citations(report, &stored);
+        let exact = recheck_citations_exact(report, &stored);
+        assert_eq!((resolved.verified, resolved.unverified), (1, 0));
+        assert_eq!((exact.verified, exact.unverified), (0, 1));
+        // A report that spells its paths properly scores identically either way,
+        // which is why the two-way match costs nothing for almost every run.
+        let plain = "at src/research.rs:5068-5291";
+        assert_eq!(
+            recheck_citations(plain, &stored),
+            recheck_citations_exact(plain, &stored)
+        );
+    }
+
     /// The offline re-check is the same pure function over journal rows: fed the
     /// spans the run stored, it must reproduce the live check's provenance
     /// verdicts byte-for-byte — that equality is what `provenance_matches` means.
@@ -12995,6 +13624,7 @@ mod tests {
                 verified: 7,
                 path_only: 1,
                 unverified: 1,
+                path_resolved: 5,
                 stale: 2,
                 unverified_paths: vec!["src/nope.rs".into()],
                 stale_paths: vec!["src/moved.rs".into()],
@@ -13010,6 +13640,7 @@ mod tests {
             }),
             server_written: false,
             shown_paths: 12,
+            hearsay_only: false,
         };
         assert_eq!(ev.name(), "citations");
         let d = ev.data();
@@ -13022,6 +13653,13 @@ mod tests {
         assert_eq!(d["path_only"], 1);
         assert_eq!(d["unverified"], 1);
         assert_eq!(d["unverified_paths"], json!(["src/nope.rs"]));
+        // How many of those 7 `verified` were spelled the way a tool spelled them,
+        // and how many the server identified for the model. Without it `verified`
+        // silently changed meaning when resolution shipped.
+        assert_eq!(d["path_resolved"], 5);
+        // Nothing shown *and* an earlier report to hand — the one case a caller may
+        // not read `shown_paths: 0` as an honest empty scope.
+        assert_eq!(d["hearsay_only"], false);
         // Freshness beside provenance: a report can be perfectly cited and still
         // describe code the index has replaced.
         assert_eq!(d["stale"], 2);
@@ -13046,6 +13684,7 @@ mod tests {
             revalidation: None,
             server_written: false,
             shown_paths: 0,
+            hearsay_only: false,
         };
         let d = ev.data();
         assert_eq!(d["draft_unverified"], Value::Null);
@@ -13067,12 +13706,14 @@ mod tests {
             revalidation: None,
             server_written: false,
             shown_paths: 0,
+            hearsay_only: false,
         };
         let server_written = ResearchEvent::Citations {
             report: CitationReport::default(),
             revalidation: None,
             server_written: true,
             shown_paths: 0,
+            hearsay_only: false,
         };
         // Same counts, opposite meanings.
         assert_eq!(model_written.data()["shown_paths"], 0);
@@ -13080,6 +13721,39 @@ mod tests {
         assert_eq!(server_written.data()["total"], 0);
         assert_eq!(model_written.data()["server_written"], false);
         assert_eq!(server_written.data()["server_written"], true);
+    }
+
+    /// The third way a `verified: 0` can arise, and the only one that is not an
+    /// explanation but a refusal. `shown_paths: 0` normally means "nothing in this
+    /// scope was shown to me" — the honest unanswerable report, which the ungrounded
+    /// gate deliberately exempts and which therefore reaches a caller looking exactly
+    /// like a clean run. With prior reports on the table the same zero means the run
+    /// had somebody else's answer to paraphrase and no evidence of its own.
+    #[test]
+    fn a_run_that_only_had_hearsay_says_so_on_the_wire() {
+        let empty_scope = ResearchEvent::Citations {
+            report: CitationReport::default(),
+            revalidation: None,
+            server_written: false,
+            shown_paths: 0,
+            hearsay_only: false,
+        };
+        let restated = ResearchEvent::Citations {
+            report: CitationReport::default(),
+            revalidation: None,
+            server_written: false,
+            shown_paths: 0,
+            hearsay_only: true,
+        };
+        // Identical counts, identical denominator, identical `server_written`.
+        assert_eq!(empty_scope.data()["shown_paths"], 0);
+        assert_eq!(restated.data()["shown_paths"], 0);
+        assert_eq!(empty_scope.data()["server_written"], false);
+        assert_eq!(restated.data()["server_written"], false);
+        // One flag apart, and it is the one that decides whether a caller re-asks
+        // with a wider scope or refuses the report outright.
+        assert_eq!(empty_scope.data()["hearsay_only"], false);
+        assert_eq!(restated.data()["hearsay_only"], true);
     }
 
     /// A `RunProgress` with every field distinct, so a wire test cannot pass by
@@ -13097,6 +13771,10 @@ mod tests {
             peak_prompt_tokens: 800,
             num_ctx: 8192,
             turns: 4,
+            generation_ms: 5_000,
+            model_load_ms: 900,
+            unaccounted_ms: 4_100,
+            eval_tokens_per_second: 20.0,
         }
     }
 
@@ -13123,6 +13801,13 @@ mod tests {
         assert_eq!(d["peak_prompt_tokens"], 800);
         assert_eq!(d["num_ctx"], 8192);
         assert_eq!(d["turns"], 4);
+        // Where the time went, and only then the rate derived from it. A slow model
+        // and a queued one produce the same `elapsed_ms` and opposite diagnoses;
+        // these four are what let a reader tell them apart without the server's log.
+        assert_eq!(d["generation_ms"], 5_000);
+        assert_eq!(d["model_load_ms"], 900);
+        assert_eq!(d["unaccounted_ms"], 4_100);
+        assert_eq!(d["eval_tokens_per_second"], 20.0);
         // Which instructions produced the report. A measurement corpus that cannot
         // tell two prompt generations apart reads a prompt regression as model
         // variance, so this is part of the record, not decoration.
@@ -13275,6 +13960,13 @@ mod tests {
             ("turns", json!(4)),
             // 800/8192 = 9.8%, rounded to one decimal.
             ("context_pct", json!(9.8)),
+            // Where the elapsed time went. `unaccounted_ms` large beside a healthy
+            // `eval_tokens_per_second` is the shape of GPU contention: the model ran
+            // at its normal rate, the request simply waited to get at the device.
+            ("generation_ms", json!(5_000)),
+            ("model_load_ms", json!(900)),
+            ("unaccounted_ms", json!(4_100)),
+            ("eval_tokens_per_second", json!(20.0)),
             // 3/20 steps (15%) beats 800/(8192*0.7) context (14%), time and tokens.
             ("binding", json!("steps")),
         ] {
@@ -13309,6 +14001,10 @@ mod tests {
             peak_prompt_tokens: 0,
             num_ctx: 100_000,
             turns: 1,
+            generation_ms: 0,
+            model_load_ms: 0,
+            unaccounted_ms: 0,
+            eval_tokens_per_second: 0.0,
         };
         assert_eq!(
             RunProgress {
@@ -13366,6 +14062,7 @@ mod tests {
             prompt_tokens: Some(1200),
             eval_tokens: Some(40),
             num_ctx: 8192,
+            ..Default::default()
         });
         tally.record(ChatOutcome {
             content: "b".into(),
@@ -13373,6 +14070,7 @@ mod tests {
             prompt_tokens: Some(1800),
             eval_tokens: None,
             num_ctx: 8192,
+            ..Default::default()
         });
         // A turn Ollama reported nothing for must not read as a free turn.
         tally.record(ChatOutcome {
@@ -13381,6 +14079,7 @@ mod tests {
             prompt_tokens: None,
             eval_tokens: None,
             num_ctx: 8192,
+            ..Default::default()
         });
         assert_eq!(
             tally,
@@ -13392,8 +14091,73 @@ mod tests {
                 // The peak, not the sum: 1800 was the largest single prompt.
                 peak_prompt_tokens: 1800,
                 num_ctx: 8192,
+                generation_nanos: 0,
+                load_nanos: 0,
+                unaccounted_nanos: 0,
             }
         );
+    }
+
+    /// Where the run's wall clock went, so a slow run can be told from a queued one.
+    /// Folded independently of the token counts: an Ollama that reports the counts
+    /// but not the durations (or the reverse) must still contribute the half it did
+    /// send, and gating one on the other would silently lose it.
+    #[test]
+    fn the_tally_sums_generation_and_load_time_over_turns() {
+        let mut tally = TokenTally::default();
+        // A turn that had to load the model, and took 3 s of wall clock for the 2.6 s
+        // Ollama accounts for — 400 ms of it spent somewhere Ollama cannot see.
+        tally.record(ChatOutcome {
+            eval_tokens: Some(40),
+            eval_nanos: Some(2_000_000_000),
+            load_nanos: Some(500_000_000),
+            total_nanos: Some(2_600_000_000),
+            wall_ms: 3_000,
+            num_ctx: 8192,
+            ..Default::default()
+        });
+        // A second turn on the resident model, and this one queued: 5 s of wall for
+        // 1 s of work.
+        tally.record(ChatOutcome {
+            eval_tokens: Some(20),
+            eval_nanos: Some(1_000_000_000),
+            load_nanos: Some(0),
+            total_nanos: Some(1_000_000_000),
+            wall_ms: 5_000,
+            num_ctx: 8192,
+            ..Default::default()
+        });
+        // A turn with counts but no timings at all — an older Ollama.
+        tally.record(ChatOutcome {
+            eval_tokens: Some(5),
+            num_ctx: 8192,
+            ..Default::default()
+        });
+
+        assert_eq!(tally.generation_nanos, 3_000_000_000);
+        assert_eq!(tally.load_nanos, 500_000_000);
+        // 400 ms + 4000 ms; the timing-less turn contributes nothing rather than
+        // reporting its whole wall clock as unaccounted.
+        assert_eq!(tally.unaccounted_nanos, 4_400_000_000);
+        // 65 tokens over 3 s of generation. Deliberately over generation time and
+        // not wall clock: this must say how fast the model ran while it had the
+        // device, so the waiting shows up as `unaccounted` instead of being averaged
+        // into the rate and hidden.
+        assert!((tally.tokens_per_second() - 21.666).abs() < 0.01);
+    }
+
+    /// A run whose turns reported no durations must report no rate — not a division
+    /// by zero, and not a fabricated one.
+    #[test]
+    fn a_run_that_measured_no_generation_reports_no_throughput() {
+        let mut tally = TokenTally::default();
+        tally.record(ChatOutcome {
+            eval_tokens: Some(100),
+            num_ctx: 8192,
+            ..Default::default()
+        });
+        assert_eq!(tally.generation_nanos, 0);
+        assert_eq!(tally.tokens_per_second(), 0.0);
     }
 
     #[test]
@@ -13405,6 +14169,7 @@ mod tests {
             prompt_tokens: Some(5),
             eval_tokens: Some(6),
             num_ctx: 8192,
+            ..Default::default()
         });
         assert_eq!(out.content, "report");
     }

@@ -1445,6 +1445,12 @@ pub struct ResearchVerification {
     /// unverified; `stale` deliberately excluded — it is *expected* to move).
     /// `false` means the journal and the re-check disagree about immutable
     /// facts: report a bug. `null` when `spans_available` is false.
+    ///
+    /// The report is scored both with and without citation path resolution, and
+    /// either match satisfies this: resolution arrived with `PROMPT_VERSION` 2.4 and
+    /// changes a bare filename's verdict, so a run journalled before it would
+    /// otherwise read as broken. For a report carrying such a citation the check is
+    /// correspondingly weaker — it can no longer tell the two scorings apart.
     pub provenance_matches: Option<bool>,
     /// Citation staleness against today's index, computable for every run —
     /// old rows included — from the baselines alone.

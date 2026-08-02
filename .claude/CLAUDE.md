@@ -285,7 +285,16 @@ let GC clean up.
   (`provenance_matches: false` = journal bug, never news about the code);
   **staleness** is computed against the index *now* and is the number that
   moves. Nothing is stamped — derived like validity, so it can never disagree
-  with a recomputation. Pre-v1.3.0 rows: `spans_available: false`, staleness
+  with a recomputation. The report is scored **twice** and either match counts
+  (`recheck_citations` / `recheck_citations_exact`): citation path resolution
+  arrived with `PROMPT_VERSION` 2.4 and flips a bare filename's verdict, so
+  scoring an older row only the new way reports a correct journal as broken —
+  an alarm on healthy history, which is what that field must never be. The
+  price is precise and bounded: for a report carrying a resolvable bare
+  filename the check can no longer tell the two scorings apart; every other
+  report is checked exactly as strictly as before. Retire the second scoring
+  when a resolved path is stored per citation (a migration).
+  Pre-v1.3.0 rows: `spans_available: false`, staleness
   half only (recomputing provenance without spans would score everything
   `unverified` — the check lying); the discriminator is `started_at IS NOT
   NULL`, which arrived in the same migration as the spans.
@@ -404,6 +413,7 @@ is the `research_runs` table.) The hard invariants:
   `plan_request` (templated by the run's `max_report_sections` — the test fakes
   match it by prefix, `PLAN_REQUEST_PREFIX`), `SUFFICIENCY_REQUEST`,
   `REVALIDATION_SYSTEM_PROMPT`, `format_citation_complaint`,
+  `format_ungrounded_complaint`, `format_hearsay_complaint`,
   `REPORT_ROLE`/`report_system_prompt`, either report turn's user message, the
   budget nudges or `tool_specs`. Sampling (`temperature/top_p/seed`) is
   `Option` — absent = model default; a request's `seed` overrides config.
@@ -499,6 +509,49 @@ is the `research_runs` table.) The hard invariants:
   `evidence.paths()` empty, or under `MIN_GROUNDED_REPORT_CHARS` (800) **from a
   budget-stopped run only** — a run that `Finalized` declared its evidence
   sufficient, so a short uncited report from it is a self-contradiction.
+- **A cited path is resolved before it is scored** (`Evidence::match_path`;
+  resolution is a field on `Evidence`, so `check_citations`, the complaint and
+  `defective_sections` physically cannot disagree about a verdict). Exact
+  first; otherwise the cited path may be the **tail** of exactly one shown path,
+  the `/` in the suffix being the whole segment-boundary rule. Two candidates =
+  none, and the complaint's own bucket asks for the directory. The measured
+  failure it fixes is not a parser gap — `parse_citations` accepts
+  `research.rs:5068-5291` — but `Unverified`, the verdict for a path *no tool
+  returned*, being handed to a report about a file it had just read; five of
+  twenty-seven in one run, and repeated inside the section the repair had made
+  it rewrite. Two spellings therefore live side by side and must not be
+  swapped: the **cited** one in anything quoting the report (`details`,
+  `unverified_paths`, every complaint line — the model has to find the string
+  it wrote), the **resolved** one in anything claiming something about a file
+  (`cited_paths`, `stale_paths`, and above all `verified_locations`, which the
+  excerpt channel reads code from — the report's spelling finds nothing there
+  and a resolved citation would silently ship no code). `is_stale` resolves
+  too, or resolution would admit exactly the citations whose staleness then
+  went unreported. `citations.path_resolved` is the honesty counter: `verified`
+  now means "a path a tool returned, identified unambiguously from what the
+  report wrote", and this says how many leaned on the second half. Not
+  journalled (`research_run_citations` stores the cited spelling, so a resolved
+  row no longer joins to `research_run_evidence.path` — that wants the
+  migration above).
+- **A run that looked at nothing while holding hearsay is refused**
+  (`citations.hearsay_only`, `format_hearsay_complaint`). The ungrounded gate's
+  first exemption exists for a run with **nothing to say**; a run handed prior
+  reports or a challenge subject has somebody else's answer to hand, and the
+  same uncited prose is then that answer restated as findings — cited to
+  nothing, in the field callers are told to trust, and byte-for-byte identical
+  on the wire to the honest "nothing in this scope was shown to me". So the
+  exemption is `!evidence.paths().is_empty() || hearsay_only`, and everything
+  downstream (`citation_defects`, `tools_reopen` on `Finalized` only, the
+  complaint push) is reused unchanged. The flag is computed **in
+  `research_inner`** and carried on `ResearchOutcome`: `run_research` has only
+  `content_paths` (span-bearing paths) while the gate asks whether any path was
+  *named*, and the two must be one predicate. Not equivalent to
+  `shown_paths == 0` in either direction — a run that called only `list_files`
+  has the zero without the flag. The complaint is a separate function, not a
+  branch of `format_ungrounded_complaint`, whose whole body is a list of shown
+  files that is empty here; its remedy is two-sided, because "this run added
+  nothing and the answer rests on run N" is a legitimate report — it just has
+  to say so.
 - **`citations.server_written` is not a nicety.** A `forced_synthesis` report
   cites nothing by construction, so `check_citations` scores it
   `total: 0, verified: 0, unverified: 0` — byte-for-byte what a clean report
@@ -702,6 +755,31 @@ is the `research_runs` table.) The hard invariants:
     (`research_runaway_thinking_turns` + `warn!`); `TokenTally::record` must
     not let its zero `num_ctx` overwrite a known window; its GPU cost lands
     in `turns_unreported`.
+  - **Contention, named** `[research].slow_turn_tokens_per_second` (**`0` =
+    off, and that is the default**): the third per-turn guard and the only one
+    that stops nothing. A run inching along at a token a second is the same
+    symptom as a broken model, a bad prompt and a wedged server — one measured
+    run spent 985 s at ~1.5 tok/s and nothing anywhere could say why, because
+    Ollama's `load_duration`/`eval_duration`/`total_duration` were parsed by no
+    one. Now they ride on `ChatOutcome` (nanoseconds, `None` ≠ 0 — a zero
+    `load_duration` *means* the model was resident), sum into `TokenTally`
+    independently of the token counts, and reach the wire as
+    `generation_ms`/`model_load_ms`/`unaccounted_ms`/`eval_tokens_per_second`
+    on `progress` and `done`. **The wall clock is not redundant**: Ollama's
+    `total_duration` is measured inside its own handler, so time queued behind
+    another client on the same GPU falls entirely outside it — during exactly
+    the contention being hunted, Ollama's numbers look healthy. Hence
+    `unaccounted_ms` = wall − total, named for what it measures (it also holds
+    HTTP/TLS/NDJSON) rather than for what a large value means. The rate is over
+    *generation* time, so waiting shows in `unaccounted_ms` instead of being
+    averaged into it and hidden. The `warn!` and the two histograms
+    (`research_turn_tokens_per_second`, which needs a `BARE` entry since
+    `_per_second` is not `_seconds`; `research_turn_load_seconds`) live in
+    `ollama.rs` beside `warn_if_context_exhausted` — the one place holding the
+    model name, the metrics handle and the timings at once. The default is `0`
+    because a healthy rate is a fact about one model on one host (15 tok/s is
+    fine for a 30B, alarming for a 7B), the `temperature = None` argument;
+    read the histogram, then set it.
   - **`max_tokens`** (400k/1.2M/6M) is the cost axis (`prompt_eval + eval`;
     transcript resent every turn → super-linear in turns).
   - **`context_fraction`** (0.5/0.7/0.85): a guard against Ollama's silent
@@ -860,8 +938,10 @@ is the `research_runs` table.) The hard invariants:
   `done_event_carries_the_reason_and_the_run_cost_on_the_wire`,
   `done_names_no_run_when_the_journal_write_failed`,
   `each_action_names_its_argument_on_the_wire`,
-  `citations_wire_fields_are_stable` (which pins `shown_paths`),
-  `a_server_written_report_says_so_on_the_wire`. `done` carries nullable
+  `citations_wire_fields_are_stable` (which pins `shown_paths`,
+  `path_resolved` and `hearsay_only`),
+  `a_server_written_report_says_so_on_the_wire`,
+  `a_run_that_only_had_hearsay_says_so_on_the_wire`. `done` carries nullable
   `run_id`/`seq` (null when the journal write failed; rendered as "not
   saved" in VS Code). `started` is always the **first** frame; event order after
   the report is fixed: `summary` → `citations` → `excerpts` (only with a verified

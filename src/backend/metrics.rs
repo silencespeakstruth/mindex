@@ -319,6 +319,22 @@ pub struct ResearchMetrics {
     pub duration: HistFamily<ModelLabels>,
     pub steps: HistFamily<ModelLabels>,
     pub turns: HistFamily<ModelLabels>,
+    /// Per-turn generation rate, tokens per second of *generation* time.
+    ///
+    /// The pair below is here to answer one question the service could not answer
+    /// at all: when a run crawls, is the model slow or is the GPU busy? On this host
+    /// the device is shared, so the second is the common case and looked exactly
+    /// like the first — a measured run spent 985 s at ~1.5 tok/s and read as a
+    /// wedged model. Rate alone still cannot distinguish them, which is why
+    /// `turn_load_seconds` ships beside it: a non-zero load after the run's first
+    /// turn means Ollama evicted and reloaded the model, i.e. something else wanted
+    /// the device.
+    ///
+    /// Per *turn*, so unlike the per-run families these are not rare — `rate()` is
+    /// fine here.
+    pub turn_tokens_per_second: HistFamily<ModelLabels>,
+    /// Seconds Ollama spent loading the model into the device for one turn.
+    pub turn_load_seconds: HistFamily<ModelLabels>,
     pub tokens: Family<ModelKindLabels, Counter>,
     pub context_used: HistFamily<ModelLabels>,
     pub tool_calls: Family<ToolOutcomeLabels, Counter>,
@@ -722,6 +738,10 @@ impl Metrics {
             duration: hist_family(long_hist),
             steps: hist_family(count_hist),
             turns: hist_family(count_hist),
+            // 1 → 8192 tok/s. A healthy local model sits in the tens; the low
+            // buckets are where contention shows, and they are the point.
+            turn_tokens_per_second: hist_family(count_hist),
+            turn_load_seconds: hist_family(request_hist),
             tokens: Family::default(),
             context_used: hist_family(ratio_hist),
             tool_calls: Family::default(),
@@ -775,6 +795,16 @@ impl Metrics {
             "research_tokens",
             "Tokens a research run made the model process, by prompt or eval",
             research.tokens.clone(),
+        );
+        registry.register(
+            "research_turn_tokens_per_second",
+            "Generation rate of one model turn, over its own generation time",
+            research.turn_tokens_per_second.clone(),
+        );
+        registry.register(
+            "research_turn_load_seconds",
+            "Time Ollama spent loading the model for one turn",
+            research.turn_load_seconds.clone(),
         );
         registry.register(
             "research_context_used_ratio",
@@ -1273,6 +1303,14 @@ mod tests {
         m.research.steps.get_or_create(&model).observe(8.0);
         m.research.turns.get_or_create(&model).observe(10.0);
         m.research
+            .turn_tokens_per_second
+            .get_or_create(&model)
+            .observe(22.5);
+        m.research
+            .turn_load_seconds
+            .get_or_create(&model)
+            .observe(0.5);
+        m.research
             .tokens
             .get_or_create(&ModelKindLabels {
                 model: "glm".into(),
@@ -1507,6 +1545,8 @@ mod tests {
             ("mindex_research_runs_by_effort_total", "counter"),
             ("mindex_research_runs_total", "counter"),
             ("mindex_research_steps", "histogram"),
+            ("mindex_research_turn_load_seconds", "histogram"),
+            ("mindex_research_turn_tokens_per_second", "histogram"),
             ("mindex_research_tokens_total", "counter"),
             ("mindex_research_tool_call_parse_retries_total", "counter"),
             ("mindex_research_tool_calls_total", "counter"),
@@ -1575,6 +1615,10 @@ mod tests {
             // thing being counted, and `_words` would only restate the name.
             "mindex_research_report_words",
             "mindex_research_steps",
+            // A rate, and the unit is in the name — but `_per_second` is not
+            // `_seconds`, so the suffix rule cannot see it. Renaming it to satisfy
+            // the rule would name it after the wrong quantity.
+            "mindex_research_turn_tokens_per_second",
             "mindex_research_turns",
             "mindex_research_worker_threads",
             "mindex_search_candidates",

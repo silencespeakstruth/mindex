@@ -4581,6 +4581,7 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   one), and cost a step like any other call;
 /// - `progress` `{steps, max_steps, elapsed_ms, max_ms, tokens, max_tokens,
 ///   prompt_tokens, eval_tokens, peak_prompt_tokens, num_ctx, context_pct, turns,
+///   generation_ms, model_load_ms, unaccounted_ms, eval_tokens_per_second,
 ///   binding, shares}` — budget consumption, so a live run is steerable instead of
 ///   opaque. Emitted once before the first turn (all limits, nothing spent), then
 ///   after every executed step and every completed turn. `binding` is the axis with
@@ -4590,13 +4591,22 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   its time budget and less into everything else reports `binding: "time"`, which
 ///   without the shares beside it reads as a run about to expire. What actually
 ///   stopped a run is `done.reason`. Not emitted on a timer: interpolate
-///   `elapsed_ms` locally between events;
+///   `elapsed_ms` locally between events. The four timing fields say where the
+///   elapsed time went, which is what separates a slow model from a busy GPU —
+///   the same symptom with opposite remedies. `generation_ms` is Ollama's own
+///   generation time and `eval_tokens_per_second` is `eval_tokens` over it (so a
+///   queued run still reports its true generation rate); `model_load_ms` is time
+///   spent loading the model, and anything non-zero there after the first turn
+///   means the model was evicted and reloaded mid-run, i.e. something else wanted
+///   the device; `unaccounted_ms` is wall clock Ollama did not account for, which
+///   is dominated by queueing when it is large. All four are `0` when the Ollama
+///   in use does not report durations;
 /// - `summary` `{text}` — the final Markdown report. Streamed as deltas when the
 ///   report was rewritten after its citation check; sent as one event otherwise,
 ///   because the first draft is withheld until that check has run;
-/// - `citations` `{server_written, shown_paths, total, verified, path_only,
-///   unverified, unverified_paths, stale, stale_paths, draft_unverified,
-///   draft_path_only, draft_stale, revalidation_steps}` —
+/// - `citations` `{server_written, shown_paths, hearsay_only, total, verified,
+///   path_only, unverified, unverified_paths, path_resolved, stale, stale_paths,
+///   draft_unverified, draft_path_only, draft_stale, revalidation_steps}` —
 ///   emitted once, after the report and before `done`: the server's provenance
 ///   check on the report's `path:start-end` references, scored against the
 ///   locations this run's own tool calls actually returned. `verified` = the path
@@ -4630,7 +4640,17 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   report cited none of the dozen files it read, while `verified: 0` over
 ///   `shown_paths: 0` is the honest "nothing in this scope was shown to me", which
 ///   is the one case the server's own grounding gate exempts and therefore the one
-///   case that reaches a caller looking exactly like a clean run;
+///   case that reaches a caller looking exactly like a clean run — **unless**
+///   `hearsay_only` is true. That flag says no tool returned a single path *and*
+///   the run was holding somebody else's report (prior context, or a challenge
+///   subject), so the zero is not an empty scope but an earlier answer restated
+///   with no evidence of its own: refuse such a report rather than re-asking it
+///   with a wider scope. A run that called only `list_files` reports
+///   `shown_paths: 0` with `hearsay_only: false`. `path_resolved` counts citations
+///   scored against a path they did not spell — a bare filename that named exactly
+///   one shown file. `verified` therefore means "a path a tool returned,
+///   identified unambiguously from what the report wrote", and this says how many
+///   leaned on the second half;
 /// - `excerpts` `{excerpts: [{path, start_line, end_line, code}], total, truncated}`
 ///   — emitted once between `citations` and `done`, and only when the report has at
 ///   least one **verified** citation: the indexed code at those locations,
@@ -4717,7 +4737,16 @@ assembled the report, which therefore cites nothing and scores `total: 0, verifi
 unverified: 0` — byte-for-byte what a clean report scores, and indistinguishable from it \
 without the flag. `shown_paths` counts the files this run's tools actually returned, so a \
 caller can machine-check admissibility (`verified: 0` over `shown_paths: 12` cited none of \
-what it read; over `shown_paths: 0` it was shown nothing at all). `excerpts` follows `citations` when the report has at least one verified \
+what it read; over `shown_paths: 0` it was shown nothing at all) — but `hearsay_only` overrides \
+that reading: nothing shown *and* an earlier report on the table, so the report is that earlier \
+prose restated with no evidence of its own and must be refused rather than re-asked wider. \
+`path_resolved` counts citations scored against a path they did not spell (a bare filename \
+naming exactly one shown file), so `verified` stays readable as \"a path a tool returned, \
+identified unambiguously from what the report wrote\". `progress` and `done` additionally carry \
+`generation_ms`/`model_load_ms`/`unaccounted_ms`/`eval_tokens_per_second`, which say where the \
+elapsed time went: a slow model and a busy GPU produce the same `elapsed_ms` and opposite \
+remedies, and a large `unaccounted_ms` beside a healthy rate is queueing. \
+`excerpts` follows `citations` when the report has at least one verified \
 citation and carries the indexed code at those locations verbatim \
 (`{path, start_line, end_line, code}`), so a caller needing a file's literal text gets it \
 from the index rather than by asking the model to retype it into the report; scope is \
@@ -6761,7 +6790,11 @@ pub async fn get_research_run(
 ///
 /// - **Provenance** (`recomputed` vs `recorded`, `provenance_matches`): immutable
 ///   facts about the run. A mismatch means the journal or the reconstruction is
-///   wrong — a bug, never news about the code.
+///   wrong — a bug, never news about the code. Scored **twice**, once with citation
+///   path resolution and once without, and matching either way counts: resolution
+///   arrived with `PROMPT_VERSION` 2.4 and changes the verdict on a bare filename,
+///   so scoring an older row only the new way would report a correct journal as
+///   broken. Retire the second scoring when a resolved path is stored per citation.
 /// - **Staleness** (`stale_citations_now`, `files_moved`): computed against the
 ///   index as it stands *now*. This is the number that moves, and the reason to
 ///   call this endpoint at all.
@@ -6939,16 +6972,16 @@ pub async fn get_research_verification(
         unverified: summary.citations_unverified,
         stale: recorded_stale,
     };
-    let recomputed = spans_available.then_some(CitationCounts {
-        total: rechecked.total as i64,
-        verified: rechecked.verified as i64,
-        path_only: rechecked.path_only as i64,
-        unverified: rechecked.unverified as i64,
-        stale: rechecked.stale as i64,
-    });
+    let counts = |r: &crate::research::CitationReport| CitationCounts {
+        total: r.total as i64,
+        verified: r.verified as i64,
+        path_only: r.path_only as i64,
+        unverified: r.unverified as i64,
+        stale: r.stale as i64,
+    };
     // Provenance only: `stale` is expected to move, and folding it in would make
     // every honest re-check after an edit read as a journal bug.
-    let provenance_matches = recomputed.as_ref().map(|r| {
+    let provenance = |r: &CitationCounts| {
         (r.total, r.verified, r.path_only, r.unverified)
             == (
                 recorded.total,
@@ -6956,7 +6989,35 @@ pub async fn get_research_verification(
                 recorded.path_only,
                 recorded.unverified,
             )
-    });
+    };
+
+    // Scored twice, and the run is called honest if *either* scoring reproduces
+    // what was journalled. Path resolution (PROMPT_VERSION 2.4) turns a bare
+    // filename that names exactly one shown file from `unverified` into `verified`,
+    // so re-checking an older row the new way would report a perfectly correct
+    // journal as broken — and `provenance_matches: false` is rendered everywhere as
+    // "the journal or this reconstruction is wrong, report a bug", a claim that must
+    // never fire on healthy history. Both are pure functions over rows already in
+    // memory, so the second scoring costs microseconds.
+    //
+    // The cost is real and bounded: for a report containing a resolvable bare
+    // filename the check can no longer tell the two scorings apart, so it would miss
+    // a journal that recorded the *other* one. Every other report scores identically
+    // either way and is checked exactly as strictly as before. This goes away with a
+    // stored resolved path per citation, which wants a migration.
+    let resolved = spans_available.then(|| counts(&rechecked));
+    let exact = spans_available
+        .then(|| counts(&crate::research::recheck_citations_exact(&report, &stored)));
+    let (recomputed, provenance_matches) = match (resolved, exact) {
+        (Some(res), Some(ex)) => {
+            let ok = provenance(&res) || provenance(&ex);
+            // Report the scoring that matched, preferring today's — so the block a
+            // caller reads is the one the verdict was reached on.
+            let shown = if provenance(&res) { res } else { ex };
+            (Some(shown), Some(ok))
+        }
+        _ => (None, None),
+    };
 
     Ok(Json(ResearchVerification {
         run_id: summary.id.clone(),

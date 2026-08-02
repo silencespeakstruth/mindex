@@ -118,6 +118,18 @@ _USAGE_KEYS = (
     # routinely read as "this run is running out of X" when it means "X is the
     # largest of four shares, and it is 12%".
     "shares",
+    # Where the elapsed time went. Without these a run that crawled is indistinguishable
+    # from a model that failed: `elapsed_ms` alone cannot say whether the model was slow
+    # or the GPU was busy with somebody else, and the two want opposite responses (raise
+    # the budget vs. wait and re-ask). `eval_tokens_per_second` is measured over
+    # `generation_ms`, so a queued run still reports its true rate and the waiting shows
+    # up in `unaccounted_ms`; a non-zero `model_load_ms` after the run's first turn means
+    # the model was evicted and reloaded mid-run. All zero when the server's Ollama
+    # reports no durations.
+    "generation_ms",
+    "model_load_ms",
+    "unaccounted_ms",
+    "eval_tokens_per_second",
     # Which prompt generation drove the run. Cheap to carry and impossible to
     # recover later: two reports written under different instructions are not
     # comparable, and without this a prompt change reads as model variance.
@@ -149,14 +161,24 @@ _USAGE_KEYS = (
 # it read, while over `shown_paths: 0` it is the honest "nothing in this scope was
 # shown to me". The server exempts the second from its own grounding gate, so that
 # one arrives looking exactly like a clean run.
+# `hearsay_only` is what rescues that exemption from being a hole: nothing was shown
+# AND the run was holding an earlier report, so the zero denominator is not an empty
+# scope but somebody else's answer restated. A run that called only `list_files` has
+# `shown_paths: 0` and `hearsay_only: false` — the two are not interchangeable.
+# `path_resolved` says how many citations were scored against a path they did not
+# spell (a bare filename naming exactly one shown file). It is the honesty counter for
+# `verified`, which now means "a path a tool returned, identified unambiguously from
+# what the report wrote".
 _CITATION_KEYS = (
     "server_written",
     "shown_paths",
+    "hearsay_only",
     "total",
     "verified",
     "path_only",
     "unverified",
     "unverified_paths",
+    "path_resolved",
     "stale",
     "stale_paths",
     "draft_unverified",
@@ -359,12 +381,27 @@ report at all, and the right move is to ask again.
 THE ADMISSION CHECK, AND IT IS ARITHMETIC, NOT JUDGEMENT: before you act on a
 report, require `steps > 0` and `citations.verified > 0`. A report that passes
 neither was written without the index being consulted, however confident it reads.
-The one legitimate exception is `citations.shown_paths == 0` — no tool returned a
-single file, so there was nothing to cite and the report can only be saying the
-question is unanswerable in this scope; treat that as a scoping problem and re-ask
-with a wider one, never as a finding about the code. `verified: 0` with
-`shown_paths` above zero is the case to refuse outright: the run read files and
+The one legitimate exception is `citations.shown_paths == 0` **with
+`citations.hearsay_only` false** — no tool returned a single file, so there was
+nothing to cite and the report can only be saying the question is unanswerable in
+this scope; treat that as a scoping problem and re-ask with a wider one, never as a
+finding about the code. When `hearsay_only` is TRUE the same zero means the opposite:
+the run looked at nothing AND was holding the earlier reports you chained, so what
+came back is that earlier prose restated as findings. Refuse it. Widening the scope
+is not the fix — the run never used the scope it had. `verified: 0` with
+`shown_paths` above zero is the other case to refuse outright: the run read files and
 grounded nothing in them.
+
+ONE CHANGE TO WHAT `verified` MEANS, so you read the number correctly: it is no
+longer "the citation was spelled exactly as a tool returned it" but "the citation
+names a path a tool returned, identified unambiguously from what the report wrote".
+A report writing `research.rs:5068-5291` for a file the tools called
+`src/research.rs` now verifies, because the name fits exactly one file the run was
+shown; a name fitting two stays unverified. `citations.path_resolved` counts how many
+verified citations leaned on that identification. It changes nothing about whether to
+trust the report — the location was still shown to the model — but if you are about
+to open a cited path yourself, take it from `excerpts`, which always carries the real
+repo-relative path, rather than retyping what the prose wrote.
 
 How to call it: pass the project GUID from the repo-root `.mindex` file and ONE
 clear question in `question` (a full question, not keywords — the local model

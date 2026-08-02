@@ -38,6 +38,14 @@ interface Progress {
     context_pct: number;
     turns: number;
     binding: string;
+    /**
+     * Where the elapsed time went — a slow model and a busy GPU produce the same
+     * `elapsed_ms`. `0` when the Ollama in use reports no durations.
+     */
+    generation_ms?: number;
+    model_load_ms?: number;
+    unaccounted_ms?: number;
+    eval_tokens_per_second?: number;
 }
 
 interface Done extends Progress {
@@ -72,6 +80,12 @@ interface Citations {
      * It cites nothing, so every count below reads as a flawless report would.
      */
     server_written?: boolean;
+    /**
+     * Nothing was shown to the run, and it was holding an earlier report. The
+     * stronger claim of the two: not "this report may be empty" but "this report is
+     * somebody else's, restated".
+     */
+    hearsay_only?: boolean;
     total: number;
     unverified: number;
     unverified_paths?: string[];
@@ -448,6 +462,20 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
                         "report was assembled by the server from what the run had found. " +
                         "It cites nothing — the citation counts below say zero because " +
                         "there was nothing to check, not because everything checked out."
+                );
+            }
+            // Prepended last, so it sits above the server-written note: this is the
+            // stronger claim of the two. `server_written` says no model wrote the
+            // report; this says no evidence went into it at all, and the prose came
+            // from an earlier run's report rather than from the code.
+            if (citations !== null && citations.hearsay_only === true) {
+                prependNote(
+                    "warning",
+                    "No lookup returned a single location in this run, and the run was " +
+                        "given earlier reports to work from — so this text rests on what " +
+                        "another run wrote about an earlier state of the tree, not on the " +
+                        "code as it stands. Treat it as a pointer to re-investigate, not " +
+                        "as a finding."
                 );
             }
             // Only the failure is worth screen space. A fully verified report is the

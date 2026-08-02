@@ -356,6 +356,22 @@ export interface ResearchProgress {
     context_pct: number;
     turns: number;
     /**
+     * Where the elapsed time went. A slow model and a busy GPU produce the same
+     * `elapsed_ms` and want opposite remedies, so these four are what tell them
+     * apart: `eval_tokens_per_second` is measured over `generation_ms` (Ollama's own
+     * generation time), so a queued run still reports its true rate and the waiting
+     * lands in `unaccounted_ms` instead of being averaged in. A non-zero
+     * `model_load_ms` after the first turn means the model was evicted and reloaded
+     * mid-run — something else wanted the device.
+     *
+     * All optional and all `0` when the Ollama in use reports no durations; an older
+     * server omits them entirely.
+     */
+    generation_ms?: number;
+    model_load_ms?: number;
+    unaccounted_ms?: number;
+    eval_tokens_per_second?: number;
+    /**
      * The axis with the largest **share spent** — a maximum, not a warning. What
      * stopped a run is `done.reason`; read this with `shares` beside it, since a run
      * 12% into its clock and less into everything else also reports `"time"`.
@@ -607,6 +623,17 @@ export interface ResearchCitations {
      * Optional for the same reason as `server_written`: an older server omits it.
      */
     shown_paths?: number;
+    /**
+     * No tool returned a single path this run, *and* the run was holding somebody
+     * else's report — prior context, or a challenge subject. This is the one case
+     * where `shown_paths: 0` is not the honest empty-scope answer it looks like: the
+     * report is that earlier prose restated with no evidence of its own. Refuse it
+     * rather than re-asking with a wider scope.
+     *
+     * Not the same as `shown_paths === 0`: a run that called only `list_files` shows
+     * nothing inside and is not hearsay. Optional; an older server omits it.
+     */
+    hearsay_only?: boolean;
     total: number;
     /** Path and an overlapping line range were both shown to the model. */
     verified: number;
@@ -615,6 +642,13 @@ export interface ResearchCitations {
     /** No tool returned that path during the run — the model invented it. */
     unverified: number;
     unverified_paths: string[];
+    /**
+     * Citations scored against a path they did not spell — a bare filename that
+     * named exactly one shown file. `verified` therefore means "a path a tool
+     * returned, identified unambiguously from what the report wrote", and this says
+     * how many leaned on the second half. Optional; an older server omits it.
+     */
+    path_resolved?: number;
     /**
      * Citations pointing into a file the index rewrote (or dropped) after the run
      * had read it. Independent of the three counts above: indexing is never blocked

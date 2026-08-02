@@ -25,6 +25,10 @@ pub struct OllamaTuning {
     /// Liveness-ping timeout for `/health`'s optional Ollama check. Short: a
     /// health probe must not hold the response hostage to a wedged Ollama.
     pub health_timeout_ms: u64,
+    /// Below this generation rate (tokens per second of *generation* time) a turn
+    /// is logged as contention. `0` disables it, and is the default — the healthy
+    /// rate is a fact about a model on a host, not about this code.
+    pub slow_turn_tokens_per_second: f64,
 }
 
 /// Per-turn generation options, from `[research]` config plus the request's
@@ -222,6 +226,54 @@ pub struct ChatOutcome {
     /// against the real window instead of the configured one; on a 32k model with a
     /// 64k setting they differ twofold.
     pub num_ctx: u64,
+    /// Ollama's own accounting for the turn, in **nanoseconds**, exactly as it
+    /// reports it. `None` means the server did not say — never zero, and here the
+    /// distinction bites twice as hard as it does for the counts, because a zero
+    /// `load_duration` is itself a fact (the model was already resident).
+    ///
+    /// This exists to tell a slow *model* from a busy *GPU*, which are the same
+    /// symptom — a run inching along at a token or two a second — and opposite
+    /// diagnoses. One measured run spent 985 seconds at ~1.5 tok/s and read as a
+    /// wedged model; nothing in the reply, the log or the metrics could say
+    /// otherwise, because none of these numbers were parsed.
+    pub load_nanos: Option<u64>,
+    pub prompt_eval_nanos: Option<u64>,
+    pub eval_nanos: Option<u64>,
+    /// Ollama's own end-to-end figure for the turn.
+    pub total_nanos: Option<u64>,
+    /// Wall clock this client measured around the same turn, in **milliseconds**.
+    ///
+    /// Not redundant with `total_nanos`, and the only field that can see the thing
+    /// this set exists to find: `total_duration` is measured inside Ollama's
+    /// handler, so time the request spends queued behind another client's
+    /// generation on the same GPU falls entirely outside it. During exactly the
+    /// contention we are hunting, Ollama's own numbers look healthy.
+    pub wall_ms: u64,
+}
+
+impl ChatOutcome {
+    /// Tokens generated per second of generation time, or `None` when either half
+    /// is unknown or zero.
+    ///
+    /// Deliberately over `eval_nanos` and not over the wall clock: this is meant to
+    /// answer "how fast did the model run *while it had the device*", so that the
+    /// queueing it was slow *because of* shows up in [`Self::unaccounted_ms`]
+    /// instead of being averaged into the rate and hidden.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        let (tokens, nanos) = (self.eval_tokens?, self.eval_nanos?);
+        (tokens > 0 && nanos > 0).then(|| tokens as f64 * 1e9 / nanos as f64)
+    }
+
+    /// Wall clock this turn took that Ollama did not account for, in milliseconds.
+    ///
+    /// Named for what it measures, not for what it usually means: it also contains
+    /// HTTP, TLS and NDJSON parsing, so a small value is noise. A *large* one is
+    /// dominated by queueing — the request sat in front of a busy GPU — but this
+    /// field states the measurement and leaves the inference to the reader.
+    pub fn unaccounted_ms(&self) -> Option<u64> {
+        let total_ms = self.total_nanos? / 1_000_000;
+        Some(self.wall_ms.saturating_sub(total_ms))
+    }
 }
 
 #[derive(Debug)]
@@ -422,6 +474,17 @@ struct ChatChunk {
     prompt_eval_count: Option<u64>,
     #[serde(default)]
     eval_count: Option<u64>,
+    /// Ollama's own timings, nanoseconds, likewise only on the `done` line. Kept in
+    /// its units all the way to `ChatOutcome`: converting at the seam would mean
+    /// two places knew what a nanosecond was.
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
+    #[serde(default)]
+    total_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -739,6 +802,59 @@ impl OllamaHttpClient {
             );
         }
     }
+
+    /// Record what this turn's generation rate was, and say so when it is far below
+    /// what the host can do.
+    ///
+    /// Here rather than in the research loop for the same reason
+    /// [`Self::warn_if_context_exhausted`] is: this is a per-turn pathology that is
+    /// invisible in the returned value, and this is the one place that has the model
+    /// name, the metrics handle and the timings at once. The loop would need the
+    /// threshold threaded through ten call sites to say the same thing later.
+    ///
+    /// The wording names the diagnosis on purpose. A run inching along at a token a
+    /// second is the *same symptom* as a broken model, a bad prompt and a wedged
+    /// server, and the operator who reads this log is about to pick one of those.
+    /// On this host the answer is usually the fourth: one GPU, shared with whatever
+    /// else the user is running.
+    fn warn_if_slow_turn(&self, model: &str, outcome: &ChatOutcome) {
+        let Some(rate) = outcome.tokens_per_second() else {
+            return;
+        };
+        if let Some(m) = &self.metrics {
+            m.research
+                .turn_tokens_per_second
+                .get_or_create(&crate::backend::metrics::ModelLabels {
+                    model: model.to_string(),
+                })
+                .observe(rate);
+            if let Some(load) = outcome.load_nanos {
+                m.research
+                    .turn_load_seconds
+                    .get_or_create(&crate::backend::metrics::ModelLabels {
+                        model: model.to_string(),
+                    })
+                    .observe(load as f64 / 1e9);
+            }
+        }
+        let floor = self.tuning.slow_turn_tokens_per_second;
+        if floor <= 0.0 || rate >= floor {
+            return;
+        }
+        warn!(
+            %model,
+            tokens_per_second = format!("{rate:.1}"),
+            eval_tokens = outcome.eval_tokens.unwrap_or(0),
+            load_ms = outcome.load_nanos.unwrap_or(0) / 1_000_000,
+            unaccounted_ms = outcome.unaccounted_ms().unwrap_or(0),
+            threshold = format!("{floor:.1}"),
+            "Ollama generated this turn far below the configured healthy rate for \
+             this host. An anomalously low rate is contention — another process \
+             holding the GPU, or Ollama evicting and reloading this model (see \
+             load_ms) — not a broken model or a bad prompt. The run will be slow \
+             and may spend its whole wall-clock budget waiting."
+        );
+    }
 }
 
 #[async_trait]
@@ -753,6 +869,10 @@ impl OllamaModel for OllamaHttpClient {
         token: &CancellationToken,
     ) -> Result<ChatOutcome, OllamaError> {
         let num_ctx = self.effective_num_ctx(model).await;
+        // Started before the request, not after it: the queue this is meant to see
+        // forms in front of Ollama, so a clock started once the response headers
+        // arrive would miss precisely the wait it exists to measure.
+        let wall = std::time::Instant::now();
         // The silence guard spans the request *and* the wait for the first token,
         // because the two are one silence from the caller's side and the stall can
         // land in either: Ollama holds the connection open while it loads, so the
@@ -837,8 +957,14 @@ impl OllamaModel for OllamaHttpClient {
                         prompt_tokens: parsed.prompt_eval_count,
                         eval_tokens: parsed.eval_count,
                         num_ctx,
+                        load_nanos: parsed.load_duration,
+                        prompt_eval_nanos: parsed.prompt_eval_duration,
+                        eval_nanos: parsed.eval_duration,
+                        total_nanos: parsed.total_duration,
+                        wall_ms: wall.elapsed().as_millis() as u64,
                     };
                     self.warn_if_context_exhausted(model, num_ctx, &outcome);
+                    self.warn_if_slow_turn(model, &outcome);
                     return Ok(outcome);
                 }
             }
@@ -951,6 +1077,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         )
@@ -1017,6 +1144,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 500,
             },
         );
@@ -1080,6 +1208,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 500,
             },
         );
@@ -1185,6 +1314,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 500,
             },
         )
@@ -1286,6 +1416,59 @@ mod tests {
         assert_eq!(outcome.eval_tokens, None);
     }
 
+    /// Ollama's own timings, which for the whole life of this client were parsed by
+    /// nothing and dropped by serde. They are the only thing that can say whether a
+    /// slow run was a slow model or a busy device.
+    #[tokio::test]
+    async fn a_done_line_carries_the_turns_durations_through_to_the_outcome() {
+        let client = stub_ollama(&[
+            r#"{"message":{"role":"assistant","content":"hi"},"done":false}"#,
+            r#"{"message":{"content":""},"done":true,"eval_count":60,"load_duration":500000000,"prompt_eval_duration":300000000,"eval_duration":3000000000,"total_duration":3900000000}"#,
+        ])
+        .await;
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(outcome.load_nanos, Some(500_000_000));
+        assert_eq!(outcome.prompt_eval_nanos, Some(300_000_000));
+        assert_eq!(outcome.eval_nanos, Some(3_000_000_000));
+        assert_eq!(outcome.total_nanos, Some(3_900_000_000));
+        // 60 tokens over 3 s of generation, measured over generation time so that
+        // waiting shows up as unaccounted rather than dragging the rate down.
+        assert_eq!(outcome.tokens_per_second(), Some(20.0));
+        // Wall clock is measured, not scripted, so only the direction is assertable:
+        // it covers the whole request and cannot be less than what Ollama accounts
+        // for by more than rounding.
+        assert!(outcome.unaccounted_ms().is_some());
+    }
+
+    /// A zero `load_duration` is a fact — the model was already resident — so the
+    /// unknown case must not be spelled the same way.
+    #[tokio::test]
+    async fn a_done_line_without_durations_is_unknown_not_zero() {
+        let client =
+            stub_ollama(&[r#"{"message":{"role":"assistant","content":"hi"},"done":true}"#]).await;
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(outcome.load_nanos, None);
+        assert_eq!(outcome.eval_nanos, None);
+        assert_eq!(outcome.total_nanos, None);
+        assert_eq!(outcome.tokens_per_second(), None);
+        assert_eq!(outcome.unaccounted_ms(), None);
+    }
+
+    /// The threshold defaults to off, because a healthy rate is a fact about one
+    /// model on one host rather than about this code. Off must mean silent — not
+    /// "warn on everything below zero", which is how a float default goes wrong.
+    #[tokio::test]
+    async fn a_slow_turn_threshold_of_zero_never_warns() {
+        let client = stub_ollama(&[
+            r#"{"message":{"content":"x"},"done":true,"eval_count":2,"eval_duration":10000000000,"total_duration":10000000000}"#,
+        ])
+        .await;
+        // 0.2 tok/s — as slow as anything gets — and the default tuning is 0.0.
+        assert_eq!(client.tuning.slow_turn_tokens_per_second, 0.0);
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(outcome.tokens_per_second(), Some(0.2));
+    }
+
     #[tokio::test]
     async fn in_band_error_line_is_surfaced() {
         let client = stub_ollama(&[r#"{"error":"model 'nope' not found"}"#]).await;
@@ -1320,6 +1503,7 @@ mod tests {
                 max_num_ctx_tokens: 8192,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1347,6 +1531,7 @@ mod tests {
                 max_num_ctx_tokens: 2048,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1365,6 +1550,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         )
@@ -1401,6 +1587,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 500,
             },
         );
@@ -1419,6 +1606,7 @@ mod tests {
                 max_num_ctx_tokens: 32768,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 500,
             },
         );
@@ -1450,6 +1638,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1510,6 +1699,7 @@ mod tests {
                 // window, exactly as the config validation requires.
                 turn_timeout_ms: 30_000,
                 first_token_timeout_ms: 200,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1567,6 +1757,7 @@ mod tests {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 30_000,
                 first_token_timeout_ms: 200,
+                slow_turn_tokens_per_second: 0.0,
                 health_timeout_ms: 2000,
             },
         );

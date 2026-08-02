@@ -123,6 +123,13 @@ def _chunk(
         # reads them for its per-run token tally and truncation warning.
         payload["prompt_eval_count"] = 512
         payload["eval_count"] = 32
+        # Nanoseconds, as real Ollama reports them. Without these the server's
+        # throughput fields stay at zero and no integration test can see them —
+        # 32 tokens in 2 s is 16 tok/s, an unremarkable healthy rate.
+        payload["load_duration"] = 10_000_000
+        payload["prompt_eval_duration"] = 500_000_000
+        payload["eval_duration"] = 2_000_000_000
+        payload["total_duration"] = 2_600_000_000
     return _line(payload)
 
 

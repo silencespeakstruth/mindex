@@ -328,6 +328,7 @@ async fn main() -> Result<(), BoxError> {
                 max_num_ctx_tokens: cfg.research.max_num_ctx_tokens,
                 turn_timeout_ms: cfg.research.turn_timeout_ms,
                 first_token_timeout_ms: cfg.research.first_token_timeout_ms,
+                slow_turn_tokens_per_second: cfg.research.slow_turn_tokens_per_second,
                 health_timeout_ms: cfg.research.health_timeout_ms,
             },
         )

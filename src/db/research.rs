@@ -507,6 +507,7 @@ mod tests {
                 verified: 1,
                 path_only: 0,
                 unverified: 1,
+                path_resolved: 0,
                 stale: 1,
                 unverified_paths: vec!["src/nope.rs".into()],
                 stale_paths: vec!["src/gc.rs".into()],

@@ -1240,3 +1240,176 @@ Not done, deliberately: journalling failed/cancelled runs; a challenge MCP
 tool on the `mindex` server (scout owns it); mock_ollama integration coverage
 of the verdict turn (unit-level fakes cover the loop; add a scripted
 integration case when the next mock_ollama change is in flight anyway).
+
+## Three defects a control run found (2026-08-02)
+
+The corpus run was `ornith-vision:35b`, `medium`, scope of two files: 261 s,
+20 steps, 22/27 verified, `budget_exhausted`, `prompt_version: 2.3`. Five
+sections, all about the code — no heading named after a step of the plan, no
+paragraph about the route the run took, which is `PROMPT_VERSION` 2.3 working.
+What was left is three separate faults, in three separate layers.
+
+### A citation the parser accepted and the scorer refused
+
+Five of twenty-seven citations were `research.rs:5068-5291` where every tool
+had said `src/research.rs`. The instinct is to widen the parser; the parser was
+never the problem. `parse_citations` accepts a bare filename — relative path,
+extension present. What refused it was `Evidence::verdict`, an exact
+`HashMap::get` against paths spelled the way the tools spelled them, whose miss
+returns `Unverified` — the verdict reserved for *a path no tool this run
+returned*. So the complaint told a report it had invented a file it had just
+read, and did so in a bucket headed "check whether the file exists".
+
+Three things follow from that framing, and each shaped the fix:
+
+- The model did not learn from the complaint. It repeated the mistake inside
+  the section the citation repair had just made it rewrite — which is the
+  strongest evidence available that the message was not describing the defect.
+- No prompt ever said paths were repo-relative. The only place it is spelled
+  out is `format_ungrounded_complaint`, which fires only on a draft with
+  **zero** parseable citations — so a report full of bare filenames could never
+  reach the one message that would have explained itself. Fixed in
+  `REPORT_ROLE` *and* `section_request`: sectioned turns never see the former.
+- The reference was unambiguous. `research.rs` named exactly one file the run
+  had been shown, and identifying it is arithmetic, not interpretation.
+
+Hence `Evidence::match_path`: exact first, else the cited path as the **tail**
+of exactly one shown path (`/` prefix on the suffix is the entire
+segment-boundary rule), else nothing. Two candidates resolve to none and get a
+complaint bucket of their own, because "you named two files" has a remedy —
+add the directory — that "no tool returned this" does not.
+
+Three decisions inside it are load-bearing:
+
+**Resolution is a field on `Evidence`, not a step in `check_citations`.** Four
+call sites need the same answer and only two are `check_citations`: the
+complaint and `defective_sections` also ask for verdicts, and if they disagree
+with the counts the model is told to repair a citation the `citations` event
+just scored `verified`, and a section is rewritten for a defect that no longer
+exists.
+
+**Two spellings, never swapped.** Anything quoting the report keeps what the
+report wrote (`details`, `unverified_paths`, every complaint line — the model
+has to find its own string); anything asserting something about a file gets the
+resolved path (`cited_paths`, `stale_paths`, and above all
+`verified_locations`, which `collect_excerpts` reads code from — with the
+report's spelling `read_chunks_core` finds nothing and a resolved citation
+silently ships no code, quietly retiring the "the report cites, the server
+quotes" contract for exactly these citations). `is_stale` resolves too, or
+resolution admits precisely the citations whose staleness then goes
+unreported.
+
+**`citations.path_resolved` is not decoration.** `verified` changed meaning —
+from "spelled as a tool spelled it" to "names a path a tool returned,
+identified unambiguously from what the report wrote" — and a number that
+changes meaning without saying so is how a corpus silently improves. scout's
+`_INSTRUCTIONS` carry the new reading.
+
+The blocker this created, and how it was answered: `/verification` compares a
+re-check against counters journalled when the run finished, and
+`provenance_matches: false` is rendered in three places as *the journal or the
+reconstruction is wrong, report a bug*. Resolving an old row's bare filename
+flips `unverified: 1` to `verified: 1` and fires that alarm on perfectly
+healthy history. The endpoint now scores both ways
+(`recheck_citations` / `recheck_citations_exact`) and accepts either. The cost
+is exact: for a report carrying a resolvable bare filename the check can no
+longer tell the two scorings apart. Every other report — which is nearly all of
+them, and the two scorings are identical for those — is checked as strictly as
+before. Retire the second scoring when a resolved path is stored per citation,
+which wants a migration and did not earn one this round. Note the consequence
+until then: `research_run_citations` keeps the cited spelling, so a resolved
+row does not join to `research_run_evidence.path`.
+
+### Contention that looked like a broken model
+
+The other half of the field record: a run at ~1.5 tokens/s over 985 seconds.
+Nothing distinguished it from a wedged model, and nothing could have — Ollama
+reports `load_duration`, `prompt_eval_duration`, `eval_duration` and
+`total_duration` on its `done` line, and `ChatChunk` had serde fields for none
+of them. They were parsed by nobody and dropped in silence.
+
+They now ride on `ChatOutcome` in nanoseconds (`None` ≠ 0 — a zero
+`load_duration` is itself the fact that the model was resident), sum into
+`TokenTally` independently of the token counts (an Ollama reporting one half
+and not the other must still contribute the half it sent), and reach the wire
+as `generation_ms` / `model_load_ms` / `unaccounted_ms` /
+`eval_tokens_per_second` on `progress` and `done`.
+
+Two things about the shape:
+
+**The wall clock is not redundant with `total_duration`.** Ollama measures that
+inside its own handler, so the time a request spends queued behind another
+client's generation on the same GPU falls entirely outside it. During exactly
+the contention this exists to find, Ollama's own numbers look healthy. So one
+`Instant` per turn, started *before* `post_chat`, and `unaccounted_ms` =
+wall − total. Named for what it measures rather than what a large value means:
+it also holds HTTP, TLS and NDJSON parsing, so a small value is noise. The rate
+is over *generation* time, not wall clock, so that waiting appears in
+`unaccounted_ms` instead of being averaged into the rate and hidden.
+
+**Four fields, not one.** The precedent is `shares` beside `binding`: publish
+the numbers a claim rests on, then the claim. A bare `eval_tokens_per_second`
+cannot be checked, and it is precisely the number a reader will use to conclude
+the model is broken. If the set is ever cut, `model_load_ms` is the one to
+keep — non-zero after a run's first turn means Ollama evicted and reloaded the
+model mid-run, which is the tell that something else wanted the device.
+
+The `warn!` and the two histograms live in `ollama.rs` beside
+`warn_if_context_exhausted`: the one place holding the model name, the metrics
+handle and the timings at once, and already the place where a per-turn
+pathology invisible in the return value gets recorded. Threading a threshold
+through `ResearchParams` and ten `tally.record` call sites would buy the same
+sentence later. `research_turn_tokens_per_second` needs a `BARE` entry in the
+unit test — `_per_second` is not `_seconds`, and renaming it to satisfy the
+rule would name it after the wrong quantity.
+
+`[research].slow_turn_tokens_per_second` **defaults to 0 (off)**, and that is
+the honest default rather than a timid one: a healthy rate is a fact about one
+model on one host — 15 tok/s is fine for a 30B and alarming for a 7B — so a
+shipped number would be a guess made on the operator's behalf. Same argument as
+`temperature = None`. Read `mindex_research_turn_tokens_per_second` for a few
+runs, then set it under the healthy low end. Validation refuses both ends: a
+warning that cannot fire and one that always fires are equally useless, and the
+second buries the ones that matter.
+
+### A run with nothing of its own to say
+
+The third: a run at `steps: 0` restating the prior reports it was handed as its
+own findings. The server knew and said nothing.
+
+The ungrounded gate exempted it, correctly-looking: `evidence.paths()` empty
+means no tool showed the run a single file, so demanding a citation would be
+demanding a fabrication. But that exemption was written for a run with
+**nothing to say** — the scoped run that honestly cannot answer. A run holding
+prior reports (or a challenge subject) has somebody else's answer to hand, and
+the identical uncited prose is then that answer restated, cited to nothing, in
+the field callers are told to trust. On the wire the two were byte-for-byte
+identical.
+
+So the exemption is now `!evidence.paths().is_empty() || hearsay_only`, and
+everything downstream is reused unchanged — `citation_defects`, tools
+re-opening only on `Finalized`, the complaint push. Three details:
+
+- **The flag is computed in `research_inner`, not at the event site.**
+  `run_research` has only `content_paths` (paths with spans) while the gate
+  asks whether any path was *named*. Two different sets; the gate and the wire
+  must be one predicate, so it rides on `ResearchOutcome`.
+- **`hearsay_only` is not `shown_paths == 0`.** A run that called only
+  `list_files` has the zero without the flag. scout's admission rule now reads
+  the pair: `shown_paths: 0` remains the legitimate "re-ask with a wider scope"
+  exception *only* while the flag is false; with it true, widening the scope is
+  not the fix — the run never used the scope it had.
+- **`format_hearsay_complaint` is a separate function.**
+  `format_ungrounded_complaint` is, in its entirety, a list of the files some
+  tool showed the run, which here is empty; reusing it prints a heading over
+  nothing and then instructs the model to cite from a set with no members. Its
+  remedy is deliberately two-sided: "this run added nothing and the answer
+  rests on run N" is a legitimate and useful report. It just has to say so.
+
+Challenge runs are included in the flag. A challenge that looked at nothing and
+restated its subject is the same defect; the grounding cap already keeps its
+*verdict* safe, but nothing stopped the report shipping, and sending the draft
+back is the better outcome.
+
+`PROMPT_VERSION` 2.3 → 2.4 covers all three: the path clause in `REPORT_ROLE`
+and `section_request`, the ambiguity bucket, and the new complaint.

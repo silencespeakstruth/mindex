@@ -297,6 +297,10 @@ const DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS: usize = 2 * MIN_RESEARCH_MAX_TUR
 /// characters, so anything in the low thousands is a guard on ordinary thinking.
 /// Use `0` to disable rather than a small number.
 const MIN_RESEARCH_MAX_TURN_THINKING_CHARS: usize = 4096;
+/// Ceiling on `slow_turn_tokens_per_second`. No local model on any hardware this
+/// service targets generates a thousand tokens a second, so a threshold at or above
+/// it fires on every turn — and a warning that always fires is one nobody reads.
+const MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND: f64 = 1000.0;
 /// Floor on `report_timeout_ms`: below this the report turn cannot finish and every
 /// truncated run would ship the server-written notice instead of a real report.
 const MIN_RESEARCH_REPORT_TIMEOUT_MS: u64 = 5000;
@@ -525,6 +529,22 @@ pub struct ResearchConfig {
     /// Characters rather than tokens because that is what a delta carries — and it is
     /// the more model-neutral unit of the two, since tokenizers differ.
     pub max_turn_thinking_chars: usize,
+    /// Below this generation rate — tokens per second of Ollama's own
+    /// `eval_duration` — a turn is logged as contention. `0` disables it.
+    ///
+    /// The third member of the per-turn guard family, and the only one that does not
+    /// *stop* anything: it names a diagnosis. A run inching along at a token a second
+    /// is the same symptom as a broken model, a bad prompt and a wedged server, and
+    /// on a host whose GPU is shared with whatever else the operator is running, the
+    /// answer is usually none of those — one measured run spent 985 s at ~1.5 tok/s
+    /// with nothing anywhere able to say why.
+    ///
+    /// **Defaults to `0`, and that is the honest default.** A healthy rate is a fact
+    /// about one model on one host — 15 tok/s is fine for a 30B and alarming for a
+    /// 7B — so shipping a number would be guessing on the operator's behalf, exactly
+    /// as `temperature` declines to. Read `mindex_research_turn_tokens_per_second`
+    /// for a few runs, then set this under the low end of the healthy population.
+    pub slow_turn_tokens_per_second: f64,
     /// How long the report phase gets after the investigation ends, in milliseconds.
     ///
     /// A window of its own rather than a slice of `max_seconds`, because a run
@@ -977,6 +997,7 @@ impl Default for ResearchConfig {
             turn_timeout_ms: DEFAULT_RESEARCH_TURN_TIMEOUT_MS,
             first_token_timeout_ms: DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS,
             max_turn_thinking_chars: DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS,
+            slow_turn_tokens_per_second: 0.0,
             report_timeout_ms: DEFAULT_RESEARCH_REPORT_TIMEOUT_MS,
             checkpoint_every_steps: DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS,
             health_timeout_ms: DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS,
@@ -1910,6 +1931,21 @@ impl Config {
                 self.research.max_turn_thinking_chars
             ));
         }
+        // Both ends, because both make the log useless in opposite ways: a negative
+        // (or NaN) threshold is nonsense a float lets you write, and a threshold
+        // above what any local model reaches warns on every healthy turn — a warning
+        // that fires always is a warning nobody reads.
+        let slow = self.research.slow_turn_tokens_per_second;
+        if slow < 0.0 || slow.is_nan() || slow >= MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND {
+            e.push(format!(
+                "[research].slow_turn_tokens_per_second = {slow} is not a usable rate: it \
+                 must be at least 0 and below {MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND} \
+                 tokens/s, or every turn of a healthy run would be logged as \
+                 contention. Fix: set it just under the low end of what \
+                 mindex_research_turn_tokens_per_second shows for your model, or 0 to \
+                 disable the check (the default)."
+            ));
+        }
         if self.research.report_timeout_ms < MIN_RESEARCH_REPORT_TIMEOUT_MS {
             e.push(format!(
                 "[research].report_timeout_ms = {} leaves no time to write the report, so \
@@ -2165,6 +2201,33 @@ mod tests {
         // Zero is not a small number here, it is the off switch.
         let off = parse("[research.effort.low]\nmax_report_words = 0\n").expect("parses");
         off.validate().expect("0 switches the ceiling off");
+    }
+
+    /// A contention threshold is refused at both ends, and for the same reason each
+    /// way: a warning that cannot fire and a warning that always fires are equally
+    /// useless, and the second is worse because it buries the ones that matter.
+    #[test]
+    fn a_slow_turn_threshold_outside_the_usable_range_is_refused() {
+        for spelling in ["-1.0", "1000.0", "5000.0"] {
+            let cfg = parse(&format!(
+                "[research]\nslow_turn_tokens_per_second = {spelling}\n"
+            ))
+            .expect("parses");
+            let err = cfg.validate().expect_err("must be rejected");
+            assert!(
+                err.iter()
+                    .any(|m| m.contains("slow_turn_tokens_per_second")),
+                "{spelling}: {err:?}"
+            );
+        }
+        // Zero is the off switch and the shipped default — a healthy rate is a fact
+        // about one model on one host, so guessing one here would be worse than
+        // measuring it.
+        let off = parse("[research]\nslow_turn_tokens_per_second = 0\n").expect("parses");
+        off.validate().expect("0 disables the check");
+        assert_eq!(off.research.slow_turn_tokens_per_second, 0.0);
+        let set = parse("[research]\nslow_turn_tokens_per_second = 8.5\n").expect("parses");
+        set.validate().expect("a plausible rate is accepted");
     }
 
     /// The silence guard has to sit strictly between "long prompt evaluation" and
