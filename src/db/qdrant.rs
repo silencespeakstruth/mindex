@@ -370,3 +370,119 @@ impl VectorStore for QdrantStore {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    /// Two projects must never name the same collection — that is the outer half of
+    /// project isolation, the `has_id` candidate filter being the inner one. And the
+    /// name must be built from the **simple** (hyphen-less) form: it is what the
+    /// schema stores, what `collection_name` is handed by the metrics probe and the
+    /// GC sweep, and what `collection_for` derives for the search path. The two
+    /// spellings disagreeing would send a search to a collection nothing indexes
+    /// into — an empty result set, for ever, with no error anywhere.
+    #[test]
+    fn a_collection_is_named_from_the_simple_guid_and_the_schema_version() {
+        let guid = Uuid::parse_str("2f1c9a70-4d3e-4e9b-8b6a-1f2e3d4c5b6a").expect("a uuid");
+
+        assert_eq!(
+            collection_for(UUIDv4(guid)),
+            format!("2f1c9a704d3e4e9b8b6a1f2e3d4c5b6a_{COLLECTION_SCHEMA_VERSION}"),
+            "the hyphenated form must never reach a collection name"
+        );
+        assert_eq!(
+            collection_for(UUIDv4(guid)),
+            collection_name(&guid.as_simple().to_string()),
+            "the convenience wrapper and the raw builder must agree; the GC sweep \
+             and the metrics probe use one, the search path the other"
+        );
+    }
+
+    /// A name carries its schema version, which is what makes a bump a rename. That
+    /// is the *whole* mechanism — a bumped version names no existing collection, so
+    /// `ensure_collection` makes an empty one and every search answers 404 with no
+    /// error. Pinned so the suffix cannot quietly stop being part of the name.
+    #[test]
+    fn the_schema_version_is_part_of_every_collection_name() {
+        let name = collection_name("a".repeat(32).as_str());
+        assert!(
+            name.ends_with(&format!("_{COLLECTION_SCHEMA_VERSION}")),
+            "{name} carries no schema version, so a bump would silently reuse the \
+             old collection instead of naming a new one"
+        );
+        assert_eq!(name.len(), 32 + 1 + COLLECTION_SCHEMA_VERSION.len());
+    }
+
+    /// Distinct projects, distinct collections — including two guids differing in
+    /// one nibble, which is what a truncating or hashing name would collapse.
+    #[test]
+    fn distinct_projects_never_share_a_collection() {
+        let a = UUIDv4(Uuid::from_u128(1));
+        let b = UUIDv4(Uuid::from_u128(2));
+        assert_ne!(collection_for(a), collection_for(b));
+        // And the same project always names the same collection, or a reindex would
+        // write somewhere the search path never looks.
+        assert_eq!(collection_for(a), collection_for(a));
+    }
+
+    /// `count_points` is a **provided** method that declines by default, so every
+    /// fake in the tree opts out without a line of code. That is deliberate, and it
+    /// is also why `MeteredVectorStore` overriding it is load-bearing: a store that
+    /// declines publishes no `project_vectors` gauge at all, which is correct for a
+    /// fake and would silently disable the lost-volume detector in production.
+    #[tokio::test]
+    async fn the_default_count_declines_rather_than_answering_zero() {
+        struct Minimal;
+
+        #[async_trait]
+        impl VectorStore for Minimal {
+            async fn ensure_project(&self, _c: &str) -> Result<(), VectorStoreError> {
+                Ok(())
+            }
+            async fn insert_batch(
+                &self,
+                _c: &str,
+                _v: Vec<ChunkAsVector>,
+            ) -> Result<(), VectorStoreError> {
+                Ok(())
+            }
+            async fn delete_batch(
+                &self,
+                _c: &str,
+                _g: Vec<String>,
+            ) -> Result<(), VectorStoreError> {
+                Ok(())
+            }
+            async fn delete_collection(&self, _c: &str) -> Result<(), VectorStoreError> {
+                Ok(())
+            }
+            async fn health(&self) -> Result<(), VectorStoreError> {
+                Ok(())
+            }
+            async fn search(
+                &self,
+                _c: &str,
+                _ids: Vec<UUIDv4>,
+                _d: Vec<f32>,
+                _si: Vec<u32>,
+                _sv: Vec<f32>,
+                _cb: Vec<Vec<f32>>,
+                _k: u64,
+            ) -> Result<Vec<SearchHit>, VectorStoreError> {
+                Ok(vec![])
+            }
+        }
+
+        assert_eq!(
+            Minimal
+                .count_points("anything")
+                .await
+                .expect("declining is not an error"),
+            None,
+            "the default must decline, never answer zero — zero is the alarming \
+             value and would page somebody about a healthy index"
+        );
+    }
+}
