@@ -802,22 +802,69 @@ async fn send_axum_response(
     resp: Response<Body>,
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pump_response(resp, stream).await
+}
+
+/// The three things sending a response over h3 needs, so the frame pump above can be
+/// driven by something other than a live QUIC connection.
+///
+/// A `RequestStream` can only be obtained from an accepted h3 request, which made the
+/// one piece of logic on this path — *when* bytes go out — reachable only from an
+/// end-to-end test with a real client. That is precisely the piece that regressed:
+/// buffering the whole body raised no error and broke no test, it just stopped both
+/// SSE endpoints from streaming.
+trait ResponseSink {
+    async fn send_head(
+        &mut self,
+        head: Response<()>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn send_body(
+        &mut self,
+        data: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn finish(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+impl ResponseSink for RequestStream<h3_quinn::BidiStream<Bytes>, Bytes> {
+    async fn send_head(
+        &mut self,
+        head: Response<()>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        RequestStream::send_response(self, head).await?;
+        Ok(())
+    }
+    async fn send_body(
+        &mut self,
+        data: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        RequestStream::send_data(self, data).await?;
+        Ok(())
+    }
+    async fn finish(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        RequestStream::finish(self).await?;
+        Ok(())
+    }
+}
+
+/// Head first, then every body frame as it arrives, then finish.
+async fn pump_response<S: ResponseSink>(
+    resp: Response<Body>,
+    sink: &mut S,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use http_body_util::BodyExt as _;
 
     let (resp_parts, mut resp_body) = resp.into_parts();
-    stream
-        .send_response(Response::from_parts(resp_parts, ()))
-        .await?;
+    sink.send_head(Response::from_parts(resp_parts, ())).await?;
     // Trailers are dropped, as they were before: nothing this server emits uses them,
     // and h3's trailer API is a different call.
     while let Some(frame) = resp_body.frame().await {
         if let Ok(data) = frame?.into_data()
             && !data.is_empty()
         {
-            stream.send_data(data).await?;
+            sink.send_body(data).await?;
         }
     }
-    stream.finish().await?;
+    sink.finish().await?;
     Ok(())
 }
 
@@ -828,6 +875,7 @@ mod tests {
     use crate::backend::metrics::Metrics;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    use std::time::Duration;
 
     /// A router carrying only the metrics layer, so these tests exercise the
     /// middleware rather than the service.
@@ -845,6 +893,192 @@ mod tests {
                     async move { record_request(metrics, per_project, req, next).await }
                 },
             ))
+    }
+
+    /// Records what reached the wire and when, in place of a QUIC stream.
+    #[derive(Default)]
+    struct RecordingSink {
+        head: Option<axum::http::StatusCode>,
+        frames: Vec<Bytes>,
+        finished: bool,
+        /// Notified after each body frame, so a test can observe bytes leaving
+        /// *before* the producer has finished writing.
+        sent: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl ResponseSink for RecordingSink {
+        async fn send_head(
+            &mut self,
+            head: Response<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            assert!(self.head.is_none(), "the head was sent twice");
+            assert!(self.frames.is_empty(), "a body frame preceded the head");
+            self.head = Some(head.status());
+            Ok(())
+        }
+        async fn send_body(
+            &mut self,
+            data: Bytes,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            assert!(self.head.is_some(), "a body frame preceded the head");
+            assert!(!self.finished, "a body frame followed finish()");
+            self.frames.push(data);
+            if let Some(n) = &self.sent {
+                n.notify_one();
+            }
+            Ok(())
+        }
+        async fn finish(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    /// The regression that removed streaming over h3 and broke no test: the body was
+    /// collected in full before the first `send_data`, so `/index?stream=yes` and
+    /// `/research` showed the client nothing until the run ended — up to seventy
+    /// minutes for a `high` research run — while the whole event history accumulated
+    /// in memory with no bound.
+    ///
+    /// The test holds the body open: if the pump buffers, this deadlocks at the
+    /// timeout instead of seeing the first frame.
+    #[tokio::test]
+    async fn a_body_frame_reaches_the_wire_before_the_body_is_finished() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        let body = Body::from_stream(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
+        let resp = Response::builder().status(200).body(body).expect("builds");
+
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let sink = Arc::new(tokio::sync::Mutex::new(RecordingSink {
+            sent: Some(Arc::clone(&sent)),
+            ..Default::default()
+        }));
+
+        let pump = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut guard = sink.lock().await;
+                pump_response(resp, &mut *guard).await
+            })
+        };
+
+        // One event, and the producer deliberately does not finish.
+        tx.send(Ok(Bytes::from_static(b"event: started\n\n")))
+            .expect("send");
+
+        tokio::time::timeout(Duration::from_secs(2), sent.notified())
+            .await
+            .expect(
+                "no frame reached the wire while the body was still open — the response \
+                 is being buffered, so neither SSE endpoint streams over h3",
+            );
+
+        // Now close the body and let the pump finish.
+        tx.send(Ok(Bytes::from_static(b"event: done\n\n")))
+            .expect("send");
+        drop(tx);
+        pump.await.expect("joins").expect("pump succeeds");
+
+        let done = sink.lock().await;
+        assert_eq!(done.head, Some(axum::http::StatusCode::OK));
+        assert_eq!(
+            done.frames,
+            vec![
+                Bytes::from_static(b"event: started\n\n"),
+                Bytes::from_static(b"event: done\n\n"),
+            ],
+            "frames must arrive separately and in order, not concatenated into one"
+        );
+        assert!(done.finished, "the stream was never finished");
+    }
+
+    /// An ordinary buffered response — every non-SSE endpoint — must still send its
+    /// head, its bytes and a finish, in that order.
+    #[tokio::test]
+    async fn a_plain_response_sends_head_then_body_then_finish() {
+        let resp = Response::builder()
+            .status(404)
+            .body(Body::from("not found"))
+            .expect("builds");
+
+        let mut sink = RecordingSink::default();
+        pump_response(resp, &mut sink).await.expect("pump succeeds");
+
+        assert_eq!(sink.head, Some(axum::http::StatusCode::NOT_FOUND));
+        assert_eq!(sink.frames, vec![Bytes::from_static(b"not found")]);
+        assert!(sink.finished);
+    }
+
+    /// A response with no body at all — a 204, or the shutdown path — must still be
+    /// finished, or the client waits for bytes that are never coming.
+    #[tokio::test]
+    async fn an_empty_response_is_still_finished() {
+        let resp = Response::builder()
+            .status(204)
+            .body(Body::empty())
+            .expect("builds");
+
+        let mut sink = RecordingSink::default();
+        pump_response(resp, &mut sink).await.expect("pump succeeds");
+
+        assert_eq!(sink.head, Some(axum::http::StatusCode::NO_CONTENT));
+        assert!(sink.frames.is_empty(), "an empty body sent bytes");
+        assert!(sink.finished, "an empty response was never finished");
+    }
+
+    /// A zero-length frame is skipped rather than sent: h3 treats an empty DATA frame
+    /// as a protocol oddity, and axum's stream bodies do produce them.
+    #[tokio::test]
+    async fn empty_frames_are_skipped_but_do_not_end_the_response() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        for chunk in [b"a".as_slice(), b"", b"b"] {
+            tx.send(Ok(Bytes::copy_from_slice(chunk))).expect("send");
+        }
+        drop(tx);
+        let resp = Response::builder()
+            .status(200)
+            .body(Body::from_stream(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+            .expect("builds");
+
+        let mut sink = RecordingSink::default();
+        pump_response(resp, &mut sink).await.expect("pump succeeds");
+
+        assert_eq!(
+            sink.frames,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            "an empty frame either reached the wire or truncated the response"
+        );
+        assert!(sink.finished);
+    }
+
+    /// A body that errors mid-stream — the shape a panicking detached job takes —
+    /// must surface as an error rather than a quietly short response the client
+    /// reads as complete.
+    #[tokio::test]
+    async fn a_body_that_fails_midway_is_an_error_not_a_short_response() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        tx.send(Ok(Bytes::from_static(b"first"))).expect("send");
+        tx.send(Err(std::io::Error::other("the job died")))
+            .expect("send");
+        drop(tx);
+        let resp = Response::builder()
+            .status(200)
+            .body(Body::from_stream(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+            .expect("builds");
+
+        let mut sink = RecordingSink::default();
+        let res = pump_response(resp, &mut sink).await;
+
+        assert!(res.is_err(), "a failed body was reported as a clean send");
+        assert_eq!(sink.frames, vec![Bytes::from_static(b"first")]);
+        assert!(
+            !sink.finished,
+            "a truncated response was finished, so the client reads it as complete"
+        );
     }
 
     fn sample(metrics: &Metrics, needle: &str) -> Option<String> {

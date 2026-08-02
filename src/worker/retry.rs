@@ -1135,4 +1135,259 @@ mod tests {
             "retry must not resurrect a cancelled file"
         );
     }
+
+    /// One corrupt chunk among good ones is skipped and the file completes. **Every**
+    /// chunk corrupt is a different answer: embedding nothing and calling it `indexed`
+    /// would hide the corruption behind a file that hash-skips for ever while search
+    /// can never find it. The file must stay `failed` for an operator to re-push.
+    #[tokio::test]
+    async fn a_file_whose_every_chunk_is_corrupt_stays_failed_rather_than_indexed() {
+        let pool = pool_with_failed_file(0).await;
+        pool.transaction(CancellationToken::new(), |tx| {
+            for _ in 0..3 {
+                tx.execute(
+                    "INSERT INTO project_file_chunks
+                         (project_guid, file_path, model_id, code, qdrant_guid,
+                          start_line, end_line, start_column, end_column, status)
+                     VALUES (?1, ?2, ?3, 'code', ?4, 1, 2, 0, 1, 'active')",
+                    params![PG, PATH, MODEL, "z".repeat(32)],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let store = Store {
+            fail_upsert: false,
+            upserted: std::sync::Mutex::new(vec![]),
+        };
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let outcome = retry_file(
+            &pool,
+            &store,
+            &OkEmbedder,
+            PG,
+            PATH,
+            MODEL,
+            TEST_EMBED,
+            &locks,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, "corrupt_guid");
+        assert_eq!(
+            current(&pool).await.0,
+            "failed",
+            "a file with nothing embeddable was marked indexed, hiding the corruption"
+        );
+        assert!(
+            store.upserted.lock().unwrap().is_empty(),
+            "nothing may be upserted when every chunk's guid is corrupt"
+        );
+    }
+
+    /// A file with zero active chunks *and* zero corrupt ones is the legitimate
+    /// "sliced to nothing" case, and must reach `indexed` — `failed → indexed` is an
+    /// illegal transition, so a wrong `failed` here would trap the file for ever. This
+    /// is the boundary against the test above: same empty embed list, opposite verdict,
+    /// and the only thing separating them is whether chunks existed at all.
+    #[tokio::test]
+    async fn a_file_that_sliced_to_nothing_is_indexed_not_failed() {
+        let pool = pool_with_failed_file(0).await;
+        let store = Store {
+            fail_upsert: false,
+            upserted: std::sync::Mutex::new(vec![]),
+        };
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+
+        let outcome = retry_file(
+            &pool,
+            &store,
+            &OkEmbedder,
+            PG,
+            PATH,
+            MODEL,
+            TEST_EMBED,
+            &locks,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, "zero_chunk");
+        assert_eq!(current(&pool).await.0, "indexed");
+    }
+
+    /// Every way the embed pass can fail must land the file in `failed` with its
+    /// retry count bumped — never `indexed`, and never left in `indexing` where only
+    /// the stuck-grace sweep would find it. The variants exist so the *log* says which
+    /// dependency to look at; the *file* must end up in the same place regardless.
+    #[tokio::test]
+    async fn every_embed_failure_leaves_the_file_failed_and_counted() {
+        /// Fails `encode` with a chosen variant.
+        struct FailingEmbedder {
+            how: &'static str,
+        }
+
+        #[async_trait]
+        impl BGEm3Model for FailingEmbedder {
+            async fn encode(
+                &self,
+                req: BGEm3EmbedRequest,
+                _token: CancellationToken,
+            ) -> Result<BGEm3EmbedResponse, EncodeError> {
+                match self.how {
+                    "timeout" => Err(EncodeError::Timeout(std::time::Duration::from_secs(600))),
+                    "decode" => Err(EncodeError::Decode("bad magic".into())),
+                    // The misalignment `embed_and_upsert` now catches: a well-formed
+                    // reply with the wrong number of rows. It must reach the worker as
+                    // a failure rather than silently indexing a file with no vectors.
+                    "misaligned" => Ok(BGEm3EmbedResponse {
+                        dense_vecs: vec![vec![0.1; 4]; req.texts.len() - 1],
+                        sparse_vecs: vec![HashMap::from([(1u32, 0.5f32)]); req.texts.len()],
+                        colbert_vecs: vec![vec![vec![0.1; 4]]; req.texts.len()],
+                    }),
+                    other => unreachable!("unknown failure mode {other}"),
+                }
+            }
+            async fn health(&self) -> Result<(), EncodeError> {
+                unreachable!()
+            }
+        }
+
+        for how in ["timeout", "decode", "misaligned"] {
+            let pool = pool_with_failed_file(2).await;
+            let (_, before) = current(&pool).await;
+            let store = Store {
+                fail_upsert: false,
+                upserted: std::sync::Mutex::new(vec![]),
+            };
+            let locks = Arc::new(Mutex::new(HashSet::new()));
+
+            let outcome = retry_file(
+                &pool,
+                &store,
+                &FailingEmbedder { how },
+                PG,
+                PATH,
+                MODEL,
+                TEST_EMBED,
+                &locks,
+                &CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(outcome, "failed", "{how} did not report a failure");
+            let (status, retries) = current(&pool).await;
+            assert_eq!(status, "failed", "{how} did not leave the file failed");
+            assert_eq!(
+                retries,
+                before + 1,
+                "{how} did not bump the retry count, so the file would be retried for ever"
+            );
+            assert!(
+                store.upserted.lock().unwrap().is_empty(),
+                "{how} upserted vectors for a batch that failed"
+            );
+        }
+    }
+
+    /// A cancelled sweep — a shutdown mid-retry — is not a failure of the file. The
+    /// retry count must not be bumped for it, or a service restarted often enough
+    /// would burn a file's whole `MAX_RETRIES` budget without a single real attempt
+    /// and strand it in `failed` for ever.
+    #[tokio::test]
+    async fn a_shutdown_mid_retry_does_not_spend_the_files_retry_budget() {
+        /// Cancels the token as it is called, then reports the cancellation.
+        struct CancellingEmbedder {
+            token: CancellationToken,
+        }
+
+        #[async_trait]
+        impl BGEm3Model for CancellingEmbedder {
+            async fn encode(
+                &self,
+                _req: BGEm3EmbedRequest,
+                _token: CancellationToken,
+            ) -> Result<BGEm3EmbedResponse, EncodeError> {
+                self.token.cancel();
+                Err(EncodeError::Cancelled)
+            }
+            async fn health(&self) -> Result<(), EncodeError> {
+                unreachable!()
+            }
+        }
+
+        let pool = pool_with_failed_file(2).await;
+        let (_, before) = current(&pool).await;
+        let token = CancellationToken::new();
+        let store = Store {
+            fail_upsert: false,
+            upserted: std::sync::Mutex::new(vec![]),
+        };
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+
+        retry_file(
+            &pool,
+            &store,
+            &CancellingEmbedder {
+                token: token.clone(),
+            },
+            PG,
+            PATH,
+            MODEL,
+            TEST_EMBED,
+            &locks,
+            &token,
+        )
+        .await;
+
+        let (_, after) = current(&pool).await;
+        assert_eq!(
+            after, before,
+            "a shutdown was charged to the file as a failed attempt"
+        );
+    }
+
+    /// The claim is released whichever way the retry ends, or the file becomes
+    /// permanently un-retryable *and* un-indexable: every later sweep and every
+    /// `/index` for it is refused, silently, for the life of the process.
+    #[tokio::test]
+    async fn the_claim_is_released_on_every_exit_path() {
+        let key = indexing_lock_key(PG, MODEL, PATH);
+
+        // (setup, expected outcome) for each distinct way out of `retry_file`.
+        for chunks in [0usize, 2] {
+            let pool = pool_with_failed_file(chunks).await;
+            let store = Store {
+                fail_upsert: chunks > 0, // force the failure path when there is work
+                upserted: std::sync::Mutex::new(vec![]),
+            };
+            let locks = Arc::new(Mutex::new(HashSet::new()));
+
+            retry_file(
+                &pool,
+                &store,
+                &OkEmbedder,
+                PG,
+                PATH,
+                MODEL,
+                TEST_EMBED,
+                &locks,
+                &CancellationToken::new(),
+            )
+            .await;
+
+            assert!(
+                IndexClaim::try_acquire(&locks, key.clone()).is_some(),
+                "the retry worker kept the claim after finishing ({chunks} chunks); \
+                 this file can never be indexed again"
+            );
+            assert!(
+                locks.lock().unwrap().len() <= 1,
+                "the lock table is accumulating keys"
+            );
+        }
+    }
 }
