@@ -5,9 +5,14 @@
  * what it is sent and reports what the user did. Nothing here re-renders the page
  * wholesale — the search box holds a half-typed query and the list holds a
  * multi-click selection, and both would be discarded.
+ *
+ * **No reading pane.** Opening a run expands its row in place with the things a
+ * one-line row cannot carry — provenance, ancestry, the files that have moved
+ * under it, and the actions — and the report itself opens as a Markdown tab. The
+ * pane this replaces rendered the report beside a 24rem list, which is a worse
+ * copy of the tab and cost the list the width its own content needed.
  */
 
-import { marked } from "marked";
 import {
     bulkSelectionNote,
     challengeBadge,
@@ -122,12 +127,12 @@ const completenessBox = el<HTMLSelectElement>("runs-completeness");
 const refreshBtn = el<HTMLButtonElement>("runs-refresh");
 const countsBox = el("runs-counts");
 const selectAllBtn = el<HTMLButtonElement>("runs-select-all");
-const presetOutdatedBtn = el<HTMLButtonElement>("runs-preset-outdated");
-const presetPartialBtn = el<HTMLButtonElement>("runs-preset-partial");
 const gcBtn = el<HTMLButtonElement>("runs-gc");
 const gcLabel = el("runs-gc-label");
 const list = el<HTMLUListElement>("runs-items");
 const empty = el("runs-empty");
+const emptyTitle = el("runs-empty-title");
+const emptyHint = el("runs-empty-hint");
 const errorBox = el("runs-error");
 
 function clearError(): void {
@@ -141,23 +146,61 @@ const useBtn = el<HTMLButtonElement>("runs-use");
 const useLabel = el("runs-use-label");
 const deleteBtn = el<HTMLButtonElement>("runs-delete");
 const deleteLabel = el("runs-delete-label");
-const preview = el("runs-preview");
-
-/** What the right pane shows when nothing is open. */
-const PREVIEW_PLACEHOLDER = "Select a run to read its report.";
+const gcView = el("runs-gc-view");
+const footBar = document.querySelector<HTMLElement>(".runs-foot");
 
 let selected = new Set<string>();
+/** The run whose row is expanded, if any. Not the selection — that is `selected`. */
 let activeId: string | undefined;
 /** Whether the current selection was built by a filter rather than by clicking. */
 let bulkSelection = false;
 /** The truncation sentence the footer appends while a bulk selection stands. */
 let bulkNote: string | undefined;
 /**
- * The GC review currently open in the right pane, if any. Held so `Cancel` can
- * restore whatever the user was reading, rather than dropping them on the
- * placeholder as though the report had been deleted.
+ * Whether the garbage-collection review has the panel.
+ *
+ * It takes the whole surface — it is a decision about the corpus, not a detail of
+ * one row — so the list, its footer and the empty note step aside while it is up,
+ * and `Cancel` puts them back untouched, expanded row and all.
  */
 let gcOpen = false;
+
+function setGcOpen(open: boolean): void {
+    gcOpen = open;
+    gcView.hidden = !open;
+    list.hidden = open;
+    if (footBar !== null) {
+        footBar.hidden = open;
+    }
+    if (open) {
+        empty.hidden = true;
+    } else {
+        gcView.replaceChildren();
+        renderEmpty();
+    }
+}
+
+/**
+ * The empty middle of the panel — and *which* empty it is.
+ *
+ * "Nothing is stored" and "nothing matched what you asked for" call for
+ * different next moves (ask a question / widen the filter), and one sentence
+ * covering both is the one that helps with neither. The discriminator is the
+ * controls themselves: a query or any select off `all`.
+ */
+function renderEmpty(): void {
+    empty.hidden = gcOpen || list.childElementCount > 0;
+    if (empty.hidden) {
+        return;
+    }
+    const filtered =
+        searchBox.value.trim() !== "" ||
+        [freshnessBox, validityBox, kindBox, completenessBox].some((b) => b.value !== "all");
+    emptyTitle.textContent = filtered ? "Nothing found" : "No research yet";
+    emptyHint.textContent = filtered
+        ? "No stored report matches this search and these filters."
+        : "Ask a question from the Ask sidebar — a run is stored when it finishes.";
+}
 /**
  * The rows currently rendered, by id. The host keeps the authoritative copy; this
  * one exists so the footer can say *why* a selection cannot be used as context
@@ -218,12 +261,6 @@ completenessBox.addEventListener("change", sendSearch);
 // the webview owns it and the host needs to know which preview to re-fetch.
 refreshBtn.addEventListener("click", () => api.postMessage({ type: "refresh", activeId }));
 selectAllBtn.addEventListener("click", () => api.postMessage({ type: "selectAllMatching" }));
-presetOutdatedBtn.addEventListener("click", () =>
-    api.postMessage({ type: "preset", preset: "outdated" })
-);
-presetPartialBtn.addEventListener("click", () =>
-    api.postMessage({ type: "preset", preset: "partial" })
-);
 gcBtn.addEventListener("click", () => api.postMessage({ type: "gcPropose" }));
 moreBtn.addEventListener("click", () => api.postMessage({ type: "more" }));
 useBtn.addEventListener("click", () => api.postMessage({ type: "useAsContext" }));
@@ -254,14 +291,34 @@ function badge(text: string, kind: string, title: string): HTMLSpanElement {
     return span;
 }
 
-/** Open a run in the right pane, from a row click or a subject link. */
+/** The `<li>` of one run, if it is on the current page. */
+function rowOf(id: string): HTMLElement | null {
+    return list.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
+}
+
+/**
+ * Expand a run's row, from a row click or a subject link.
+ *
+ * Only one is open at a time: two expanded rows would push the list around while
+ * the reader is still deciding, and the panel keeps exactly one `activeId` that
+ * the host's `preview`, `challengeState` and `verification` messages all key on.
+ */
 function selectRun(id: string): void {
+    closeDetail();
     activeId = id;
-    for (const other of list.querySelectorAll(".runs-item")) {
-        other.classList.toggle("selected-row", (other as HTMLElement).dataset.id === id);
-    }
+    rowOf(id)?.classList.add("open");
     save();
     api.postMessage({ type: "select", id });
+}
+
+/** Collapse whatever is open, leaving the selection alone. */
+function closeDetail(): void {
+    for (const open of list.querySelectorAll(".runs-item.open")) {
+        open.classList.remove("open");
+        open.querySelector(".runs-detail")?.remove();
+    }
+    activeId = undefined;
+    save();
 }
 
 /** A meta-row link from a challenge to the report it attacked. */
@@ -308,7 +365,7 @@ function renderRow(run: RunSummary): HTMLLIElement {
     li.className = "runs-item";
     li.dataset.id = run.id;
     if (run.id === activeId) {
-        li.classList.add("selected-row");
+        li.classList.add("open");
     }
 
     const check = document.createElement("input");
@@ -483,8 +540,19 @@ function renderRow(run: RunSummary): HTMLLIElement {
         )
     );
 
-    li.append(check, body, actions);
-    li.addEventListener("click", () => selectRun(run.id));
+    const head = document.createElement("div");
+    head.className = "runs-row";
+    head.append(check, body, actions);
+    // Clicking the open row closes it. Without that the only way out of an
+    // expanded row is to open a different one, which is not a way out.
+    head.addEventListener("click", () => {
+        if (activeId === run.id) {
+            closeDetail();
+        } else {
+            selectRun(run.id);
+        }
+    });
+    li.appendChild(head);
     return li;
 }
 
@@ -548,31 +616,40 @@ function renderCounts(totals: CorpusTotalsLike | undefined, legacy: boolean): vo
     setEnabled(selectAllBtn, (totals?.total ?? 0) > 0 || legacy);
 }
 
-/** Return the right pane to its placeholder. */
-function clearPreview(): void {
-    preview.replaceChildren();
-    const p = document.createElement("p");
-    p.className = "runs-placeholder dim";
-    p.textContent = PREVIEW_PLACEHOLDER;
-    preview.appendChild(p);
-}
-
+/**
+ * The expanded row: everything about a run except its report.
+ *
+ * Built into the `<li>` it belongs to rather than into a pane, so the answer sits
+ * under the question the user clicked. If the row is no longer on the page — a
+ * filter moved under an in-flight fetch — the detail is simply dropped: there is
+ * nowhere honest to put it.
+ */
 function renderDetail(run: RunDetail): void {
-    preview.replaceChildren();
+    const row = rowOf(run.id);
+    if (row === null) {
+        return;
+    }
+    closeDetail();
+    activeId = run.id;
+    row.classList.add("open");
+    save();
 
     const head = document.createElement("div");
-    head.className = "runs-detail-head";
-    const h = document.createElement("h3");
-    h.textContent = `#${run.seq} — ${run.question}`;
+    head.className = "runs-detail";
+    const h = document.createElement("h4");
+    h.textContent = run.question;
     head.appendChild(h);
 
     const openTab = document.createElement("button");
     openTab.className = "secondary";
     openTab.append(icon("go-to-file", true), document.createTextNode(" Open in a tab"));
     openTab.title =
-        "Open this report as a Markdown document, so it can sit beside the code it " +
-        "describes.";
-    openTab.addEventListener("click", () => api.postMessage({ type: "openRun", id: run.id }));
+        "Read the report as a Markdown document, so it can sit beside the code it " +
+        "describes. This panel deliberately does not render it.";
+    openTab.addEventListener("click", (e) => {
+        e.stopPropagation();
+        api.postMessage({ type: "openRun", id: run.id });
+    });
     const reAsk = document.createElement("button");
     reAsk.className = "secondary";
     reAsk.append(icon("debug-restart", true), document.createTextNode(" Ask again"));
@@ -580,14 +657,17 @@ function renderDetail(run: RunDetail): void {
         "Put this question back in the form with its scope and settings, and this " +
         "report as context — the usual way to follow one up.";
     reAsk.dataset.busyKey = "preview";
-    reAsk.addEventListener("click", () => api.postMessage({ type: "reAsk", id: run.id }));
+    reAsk.addEventListener("click", (e) => {
+        e.stopPropagation();
+        api.postMessage({ type: "reAsk", id: run.id });
+    });
     const headActions = document.createElement("div");
-    headActions.className = "row";
+    headActions.className = "runs-detail-actions";
     headActions.append(openTab, reAsk);
     head.appendChild(headActions);
 
     const meta = document.createElement("div");
-    meta.className = "dim";
+    meta.className = "dim runs-verify-line";
     const parts = [
         run.model,
         run.effort,
@@ -603,7 +683,7 @@ function renderDetail(run: RunDetail): void {
 
     if (run.done_reason !== "finalized") {
         const warn = document.createElement("p");
-        warn.className = "dim";
+        warn.className = "dim runs-verify-line";
         warn.textContent =
             `This run was stopped (${run.done_reason}) rather than finishing, so the ` +
             "report rests on partial evidence.";
@@ -685,12 +765,10 @@ function renderDetail(run: RunDetail): void {
         }
         head.appendChild(ul);
     }
-    preview.appendChild(head);
-
-    const report = document.createElement("div");
-    report.className = "runs-report";
-    report.innerHTML = marked.parse(run.report) as string;
-    preview.appendChild(report);
+    // The report is NOT rendered here — "Open in a tab" above is the whole
+    // reading surface, and a second, worse copy of it is what this panel dropped.
+    row.appendChild(head);
+    paintBusy(head);
 }
 
 /**
@@ -846,8 +924,8 @@ function renderChallengeState(holder: HTMLElement, state: ChallengeState): void 
  * being read; it is a review, not a mode.
  */
 function renderGc(proposed: GcRow[], expected: number | null): void {
-    gcOpen = true;
-    preview.replaceChildren();
+    setGcOpen(true);
+    gcView.replaceChildren();
     const checks = new Map<string, HTMLInputElement>();
 
     const head = document.createElement("div");
@@ -858,7 +936,7 @@ function renderGc(proposed: GcRow[], expected: number | null): void {
     note.className = "runs-gc-note";
     note.textContent = gcProposalNote(proposed.length, expected ?? undefined);
     head.append(h, note);
-    preview.appendChild(head);
+    gcView.appendChild(head);
 
     const deleteBtnGc = document.createElement("button");
     const updateCount = (): void => {
@@ -951,7 +1029,7 @@ function renderGc(proposed: GcRow[], expected: number | null): void {
             ul.appendChild(li);
         }
         group.appendChild(ul);
-        preview.appendChild(group);
+        gcView.appendChild(group);
     }
 
     const foot = document.createElement("div");
@@ -968,16 +1046,11 @@ function renderGc(proposed: GcRow[], expected: number | null): void {
     const cancel = document.createElement("button");
     cancel.className = "secondary";
     cancel.textContent = "Cancel";
-    cancel.addEventListener("click", () => {
-        gcOpen = false;
-        if (activeId === undefined) {
-            clearPreview();
-        } else {
-            api.postMessage({ type: "select", id: activeId });
-        }
-    });
+    // A review, not a mode: cancelling puts the list back exactly as it was,
+    // including whichever row was expanded.
+    cancel.addEventListener("click", () => setGcOpen(false));
     foot.append(deleteBtnGc, cancel);
-    preview.appendChild(foot);
+    gcView.appendChild(foot);
     updateCount();
 }
 
@@ -1048,11 +1121,20 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             // Rows are rebuilt constantly; without this a row rendered during an
             // in-flight delete is the one live button on a frozen page.
             paintBusy(list);
-            const total = list.childElementCount;
-            empty.hidden = total > 0;
+            renderEmpty();
             moreBtn.hidden = msg.nextBeforeSeq === null || msg.nextBeforeSeq === undefined;
             refreshFooter();
             save();
+            // The expanded row is attached to a `<li>`, so a list that arrives
+            // *after* its detail did — a reload restoring `activeId`, a refresh —
+            // has the row back but not what was open in it. Ask again; the row
+            // being present is what makes this terminate.
+            if (activeId !== undefined) {
+                const row = rowOf(activeId);
+                if (row !== null && row.querySelector(".runs-detail") === null) {
+                    api.postMessage({ type: "select", id: activeId });
+                }
+            }
             break;
         }
         case "totals":
@@ -1061,28 +1143,17 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
                 msg.legacy === true
             );
             break;
-        case "filters":
-            // The host echoes a preset back so the four selects move with it. A
-            // shortcut that left the controls disagreeing with the list would be a
-            // second, invisible filter.
-            freshnessBox.value = String(msg.freshness);
-            validityBox.value = String(msg.validity);
-            kindBox.value = String(msg.kind);
-            completenessBox.value = String(msg.completeness);
-            save();
-            break;
         case "gc":
             renderGc((msg.rows ?? []) as GcRow[], (msg.expected ?? null) as number | null);
-            paintBusy(preview);
+            paintBusy(gcView);
             break;
         case "preview":
-            gcOpen = false;
+            setGcOpen(false);
             renderDetail(msg.run as RunDetail);
-            paintBusy(preview);
             break;
         case "challengeState": {
-            // Async enrichment of the open preview. A stale answer (the user has
-            // already clicked another row) must not paint over the newer pane.
+            // Async enrichment of the open row. A stale answer (the user has
+            // already clicked another row) must not paint over the newer one.
             if (msg.runId !== activeId || gcOpen) {
                 break;
             }
@@ -1130,18 +1201,17 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
                 ? (msg.ids as unknown[]).map(String)
                 : [String(msg.id)];
             for (const id of ids) {
+                // The row carries its own expanded detail now, so removing it
+                // takes the detail with it — but `activeId` must still be let go,
+                // or the next `challengeState` would key on a run that is gone.
                 list.querySelector(`[data-id="${CSS.escape(id)}"]`)?.remove();
                 selected.delete(id);
                 rows.delete(id);
-                // The report on the right outlives its row otherwise: a deleted run
-                // stayed fully rendered, with `activeId` pointing at an id nothing
-                // could resolve, and the next render highlighted no row at all.
                 if (activeId === id) {
                     activeId = undefined;
-                    clearPreview();
                 }
             }
-            empty.hidden = list.childElementCount > 0;
+            renderEmpty();
             refreshFooter();
             save();
             break;

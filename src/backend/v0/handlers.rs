@@ -6476,6 +6476,8 @@ fn research_totals_sql() -> String {
         "{ctes}
          SELECT COUNT(*),
                 SUM(inv = 0),
+                SUM(r.kind = 'challenge'),
+                SUM(m.files_moved > 0),
                 SUM(unpinned AND (inv = 1 OR m.files_moved > 0
                                   OR r.done_reason <> 'finalized'
                                   OR (r.kind = 'challenge'
@@ -6503,11 +6505,13 @@ fn research_totals_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Researc
     Ok(ResearchCorpusTotals {
         total: row.get(0)?,
         current: n(1)?,
-        gc_candidates: n(2)?,
-        gc_invalid: n(3)?,
-        gc_stale: n(4)?,
-        gc_partial: n(5)?,
-        gc_inconclusive: n(6)?,
+        challenges: n(2)?,
+        stale: n(3)?,
+        gc_candidates: n(4)?,
+        gc_invalid: n(5)?,
+        gc_stale: n(6)?,
+        gc_partial: n(7)?,
+        gc_inconclusive: n(8)?,
     })
 }
 
@@ -8299,6 +8303,10 @@ mod tests {
             assert_eq!(t.total, 4, "every run of the project, of either kind");
             // `both` has a moved baseline file, so it is the only invalid one.
             assert_eq!(t.current, 3);
+            assert_eq!(t.challenges, 1, "only `incon`");
+            // Pinned included, unlike `gc_stale`: this one is a denominator, not a
+            // delete proposal, and exempting pinned runs would under-report drift.
+            assert_eq!(t.stale, 1, "only `both`");
             assert_eq!(t.gc_invalid, 1, "only `both`");
             assert_eq!(t.gc_stale, 1, "only `both`");
             assert_eq!(t.gc_partial, 1, "`both`; `kept` is pinned");

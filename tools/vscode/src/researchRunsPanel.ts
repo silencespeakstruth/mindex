@@ -69,14 +69,17 @@ const FALLBACK_MAX_DELETE = 500;
 const MAX_PAGES = 64;
 
 /**
- * Research History: a two-pane reader over the runs this project has stored — a
- * searchable list on the left, the selected report rendered on the right, and a
- * multi-select that feeds the Ask form.
+ * Research History: one full-width, searchable list of the runs this project has
+ * stored, with a multi-select that feeds the Ask form.
  *
  * **An editor tab, not a third sidebar view.** Same argument `icons.test.ts` already
  * records for moving Server Status out of the sidebar: a permanent third of the
- * sidebar is the wrong price for something consulted deliberately, and a
- * Markdown report needs width the sidebar has never had.
+ * sidebar is the wrong price for something consulted deliberately.
+ *
+ * **No reading pane.** The report opens as a Markdown tab (`openReport`); this
+ * panel's job is finding, judging and pruning runs, and the pane that used to
+ * render the report beside a 24rem list was a worse copy of the tab that cost the
+ * list every pixel it needed.
  *
  * A **singleton** — two tabs of the same corpus is clutter — and `retainContextWhenHidden`
  * unlike `StatusPanel`, because this one holds user input: a half-typed query and a
@@ -204,9 +207,6 @@ export class ResearchRunsPanel {
                         // letter, and its results would be wrong by the time they
                         // arrived.
                         this.search(this.query, true);
-                        break;
-                    case "preset":
-                        this.applyPreset(asString(msg.preset));
                         break;
                     case "selectAllMatching":
                         void this.busy.run("list", () => this.selectAllMatching());
@@ -599,31 +599,6 @@ export class ResearchRunsPanel {
             this.inFlight = undefined;
             this.post({ type: "busy", key: "list", busy: false });
         }
-    }
-
-    /** One-click filter shortcuts. The selects stay the general mechanism. */
-    private applyPreset(preset: string): void {
-        this.dropBulkSelection();
-        this.freshness = "all";
-        this.validity = "all";
-        this.completeness = "all";
-        this.kind = "all";
-        if (preset === "outdated") {
-            this.freshness = "stale";
-        } else if (preset === "partial") {
-            this.completeness = "partial";
-        }
-        // Echoed so the four selects move with the preset: a shortcut that left the
-        // controls disagreeing with the list would be a second, invisible filter.
-        this.post({
-            type: "filters",
-            freshness: this.freshness,
-            validity: this.validity,
-            kind: this.kind,
-            completeness: this.completeness,
-        });
-        this.search.cancel();
-        void this.load(this.query, undefined);
     }
 
     /**

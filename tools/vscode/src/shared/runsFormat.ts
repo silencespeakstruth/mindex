@@ -278,6 +278,8 @@ export function recheckOptions(s: ChallengeStatePresent): {
 export interface CorpusTotalsLike {
     total: number;
     current: number;
+    challenges?: number;
+    stale?: number;
     gc_candidates: number;
     gc_invalid: number;
     gc_stale: number;
@@ -304,13 +306,26 @@ export const GC_BUCKETS: readonly GcBucket[] = [
  * rather than a guess, because a wrong denominator is worse than none.
  */
 export function corpusCountsLine(totals: CorpusTotalsLike | undefined): string {
-    if (totals === undefined) {
-        return "— reports";
+    // Silent when there is nothing to count, and silent when the server cannot
+    // count: the empty list already says so, in the middle of the panel and in
+    // words, and a header note repeating it is one line of chrome saying what the
+    // whole surface already said.
+    if (totals === undefined || totals.total === 0) {
+        return "";
     }
-    if (totals.total === 0) {
-        return "No stored reports yet";
+    // Four numbers, because a corpus is not one population: challenges are
+    // *about* other reports rather than answers to questions, validity is what
+    // the server will accept as context, and staleness is what has moved since.
+    // "128 reports · 74 current" made the first two invisible.
+    const parts = [`${totals.total} report${totals.total === 1 ? "" : "s"}`];
+    if (totals.challenges !== undefined && totals.challenges > 0) {
+        parts.push(`${totals.challenges} challenge${totals.challenges === 1 ? "" : "s"}`);
     }
-    return `${totals.total} report${totals.total === 1 ? "" : "s"} · ${totals.current} current`;
+    parts.push(`${totals.current} valid`);
+    if (totals.stale !== undefined && totals.stale > 0) {
+        parts.push(`${totals.stale} outdated`);
+    }
+    return parts.join(" · ");
 }
 
 /** The Collect-garbage button's label. `gc_candidates` is the union, never a sum. */

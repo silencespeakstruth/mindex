@@ -532,6 +532,10 @@ export interface ResearchCorpusTotals {
     total: number;
     /** How many are valid — the same predicate the server enforces on context. */
     current: number;
+    /** How many of `total` are challenges. Absent on a server older than the field. */
+    challenges?: number;
+    /** How many have a moved baseline file, **pinned included** — not `gc_stale`. */
+    stale?: number;
     /** The UNION of the four buckets below, unpinned only. Never their sum. */
     gc_candidates: number;
     gc_invalid: number;

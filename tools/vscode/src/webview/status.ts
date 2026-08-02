@@ -115,14 +115,11 @@ function render(s?: StatusSnapshot): void {
         return;
     }
 
-    stateIcon.className = `state-dot codicon codicon-${
-        {
-            ok: "circle-filled",
-            degraded: "warning",
-            unhealthy: "error",
-            unreachable: "error",
-        }[s.state]
-    } state-${s.state}`;
+    // One glyph in every state, colour carrying the verdict — the same rule the
+    // check rows below follow. A dot that turns into a warning triangle and then
+    // into an error circle reads as three unrelated indicators; what the user is
+    // actually tracking is one thing changing colour.
+    stateIcon.className = `state-dot codicon codicon-circle-filled state-${s.state}`;
     titleText.textContent = `MINDex — ${s.state}`;
     subtitle.textContent =
         (s.version !== undefined ? `server v${s.version} · ` : "") + s.serverUrl;
@@ -155,10 +152,14 @@ function render(s?: StatusSnapshot): void {
 /**
  * What each dependency is, and what its absence costs.
  *
- * `optional` is the load-bearing column, and there is now exactly one entry in
- * it. A failing optional dependency is the *only* thing that produces the
- * server's `degraded`, so a yellow row beside a yellow header is the whole story;
- * everything else failing is `unhealthy` and red. Anything not listed here is
+ * `purpose` is a standing caption — it is drawn under the name in every state,
+ * because "qdrant is not answering" only means something to a reader who knows
+ * what qdrant is *for*, and that was previously only in a tooltip nobody hovers
+ * a green row for. Kept to one short clause: this card is scanned, not read.
+ *
+ * `optional` is the load-bearing column, and there is exactly one entry in it. A
+ * failing optional dependency is the *only* thing that produces the server's
+ * `degraded`; everything else failing is `unhealthy`. Anything not listed here is
  * treated as **required**, which is the safe direction to be wrong in: a check
  * the server adds later renders red when it fails.
  *
@@ -166,16 +167,34 @@ function render(s?: StatusSnapshot): void {
  * counted it when it is present, because a dead query instance is *every search
  * failing*. It rendered as a soft warning for a hard outage.
  */
-const CHECK_META: Record<string, { optional?: boolean; costs: string }> = {
-    sqlite: { costs: "The metadata database. Nothing works without it." },
-    qdrant: { costs: "The vector store. Search and indexing both need it." },
-    embedder: { costs: "BGE-M3. Indexing and search both embed through it." },
-    query_embedder: {
-        costs:
-            "The second embedder instance, present only on a split deployment — " +
-            "and required whenever it is: every search embeds through it.",
+const CHECK_META: Record<string, { optional?: boolean; purpose: string; cost: string }> = {
+    sqlite: {
+        purpose: "Metadata database — files, chunks, research journal.",
+        cost: "nothing works until it answers",
     },
-    ollama: { optional: true, costs: "The local model behind Research." },
+    qdrant: {
+        purpose: "Vector store — holds every embedded chunk.",
+        cost: "search and indexing stop until it answers",
+    },
+    embedder: {
+        purpose: "BGE-M3 — turns code and questions into vectors.",
+        cost: "search and indexing stop until it answers",
+    },
+    query_embedder: {
+        purpose: "Second embedder — the query half of a split deployment.",
+        cost: "every search fails until it answers",
+    },
+    ollama: {
+        optional: true,
+        purpose: "Local model — Research runs on it.",
+        cost: "only research needs it",
+    },
+};
+
+/** An unlisted check: required by default, and honest about knowing no more. */
+const UNKNOWN_CHECK = {
+    purpose: "A dependency this version of the extension does not know.",
+    cost: "treated as required until it is described here",
 };
 
 function renderChecks(s: StatusSnapshot): void {
@@ -189,65 +208,75 @@ function renderChecks(s: StatusSnapshot): void {
 }
 
 /**
- * One dependency: a coloured dot, its name, its verdict in the same colour, and an
- * `optional` badge where one applies.
+ * One dependency, as a 2×2 block: **identity on the left, verdict on the right**.
  *
- * A failing optional dependency is **yellow, not red** — it is the difference between
- * "this server is broken" and "one feature is unavailable", and it is the whole reason
- * the row carries a sentence saying which.
+ * - top-left: the dot, the name, and the `optional` badge immediately after it —
+ *   optionality is a property of the dependency, so it belongs to its name;
+ * - bottom-left: what the thing is *for*;
+ * - top-right: `ok` / `failed`;
+ * - bottom-right: what its state costs, under the word it qualifies.
  *
- * The value column renders a *word*, not the wire token. `error` beside a red dot
- * says nothing the dot has not already said, and the reason it used to carry is
- * no longer sent — it is in the server's log, which is where an error chain full
- * of ports and versions can actually be acted on.
+ * The arrangement is the point. Everything that says *what this is* stacks on one
+ * edge and everything that says *how it is doing* stacks on the other, so a column
+ * of rows scans as two columns rather than as five kinds of text taking turns.
+ * Both captions ride in the same row of the grid, which is what keeps the two
+ * halves aligned when either of them wraps.
+ *
+ * **One glyph in every state.** A failing optional dependency is yellow and a
+ * failing required one is red — the colour is the severity, and swapping the dot
+ * for a triangle and then for an error circle made three indicators out of one.
+ * The word beside it is what carries the state without colour, which is what the
+ * shape used to be doing badly.
  */
 function checkRow(name: string, state: string): HTMLElement {
-    const meta = CHECK_META[name];
+    const meta = CHECK_META[name] ?? UNKNOWN_CHECK;
     // `=== "ok"` and never `startsWith("error")`: an older server sends
     // `"error: <reason>"` and this one sends `"error"`, and only one of those
     // tests survives both.
     const ok = state === "ok";
-    const optional = meta?.optional === true;
+    const optional = meta.optional === true;
     const tone = ok ? "ok" : optional ? "warn" : "bad";
 
     const row = document.createElement("div");
     row.className = `line check check-${tone}`;
     row.title = ok
-        ? (meta?.costs ?? "") + (optional ? "\nOptional — the server is fine without it." : "")
-        : `${meta?.costs ?? ""}` +
+        ? meta.purpose + (optional ? "\nOptional — the server is fine without it." : "")
+        : meta.purpose +
           (optional
               ? '\nOptional, which is why the server says "degraded" rather than ' +
                 '"unhealthy".'
               : "\nRequired — the server reports itself unhealthy without it.") +
           "\nThe reason is in the server's log.";
 
-    const label = document.createElement("span");
-    label.className = "name check-name";
-    label.append(
-        icon(ok ? "circle-filled" : optional ? "warning" : "error", true),
-        document.createTextNode(name)
-    );
-
-    const value = document.createElement("span");
-    value.className = "value check-state";
-    value.textContent = ok ? "ok" : "not answering";
-
-    row.append(label, value);
+    const label = document.createElement("div");
+    label.className = "check-name";
+    label.append(icon("circle-filled", true), document.createTextNode(name));
     if (optional) {
+        // Beside the name, not down with the captions: it qualifies *this
+        // dependency*, permanently, and never its current answer.
         const badge = document.createElement("span");
         badge.className = "badge";
         badge.textContent = "optional";
         badge.title = "The server stays healthy without this one.";
-        row.appendChild(badge);
+        label.appendChild(badge);
     }
-    if (!ok && name === "ollama") {
-        // The one failure worth spelling out on the row itself: it is the dependency a
-        // user is most likely to be missing, and Research is the only thing it costs.
-        const note = document.createElement("span");
-        note.className = "note";
-        note.textContent = "only Research needs it";
-        row.appendChild(note);
-    }
+
+    const value = document.createElement("div");
+    value.className = "check-state";
+    value.textContent = ok ? "ok" : "failed";
+
+    const purpose = document.createElement("div");
+    purpose.className = "check-purpose";
+    purpose.textContent = meta.purpose;
+
+    // Drawn in both states, under the word it qualifies: it is what this
+    // dependency's state costs, and a caption that appeared only on failure
+    // would make every red row taller than the green one above it.
+    const impact = document.createElement("div");
+    impact.className = "check-impact";
+    impact.textContent = ok ? `otherwise: ${meta.cost}` : meta.cost;
+
+    row.append(label, value, purpose, impact);
     return row;
 }
 

@@ -278,7 +278,10 @@ let GC clean up.
   column added without moving it once handed the caller `invalid_flag` where
   `report` belonged).
   The response also carries **`totals`** (`ResearchCorpusTotals`:
-  `total`/`current` + `gc_candidates` and its four buckets) — one extra `SELECT`
+  `total`/`current`/`challenges`/`stale` + `gc_candidates` and its four buckets;
+  `challenges` and `stale` are the denominators a corpus of two populations
+  needs — `stale` counts **pinned runs too**, unlike `gc_stale`, because it is a
+  measure of drift and not a delete proposal) — one extra `SELECT`
   reusing the same recursive validity CTE the page already paid for, selecting
   no report body. **No filter on the request touches them**, deliberately: they
   are a fixed denominator, and a count that shrank as the caller typed into `q`
@@ -1615,7 +1618,10 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   SSE client is hand-rolled in `api.ts` (no reconnects — a drop is a cancel,
   by contract). **Full UX rationale: `docs/claude/vscode.md`** — read it
   before modifying the extension. Load-bearing rules: Research History is an
-  editor-area panel (keyset paging by `seq`; one `AbortController` aborted
+  editor-area panel — **one full-width list, no reading pane**; a selected
+  run expands under its own row (provenance, ancestry, moved files, actions)
+  and the report itself opens only as a Markdown tab, so nothing in that
+  panel renders it (keyset paging by `seq`; one `AbortController` aborted
   per keystroke, and callers swallow `AbortError` themselves — `api.request`
   *rejects* on abort while `research()` resolves; keep the asymmetry). The
   context QuickPick offers **valid runs only**, tracks
@@ -1632,12 +1638,15 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   server says `degraded`, not `unhealthy`), and derived by `readHealth` from
   `status` **and** `checks` together — an older server spells the *required*
   failure `degraded` too, so keying on `status` alone would paint yellow and
-  leave the form armed. **A degradation disables only what it costs**: the
-  question box, the fields and the scope buttons compose and stay live (and
-  undimmed); `#submit` and the context picker need `ask`, the Research tab
-  needs `research`, Stop is always live. `canSubmit()` gates the click *and*
-  the Enter keydown — one predicate, or a keyboard path fires research at a
-  dead Ollama. A degradation also aborts running work via `RunRegistry`,
+  leave the form armed. **A degradation freezes the form and never
+  the tabs**: both mode buttons stay live in every state (a disabled tab is a
+  dead end whose explanation lives behind it), and the notice inside the mode
+  names the missing dependency *and* what it costs in this tab; when the mode
+  on screen cannot be served, every control inside `#form` is disabled through
+  `setEnabled` except the mode switch, Stop and the notices' own
+  Open-Server-Status links — and anything that rebuilds controls must re-run
+  that sweep. `canSubmit()` gates the click *and* the Enter keydown — one
+  predicate, or a keyboard path fires research at a dead Ollama. A degradation also aborts running work via `RunRegistry`,
   resetting handles **before** any notification (its thenable resolves only
   on dismissal), reported as a failure, not a cancellation; none of it is
   observable without `[mindex.statusPollSeconds]` (default 30, `0` = off).
@@ -1662,8 +1671,8 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   in `shared/runsFormat.ts`; offline re-verify (Verify button) renders
   provenance and staleness as separate answers; `GET /research/active` +
   cancel is a palette QuickPick (`activeRunsPick.ts`), which the 429 names.
-  **The preview always states what was said about a report**
-  (`challengeStateLine`, one indexed `challenged_run_id` lookup per preview):
+  **The expanded row always states what was said about a report**
+  (`challengeStateLine`, one indexed `challenged_run_id` lookup per opened row):
   it used to render a trust badge and nothing else, and trust is correctly
   silent about an inconclusive challenge and about one whose own evidence has
   moved — so a report that had been challenged and *refuted* could read as
@@ -1682,15 +1691,28 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   through `summaries` (every row ever fetched), not `rows` (the rendered page),
   or a bulk delete would report `0` dependants for everything off screen.
   `Collect garbage` proposes the union of invalid/stale/partial/inconclusive
-  (**pinned exempt, via the server's `pinned=false`**) into a review in the
-  right pane — not a QuickPick, which cannot show *why* a row is proposed or
-  that four reports were built on it, the two things a reviewer unchecks over —
+  (**pinned exempt, via the server's `pinned=false`**) into a review that
+  takes the whole panel — not a QuickPick, which cannot show *why* a row is
+  proposed or that four reports were built on it, the two things a reviewer
+  unchecks over —
   each run in one group with its other reasons as labels, since three
   checkboxes for one report would let an uncheck not stick. The counts line is
-  the corpus `totals`, a **fixed denominator** no filter moves. Head chrome:
-  the magnifier is inside the field, the refresh button sits in the search row
-  (the filter row wraps, and an icon button on its right edge was clipped past
-  the 260px grid minimum). `mindex.browseResearch` is **gone** — one reading
+  the corpus `totals` — `N reports · N challenges · N valid · N outdated`, a
+  **fixed denominator** no filter moves, and *silent* when there is nothing to
+  count (the empty middle of the panel already says so, in words and in two
+  wordings: nothing stored versus nothing matched). The filter row
+  is four selects and nothing else — the `Show` label and the
+  `Outdated`/`Partial` preset buttons were a second, competing way to set one
+  filter. Head chrome: the magnifier is inside the field, the refresh button
+  sits in the search row, and the whole panel is drawn in the shared `--mx-*`
+  tokens and controls rather than a palette of its own. In Server Status, the
+  health card is **one dot per dependency in every state** (colour is the
+  severity; the word beside it carries it without colour), laid out as a 2×2
+  block: identity left (dot, name, `optional` badge, and under them what the
+  dependency is for), verdict right (`ok`/`failed`, and under it what that
+  state costs). Everything saying *what this is* stacks on one edge and
+  everything saying *how it is doing* on the other, or a column of rows scans
+  as five kinds of text taking turns. `mindex.browseResearch` is **gone** — one reading
   surface, and `ctrl+alt+,` now opens the panel. A reindex
   reads the server's claims from `/status.indexing_claims` + the follow-up
   `/drift`'s `indexing` bucket — never from the `/index` response, which

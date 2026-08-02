@@ -4,6 +4,9 @@
 
 .page {
     max-width: 820px;
+    /* Centred: this panel opens as a full editor tab, and a 820px column pinned to
+     * the left edge of a wide screen reads as a page that failed to load. */
+    margin: 0 auto;
     padding: 0 20px 32px;
     display: flex;
     flex-direction: column;
@@ -180,28 +183,56 @@
 }
 
 /* ── health checks ───────────────────────────────────────────────────────── */
-/* The one place in the panel where colour is the content: a dependency is fine, or it
- * is not, or it is not and that is allowed. Three states, three colours, and the dot
- * changes shape with the colour so the row still reads on a monochrome display. */
+/* Two lines per dependency: the verdict on the first, what the thing is for on the
+ * second. Colour is the severity and the same dot carries it in all three states —
+ * the *word* beside it is what makes the row readable without colour, which is the
+ * job the changing glyph used to do badly. */
 
+/* Two columns, two rows: identity left, verdict right, a caption under each. Both
+ * captions share the second grid row, which is what keeps the halves aligned when
+ * either of them wraps — the thing a pair of stacked flex rows could not do. */
+.check {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+    column-gap: var(--mx-gap-loose);
+    row-gap: 2px;
+    align-items: baseline;
+    padding: 9px 0;
+}
 .check .check-name {
     display: flex;
     align-items: center;
     gap: 7px;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 .check .check-state {
+    text-align: right;
     font-variant: small-caps;
+    white-space: nowrap;
+}
+/* The two captions: same size, same tone, each under the half it belongs to. */
+.check-purpose,
+.check-impact {
+    font-size: var(--mx-fs-sm);
+    line-height: 1.45;
+    color: var(--mx-dim);
+}
+.check-impact {
+    text-align: right;
 }
 .check-ok .check-name .codicon,
 .check-ok .check-state {
     color: var(--mx-ok);
 }
 .check-warn .check-name .codicon,
-.check-warn .check-state {
+.check-warn .check-state,
+.check-warn .check-impact {
     color: var(--mx-warn);
 }
 .check-bad .check-name .codicon,
-.check-bad .check-state {
+.check-bad .check-state,
+.check-bad .check-impact {
     color: var(--mx-bad);
 }
 
@@ -209,7 +240,6 @@
  * standing label rather than something that appears when the row goes yellow. */
 .badge {
     flex: none;
-    align-self: center;
     padding: 1px 6px;
     border: 1px solid var(--mx-border);
     border-radius: 999px;

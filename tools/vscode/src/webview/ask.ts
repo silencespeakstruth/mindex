@@ -439,6 +439,9 @@ function renderContextRuns(): void {
         });
         pills.appendChild(chip);
     }
+    // The chips were just rebuilt; without this a chip created while the form is
+    // frozen is the one live control on it.
+    setComposingEnabled(modeUsable());
 }
 
 function renderPanels(): void {
@@ -512,19 +515,20 @@ function render(): void {
     cancel.hidden = mode !== "research";
     cancel.disabled = !running;
 
-    // The mode is never switched out from under the user when Research goes away: a
-    // tab that changes what Enter does while they are typing is worse than a tab that
-    // is visibly unavailable. The button disables, the notice explains, the question
-    // they were writing survives.
+    // The tabs stay live in every state, including the one they lead into. A
+    // disabled tab is a dead end that explains nothing: the user learns that
+    // Research is unavailable and not that the server's Ollama is down, because
+    // the sentence saying so lives *behind* the tab they cannot press. So the tab
+    // opens, and the notice inside it is the answer.
     const researchTab = el("mode").querySelector<HTMLButtonElement>('[data-mode="research"]');
     if (researchTab !== null) {
-        researchTab.disabled = !available.research;
-        researchTab.setAttribute("aria-disabled", String(!available.research));
+        researchTab.disabled = false;
+        researchTab.removeAttribute("aria-disabled");
     }
 
-    const usable = available.ask && (mode === "search" || available.research);
+    const usable = modeUsable();
     setEnabled(el<HTMLButtonElement>("submit"), usable && !running && !searching);
-    setComposingEnabled();
+    setComposingEnabled(usable);
 
     // Only in the Research tab: in Search the server's Ollama is irrelevant. Suppressed
     // entirely when the server itself is down — two notices saying the same thing at
@@ -532,46 +536,61 @@ function render(): void {
     el("ollama-notice").hidden = mode !== "research" || available.research || !available.ask;
     el("degraded-notice").hidden = available.ask;
     if (!available.ask) {
-        el("degraded-reason").textContent = capitalise(
+        // What is missing, and what it costs *in this tab*. "The server is
+        // degraded" is not an answer to "why is my Search button dead".
+        el("degraded-reason").textContent = `${capitalise(
             available.reason === "" ? "the server is not answering" : available.reason
-        );
+        )}, so ${copy.label} is unavailable until it recovers.`;
     }
 
     el("hint").innerHTML = running
         ? '<span class="running"><span class="spinner"></span>Researching — Stop drops the ' +
           "connection, which frees the model.</span>"
-        : !available.ask
-          ? "Nothing can be asked until the server is healthy again."
+        : !usable
+          ? "The form is frozen while what it needs is down; Stop still works."
           : copy.hint;
 
     renderPanels();
 }
 
 /**
- * Disable only what the server's absence actually costs.
+ * Freeze the form when the mode it is showing cannot be served.
  *
- * The rule used to be "`!ask` disables every control", which was defensible while
- * the only question this form answered was *can this be submitted*. It is the
- * wrong shape for a form the user **composes** in. A question, a scope and a
- * budget cost the server nothing to write down; the notice above already says it
- * is down; and freezing the textarea takes away the one thing that still worked,
- * along with whatever was half-typed in it.
+ * The gate moved outward on purpose. It used to be "disable only what reaches
+ * the server", which left every field live under a red notice — and a form that
+ * accepts text, globs and budget changes while stating that nothing can be asked
+ * is telling the user two different things at once. A dead-looking field is the
+ * honest rendering: the notice says what is missing, and the controls say they
+ * are not currently worth filling in.
  *
- * So the split is by what a control *reaches*, not by what it belongs to:
+ * Three exemptions, each for a reason:
  *
- * - **Nothing** — the question box, every `ASK_FIELDS` control, the three scope
- *   buttons, the disclosures. Local edits to local state.
- * - **`ask`** — Submit, and the context picker, which lists stored runs over
- *   HTTP and would open onto an error.
- * - **`research`** — the Research tab, and Submit while that tab is selected.
+ * - **The mode switch** — always live. It is how the user reaches the notice
+ *   that explains the other tab, and a disabled tab explains nothing.
+ * - **Stop** — a run in flight when the server went down still has a connection
+ *   to drop, and the one control that ends it must not be the one that dies.
+ * - **The notices' own links** — "Open Server Status" is the remedy being
+ *   offered; disabling it would disable the way out.
  *
- * Stop is exempt from all of it: a run in flight when the server went down still
- * has a connection to drop, and the one control that ends it must not be the one
- * that disappears.
+ * Submit is gated by `render` (it also has `running`/`searching` to account for)
+ * and skipped here so the two cannot fight over it.
  */
-function setComposingEnabled(): void {
-    // Reaches the server: gated. Everything not named here composes and stays live.
-    setEnabled(el<HTMLButtonElement>("context-runs-pick"), available.ask);
+const ALWAYS_LIVE = new Set(["cancel", "submit", "notice-status", "degraded-status"]);
+
+/** Whether the mode currently on screen can actually be served right now. */
+function modeUsable(): boolean {
+    return available.ask && (mode === "search" || available.research);
+}
+
+function setComposingEnabled(usable: boolean): void {
+    for (const node of el("form").querySelectorAll<HTMLElement & { disabled?: boolean }>(
+        "input, textarea, select, button"
+    )) {
+        if (ALWAYS_LIVE.has(node.id) || node.closest("#mode") !== null) {
+            continue;
+        }
+        setEnabled(node, usable);
+    }
 }
 
 function capitalise(s: string): string {
@@ -774,7 +793,9 @@ window.addEventListener("message", (e: MessageEvent<Record<string, unknown>>) =>
         case "languages":
             languagePills.setOptions((msg.languages as string[] | undefined) ?? []);
             persist();
-            renderPanels();
+            // `render`, not `renderPanels`: the pill buttons were just replaced and
+            // must inherit whatever the form's frozen/live state currently is.
+            render();
             break;
         case "contextRuns":
             contextRuns = (msg.runs ?? []) as typeof contextRuns;

@@ -13,7 +13,8 @@ modifying `tools/vscode`.
   menu.
   **Research History** (`researchRunsPanel.ts` + `webview/runs.ts`) is an
   editor-area panel, not a third sidebar view (the `icons.test.ts` argument).
-  Two panes, a debounced search (`shared/debounce.ts`, vscode-free so
+  **One full-width list and no reading pane**, a debounced search
+  (`shared/debounce.ts`, vscode-free so
   `node --test` reaches it; trailing — first-keystroke results would be wrong
   on arrival), keyset paging by `seq`, and a multi-select that arrives in the
   Ask form as removable chips. **One `AbortController`, aborted on every
@@ -45,20 +46,48 @@ modifying `tools/vscode`.
   provider serves from the URI alone so a tab survives a window reload. It
   prepends a provenance block (the stored Markdown says what the run
   concluded, nothing about what it was entitled to claim).
+  **The reading pane is gone; a row expands in place.** It used to be a
+  `minmax(260px, 24rem)` list beside a `marked`-rendered report: on a wide
+  screen that is a cramped column of overlapping badges next to acres of
+  prose, and the prose was already available — better, with outline, find and
+  the user's theme — as the Markdown tab `openReport` opens. So the list takes
+  the whole panel and the selected run expands under its own row with what a
+  one-line row cannot carry: provenance, ancestry, the files that have moved,
+  the verify/challenge/re-ask actions, and `Open in a tab`. **The report is
+  deliberately not rendered anywhere in this panel** — re-adding it is
+  re-adding the pane. Consequences that must move together: `activeId` means
+  *expanded*, not *selected* (the checkbox is what selects, and sharing a
+  highlight made a five-row selection look like five open reports); only one
+  row is open at a time (`selectRun` closes first) and clicking the open row
+  closes it, since otherwise the only way out of an expansion is another
+  expansion; `renderDetail` renders into the `<li>` and **drops the answer if
+  the row is gone** (a filter moved under an in-flight fetch — there is
+  nowhere honest to put it), so the `runs` handler re-asks for the detail
+  when it finds `activeId`'s row present but empty, which is what makes a
+  restored `activeId` and a refresh work; and the `challengeState` /
+  `verification` messages still key on `activeId` and on ids inside the open
+  detail, which one-at-a-time is what keeps unambiguous.
+  **The filter row is four selects and nothing else.** The `Show` label and
+  the `Outdated`/`Partial` preset buttons (and the host's `applyPreset` and
+  its `filters` echo) are gone: a select whose first option reads "Any
+  freshness" needs no word in front of it, and a preset button beside the
+  select that does the same thing is a second, competing way to set one
+  filter — which then has to be echoed back so the two do not disagree.
   In the panel: selection means *rows*, not *context* — the checkbox stays
   enabled on invalid rows and `Use as context` is what refuses. The delete
   confirmation names `referenced_by_count` and states it rather than netting
   it against the selection (a summary carries ancestors, never dependants;
   under-reporting in a delete dialog is the wrong way to be wrong). The
   invalid badge shows the **reason**, not the verdict. `removed` carries an
-  id *list* so one path serves both deletes, and it must clear the preview
-  when the open report is the one going (it used to leave `activeId`
-  pointing at a dead id). The header's refresh button is in-panel, not a
+  id *list* so one path serves both deletes, and it must release `activeId`
+  when the open report is the one going (removing the row now takes its
+  expansion with it, but a live `activeId` would still key a later
+  `challengeState` on a run that is gone). The header's refresh button is in-panel, not a
   `webview/title` menu — three contribution surfaces for one button that
   would then sit in the tab bar, away from the filters it re-runs; it
   supersedes any pending keystroke (`search.cancel()`) and re-fetches the
-  open preview, whose staleness and trust are exactly the numbers that move
-  under the panel. The `kind` and `completeness` filter selects are backed by
+  open row's detail, whose staleness and trust are exactly the numbers that
+  move under the panel. The `kind` and `completeness` filter selects are backed by
   server-side query params — filtered inside the cursor-bounded subquery like
   the rest, so a full page still means "there may be more". That is not a
   detail: `Select all` and `Collect garbage` both page this list **to
@@ -81,28 +110,43 @@ modifying `tools/vscode`.
   **`Collect garbage`** proposes the union of invalid / stale / partial /
   inconclusive-challenge runs, with pinned excluded by the **server's**
   `pinned=false` rather than a client test, so the exemption cannot leak and
-  the button's count equals the proposal. The review lives in the **right
-  pane**. Not a second webview: that is a second copy of the CSP page
-  assembly, the state protocol, the `AbortController` discipline and the
-  delete path, for one screen. Not a multi-select QuickPick either: it can
-  pre-select items but cannot show *why* each row is proposed or that four
-  later reports were built on it — the two things a reviewer unchecks a row
-  over — and the right pane leaves the list visible so a proposed report can
-  be opened and read before the decision. Each run appears in **one** group
+  the button's count equals the proposal. The review **takes the whole panel**
+  while it is up (the list, its footer and the empty note step aside;
+  `Cancel` puts them back untouched, expanded row and all) — it is a decision
+  about the corpus, not a detail of one row. Not a second webview: that is a
+  second copy of the CSP page assembly, the state protocol, the
+  `AbortController` discipline and the delete path, for one screen. Not a
+  multi-select QuickPick either: it can pre-select items but cannot show *why*
+  each row is proposed or that four later reports were built on it — the two
+  things a reviewer unchecks a row over — and each row carries a `read` link
+  back into the list for the report itself. Each run appears in **one** group
   (its most serious reason) with the others as labels; three checkboxes for
   one report would let an uncheck in one group not stick. The classification
   is client-side, which is safe *here specifically* because that pass runs to
   exhaustion — no inference is drawn from a page's length.
   The counts line is the corpus `totals`: a **fixed denominator** that no
   filter moves, because the number the filters would give is `runs.length`,
-  already on screen. An older server sends no totals and it renders "—"
-  rather than a guess.
+  already on screen. It is **four numbers, not two** —
+  `N reports · N challenges · N valid · N outdated` — because a corpus is two
+  populations (a challenge is *about* another report, not an answer to a
+  question) measured on two axes (validity is what the server will accept as
+  context; staleness is what has moved since). `challenges`/`stale` are
+  optional on the wire and simply absent from the line on a server too old to
+  send them, as are the two counts at zero.
+  It says **nothing at all** when the corpus is empty or uncountable: the empty
+  state below already says it, in the middle of the panel and at 20px, and it
+  says *which* empty — "No research yet" versus "Nothing found", discriminated
+  by the controls themselves (a query, or any select off `all`), because "ask a
+  question" and "widen the filter" are different next moves. `.runs-items:empty`
+  gives up its `flex: 1` so that block owns the height it is centred in.
   **Head chrome**: the magnifier is inside the search field (two controls in a
   row where one is decoration reads as two), and the refresh button and spinner
   sit in the search row rather than among the filters — the filter row wraps,
-  and a fixed-size icon button on its right edge was clipped past the panel's
-  260px grid minimum, which is what "the refresh icon runs off the edge"
-  actually was.
+  and a fixed-size icon button on its right edge was clipped. The panel's own
+  chrome is the shared `--mx-*` tokens and the shared controls from
+  `common.css`; it used to hand-roll a palette out of raw VS Code variables,
+  which is how it came to look like a different product from the sidebar it is
+  opened out of.
   **Challenge flow** (`challengeFlow.ts` + `startChallenge` in
   `extension.ts`): launching a challenge is a **QuickPick chain** (effort →
   optional model → optional max-seconds), not a form and not an Ask mode —
@@ -135,7 +179,7 @@ modifying `tools/vscode`.
   none); a challenge row links its subject from the **server-resolved**
   `challenged_seq`/`challenged_title`, so a `null` now means the subject is
   genuinely deleted rather than merely off the loaded page.
-  **The preview always states what was said about a report**
+  **The expanded row always states what was said about a report**
   (`challengeStateLine`). The old version rendered a trust badge and a list,
   and fired the lookup only when `trust !== "unchallenged"` — reasoning that
   derived trust already proves the absence of *valid* challenges. Both halves
@@ -145,8 +189,8 @@ modifying `tools/vscode`.
   about having been challenged; and the list was filtered client-side out of
   one unfiltered `kind=challenge` page, so anything past that page was simply
   never found. It is now one indexed `challenged_run_id` query per preview,
-  fired for every research run, and every state — including "never
-  challenged" — gets a sentence. `limit: 2` is deliberate: the server's
+  fired for every research run whose row is opened, and every state —
+  including "never challenged" — gets a sentence. `limit: 2` is deliberate: the server's
   replace rule is verdict-gated, so an inconclusive re-check leaves the
   standing verdict in place and two rows is a real state the line must name
   rather than silently pick from.
@@ -201,18 +245,58 @@ modifying `tools/vscode`.
   need a control that is live under `unhealthy` and dead under
   Ollama-degradation, and there is none.
 
-  **What a degradation disables is only what it costs**, which is a reversal
-  of the old rule. `!ask` used to disable *every* control, defensible while
-  the only question the form answered was "can this be submitted" and wrong
-  for a form the user *composes* in: the notice already says the server is
-  down, and freezing the textarea takes away the one thing still working
-  along with whatever was half-typed in it. Now the split is by what a
-  control **reaches** — the question box, the `ASK_FIELDS` controls, the
-  three scope buttons and the disclosures reach nothing and stay live (the
-  form is not dimmed either, for the same reason: dimming something the user
-  can still type into says "this does nothing"); `#submit` and the context
-  picker need `ask`; the Research tab and `#submit`-in-research-mode need
-  `research`; Stop is exempt always. `canSubmit()` reads the button's own
+  **The Server Status health card is one dot per dependency and a 2×2 block per
+  row** (`webview/status.ts` + `CHECK_META`): dot + name + `optional` badge
+  top-left, purpose bottom-left, `ok`/`failed` top-right, what that state costs
+  bottom-right. Identity stacks on one edge, verdict on the other, and **both
+  captions share the grid's second row** — which is what keeps the halves
+  aligned when either wraps, and what two stacked flex rows could not do. The glyph is the **same circle
+  in every state** — colour is the severity, and swapping it for a warning
+  triangle and then an error circle made three unrelated indicators out of one
+  thing changing colour; the word beside it (`ok` / `not answering`) is what
+  carries the state without colour, which is the job the changing shape was
+  doing badly. The captions are the second half of the fix: a standing `purpose`
+  clause under the name (3-10 words — "qdrant is not
+  answering" means nothing to a reader who does not know what qdrant is for,
+  and that used to live only in a tooltip nobody hovers a green row for), and a `cost` clause under the verdict, drawn in
+  **both** states (dim and prefixed "otherwise:" when the row is green, in the
+  row's colour when it is not — a caption that appeared only on failure made
+  every red row taller than the green one above it). The `optional` badge sits
+  beside the *name*: it qualifies the dependency permanently and never its
+  current answer. Both it and "only Research needs it" used to ride at the end
+  of the verdict row, centred against a value column they had nothing to do
+  with, reading as part of the verdict. An unlisted check
+  falls back to `UNKNOWN_CHECK` and is treated as **required**, which is the
+  safe direction to be wrong in.
+
+  **A degradation freezes the form and never the tabs**, and both halves are
+  reversals of earlier rules.
+
+  The *tabs* used to disable: a dead Ollama greyed out the Research tab. That
+  is a dead end which explains nothing — the sentence saying *why* Research
+  is unavailable lives behind the tab the user cannot press. So both tabs are
+  live in every state, switching modes is always allowed, and the notice
+  inside the mode is the answer. It names the missing dependency **and what
+  it costs in this tab** ("…, so Search is unavailable until it recovers"):
+  "the server is degraded" is not an answer to "why is my Search button
+  dead".
+
+  The *fields* used to stay live, on the argument that composing costs the
+  server nothing. In practice a form that accepts text, globs and budget
+  changes under a red notice states two contradictory things at once, so the
+  gate moved outward: when the mode on screen cannot be served
+  (`modeUsable()` — `ask`, plus `research` in the Research tab), every
+  `input`/`textarea`/`select`/`button` inside `#form` is disabled through
+  `setEnabled`, so the busy layer keeps composing with it. Three exemptions,
+  each load-bearing: the **mode switch** (it is how the user reaches the
+  other tab's explanation), **Stop** (a run in flight still has a connection
+  to drop, and the control that ends it must not be the one that dies) and
+  the notices' own **Open Server Status** links (disabling the remedy being
+  offered). `#submit` is skipped by the sweep and gated in `render`, which
+  also has `running`/`searching` to account for — two writers on one button
+  would fight. Anything that *rebuilds* controls (`renderContextRuns`, the
+  `languages` message) must re-run the sweep, or a chip born during a freeze
+  is the one live control on the form. `canSubmit()` reads the button's own
   `disabled` and is asked at **both** entry points — the click *and* the
   Enter keydown, which used to call `submit()` blind and fire research at a
   dead Ollama. `#scope-folder` posts its own `scopeFolder` message rather

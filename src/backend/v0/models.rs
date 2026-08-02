@@ -1444,6 +1444,16 @@ pub struct ResearchCorpusTotals {
     /// So this is literally "how many of these could be handed to the next
     /// question", not a softer notion of freshness.
     pub current: i64,
+    /// How many of `total` are challenges rather than research runs. A corpus is
+    /// two populations with different lifecycles — a challenge is *about* another
+    /// report — and "128 reports" without this says nothing about how many
+    /// questions were actually asked.
+    pub challenges: i64,
+    /// How many have at least one baseline file changed or removed since, **pinned
+    /// included**. Deliberately not `gc_stale`, which is unpinned-only because it
+    /// feeds a delete proposal: as a denominator that exemption would under-report
+    /// the corpus's actual drift.
+    pub stale: i64,
     /// The union of the four buckets below: how many **unpinned** runs a
     /// garbage-collection pass would propose deleting. A run in several buckets is
     /// counted once here, so this is never the sum of the four.

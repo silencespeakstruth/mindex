@@ -316,6 +316,8 @@ function totals(overrides: Partial<CorpusTotalsLike> = {}): CorpusTotalsLike {
     return {
         total: 128,
         current: 74,
+        challenges: 21,
+        stale: 33,
         gc_candidates: 31,
         gc_invalid: 20,
         gc_stale: 22,
@@ -326,19 +328,32 @@ function totals(overrides: Partial<CorpusTotalsLike> = {}): CorpusTotalsLike {
 }
 
 describe("corpusCountsLine", () => {
-    it("reports the corpus size and how much of it is usable", () => {
-        assert.strictEqual(corpusCountsLine(totals()), "128 reports · 74 current");
-    });
-
-    it("says nothing rather than guessing when the server cannot count", () => {
-        assert.strictEqual(corpusCountsLine(undefined), "— reports");
-    });
-
-    it("has a first-run wording", () => {
+    it("breaks the corpus into the four numbers that mean different things", () => {
         assert.strictEqual(
-            corpusCountsLine(totals({ total: 0, current: 0 })),
-            "No stored reports yet"
+            corpusCountsLine(totals()),
+            "128 reports · 21 challenges · 74 valid · 33 outdated"
         );
+    });
+
+    it("drops the two counts that say nothing at zero", () => {
+        assert.strictEqual(
+            corpusCountsLine(totals({ challenges: 0, stale: 0 })),
+            "128 reports · 74 valid"
+        );
+    });
+
+    it("degrades to what an older server sends", () => {
+        assert.strictEqual(
+            corpusCountsLine(totals({ challenges: undefined, stale: undefined })),
+            "128 reports · 74 valid"
+        );
+    });
+
+    // The empty corpus and the uncountable one are both said by the list itself,
+    // in the middle of the panel; a header note repeating it is chrome.
+    it("says nothing at all when there is nothing to count", () => {
+        assert.strictEqual(corpusCountsLine(undefined), "");
+        assert.strictEqual(corpusCountsLine(totals({ total: 0, current: 0 })), "");
     });
 });
 
