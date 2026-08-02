@@ -13131,4 +13131,130 @@ mod tests {
             "the orphaned winner was dropped silently"
         );
     }
+
+    /// `mark_indexed` is the **last** line of defence on the cancel path, and the
+    /// only status write in the file that deliberately does not go through
+    /// `set_file_status`.
+    ///
+    /// `POST /cancel` takes no `IndexClaim` on purpose — it has to be able to
+    /// interrupt one — so correctness against a live `/index` rests on two re-reads
+    /// and this `AND status = 'indexing'`. A cancel landing *after* `drop_cancelled`
+    /// has already re-read the statuses reaches phase 3 with the file `cancelled`;
+    /// the UPDATE then matches zero rows, the illegal `cancelled → indexed`
+    /// transition is never attempted, and the trigger stays the backstop rather than
+    /// the mechanism.
+    ///
+    /// The return value is what the handler reports. Unchecked — which is what it
+    /// was — the client is told `indexed` for a file the database says is
+    /// `cancelled`, and sees no drift afterwards to correct it.
+    #[tokio::test]
+    async fn a_cancel_landing_during_the_embed_pass_is_refused_by_mark_indexed() {
+        let pool = pool_with_prepared_files(&["a.rs"], 2).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let fx = fixture();
+
+        // The window `drop_cancelled` cannot cover: the cancel arrives after it ran.
+        let pg = guid().0.as_simple().to_string();
+        let _ = set_file_status(
+            &pool,
+            &pg,
+            "a.rs",
+            MODEL,
+            "cancelled",
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+
+        let moved = indexer(&pool, &locks, &fx)
+            .mark_indexed("a.rs", &"b".repeat(64))
+            .await
+            .expect("the write itself must not fail — it simply matches nothing");
+
+        assert!(
+            !moved,
+            "a cancelled file was reported to the client as indexed"
+        );
+        assert_eq!(
+            file_state(&pool, "a.rs").await.0,
+            "cancelled",
+            "the refused write must leave the file exactly as the cancel left it"
+        );
+    }
+
+    /// The ordinary path, and the reason the guard above is a `bool` rather than a
+    /// silent no-op: a file that really is `indexing` moves, has its hash confirmed
+    /// and its retry counter cleared.
+    #[tokio::test]
+    async fn mark_indexed_confirms_the_hash_and_clears_the_retry_count() {
+        let pool = pool_with_prepared_files(&["a.rs"], 2).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let fx = fixture();
+        let sha = "c".repeat(64);
+
+        let moved = indexer(&pool, &locks, &fx)
+            .mark_indexed("a.rs", &sha)
+            .await
+            .expect("write succeeds");
+
+        assert!(moved);
+        let (status, retries, stored) = pool
+            .transaction(CancellationToken::new(), |tx| {
+                tx.query_row(
+                    "SELECT status, retry_count, sha256 FROM project_files
+                      WHERE project_guid = ?1 AND model_id = ?2 AND path = 'a.rs'",
+                    params![guid(), MODEL],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .await
+            .expect("read");
+
+        assert_eq!(status, "indexed");
+        assert_eq!(retries, 0, "a clean success clears prior failures");
+        assert_eq!(
+            stored, sha,
+            "the hash is confirmed at `indexed`, not before"
+        );
+    }
+
+    /// A file deleted out from under the batch is the same shape as a cancel: zero
+    /// rows, no claim of success. `DELETE /projects/{guid}` hard-deletes rows, so
+    /// this is reachable whenever a project is dropped mid-index.
+    #[tokio::test]
+    async fn mark_indexed_reports_a_file_that_vanished_rather_than_inventing_it() {
+        let pool = pool_with_prepared_files(&["a.rs"], 2).await;
+        let locks = Arc::new(Mutex::new(HashSet::new()));
+        let fx = fixture();
+
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute(
+                "DELETE FROM project_file_chunks WHERE project_guid = ?1",
+                params![guid()],
+            )?;
+            tx.execute(
+                "DELETE FROM project_files WHERE project_guid = ?1",
+                params![guid()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("hard delete");
+
+        let moved = indexer(&pool, &locks, &fx)
+            .mark_indexed("a.rs", &"d".repeat(64))
+            .await
+            .expect("write succeeds against no rows");
+        assert!(
+            !moved,
+            "a file that no longer exists was reported as indexed"
+        );
+    }
 }
