@@ -2421,4 +2421,153 @@ mod tests {
         assert!(serde_urlencoded::from_str::<IndexQuery>("stream=true").is_err());
         assert!(serde_urlencoded::from_str::<IndexQuery>("streem=yes").is_err());
     }
+
+    // ── the language checklist, as far as one crate can check it ─────────────
+
+    /// **The silent step of the Languages checklist.** The
+    /// `project_files.programming_language` CHECK lives in *two* files, and editing
+    /// only the first is invisible: `v1.0.0_schema.sql` builds a fresh database and
+    /// is never re-read, so a database in use needs the later rebuild migration to
+    /// carry the widened list too. Get it wrong and the language works perfectly in
+    /// a new container and fails on every existing one — a 500 from a constraint,
+    /// at insert time, for that language only.
+    ///
+    /// This walks `ALL` against a fully migrated database, which is the state a real
+    /// deployment is in, so the second copy is the one being checked.
+    #[tokio::test]
+    async fn every_language_in_all_is_accepted_by_the_migrated_schema() {
+        use crate::db::sqlite3::SQLite3Pool;
+        use tokio_util::sync::CancellationToken;
+
+        let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            for (_, m) in crate::MIGRATIONS {
+                tx.execute_batch(m)?;
+            }
+            tx.execute(
+                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
+                ["a".repeat(32)],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("migrations apply");
+
+        for pl in ProgrammingLanguage::ALL {
+            let pl = *pl;
+            let inserted = pool
+                .transaction(CancellationToken::new(), move |tx| {
+                    tx.execute(
+                        "INSERT INTO project_files
+                             (project_guid, model_id, path, sha256, programming_language, status)
+                         VALUES (?1, 'BAAI/bge-m3', ?2, ?3, ?4, 'indexing')",
+                        rusqlite::params![
+                            "a".repeat(32),
+                            format!("src/{}.x", pl.name()),
+                            "0".repeat(64),
+                            pl
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await;
+            assert!(
+                inserted.is_ok(),
+                "the schema rejects `{}`, which `ProgrammingLanguage::ALL` offers. \
+                 The CHECK constraint is in two files — a new language needs the \
+                 rebuild migration as well as v1.0.0_schema.sql: {inserted:?}",
+                pl.name()
+            );
+        }
+    }
+
+    /// A missing `FromSql` arm fails on **read**, not on write: rows insert fine and
+    /// then every query selecting the column 500s. So the round trip has to be
+    /// checked in both directions, per language.
+    #[tokio::test]
+    async fn every_language_survives_the_round_trip_through_sqlite() {
+        use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
+        use tokio_util::sync::CancellationToken;
+
+        let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
+        pool.transaction(CancellationToken::new(), |tx| {
+            tx.execute_batch("CREATE TABLE t (pl TEXT NOT NULL);")?;
+            Ok(())
+        })
+        .await
+        .expect("table");
+
+        for pl in ProgrammingLanguage::ALL {
+            let pl = *pl;
+            let back: ProgrammingLanguage = pool
+                .transaction(CancellationToken::new(), move |tx| {
+                    tx.execute("DELETE FROM t", [])?;
+                    tx.execute("INSERT INTO t (pl) VALUES (?1)", rusqlite::params![pl])?;
+                    tx.query_row("SELECT pl FROM t", [], |r| r.get(0))
+                        .map_err(SQLite3PoolError::from)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "`{}` does not round-trip through SQLite — a missing FromSql \
+                         arm fails on read, so rows insert fine and every later query \
+                         500s: {e:?}",
+                        pl.name()
+                    )
+                });
+            assert_eq!(back, pl);
+        }
+    }
+
+    /// The same for the wire: a missing serde rename makes a request naming that
+    /// language a 400 `request.malformed_body`, and the language is simply
+    /// unusable through the API while being present everywhere else.
+    #[test]
+    fn every_language_survives_the_round_trip_through_json() {
+        for pl in ProgrammingLanguage::ALL {
+            let json = serde_json::to_string(pl).expect("serializes");
+            assert_eq!(
+                json,
+                format!("\"{}\"", pl.name()),
+                "the serde name and `name()` disagree; `GET /config` publishes one \
+                 and requests are parsed with the other"
+            );
+            let back: ProgrammingLanguage =
+                serde_json::from_str(&json).expect("deserializes by its own name");
+            assert_eq!(back, *pl);
+        }
+    }
+
+    /// `name()` is the label on every metric, the value in `GET /config`'s list and
+    /// the SQL literal. Two languages sharing one would make a project's per-language
+    /// counts silently merge.
+    #[test]
+    fn no_two_languages_share_a_name() {
+        let mut seen = std::collections::HashMap::new();
+        for pl in ProgrammingLanguage::ALL {
+            if let Some(other) = seen.insert(pl.name(), *pl) {
+                panic!(
+                    "{:?} and {pl:?} both call themselves {:?}",
+                    other,
+                    pl.name()
+                );
+            }
+        }
+        assert_eq!(seen.len(), ProgrammingLanguage::ALL.len());
+    }
+
+    /// `ALL` must hold each language once. A duplicate would make every `ALL`-driven
+    /// check — the tags-query construction test among them — run twice for one
+    /// language and, more to the point, would mean the list was edited by hand
+    /// without being read.
+    #[test]
+    fn all_lists_every_language_exactly_once() {
+        let unique: std::collections::HashSet<_> = ProgrammingLanguage::ALL.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ProgrammingLanguage::ALL.len(),
+            "ProgrammingLanguage::ALL contains a duplicate"
+        );
+        assert!(!ProgrammingLanguage::ALL.is_empty());
+    }
 }
