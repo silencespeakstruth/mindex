@@ -80,19 +80,22 @@ jobs:
           cargo build --release --locked --manifest-path tools/indexer/Cargo.toml
           cargo build --release --locked --manifest-path tools/watcher/Cargo.toml
 
+      # Staging and dist are separate directories on purpose: the upload step globs
+      # `dist/*`, so anything in there must be an artefact. Globbing by extension
+      # instead means naming both .tar.gz and .zip on every platform, and gh fails
+      # the job on the one that cannot match.
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           name="mindex-cli-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp tools/indexer/target/release/mindex-index "dist/$name/"
-          cp tools/watcher/target/release/mindex-watch "dist/$name/"
-          cp LICENSE README.md "dist/$name/"
-          cd dist
-          tar -czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          mkdir -p "staging/$name" dist
+          cp tools/indexer/target/release/mindex-index "staging/$name/"
+          cp tools/watcher/target/release/mindex-watch "staging/$name/"
+          cp LICENSE README.md "staging/$name/"
+          tar -czf "dist/$name.tar.gz" -C staging "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -100,20 +103,19 @@ jobs:
         run: |
           set -euo pipefail
           name="mindex-cli-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp tools/indexer/target/release/mindex-index.exe "dist/$name/"
-          cp tools/watcher/target/release/mindex-watch.exe "dist/$name/"
-          cp LICENSE README.md "dist/$name/"
-          cd dist
-          7z a "$name.zip" "$name" > /dev/null
-          certutil -hashfile "$name.zip" SHA256 > "$name.zip.sha256"
+          mkdir -p "staging/$name" dist
+          cp tools/indexer/target/release/mindex-index.exe "staging/$name/"
+          cp tools/watcher/target/release/mindex-watch.exe "staging/$name/"
+          cp LICENSE README.md "staging/$name/"
+          (cd staging && 7z a "../dist/$name.zip" "$name" > /dev/null)
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
 
       - name: Upload to the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber
+        run: gh release upload "$TAG" dist/* --clobber
 
   server:
     name: Server (linux x86-64)
@@ -147,19 +149,18 @@ jobs:
         run: |
           set -euo pipefail
           name="mindex-server-x86_64-unknown-linux-gnu"
-          mkdir -p "dist/$name"
-          cp target/release/mindex "dist/$name/"
-          cp LICENSE README.md config.example.toml "dist/$name/"
-          cd dist
-          tar -czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          mkdir -p "staging/$name" dist
+          cp target/release/mindex "staging/$name/"
+          cp LICENSE README.md config.example.toml "staging/$name/"
+          tar -czf "dist/$name.tar.gz" -C staging "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 
       - name: Upload to the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
+        run: gh release upload "$TAG" dist/* --clobber
 
   vsix:
     name: VS Code extension
