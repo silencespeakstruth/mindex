@@ -26,4 +26,13 @@ src/**
 # runs the esbuild bundle in dist/.
 out/**
 
+# Tool caches. They are gitignored, so CI never sees them and a clean checkout packs
+# fine — which is exactly why this went unnoticed: a maintainer running mypy or ruff
+# from this directory shipped 256 KB of .mypy_cache inside the .vsix, and only a local
+# `npm run package` could produce it.
+.mypy_cache/**
+.ruff_cache/**
+.pytest_cache/**
+.eslintcache
+
 **/*.vsix

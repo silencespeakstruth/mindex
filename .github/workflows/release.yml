@@ -170,9 +170,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 22, not 20, and both halves of the toolchain insist on it: `npm run test`
+      # is `node --test "out/**/*.test.js"`, and glob expansion by `--test` landed
+      # in Node 21 — under 20 it reports the pattern as a missing file and exits 1.
+      # vsce's own Azure dependencies declare `node: >=22.0.0` besides.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: tools/vscode/package-lock.json
 
