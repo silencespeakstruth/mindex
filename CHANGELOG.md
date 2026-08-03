@@ -9,6 +9,322 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
+## [1.1.0] — 2026-08-03
+
+Gives research reports an **opponent** and an **offline re-verification**, writes them
+**section by section** so a run that runs out of time still returns findings, makes
+`GET /health` **tri-state** so a client stops guessing which dependency matters,
+publishes the whole workflow at **`/llms.txt`**, and halves the on-disk size of a
+collection. Withdraws the `callers` tool and the reference half of the symbol table,
+which is the one removal here. A broad stability pass gave every wait a number.
+
+### Upgrading — REQUIRED. Until you do this, search returns nothing and says nothing
+
+`COLLECTION_SCHEMA_VERSION` moved `v1` → `v2`, and it is **not self-healing**: the new
+name names no collection, an empty one is created, SQLite still reports every file
+`indexed`, and every search comes back empty with no error anywhere.
+
+1. Stop the server.
+2. Start it once. Migrations 5 and 6 apply in place.
+3. **Reindex every project**: `mindex-index --root <repo> --force`. This also rebuilds
+   the symbol table, which migration 6 needs (`SYMBOLS_DERIVATION_VERSION` is `1.1`).
+4. **Drop the leftover `*_v1` Qdrant collections by hand.** They still hold the whole
+   pre-upgrade index and nothing reaches them.
+
+Step 4 is deliberately not automated: leaving the old collections in place is what makes
+a rollback possible. New in this release, `worker::stale` runs at startup and hourly and
+publishes `mindex_stale_collections` and `mindex_orphaned_collections`, so the state
+between steps 2 and 4 is visible rather than silent. Both gauges are seeded at `-1`,
+never `0` — `0` is the healthy reading and an unreachable Qdrant must not be able to
+spell it. The runbook is in `docs/claude/qdrant.md`.
+
+Two smaller notes: **`role:` on `POST /v0/{guid}/symbols` is now a `400`**, not an
+ignored field (see below); and `PROMPT_VERSION` is `2.7`, so reports written before this
+release are not directly comparable — partition a stored corpus on it.
+
+### Added
+
+- **Reports have an opponent.** `POST /v0/{guid}/research/{run_id}/challenge` is a
+  research run whose subject is a stored report: same loop, same semaphore, same
+  budgets, its own citation gate. The subject is injected as hearsay under examination
+  and **never seeds the evidence** — re-deriving every location through the tools *is*
+  the refutation. A closing verdict turn scores each claim `CONFIRMED` / `DISPUTED` /
+  `REFUTED`, and the stream carries one new event, `verdict`, between `excerpts` and
+  `done`; an ordinary run's stream is byte-for-byte unchanged.
+  - **The grounding cap is what makes this safe with a weak model, and it is
+    symmetric.** A challenge is `grounded` when it verified at least one citation and
+    its unverified citations do not outnumber them. An **ungrounded `refuted` caps at
+    `disputed`** — an accusation that showed no code refutes nothing — and an ungrounded
+    `confirmed` resolves to NULL, because an unshown *acquittal* is not one either. One
+    surviving citation out of nine was enough to launder a challenge that had checked
+    nothing; that is measured, not hypothetical.
+  - Zero parseable verdict lines is NULL: **challenged, inconclusive**, which no reader
+    may render as an acquittal.
+  - **Trust is derived at read time, never stored** — over *valid* challenges only, so a
+    challenge whose own evidence goes stale stops counting by itself. Severity wins
+    (`refuted` > `disputed` > `confirmed` > `unchallenged`). One challenge stands per
+    report: a newer one **with a parseable verdict** evicts the older, inside the same
+    transaction as its own insert. An inconclusive run evicts nothing — it produced no
+    finding, and letting it erase a `refuted` would spend the mechanism's most valuable
+    output on its least informative outcome.
+  - Refused when the subject is invalid (`400 research.challenge_subject_invalid` —
+    staleness must not be spendable as refutation) or is itself a challenge
+    (`research.challenge_subject_is_challenge`; trust aggregation is single-level).
+- **Offline re-verification.** `GET /projects/{guid}/research/{run_id}/verification`
+  re-runs the citation check as a pure function over journal rows — no model, no GPU.
+  It answers two questions and keeps them **separate**: *provenance* is immutable and
+  must match the recorded counters, so a mismatch is a journal bug and never news about
+  the code; *staleness* is computed against the index as it stands now and is the number
+  that actually moves. Nothing is stamped, so it can never disagree with a
+  recomputation.
+- **Migration 5** (`v1.3.0_research_verification.sql`) makes the run journal structured:
+  `research_run_evidence` (the shown spans — the one `check_citations` input that
+  otherwise died with the run, and what makes the offline check possible),
+  `research_run_citations` (per-occurrence verdicts in report order) and
+  `research_run_steps` (calls, arguments and landing spans; no result bodies — the code
+  is in the index). Trace rows are built at the same sites as the `step` SSE frames from
+  the same locals, so wire and journal cannot drift.
+- **`GET /llms.txt`** — the whole workflow as one document, so pointing an agent at a
+  URL is enough to get it started. Static narrative plus a live section rendered from
+  the same snapshot `GET /config` serves: available models, the effort ladder, and the
+  **measured** p50/p90 per model and effort. Absent data is stated as absent rather than
+  papered over with an invented value. Deliberately outside the OpenAPI spec, and a test
+  asserts the absence so the omission reads as a decision.
+- **A report of three or more plan items is written one section at a time.** The report
+  used to be a single turn, so a model that could not produce it produced *nothing* — a
+  fifteen-minute run returning zero. Each numbered sub-question now gets its own turn,
+  the server assembles the document, and a section that fails costs that section rather
+  than the document. Below three plan items the run takes the old single-turn path
+  byte-for-byte, which is both the safety valve and the revert switch.
+- **Checkpoints make a stopped run return findings.** `[research].checkpoint_every_steps`
+  (6; `0` disables) interrupts the tool loop to bank the sections already answerable.
+  A section that cannot be written later ships its banked version, and a forced synthesis
+  assembles real findings instead of "No report was produced." It costs a step, so it is
+  visible in the operator's budget, and is capped so a mis-set interval cannot eat a run.
+- **A request can shape the report.** `max_report_sections`, `max_report_words`,
+  `checkpoint_every_steps` and `evidence_width` join the per-axis budget overrides, each
+  capped by a new `[research]` ceiling that config validation refuses to set below what
+  `effort.high` already grants. `evidence_width` is one integer multiplier on how much a
+  single lookup returns; it deliberately does not scale navigation tools or `search`.
+- **A run is named from admission and listed while it runs.** `run_id` is minted before
+  the work starts, streamed as the first frame, and registered — so `GET /research/active`
+  lists live runs and `DELETE /research/active/{run_id}` cancels one whose caller
+  abandoned it without closing the socket. Before this a run had no id until it ended:
+  with `max_concurrent = 1` an occupied slot was an unattributable total outage whose
+  only remedy was a restart. A `429` now names the endpoint that explains it.
+- **`GET /health` is tri-state, and the server owns the verdict.** `ok`; `degraded`,
+  meaning only the **optional** Ollama is failing — exactly the state where a client
+  should keep offering search and stop offering research; `unhealthy`, meaning a
+  required check failed or a research run is wedged. Severity wins, so Ollama down *and*
+  Qdrant down is `unhealthy`. Two words rather than three was the defect: every client
+  then needed its own copy of which check is required, and the VS Code extension's did
+  not match the server's. `checks.*` is now exactly `"ok"` or `"error"` — the reason a
+  probe failed goes to a log with a sysadmin hint, because this response is readable by
+  anything that can reach the port and a driver's error chain carries paths, URLs and
+  versions. Clients must test `== "ok"`, never a prefix.
+- **`[research].allowed_models`**, a glob whitelist compiled once at startup (empty =
+  any). Checked before the semaphore, so a refused model costs no slot; `GET /config`
+  publishes the model list already filtered by it, plus the raw patterns.
+- **A toolless model is refused before it costs anything.** `/api/show`'s `capabilities`
+  is now read and cached alongside the context length, and a model that does not declare
+  `tools` is a `400` at admission instead of a slot, a model load and a wasted turn. It
+  is three-valued on purpose: only an explicit "no" refuses, since a pre-flight that
+  cannot be performed is not a refusal.
+- **Three contention guards, all shipping armed.** `[research].max_turn_seconds` (300)
+  abandons a turn that is still producing but has consumed a whole run's wall clock —
+  measured twice on one host, 985 s at ~1.5 tok/s and 912 s for 702 tokens, each time a
+  single plan turn eating the run. `slow_turn_tokens_per_second` and
+  `slow_turn_unaccounted_ms` warn without stopping anything; they are **independent**,
+  and neither may gate the other, because the second exists precisely for the case the
+  first cannot see (time spent queueing behind another client falls outside Ollama's own
+  accounting entirely). Ollama's `load_duration` / `eval_duration` / `total_duration`
+  were previously parsed by nobody; they now ride on `progress` and `done` as
+  `generation_ms` / `model_load_ms` / `unaccounted_ms` / `eval_tokens_per_second`.
+- **`GET /config` publishes what a run costs, not only what it grants.** `observed` is
+  measured p50/p90 per `(model, effort)` from the journal, and a pair with too few runs
+  is absent rather than noisy. Also `worst_case_seconds` per level, since `max_seconds`
+  and the report window bound *different phases* and reading the first as the whole wait
+  understated `high` by five minutes.
+- **A step reports where it landed** (`spans`, `path:start-end`), from the same locations
+  citation provenance is scored against. `hits: 3` on a 4000-line file named no lines,
+  which made the trace unusable for the only thing it is for.
+- **Collection metrics.** `mindex_stale_collections` and `mindex_orphaned_collections`
+  (see Upgrading), `mindex_project_vectors` (Qdrant's own point count per project — the
+  only detector for a lost vector volume, and a project the store cannot answer for is
+  *absent*, not zero), `mindex_search_orphaned_winners`, `mindex_search_unscorable_winners`,
+  `mindex_worker_running` / `mindex_worker_exits_total`, and
+  `mindex_research_unjournalled_runs` — the denominator every research rate lacked, since
+  the three endings that write no row were absent from every per-run metric at once.
+- **VS Code — Research History is now the one reading surface**, an editor-area panel
+  with a challenge launcher, kind/trust badges linking challenge to subject, a Verify
+  action for the offline re-check, an active-runs picker, and a garbage-collection review
+  that proposes invalid, stale, partial and inconclusive runs (pinned exempt) with the
+  reasons visible. `mindex.browseResearch` is gone; `ctrl+alt+,` opens the panel.
+- **VS Code — `.gitignore` writes the excludes it already knows.** Creating a `.mindex`
+  translates every `.gitignore` in the project, nested ones included, naming the file
+  each block came from and commenting out what it cannot express rather than guessing.
+- **VS Code — three new settings**: `mindex.requestTimeoutSeconds`,
+  `mindex.streamIdleTimeoutSeconds` (an **idle** clock, never a total one — a `high` run
+  may legitimately live 70 minutes) and `mindex.indexingPanel`.
+- **Prebuilt binaries.** `mindex-index` and `mindex-watch` for Linux, Windows and macOS
+  (Intel and Apple silicon), the server for Linux x86-64, and the `.vsix`, all built on
+  native runners by a new release workflow. `mindex-watch`'s filesystem watching has only
+  ever been exercised on Linux inotify.
+
+### Changed
+
+- **The ColBERT vector is stored as fp16, with no HNSW graph.** Measured on this repo's
+  own index, ColBERT was **99.6% of the collection's bytes** — 838 MB per segment against
+  2.6 MB dense and 0.5 MB sparse, roughly 1.85 MB per chunk. `datatype: Float16` halves
+  that and is not a quality trade the way quantization would be: this vector only
+  *orders* a pool dense and sparse already agreed on. `hnsw_config.m = 0` builds no graph
+  at all, which is correct only because ColBERT is always the outer query over a prefetch
+  pool and never an entry point. This is what `COLLECTION_SCHEMA_VERSION` `v2` is.
+- **`callers` is withdrawn, along with the reference half of the symbol table and the
+  repo map that ranked by it.** The reference rows were measured rather than assumed:
+  23 810 of them against 3 397 definitions — **87.5% of the table** — serving one
+  model-facing tool called **twice** across twenty-five recorded research runs at a 50%
+  miss rate. The edges were lexical, so the most-referenced names here were `assert_eq`
+  (1084), `clone`, `Ok`, `unwrap`, `map`, several with exactly one definition in the
+  tree. Separating a core abstraction from a name shared with a language builtin is name
+  resolution, which is the wall this project declines to climb. `grep` answers "who uses
+  this name" lexically **and says so**, which is the honest version of what `callers`
+  implied. `parent_name`/`parent_kind` survive — for a definition, the enclosing
+  definition is what makes `Gc::collect` readable.
+  - **Migration 6** (`v1.4.0_symbol_definitions.sql`) drops `project_file_symbols.role`,
+    now that every value is `'definition'`. It does not delete the reference rows:
+    symbol rows are wholly derived, so `SYMBOLS_DERIVATION_VERSION` `1.0` → `1.1` removes
+    them on the next indexing run, keeping the rule in one place.
+  - **`POST /v0/{guid}/symbols` now rejects `role:` with a `400`.** Accepting and
+    ignoring it would answer a `role: "reference"` query with the *definitions* — the one
+    wrong answer that costs nothing to detect and looks exactly like a right one.
+- **A score that cannot be compared ranks last, not first.** `total_cmp` orders `+NaN`
+  above every finite value, so the plain descending sort handed the **top result slot** to
+  a chunk the reranker could not score. NaN results are ranked last rather than dropped —
+  the chunk really did match the filters — and counted, because the symptom otherwise
+  reads as a ranking-quality complaint rather than the misconfigured embedder it is.
+- **Every wait has a number, and it is the server's, not the library's.**
+  `[qdrant].timeout_ms` / `connect_timeout_ms` exist because the client's own default was
+  5 s and no knob reached it: a project whose rerank ran past that failed **every** search,
+  untunably. `[model].encode_timeout_ms` now bounds the whole call rather than each
+  attempt — per attempt the worst case was forty minutes at the defaults. `GET /health`
+  runs its probes concurrently under a fixed 3 s ceiling; they were sequential, and the
+  SQLite one was the file's only transaction without a cancellation token, so a wedged
+  pool hung the one endpoint that must always answer. Shutdown now drains for 8 s instead
+  of logging "Shutdown complete." while in-flight batches were torn out mid-flight.
+- **HTTP/3 now streams frame by frame.** The response body was buffered whole before the
+  first send, so `/index?stream=yes` and `/research` did not stream over h3 at all — the
+  client saw nothing until the run ended, up to seventy minutes, while the server
+  accumulated every event in memory. Both endpoints exist *because* their output is worth
+  watching arrive.
+- **A prose tool call is detected in two notations.** A model that calls tools natively
+  all run long can still write markup on the report turn, where no tools are passed;
+  JSON-only detection let that through every gate meant to catch it, and a run shipped and
+  journalled a "report" whose whole body was three fake calls.
+- **A cited path is resolved before it is scored.** A cited path may be the unambiguous
+  tail of exactly one shown path; two candidates resolve to none. The failure this fixes
+  is not a parser gap but `unverified` — the verdict for a path no tool returned — being
+  handed to a report about a file it had just read, five times in one run. `citations`
+  gained `path_resolved` as the honesty counter, plus `shown_paths` (how many files the
+  run saw the *inside* of) and `server_written`, because a forced-synthesis report cites
+  nothing by construction and scored byte-for-byte what a clean report scores.
+- **A run that looked at nothing while holding hearsay is refused.** The ungrounded gate
+  exempts a run with nothing to say; a run handed prior reports or a challenge subject has
+  somebody else's answer to hand, and the same uncited prose is then that answer restated
+  as findings, in the field callers are told to trust.
+- **Research metrics are charted with `increase()`, and the report phase is charted at
+  all.** The Grafana dashboard gained the report-phase row, which is where runs actually
+  fail; rare histograms are drawn as points with gaps kept.
+- **VS Code — a degradation freezes the form and never the tabs.** Both mode buttons stay
+  live in every state: a disabled tab is a dead end whose explanation lives behind it.
+  Every server-touching button single-flights, supersedable for reads and refused for
+  writes. No raw error reaches a user — one funnel, machine codes to the log.
+- `mindex-watch` is described as a filesystem watcher rather than an inotify daemon, since
+  it is now released for three platforms.
+
+### Fixed
+
+- **Recovery ran under the request's own token, so it was a no-op in the one case it
+  exists for.** The pool short-circuits on a cancelled token *before* touching the
+  database, so a cancelled or disconnected request left every prepared file `indexing`
+  until the 30-minute stuck-grace sweep. The unit test passed a fresh token and so agreed
+  with the bug.
+- **A failed status write read as a success.** `set_file_status` returns a `bool` covering
+  a DB error, a trigger rejection and a 0-row update, and it was discarded: the retry
+  worker reported `"indexed"` on the strength of a write it never checked, so a database
+  that had stopped accepting writes kept a clean success rate while every file stayed
+  stuck. It is `#[must_use]` now, and the legitimate discards are written as such with
+  their reason.
+- **The retry worker inferred "no chunks" from a failed read.** Behind an
+  `unwrap_or_default()`, a `PoolEmpty` or a locked database silently promoted files to
+  permanently-indexed-and-empty, at `info!`. A read that fails now leaves the file for the
+  next sweep.
+- **A crash read as the client hanging up.** A panicked pool task became `Cancelled`,
+  which told the client it had closed a connection it never closed, told the dashboard a
+  disconnect, and silenced every call site's log — while permanently costing a pool
+  connection. It is its own variant now, counted as `outcome="panic"`; after
+  `db_pool_size` of them every request failed with `database.busy` and nothing said why.
+  The reachable instance was `grep` slicing a string with an offset found in its
+  lowercased copy (`İ` grows by a byte), so any indexed file containing one made `grep` a
+  way to dismantle the pool four requests at a time.
+- **A dead background worker was invisible.** Workers were bare spawns with the handle
+  dropped, so a panic stopped GC or the retry sweep permanently and in silence —
+  indistinguishable from a healthy idle system. They are supervised now, publishing
+  `worker_running` *before* the task starts, because a series that never existed cannot be
+  alerted on.
+- **`PoolEmpty` was an unretryable-looking 500 that produced no log line at all** — the
+  likeliest production failure, invisible. It is `503 database.busy` with a hint.
+- **GC reported success for a pass that could not run.** Each phase returned a bare count
+  with every error mapped to `0`, and the run counted as `ok` whenever the token was live,
+  so a GC failing for days looked idle and `POST /gc` answered 200 with zeros either way.
+  Phases now report whether they finished, and `failed_phases` names them on the wire.
+- **A missing Qdrant collection was treated as a GC failure, which made the backlog
+  permanent.** "Keep the row until the vector is confirmed gone" then meant *never*: chunk
+  rows were unsweepable, their file rows unprunable behind the RESTRICT FK, and the
+  backlog grew for the life of the deployment — in exactly the state a lost Qdrant volume
+  leaves behind, where GC needs to work most. A missing collection is a confirmation now,
+  checked only after a failure, and only a definitive answer converts.
+- **`cancel_overdue` re-reported what it had already cancelled.** A run wedged in an await
+  its token cannot reach stays registered, so the sweep re-cancelled, re-warned and
+  re-counted it every 30 s, turning a counter documented to stay at zero into an unbounded
+  number describing one event.
+- **`show_facts` cached failures**, making one blip permanent for the process and silently
+  running every later run of that model at the configured ceiling instead of its own
+  window. Successes only, now.
+- **Ollama's two failure classes are two codes.** `ollama.unavailable` is unreachable or
+  reachable-and-mute; `ollama.error` is Ollama answering *with* an error, nearly always a
+  model that is not pulled. Collapsed into one, a client could not word the message or
+  decide whether re-reading `/health` would say anything — and for a typo, health is green
+  every time.
+- **A turn against a live but mute socket spent the whole budget waiting.**
+  `[research].first_token_timeout_ms` (120 s) bounds the silent prefix only, armed across
+  the request *and* the wait for the first delta, since Ollama holds the connection open
+  while it loads a model.
+- **A scope that admits no file is refused at admission.** Without it such a run refuses
+  every lookup and then reports the question unanswerable, which reads as a finding about
+  the code: the commonest spelling (`"src/"`, where SQLite `GLOB` wanted `"src/**"`) cost a
+  measured 302-second run with zero citations and no error anywhere.
+- **A report missing its heading is repaired rather than refused**, when that is the sole
+  problem — and always *after* the citation check, since the derived heading comes from the
+  question and a server-written line must never enter the provenance report.
+- **An empty `grep` result had three meanings and one spelling.** Out-of-scope, nothing
+  searchable, and genuinely absent are now distinguished, and a miss whose pattern carries
+  regex punctuation says the match was literal: `\.bwp` → 0 against `.bwp` → 7 is a false
+  negative the reader was handed as proof of absence.
+- **`embed_and_upsert` trusted the row counts off the wire.** `zip` silently truncated a
+  short response, leaving a file marked `indexed` with vectors missing and no error
+  anywhere; a long one indexed out of bounds. Relatedly, a `Vec::with_capacity` from an
+  unvalidated `u32` asked for ~100 GB on a corrupt body and aborted the process.
+- **A section turn could ship the checkpoint's sections again, or somebody else's.** A
+  reply whose numbered headings are all *other* items is not this section written badly; it
+  is a second document, and one was measured shipping sections 1-2 twice.
+- **Search returned `200` with an empty list when every winner was orphaned** — the
+  reassuring spelling for the case that means the two stores disagree, while an over-narrow
+  filter gets a `404`. It is a `404` uniformly now, and the orphans are counted.
+- **VS Code: a reindex read its result from the `/index` response**, which swallows claim
+  conflicts and answers `200`, so a refused reindex read as `unchanged`. It reads the
+  server's claims and the follow-up drift check instead.
+
 ## [1.0.1] — 2026-07-31
 
 Adds a second channel for research — **git history** — turns its stored reports into a
@@ -254,6 +570,7 @@ server.
 - **Tools**: `mindex-index`, `mindex-watch`, `mindex-search.sh`, the `mindex` and
   `scout` MCP servers, and a VS Code extension.
 
-[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/silencespeakstruth/mindex/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/silencespeakstruth/mindex/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/silencespeakstruth/mindex/releases/tag/v1.0.0

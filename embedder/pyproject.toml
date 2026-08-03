@@ -1,6 +1,6 @@
 [project]
 name = "bge-m3-api"
-version = "1.0.0"
+version = "1.1.0"
 description = "BGE-M3 embedding server exposing all three heads (dense, sparse, ColBERT) over a compact binary wire format."
 authors = [{ name = "Сергей Боголюбов" }]
 license = "MIT"

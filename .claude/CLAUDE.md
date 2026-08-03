@@ -81,7 +81,7 @@ container means mounting a `config.toml`.
   attention kernel**, which returns NaN for padded fp16 rows and still answers
   200 — `attention_backend()` in `__main__.py`; removing it silently corrupts
   every batch of more than one text.
-- Migrations in `src/db/migrations/`. **Six**: `v1.0.0_schema.sql` (version 1,
+- Migrations in `src/db/migrations/`. **Seven**: `v1.0.0_schema.sql` (version 1,
   the whole 1.0.0 schema), `v1.1.0_git_history.sql` (2, adds `project_commits`
   + `project_commit_paths`), `v1.1.0_toml_yaml_languages.sql` (3, rebuilds
   `project_files` to widen its `programming_language` CHECK),
@@ -89,7 +89,11 @@ container means mounting a `config.toml`.
   `seq`/`expires_at`/`context_run_ids_json`, adds `research_run_files`),
   `v1.3.0_research_verification.sql` (5, rebuilds `research_runs` for the
   validation metadata + the challenge columns, adds `research_run_evidence` /
-  `research_run_citations` / `research_run_steps`). The
+  `research_run_citations` / `research_run_steps`),
+  `v1.4.0_symbol_definitions.sql` (6, rebuilds `project_file_symbols` to drop
+  `role` and its index — with references gone every value was `'definition'`;
+  the file carries surviving rows across verbatim and leaves the deletion to
+  `SYMBOLS_DERIVATION_VERSION`, so the rule lives in one place). The
   applied set is the `MIGRATIONS` slice in `main.rs`, keyed by the integer in
   `PRAGMA user_version`; the filename version is documentation. **v1.0.0 is
   frozen** — the filter is `version > user_version`, so an in-place edit never
@@ -109,7 +113,7 @@ container means mounting a `config.toml`.
 ## Core invariants (violating these causes bugs)
 
 **Project isolation = collection + has_id filter.** One Qdrant collection per
-project, `{guid_simple}_v1` (`COLLECTION_SCHEMA_VERSION`, `qdrant.rs`); always
+project, `{guid_simple}_v2` (`COLLECTION_SCHEMA_VERSION`, `qdrant.rs`); always
 derive names via `collection_for(project_guid)`. The candidate set is a `has_id`
 filter built from SQLite (`qdrant_guid` for chunks matching project + filters +
 **`status='active'`**) — the *sole* isolation mechanism, also excluding
@@ -993,7 +997,7 @@ is the `research_runs` table.) The hard invariants:
     validators share it), `max_report_words` (see the output-volume bullet),
     `checkpoint_every_steps` (see the checkpoints bullet) and
     `evidence_width` (1 at every level, `1..=[research].max_evidence_width`) —
-    an integer multiplier on `READ_CHUNKS_LIMIT`/`GREP_LIMIT`/`CALLERS_LIMIT`/
+    an integer multiplier on `READ_CHUNKS_LIMIT`/`GREP_LIMIT`/
     `FILE_HISTORY_LIMIT`/`SYMBOLS_LIMIT`, threaded as a `limit` param into the
     research-only core fns and stored on `StateResearchTools` (constant per
     run, so the `ResearchTools` trait is untouched). It deliberately does

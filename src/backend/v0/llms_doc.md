@@ -47,18 +47,21 @@ One measured retrieval hint: queries carrying real identifiers retrieve
 implementations; pure natural-language queries tend to retrieve tests and
 docs. If you know a symbol name, put it in the query.
 
-`POST /v0/{project_guid}/symbols` — exact-name symbol lookup (definitions
-and references), returning ranked candidates plus full totals. Name
-collisions are part of the contract: you get candidates, never a single
-"the" answer. An empty result is a definitive "not defined in the index".
+`POST /v0/{project_guid}/symbols` — exact-name lookup over **definitions**,
+returning ranked candidates plus full totals. Name collisions are part of
+the contract: you get candidates, never a single "the" answer. An empty
+result is a definitive "not defined in the index". It does not answer "who
+uses this name" — that is a lexical question, and `grep` answers it and says
+so. The body rejects unknown fields, so a `role` filter from an older client
+is a `400` rather than a plausible wrong answer.
 
 ## Research — the core feature
 
 `POST /v0/{project_guid}/research` starts a full investigation on the
 server's local model: it plans, loops over internal tools (search, grep,
-symbols, outline, callers, file history, prior research), and streams back a
-cited Markdown report. You ask one substantial question; the server does the
-reading.
+symbols, outline, list_files, read_chunks, file history, prior research),
+and streams back a cited Markdown report. You ask one substantial question;
+the server does the reading.
 
 Request: `{"question": "..."}` plus optional `model` (must be in
 `research.models` from `GET /config`), `effort` (`low` / `medium` / `high`),
@@ -146,6 +149,12 @@ Every finished run is journalled and browsable:
 
 ## Health
 
-`GET /health` — readiness of the stores, the embedder and Ollama (Ollama
-down disables only research), plus research slot occupancy. A busy slot is
-never a degradation; a wedged one is.
+`GET /health` — readiness of the stores, the embedder and Ollama, plus
+research slot occupancy. HTTP is always 200; read `status`, which the server
+computes so you do not have to: `ok`; `degraded`, meaning only the
+**optional** Ollama is failing — keep offering search, stop offering
+research; `unhealthy`, meaning a required dependency failed or a run is
+wedged. Severity wins, so Ollama down *and* Qdrant down is `unhealthy`.
+Each entry in `checks` is exactly `"ok"` or `"error"` — test `== "ok"`,
+never a prefix, since an older server spells it `"error: <reason>"`. A busy
+research slot is never a degradation; a wedged one is.

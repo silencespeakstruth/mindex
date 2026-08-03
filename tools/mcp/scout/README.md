@@ -1,8 +1,9 @@
 # scout — MCP server that investigates so your model doesn't have to
 
-One tool, `research`. The calling model sends **a question**; a **local** model runs the
-entire investigation — searching the index, looking up symbols, reading the code — and
-sends back a cited Markdown report.
+Two tools, `research` and `challenge`. The calling model sends **a question**; a
+**local** model runs the entire investigation — searching the index, looking up symbols,
+reading the code — and sends back a cited Markdown report. `challenge` points the same
+machinery at a report that already exists, to try to break it.
 
 ```
 your question (a few dozen tokens)  →  mindex POST /research (SSE)
@@ -68,6 +69,45 @@ research(project_guid, question, effort="medium", model=None,
   names a maximum rather than a problem.
 - `include`/`exclude` — `{"paths": [...], "programming_languages": [...]}`, applied to
   every lookup. Standing project scope belongs in `.mindex`.
+
+## The opponent
+
+```
+challenge(project_guid, run_id, effort="medium", model=None,
+          budget=None, include_excerpts=False)
+  → the same shape as research, plus
+    "verdict": {"challenged_run_id", "overall", "grounded",
+                "claims": [{"claim", "verdict"}]}
+```
+
+A local model receives a **stored report as the subject under examination**, extracts
+its principal claims, and spends a whole research budget trying to refute each one
+against the live index. Nothing in the subject counts as evidence: every location has to
+be re-derived through the opponent's own tools, and that re-derivation *is* the check.
+
+**Two rules the caller must read it under, both enforced server-side:**
+
+- **Inconclusive is not an acquittal.** `overall: null` means the verdict turn parsed to
+  nothing — challenged, inconclusive. It must never be rendered as "the report stands".
+- **An ungrounded challenge can dispute but never refute.** `grounded: false` means the
+  challenge's own report verified no citations; the server then caps `refuted` down to
+  `disputed`, and resolves an ungrounded `confirmed` to null. An accusation that showed
+  no code refutes nothing, and neither does an acquittal that looked at nothing.
+
+The durable half is on the **subject**: every research listing from then on carries a
+derived `trust` (`unchallenged` / `confirmed` / `disputed` / `refuted`, severity wins).
+It is derived at read time over *valid* challenges only, so a challenge whose own
+evidence goes stale stops counting by itself. One challenge stands per report — a newer
+one with a parseable verdict replaces it.
+
+Refused with a 400 when the subject is no longer valid (its files moved, so "the code
+changed" cannot be spent as "the report was wrong" — re-run the research first), and
+when the subject is itself a challenge (trust aggregation is single-level).
+
+It costs a full research run of wall-clock, so it is for reports that have earned the
+scrutiny — one you are about to hand to a human, cite in a decision, or chain many
+follow-ups onto. Challenging with a *different* model than wrote the subject is the
+interesting experiment.
 
 ## Setup
 

@@ -1,0 +1,192 @@
+name: release
+
+# Builds the release artefacts on native runners and uploads them to the release
+# for the tag that triggered this run.
+#
+# Why native runners rather than cross-compiling: the server carries twenty
+# tree-sitter C grammars, a bundled SQLite and protobuf codegen, and macOS cannot
+# be cross-targeted from Linux at all without an SDK. Native runners are the only
+# way to produce a macOS binary anyone should install, and they exercise each
+# target's own linker.
+#
+# What is built where, and why not everything everywhere:
+#   - mindex-index / mindex-watch are pure Rust over reqwest+rustls with no C
+#     grammars and no protoc. They cross platforms cleanly, and they are what a
+#     user actually runs on their own machine.
+#   - the mindex server is Linux x86-64 only. It is developed, run and released
+#     on Linux; Docker is the supported way to run it elsewhere. A server binary
+#     nobody has exercised on a platform is worse on the release page than an
+#     absent one.
+#
+# The release itself is created by hand (`gh release create`) so its notes are
+# written rather than generated; these jobs only upload into it. `--clobber` makes
+# a re-run idempotent.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and upload to"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # A release build is not the place to discover a warning.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  cli:
+    name: CLI tools (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins the channel; `rustup show` materialises it.
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/indexer/target
+            tools/watcher/target
+          key: cli-${{ matrix.target }}-${{ hashFiles('tools/*/Cargo.lock') }}
+
+      # tools/indexer and tools/watcher are SEPARATE workspaces with their own
+      # Cargo.lock — they are not members of the root workspace, so they must be
+      # built by manifest path rather than with -p from the root.
+      - name: Build
+        run: |
+          cargo build --release --locked --manifest-path tools/indexer/Cargo.toml
+          cargo build --release --locked --manifest-path tools/watcher/Cargo.toml
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="mindex-cli-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp tools/indexer/target/release/mindex-index "dist/$name/"
+          cp tools/watcher/target/release/mindex-watch "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="mindex-cli-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp tools/indexer/target/release/mindex-index.exe "dist/$name/"
+          cp tools/watcher/target/release/mindex-watch.exe "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          7z a "$name.zip" "$name" > /dev/null
+          certutil -hashfile "$name.zip" SHA256 > "$name.zip.sha256"
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber
+
+  server:
+    name: Server (linux x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # protoc is qdrant-client's build-time dependency. rusqlite is `bundled`
+      # and utoipa-swagger-ui is `vendored`, so nothing else reaches the network.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler cmake pkg-config
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: server-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked --bin mindex
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="mindex-server-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/$name"
+          cp target/release/mindex "dist/$name/"
+          cp LICENSE README.md config.example.toml "dist/$name/"
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
+
+  vsix:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/vscode
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/vscode/package-lock.json
+
+      - run: npm ci
+
+      # `npm run package` runs the full check suite (prettier, eslint, tsc, the
+      # node:test suite) before vsce, so a broken extension fails the release
+      # rather than shipping. vsce runs vscode:prepublish, which rebuilds dist/ —
+      # the extension runs dist/, so a stale one would ship yesterday's code.
+      - run: npm run package
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: gh release upload "$TAG" ./*.vsix --clobber

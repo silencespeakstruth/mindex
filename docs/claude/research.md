@@ -31,8 +31,8 @@ streams a Markdown report. Non-obvious invariants:
   `tool_calls`, recognises the report turn by the *absence* of `tools`;
   `force_text_calls` covers the `research.model_lacks_tools` path), fakes in
   `research.rs` tests.
-- **Model protocol = Ollama's native tool calling.** The twelve tools
-  (search/grep/symbols/outline/callers/list_files/read_chunks/file_history/
+- **Model protocol = Ollama's native tool calling.** The eleven tools
+  (search/grep/symbols/outline/list_files/read_chunks/file_history/
   list_research/read_research/note/revise_plan, plus `finalize`) go out as
   `tools` JSON Schemas (`tool_specs`) and come back in `message.tool_calls` — a
   field distinct from `content`/`thinking`, so a model cannot put its decision
@@ -410,7 +410,7 @@ streams a Markdown report. Non-obvious invariants:
   written in identifiers** (measured: an NL query retrieves the *test* (~9),
   the identifier the implementation (~13) — a model that doesn't know a name
   burns budget rephrasing). The intended path is `list_files → outline →
-  symbols/search/callers → read_chunks`, and the system prompt says so — that
+  symbols/search/grep → read_chunks`, and the system prompt says so — that
   instruction is half the feature. Both are pure SQL over
   `project_files`/`project_file_symbols` (`outline_core`/`list_files_core`,
   covered by `idx_project_file_symbols_file`). `outline` reports `indexed`
@@ -430,10 +430,9 @@ streams a Markdown report. Non-obvious invariants:
   against the chunk/symbol tables). Two shapes: path-keyed (`outline`,
   `read_chunks`) get an **explicit refusal** — a third read plus an `in_scope`
   flag mirroring `indexed` (a refusal reading as empty tells the model the
-  file is empty); name/text-keyed (`symbols`, `callers`, `grep`) drop rows
+  file is empty); name/text-keyed (`symbols`, `grep`) drop rows
   **and count them** against one extra unscoped `COUNT(*)` ("not here" ≠ "not
-  anywhere", and `/symbols` calls the second definitive). `callers`' `defined`
-  probe stays unscoped for the same reason. All gated on `is_scoped()`, so an
+  anywhere", and `/symbols` calls the second definitive). All gated on `is_scoped()`, so an
   unscoped run builds byte-for-byte the SQL it always did — which is what
   makes the public `/symbols` sharing these cores provably unaffected.
   `SymbolsRequest` gained optional `include`/`exclude` (the MCP `symbols` tool
@@ -459,29 +458,34 @@ streams a Markdown report. Non-obvious invariants:
   by the scope subquery, stopped by `GREP_LIMIT`, refused below
   `GREP_MIN_PATTERN_CHARS`. FTS5 is the real answer, deferred — a table plus an
   invalidation surface is a project, not a tool.
-- **`callers` is deliberately an *approximate* call graph.**
-  `project_file_symbols` has no target column — a `role='reference'` row
-  records a token in call position, not which definition it binds to — but
-  carries `parent_name` (the enclosing definition, by byte-span containment),
-  so "who calls X" is one indexed SELECT, grouped per (file, definition)
-  because raw rows are resent every later turn (`callers_core` +
-  `build_callers_query`, testable like `build_symbols_query`).
-  `direction: "out"` reads the table the other way (`WHERE parent_name = ?`,
-  hence `idx_project_file_symbols_parent`). Edges are exact only up to name
-  collision and an aliased import breaks them — stated in the tool description
-  **and repeated on every result** (by result-reading time the description is
-  thousands of tokens back). An empty answer distinguishes "defined, never
-  referenced" from "no such name" (two reads); a top-level reference with no
-  parent is reported, not dropped (or totals disagree with the list).
-  LSP/SCIP resolution was **rejected** for the product case (lifecycle can't
-  be plug-and-play; readiness differs per server and early queries return
-  *wrong empty answers*; degradation is per-language and invisible) — this
-  tool makes the ambiguity **measurable** first. The property it rests on — a
-  tags query tags the enclosing definition with a span covering the call — is
-  not guaranteed, so `symbols_cross_language_tests.rs` pins it across five
-  non-Rust languages and its allow-list forces a decision when a language with
-  a tags query is added. Measured: the model calls it when the question is
-  shaped as reach, so the lever is the prompt's wording, not edge precision.
+- **`callers` was withdrawn, and this is the record of why** (1.1.0, migration
+  6, `SYMBOLS_DERIVATION_VERSION` 1.0 → 1.1). It was shipped as a deliberately
+  *approximate* call graph: `project_file_symbols` has no target column — a
+  `role='reference'` row recorded a token in call position, not which
+  definition it binds to — but carried `parent_name`, so "who calls X" was one
+  indexed SELECT. The argument for shipping it was that it made the ambiguity
+  **measurable** before deciding whether to climb the LSP/SCIP wall. It was
+  then measured, and the measurement went against it on both axes at once.
+  - **Cost.** 23 810 reference rows against 3 397 definitions — **87.5% of the
+    table** — carried on every index, every reindex and every backup.
+  - **Use.** Called **twice** across twenty-five recorded research runs, at a
+    50% miss rate. The model did not reach for it.
+  - **Signal.** The edges are lexical, so on this repo the most-referenced
+    names were `assert_eq` (1084), `clone`, `Ok`, `unwrap`, `map` — several
+    with exactly one definition in the tree. A file whose only content was a
+    method named `map` collected 372 votes from everybody else's `.map()`.
+    Nothing aggregates usefully over that, which is why the repo map that
+    ranked by it went out in the same commit.
+
+  Separating a core abstraction from a name shared with a language builtin
+  **is** name resolution — the wall this project declines to climb (see the
+  LSP refusal in `CLAUDE.md`, which rests on the server never walking a tree).
+  `grep` answers "who uses this name" lexically **and says so**, which is the
+  honest version of what `callers` implied. `parent_name`/`parent_kind` stay:
+  for a definition, the enclosing definition is what makes `Gc::collect`
+  readable, and both `outline` and `/symbols` return it. If exact resolution is
+  ever wanted, the rung is SCIP/LSIF artifacts posted by a client, never a
+  language server the index talks to.
 - **The loop terminates on counters, not on a clock** (regression guard).
   Every tool-loop iteration either breaks or increments exactly one of `steps`
   (≤ `max_steps`), `parse_retries` (≤ `MAX_PARSE_RETRIES`) or
@@ -957,7 +961,7 @@ Decisions of record:
   grant below it would name a shape the mechanism cannot produce. A caller
   wanting a short report has `max_report_words`.
 - **`evidence_width` is one integer multiplier**, not per-tool fields. It
-  scales `READ_CHUNKS_LIMIT` 8, `GREP_LIMIT` 20, `CALLERS_LIMIT` 50,
+  scales `READ_CHUNKS_LIMIT` 8, `GREP_LIMIT` 20,
   `FILE_HISTORY_LIMIT` 20, `SYMBOLS_LIMIT` 10 — the per-call evidence widths —
   and deliberately not `outline`/`list_files` (navigation; when 300 rows bind,
   the fix is a narrower glob), not `search` (`search_top_k` stays TOML-only:

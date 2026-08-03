@@ -2718,13 +2718,18 @@ fn build_symbols_query(
 
 /// Exact-name symbol lookup within one project.
 ///
-/// Symbols (definitions + references, with kinds, enclosing definition and doc
-/// comments) are extracted at indexing time from the language's upstream
-/// tree-sitter tags query — purely syntactic, no type resolution. The response is
-/// therefore **candidate lists, never a single answer**: an exact name can
-/// legitimately have several definitions (same name in different modules,
-/// overloads); `total_definitions`/`total_references` always carry the full
-/// counts so a truncated list is visible to the caller, who disambiguates.
+/// Symbols (definitions, with kinds, enclosing definition and doc comments) are
+/// extracted at indexing time from the **definition** tags of the language's
+/// upstream tree-sitter tags query — purely syntactic, no type resolution. The
+/// response is therefore a **candidate list, never a single answer**: an exact
+/// name can legitimately have several definitions (same name in different
+/// modules, overloads); `total_definitions` always carries the full count so a
+/// truncated list is visible to the caller, who disambiguates.
+///
+/// It does **not** answer "who uses this name". The reference half of the table
+/// was withdrawn in 1.1.0 — its edges were lexical, recording a token in call
+/// position rather than which definition it binds to — and `grep` answers that
+/// question lexically and says so.
 ///
 /// Ranking is deterministic and purely path-based: with `anchor_path`, candidates
 /// in that file come first, then its directory, then the rest; ties break by

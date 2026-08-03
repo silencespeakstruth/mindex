@@ -98,6 +98,13 @@ max_doc_chunk_tokens = 1024
 # this measurably changes nothing — it earns its keep on documents whose headings
 # are sparse or absent, where structure alone can only pack up to the cap.
 doc_semantic_weight = 1.0
+# Node selection alone leaves roughly a third of lines in no chunk at all —
+# consts, type aliases, small helpers, trait signatures and, crucially, the doc
+# comments that have no chunk to attach to. The gap pass packs those into
+# line-aligned windows; measured here it took line coverage from 63% to 99.7%
+# and doc-comment coverage from 40% to 100%. It roughly doubles embedding work,
+# which is the only reason it is a knob rather than a constant.
+fill_gaps = true
 
 [search]
 default_top_k = 5       # results returned when a /search request omits top_k
@@ -112,9 +119,14 @@ max_files_per_request = 10000 # max files in one /index request
 max_drift_files = 200000      # max entries in one /drift path→sha256 map
 max_selector_patterns = 256   # max globs+languages combined in one include/exclude
 max_symbol_name_bytes = 512   # max /symbols name length in bytes
-max_symbol_results = 50       # upper bound a /symbols request may set for limit (per role)
+max_symbol_results = 50       # upper bound a /symbols request may set for limit
 max_history_commits = 20000   # max commits in one /history reconciliation request
 max_commit_message_bytes = 65536 # max subject+body of one commit, in bytes
+# Max ids in one batch DELETE of stored research. An empty list is a 400 rather
+# than a whole-corpus wipe, and over this cap the code is
+# validation.research_delete_too_many. Published on GET /config, because a client
+# pruning a corpus sizes its paging loop from it rather than guessing.
+max_research_delete_ids = 500
 
 # /research — the Ollama-driven iterative research endpoint (SSE). Talks to a
 # local Ollama; each request names its model (or falls back to default_model).
@@ -281,6 +293,17 @@ max_num_ctx_tokens = 131072
 max_request_seconds = 3600
 max_request_tokens = 8000000
 max_request_steps = 200
+# Ceilings on the report-SHAPE axes a request may override. Unlike the three
+# above, two of these carry a floor as well, and two accept 0 meaning "off" —
+# which is why an out-of-range value gets its own code,
+# validation.research_shape_out_of_range. Startup refuses any ceiling below what
+# effort.high already grants.
+max_request_report_sections = 12  # a request may ask for 3..=this many sections
+max_request_report_words = 4000   # 0 (no ceiling announced) or 150..=this
+# Multiplier a request may put on how much evidence one lookup returns
+# (read_chunks / grep / file_history / symbols row limits). Width is resent every
+# turn, so it compounds into max_tokens — hence a small ceiling.
+max_evidence_width = 3            # a request may ask for 1..=this
 
 # Stored research. A finished run is journalled with an `expires_at` of
 # created_at + retention_days, and /gc reaps it once that passes. The deadline is
@@ -373,6 +396,16 @@ max_steps = 8
 search_top_k = 5
 max_report_words = 400
 
+# How many sections a report is written in. At 3 or more plan items the report is
+# written one section at a time, so a section that fails costs that section rather
+# than the whole document; below 3 the run takes the old single-turn path. This is
+# also what the plan prompt asks for ("3-N").
+max_report_sections = 6
+# Multiplier on how much one evidence-returning lookup may return (read_chunks,
+# grep, file_history, symbols). Deliberately does NOT scale outline/list_files
+# (navigation) or search (which has search_top_k). Width is resent every turn.
+evidence_width = 1
+
 [research.effort.medium]
 max_seconds = 900
 max_tokens = 1200000
@@ -380,6 +413,8 @@ context_fraction = 0.7
 max_steps = 20
 search_top_k = 5
 max_report_words = 900
+max_report_sections = 6
+evidence_width = 1
 
 [research.effort.high]
 max_seconds = 3600
@@ -388,6 +423,8 @@ context_fraction = 0.85
 max_steps = 64
 search_top_k = 5
 max_report_words = 1800
+max_report_sections = 6
+evidence_width = 1
 
 [workers]
 gc_interval_seconds = 3600          # how often the GC sweep runs
