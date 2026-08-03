@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -181,6 +182,13 @@ async fn main() -> Result<()> {
             c.cancel();
         });
     }
+    // SIGTERM is how a service manager asks for a clean stop, and it is the signal
+    // that matters for a daemon — but `tokio::signal::unix` does not exist on
+    // Windows, where the whole module is absent rather than empty. Ctrl+C above is
+    // already cross-platform and covers the interactive case on both; on Windows a
+    // service stop arrives as a console control event, which tokio maps to
+    // `ctrl_c()` too, so nothing is left unhandled there.
+    #[cfg(unix)]
     {
         let c = cancel.clone();
         tokio::spawn(async move {
