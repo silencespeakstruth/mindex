@@ -21,8 +21,15 @@ which is the one removal here. A broad stability pass gave every wait a number.
 ### Upgrading — REQUIRED. Until you do this, search returns nothing and says nothing
 
 `COLLECTION_SCHEMA_VERSION` moved `v1` → `v2`, and it is **not self-healing**: the new
-name names no collection, an empty one is created, SQLite still reports every file
-`indexed`, and every search comes back empty with no error anywhere.
+name names no collection while SQLite still reports every file `indexed`. Search then
+fails in one of two ways, and which one you get is not a distinction worth relying on:
+
+- If nothing has indexed the project since the upgrade, the collection does not exist and
+  `/search` answers **`503 qdrant.unavailable`** — which reads as an infrastructure
+  problem rather than as "this project needs reindexing".
+- If anything *has* touched it, `ensure_project` will have created an **empty** collection
+  and search comes back empty **with no error anywhere** — the worse of the two, because
+  nothing anywhere says the index is gone.
 
 1. Stop the server.
 2. Start it once. Migrations 5 and 6 apply in place.

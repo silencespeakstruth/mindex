@@ -243,8 +243,13 @@ that never existed). Deliberately outside it:
 migration `i32` in `PRAGMA user_version`.
 
 `COLLECTION_SCHEMA_VERSION` **is still not self-healing** — bump it and the new
-name names no collection, `ensure_project` makes an empty one, SQLite still
-reports every file `indexed`, and search returns nothing. A bump means
+name names no collection while SQLite still reports every file `indexed`. The
+symptom then depends on whether anything has indexed the project since, and
+neither half is a good signal: untouched, the collection does not exist and
+`/search` answers **503 `qdrant.unavailable`**, which reads as an infrastructure
+fault rather than a missing index (observed on this host at the v1→v2 bump, for
+the one project that had not been reindexed); touched, `ensure_project` has made
+an empty one and search returns nothing at all. A bump means
 reindexing every project by hand (`mindex-index --force`) and dropping the
 collections left behind at the old version. What it is no longer is *silent*:
 `worker::stale` runs at startup and hourly and answers two separate questions —
