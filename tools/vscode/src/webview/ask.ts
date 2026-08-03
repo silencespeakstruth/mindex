@@ -534,6 +534,15 @@ function render(): void {
     // entirely when the server itself is down — two notices saying the same thing at
     // two severities is worse than the one that names the real cause.
     el("ollama-notice").hidden = mode !== "research" || available.research || !available.ask;
+    if (!available.research && available.ask) {
+        // The reason travels from the host because the two causes have different
+        // remedies: a dependency is restarted, a token is replaced. Falling back
+        // to Ollama's wording is right for an older host that sends none — that
+        // was the only cause this notice used to have.
+        el("ollama-reason").textContent = `${capitalise(
+            available.reason === "" ? "the server's Ollama is not answering" : available.reason
+        )}, so ${copy.label} is unavailable.`;
+    }
     el("degraded-notice").hidden = available.ask;
     if (!available.ask) {
         // What is missing, and what it costs *in this tab*. "The server is

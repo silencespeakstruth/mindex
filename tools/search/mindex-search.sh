@@ -43,10 +43,10 @@ NO_VERIFY=0
 VERBOSE=0
 # A CA the OS already trusts needs nothing here; this names one it does not.
 CACERT="${MINDEX_CACERT:-}"
-# Sent as X-Api-Key when set. mindex has no authentication of its own and ignores
-# the header; it is for a reverse proxy in front of it that refuses unknown keys.
-# Empty (the default) sends no header, which is what a direct localhost call wants.
-API_KEY="${MINDEX_API_KEY:-}"
+# Sent as `Authorization: Bearer` when set — mindex's own token, naming the
+# projects and actions it permits. Issue one with `mindex mint-token`. Empty (the
+# default) sends no header, which is what a server that authorizes nothing wants.
+TOKEN="${MINDEX_TOKEN:-}"
 if truthy "${MINDEX_NO_VERIFY:-}"; then NO_VERIFY=1; fi
 if truthy "${MINDEX_VERBOSE:-}"; then VERBOSE=1; fi
 
@@ -96,8 +96,8 @@ Options:
   --protocol VERSION      API version in the URL path (default: $PROTOCOL)
   --no-verify             skip TLS certificate verification (self-signed cert)
   --ca-cert PATH          extra CA bundle to trust, on top of the OS store
-  --api-key KEY           X-Api-Key for a proxy in front of mindex (prefer
-                          \$MINDEX_API_KEY — a flag value is visible in ps)
+  --token TOKEN           bearer token from \`mindex mint-token\` (prefer
+                          \$MINDEX_TOKEN — a flag value is visible in ps)
   --top-k N               max results to request (server default: 5)
   --include-lang LANG     restrict to LANG (repeatable)
   --include-path GLOB     restrict to paths matching GLOB (repeatable)
@@ -114,7 +114,7 @@ Environment (every option has a fallback; an explicit flag always wins):
   MINDEX_SERVER, MINDEX_PROJECT, MINDEX_PROTOCOL, MINDEX_TOP_K,
   MINDEX_THEME, MINDEX_COLOR                 — same as the flags above
   MINDEX_CACERT                              — same as --ca-cert
-  MINDEX_API_KEY                             — same as --api-key (preferred over
+  MINDEX_TOKEN                               — same as --token (preferred over
                                                the flag: not visible in ps)
   MINDEX_NO_VERIFY, MINDEX_VERBOSE           — truthy: 1/true/yes/on
   MINDEX_INCLUDE_LANG, MINDEX_INCLUDE_PATH,
@@ -145,9 +145,11 @@ refresh_valid_langs() {
     local cfg_opts=(-sS -X GET "${SERVER%/}/config")
     [[ "$NO_VERIFY" -eq 1 ]] && cfg_opts+=(-k)
     [[ -n "$CACERT" ]] && cfg_opts+=(--cacert "$CACERT")
-    # The probe needs the key too: behind the gate a keyless /config is closed
-    # outright, and the fallback language list would silently take over.
-    [[ -n "$API_KEY" ]] && cfg_opts+=(-H "X-Api-Key: $API_KEY")
+    # /config is a public route, so this probe works with no credential at all —
+    # but the token is sent anyway, because the gateway in front of a remote
+    # deployment admits nothing without one and the fallback language list would
+    # then silently take over.
+    [[ -n "$TOKEN" ]] && cfg_opts+=(-H "Authorization: Bearer $TOKEN")
     local body langs
     body=$(curl "${cfg_opts[@]}" 2>/dev/null) || return 0
     mapfile -t langs < <(printf '%s' "$body" | jq -r '.languages[]?' 2>/dev/null) || return 0
@@ -179,8 +181,8 @@ while [[ $# -gt 0 ]]; do
             CACERT="$2"
             shift 2
             ;;
-        --api-key)
-            API_KEY="$2"
+        --token)
+            TOKEN="$2"
             shift 2
             ;;
         --top-k)
@@ -346,7 +348,7 @@ url="${SERVER%/}/${PROTOCOL}/${PROJECT}/search"
 curl_opts=(-sS -o "$resp_file" -w '%{http_code}' -X POST "$url" -H 'Content-Type: application/json' --data-binary "@$req_file")
 [[ "$NO_VERIFY" -eq 1 ]] && curl_opts+=(-k)
 [[ -n "$CACERT" ]] && curl_opts+=(--cacert "$CACERT")
-[[ -n "$API_KEY" ]] && curl_opts+=(-H "X-Api-Key: $API_KEY")
+[[ -n "$TOKEN" ]] && curl_opts+=(-H "Authorization: Bearer $TOKEN")
 
 set +e
 http_code=$(curl "${curl_opts[@]}")

@@ -37,10 +37,15 @@ pub struct IndexerConfig {
     /// the host does not know. `None` = the OS store alone, which is right
     /// whenever the CA is installed system-wide (mkcert, a corporate root).
     pub ca_cert: Option<PathBuf>,
-    /// Sent as `X-Api-Key` on every request. mindex itself has no authentication;
-    /// this exists for a reverse proxy in front of it that does. `None` sends no
-    /// header at all, which is what a direct `https://127.0.0.1:11111` wants.
-    pub api_key: Option<String>,
+    /// Sent as `Authorization: Bearer` on every request, for a server running
+    /// with `[auth].enabled`. `None` sends no header, which is what a server
+    /// that authorizes nothing wants.
+    ///
+    /// It is the only credential a client sends. An `X-Api-Key` for a gateway in
+    /// front of the server used to sit beside it, and requiring both is what made
+    /// a token unusable on its own: the shared key had to travel with it. Issue a
+    /// token with `mindex mint-token`.
+    pub token: Option<String>,
 
     /// Reconcile the project's git history alongside the working tree.
     ///
@@ -68,7 +73,7 @@ impl Default for IndexerConfig {
             concurrency: None,
             no_verify: false,
             ca_cert: None,
-            api_key: None,
+            token: None,
             history: false,
             git_refs: vec!["HEAD".to_string()],
             history_max_age_days: Some(DEFAULT_HISTORY_MAX_AGE_DAYS),
@@ -88,7 +93,7 @@ pub struct Overrides {
     pub concurrency: Option<usize>,
     pub no_verify: bool,
     pub ca_cert: Option<PathBuf>,
-    pub api_key: Option<String>,
+    pub token: Option<String>,
     /// `Some(true)` from `--history`, `Some(false)` from `--no-history`, `None`
     /// when neither was passed. A plain bool cannot express "explicitly off",
     /// and the file default being `false` makes that distinction necessary.
@@ -188,9 +193,16 @@ pub fn resolve(ov: Overrides) -> Result<IndexerConfig> {
     }
     // Never echoed, unlike every other override above: this one is a secret, and
     // the resolution report goes to stderr where it lands in logs and CI output.
-    if let Some(v) = ov.api_key {
-        eprintln!("config: api_key overridden by --api-key / $MINDEX_API_KEY (value hidden)");
-        cfg.api_key = Some(v);
+    if let Some(v) = ov.token {
+        eprintln!("config: token overridden by --token / $MINDEX_TOKEN (value hidden)");
+        cfg.token = Some(v);
+    }
+
+    // Last resort, after every explicit source: the shared credentials file,
+    // looked up by the *resolved* server URL — so it must run after the
+    // `--server` override above, not before it.
+    if cfg.token.is_none() {
+        cfg.token = mindexfile::credentials::credentials_for(&cfg.server_url)?.token;
     }
     if let Some(v) = ov.history {
         eprintln!(
@@ -210,6 +222,17 @@ pub fn resolve(ov: Overrides) -> Result<IndexerConfig> {
 
     // Validation: collect all problems, fail with the full list.
     let mut errs = Vec::new();
+    // The token is fully resolved by here — flag, environment, file, credentials
+    // — so this is the one place that sees what will actually be sent. A token
+    // labelled for another kind of holder is refused rather than warned about:
+    // the server does not check `aud`, so the request would work, and a warning
+    // that is followed by success is a warning nobody reads twice.
+    if let Some(t) = cfg.token.as_deref()
+        && let Some(refusal) =
+            mindexfile::token::audience_refusal(t, mindexfile::token::AUDIENCE_CLI)
+    {
+        errs.push(refusal);
+    }
     if cfg.server_url.trim().is_empty() {
         errs.push("server_url is empty; set it in the config file or --server".to_string());
     }

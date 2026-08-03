@@ -63,6 +63,8 @@ export const ICON = {
     activeRuns: "record",
     /** Jump to the extension's own settings. */
     settings: "gear",
+    /** The stored bearer token: the command that sets one, and its warning. */
+    token: "key",
     /** Refresh whatever the surface is showing. */
     refresh: "refresh",
 

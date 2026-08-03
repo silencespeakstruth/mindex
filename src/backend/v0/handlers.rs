@@ -6,7 +6,10 @@ use std::sync::Mutex;
 use super::models::IndexRequest;
 use crate::backend::error::ApiError;
 use crate::backend::error::ProblemDetails;
-use crate::backend::extract::{ApiJson, ApiPath, ApiQuery};
+use crate::backend::extract::{
+    ActiveRunsScope, AdminScope, ApiJson, ApiPath, ApiQuery, DeleteScope, DriftScope, IndexScope,
+    ListProjectsScope, MintScope, ResearchScope, SearchScope,
+};
 use crate::backend::http3;
 use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
@@ -23,6 +26,7 @@ use crate::backend::v0::models::CommitSummary;
 use crate::backend::v0::models::ConfigResponse;
 use crate::backend::v0::models::DeleteFilesRequest;
 use crate::backend::v0::models::DeleteFilesResponse;
+use crate::backend::v0::models::DescriptorAuthentication;
 use crate::backend::v0::models::DriftRequest;
 use crate::backend::v0::models::DriftResponse;
 use crate::backend::v0::models::FileHistoryResponse;
@@ -40,6 +44,8 @@ use crate::backend::v0::models::IndexQuery;
 use crate::backend::v0::models::IndexResponse;
 use crate::backend::v0::models::LanguageStats;
 use crate::backend::v0::models::ListFilesResponse;
+use crate::backend::v0::models::MintTokenRequest;
+use crate::backend::v0::models::MintTokenResponse;
 use crate::backend::v0::models::OutlineResponse;
 use crate::backend::v0::models::OutlineSymbol;
 use crate::backend::v0::models::ProgrammingLanguage;
@@ -1296,7 +1302,7 @@ the stable `ApiError` code). Closing the connection cancels the request.", body 
 )]
 #[debug_handler]
 pub async fn post_index(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    IndexScope(project_guid, _auth): IndexScope,
     ApiQuery(q): ApiQuery<IndexQuery>,
     State(s): State<RouterState>,
     ApiJson(payload): ApiJson<IndexRequest>,
@@ -1887,13 +1893,25 @@ async fn read_drift_baseline(
 )]
 #[debug_handler]
 pub async fn post_drift(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    DriftScope {
+        guid: project_guid,
+        in_scope,
+    }: DriftScope,
     State(s): State<RouterState>,
     ApiJson(payload): ApiJson<DriftRequest>,
 ) -> Result<Json<DriftResponse>, ApiError> {
     validate::validate_drift_request(&payload, s.max_drift_files)?;
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let (indexed, in_flight) = read_drift_baseline(&s, &guard.0, project_guid).await?;
+    // A project this token cannot see answers exactly as a project that was never
+    // indexed does — an empty baseline, so every posted file comes back `missing`.
+    // This endpoint already documents that an unknown project is not a 404, so
+    // reusing that path costs nothing and is what keeps it from being the one
+    // route where a caller can distinguish "not mine" from "not there".
+    let (indexed, in_flight) = if in_scope {
+        read_drift_baseline(&s, &guard.0, project_guid).await?
+    } else {
+        Default::default()
+    };
     let res = compute_drift(&indexed, &in_flight, &payload.files);
 
     // The one read endpoint whose *answer* is worth a log line. Drift is computed
@@ -2118,7 +2136,7 @@ fn reconcile_history(
 )]
 #[debug_handler]
 pub async fn post_history(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    IndexScope(project_guid, _auth): IndexScope,
     State(s): State<RouterState>,
     ApiJson(payload): ApiJson<HistoryRequest>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
@@ -2234,7 +2252,7 @@ fn prune_history(
 )]
 #[debug_handler]
 pub async fn delete_history(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    DeleteScope(project_guid, _auth): DeleteScope,
     State(s): State<RouterState>,
     ApiQuery(q): ApiQuery<HistoryPruneQuery>,
 ) -> Result<Json<HistoryPruneResponse>, ApiError> {
@@ -2300,7 +2318,7 @@ pub async fn delete_history(
 )]
 #[debug_handler]
 pub async fn post_search(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    SearchScope(project_guid, _auth): SearchScope,
     State(state): State<RouterState>,
     ApiJson(payload): ApiJson<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
@@ -2758,7 +2776,7 @@ fn build_symbols_query(
 )]
 #[debug_handler]
 pub async fn post_symbols(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    SearchScope(project_guid, _auth): SearchScope,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<SymbolsRequest>,
 ) -> Result<Json<SymbolsResponse>, ApiError> {
@@ -4737,7 +4755,7 @@ an invalid run is refused up front with 400 `validation.research_context_invalid
 )]
 #[debug_handler]
 pub async fn post_research(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    ResearchScope(project_guid, _auth): ResearchScope,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ResearchRequest>,
 ) -> Result<Response, ApiError> {
@@ -4864,7 +4882,7 @@ pub async fn post_research(
 )]
 #[debug_handler]
 pub async fn post_research_challenge(
-    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    ResearchScope((project_guid, run_id), _auth): ResearchScope<(UUIDv4, String)>,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ChallengeRequest>,
 ) -> Result<Response, ApiError> {
@@ -5248,6 +5266,7 @@ async fn launch_research_job(
 )]
 #[debug_handler]
 pub async fn get_projects(
+    ListProjectsScope(auth): ListProjectsScope,
     State(s): State<RouterState>,
 ) -> Result<Json<ProjectListResponse>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -5286,6 +5305,28 @@ pub async fn get_projects(
             ApiError::from(e)
         })?;
 
+    // Filtered here rather than in the SQL, deliberately: with authorization off
+    // — which is every deployment that has not opted in — `visible_projects` is
+    // `None` and this is a move, so the query above stays the byte-identical
+    // statement it has always been rather than growing a parameter that is
+    // usually a no-op.
+    //
+    // This listing is why the whole mechanism had to live in the server. The
+    // project GUIDs are in a response *body*, and a gateway cannot filter a body
+    // without parsing it — while a GUID is a bearer identifier, so leaking one
+    // hands over that project's entire data plane.
+    let projects = match auth.visible_projects() {
+        None => projects,
+        Some(visible) => projects
+            .into_iter()
+            .filter(|p| {
+                visible
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case(&p.project_guid))
+            })
+            .collect(),
+    };
+
     Ok(Json(ProjectListResponse { projects }))
 }
 
@@ -5310,7 +5351,7 @@ pub async fn get_projects(
 )]
 #[debug_handler]
 pub async fn get_project_stats(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    SearchScope(project_guid, _auth): SearchScope,
     State(s): State<RouterState>,
 ) -> Result<Json<ProjectStats>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -5445,7 +5486,7 @@ pub async fn get_project_stats(
 )]
 #[debug_handler]
 pub async fn delete_project(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    DeleteScope(project_guid, _auth): DeleteScope,
     State(s): State<RouterState>,
 ) -> Result<StatusCode, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -5616,7 +5657,7 @@ fn build_file_filter_from(
 )]
 #[debug_handler]
 pub async fn delete_files(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    DeleteScope(project_guid, _auth): DeleteScope,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<DeleteFilesRequest>,
 ) -> Result<Response, ApiError> {
@@ -5749,7 +5790,7 @@ pub async fn delete_files(
 )]
 #[debug_handler]
 pub async fn post_cancel(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    IndexScope(project_guid, _auth): IndexScope,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<CancelRequest>,
 ) -> Result<Response, ApiError> {
@@ -5881,7 +5922,7 @@ pub async fn post_cancel(
 )]
 #[debug_handler]
 pub async fn get_files(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    SearchScope(project_guid, _auth): SearchScope,
     State(s): State<RouterState>,
     ApiQuery(q): ApiQuery<FileListQuery>,
 ) -> Result<Json<FileListResponse>, ApiError> {
@@ -5993,7 +6034,7 @@ pub async fn get_files(
 )]
 #[debug_handler]
 pub async fn post_retry(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    IndexScope(project_guid, _auth): IndexScope,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<RetryRequest>,
 ) -> Result<Response, ApiError> {
@@ -6052,7 +6093,10 @@ pub async fn post_retry(
     ),
 )]
 #[debug_handler]
-pub async fn get_status(State(s): State<RouterState>) -> Result<Json<StatusResponse>, ApiError> {
+pub async fn get_status(
+    AdminScope(_auth): AdminScope,
+    State(s): State<RouterState>,
+) -> Result<Json<StatusResponse>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
 
     let counts: Vec<(String, i64)> = s
@@ -6251,7 +6295,7 @@ fn llms_document(c: &ConfigResponse) -> String {
 /// Shape version of `/.well-known/mindex.json`. Bumped when a field changes
 /// meaning, not when the server is upgraded — the two move independently, which
 /// is why the document reports both.
-pub const DESCRIPTOR_VERSION: u32 = 1;
+pub const DESCRIPTOR_VERSION: u32 = 2;
 
 /// `GET /.well-known/mindex.json` — what this server is, as data.
 ///
@@ -6282,15 +6326,21 @@ pub const DESCRIPTOR_VERSION: u32 = 1;
 #[debug_handler]
 pub async fn get_mindex_descriptor(State(s): State<RouterState>) -> Json<MindexDescriptor> {
     let schema_version = s.db_schema_version;
+    let auth_enabled = s.auth.is_some();
     Json(descriptor_document(
         config_snapshot(&s).await,
         schema_version,
+        auth_enabled,
     ))
 }
 
 /// The whole descriptor. Pure over the snapshot so tests can build it without a
 /// `RouterState`, exactly as [`llms_document`] is.
-fn descriptor_document(config: ConfigResponse, db_schema_version: i32) -> MindexDescriptor {
+fn descriptor_document(
+    config: ConfigResponse,
+    db_schema_version: i32,
+    auth_enabled: bool,
+) -> MindexDescriptor {
     MindexDescriptor {
         service: "mindex",
         summary: "Semantic code index over indexed source trees, with a local research agent \
@@ -6303,7 +6353,19 @@ fn descriptor_document(config: ConfigResponse, db_schema_version: i32) -> Mindex
             openapi_ui: "/swagger-ui",
             narrative: "/llms.txt",
         },
-        authentication: None,
+        // Present only when this deployment actually requires a token. An
+        // always-on description would tell a caller to obtain a credential the
+        // server would then ignore, which is a worse answer than silence.
+        authentication: auth_enabled.then(|| DescriptorAuthentication {
+            kind: "bearer-jwt",
+            scheme: "Authorization: Bearer <token>",
+            actions: crate::backend::auth::Action::ALL
+                .iter()
+                .map(|a| a.as_str())
+                .collect(),
+            note: "A project outside the token's scope answers 404, identically to a project \
+                   that was never indexed. Do not render that as absence.",
+        }),
         transport: DescriptorTransport {
             tls: true,
             alpn: vec!["h2", "http/1.1"],
@@ -6784,7 +6846,7 @@ fn research_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resear
 )]
 #[debug_handler]
 pub async fn get_research_runs(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    ResearchScope(project_guid, _auth): ResearchScope,
     State(s): State<RouterState>,
     ApiQuery(q): ApiQuery<ResearchListQuery>,
 ) -> Result<Json<ResearchRunListResponse>, ApiError> {
@@ -6981,7 +7043,7 @@ pub async fn get_research_runs(
 )]
 #[debug_handler]
 pub async fn get_research_run(
-    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    ResearchScope((project_guid, run_id), _auth): ResearchScope<(UUIDv4, String)>,
     State(s): State<RouterState>,
 ) -> Result<Json<ResearchRunDetail>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -7128,7 +7190,7 @@ pub async fn get_research_run(
 )]
 #[debug_handler]
 pub async fn get_research_verification(
-    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    ResearchScope((project_guid, run_id), _auth): ResearchScope<(UUIDv4, String)>,
     State(s): State<RouterState>,
 ) -> Result<Json<ResearchVerification>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -7373,7 +7435,7 @@ pub async fn get_research_verification(
 )]
 #[debug_handler]
 pub async fn post_research_pin(
-    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    ResearchScope((project_guid, run_id), _auth): ResearchScope<(UUIDv4, String)>,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ResearchPinRequest>,
 ) -> Result<Json<ResearchRunSummary>, ApiError> {
@@ -7461,7 +7523,7 @@ pub async fn post_research_pin(
 )]
 #[debug_handler]
 pub async fn delete_research_run(
-    ApiPath((project_guid, run_id)): ApiPath<(UUIDv4, String)>,
+    DeleteScope((project_guid, run_id), _auth): DeleteScope<(UUIDv4, String)>,
     State(s): State<RouterState>,
 ) -> Result<StatusCode, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
@@ -7538,7 +7600,7 @@ pub async fn delete_research_run(
 )]
 #[debug_handler]
 pub async fn delete_research_runs(
-    ApiPath(project_guid): ApiPath<UUIDv4>,
+    DeleteScope(project_guid, _auth): DeleteScope,
     State(s): State<RouterState>,
     ApiJson(mut req): ApiJson<DeleteResearchRunsRequest>,
 ) -> Result<Response, ApiError> {
@@ -7615,7 +7677,10 @@ pub async fn delete_research_runs(
     ),
 )]
 #[debug_handler]
-pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, ApiError> {
+pub async fn post_gc(
+    AdminScope(_auth): AdminScope,
+    State(s): State<RouterState>,
+) -> Result<Json<GcResponse>, ApiError> {
     let Some(_guard) = crate::worker::gc::GcGuard::try_acquire(&s.gc_flag) else {
         info!("POST /gc rejected: a garbage-collection pass is already running.");
         return Err(ApiError::GcRunning);
@@ -7636,6 +7701,142 @@ pub async fn post_gc(State(s): State<RouterState>) -> Result<Json<GcResponse>, A
         status_log_pruned: out.status_log.removed,
         research_runs_pruned: out.research.removed,
         failed_phases: out.failed_phases().into_iter().map(str::to_owned).collect(),
+    }))
+}
+
+/// `POST /auth/tokens` — issue a scoped bearer token, signed by this server.
+///
+/// The network half of minting; `mindex mint-token` is the other, and the other
+/// is the bootstrap, because this one needs a token to call. That ordering is
+/// deliberate — a mint endpoint reachable without one would be a credential
+/// vending machine on the open port.
+///
+/// **A minted token can never exceed its minter** — not a wider action set, not
+/// a wider project list, not a later expiry (`Claims::may_mint`). Without that
+/// rule, handing somebody a read-only `mint` credential would hand them `admin`
+/// one call later, which is exactly the escalation `mint` invites. It is the one
+/// piece of logic in this feature with its own test.
+///
+/// The token is returned once. There is no store of issued tokens, by design:
+/// the whole mechanism is stateless, and a list of live credentials would be the
+/// state it exists without.
+///
+/// **Concurrency:** safe — no I/O, no locks; one HMAC.
+#[utoipa::path(
+    post,
+    path = "/auth/tokens",
+    tag = "Authorization",
+    request_body = MintTokenRequest,
+    responses(
+        (status = 200, description = "The issued token. Returned once and stored nowhere.", body = MintTokenResponse),
+        (status = 400, description = "Unknown action, unparseable project, or a grant wider than the minting token's own.", body = ProblemDetails),
+        (status = 401, description = "No token, or one that does not verify.", body = ProblemDetails),
+        (status = 403, description = "The token does not carry `mint`.", body = ProblemDetails),
+        (status = 404, description = "Authorization is not enabled on this server.", body = ProblemDetails),
+    ),
+)]
+#[debug_handler]
+pub async fn post_auth_tokens(
+    MintScope(auth): MintScope,
+    State(s): State<RouterState>,
+    ApiJson(payload): ApiJson<MintTokenRequest>,
+) -> Result<Json<MintTokenResponse>, ApiError> {
+    // With authorization off there is no keyring, so there is nothing to sign
+    // with. 404 rather than 500: on such a deployment this endpoint genuinely is
+    // not a thing the server does, and `MintScope` waved the request through
+    // precisely because no token was required.
+    let Some(state) = s.auth.as_ref() else {
+        return Err(ApiError::ProjectNotFound);
+    };
+    let Some(minter) = auth.0.as_ref() else {
+        return Err(ApiError::TokenMissing);
+    };
+
+    let actions = payload
+        .actions
+        .iter()
+        .map(|a| {
+            crate::backend::auth::Action::parse(a.trim()).ok_or_else(|| {
+                ApiError::MalformedBody(format!(
+                    "unknown action {a:?}; the vocabulary is {}",
+                    crate::backend::auth::Action::ALL
+                        .iter()
+                        .map(|a| a.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let audiences = payload
+        .audiences
+        .iter()
+        .map(|a| {
+            crate::backend::auth::Audience::parse(a.trim()).ok_or_else(|| {
+                ApiError::MalformedBody(format!(
+                    "unknown audience {a:?}; the vocabulary is {}",
+                    crate::backend::auth::Audience::ALL
+                        .iter()
+                        .map(|a| a.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // `0` means no expiry, and it is refused here on purpose: minting an eternal
+    // credential must require shell access to the host, not a token. The local
+    // `mint-token` command is the only way, and its whole audience is an
+    // operator who can already read the signing key.
+    if payload.days == 0 {
+        return Err(ApiError::MalformedBody(
+            "days must be at least 1; a non-expiring token can only be minted locally with \
+             `mindex mint-token --days 0`"
+                .to_string(),
+        ));
+    }
+    let days = payload.days.min(state.max_token_days);
+
+    // Built but not yet signed, so `may_mint` judges the real claim set rather
+    // than a paraphrase of the request — the containment rule and the token must
+    // be talking about the same thing.
+    let (token, claims) = crate::backend::auth::mint_with_key(
+        &state.keyring,
+        payload.key_id.as_deref(),
+        &payload.sub,
+        payload.projects.clone(),
+        actions,
+        audiences,
+        days,
+    )
+    .and_then(|(t, c)| minter.may_mint(&c).map(|()| (t, c)))
+    .map_err(|e| {
+        warn!(
+            error = %e,
+            minter = %minter.sub,
+            "Refused to mint a token."
+        );
+        ApiError::MalformedBody(e.to_string())
+    })?;
+
+    info!(
+        minter = %minter.sub,
+        subject = %claims.sub,
+        projects = ?claims.prj,
+        actions = ?claims.act.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        audiences = ?claims.aud.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        expires_at = claims.exp,
+        "Minted a bearer token."
+    );
+
+    Ok(Json(MintTokenResponse {
+        token,
+        expires_at: claims.exp,
+        projects: claims.prj,
+        actions: claims.act.iter().map(|a| a.as_str().to_string()).collect(),
+        audiences: claims.aud.iter().map(|a| a.as_str().to_string()).collect(),
     }))
 }
 
@@ -7671,7 +7872,10 @@ pub async fn get_version(State(s): State<RouterState>) -> Json<VersionResponse> 
 ///
 /// **Concurrency:** safe — reads counters and one in-memory lock table, no I/O.
 #[debug_handler]
-pub async fn get_metrics(State(s): State<RouterState>) -> Result<Response, ApiError> {
+pub async fn get_metrics(
+    AdminScope(_auth): AdminScope,
+    State(s): State<RouterState>,
+) -> Result<Response, ApiError> {
     let m = &s.metrics;
 
     // Recover from a poisoned lock rather than panic, exactly as `get_status`
@@ -7963,11 +8167,24 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
     responses((status = 200, description = "Live research runs, oldest first.", body = ActiveResearchResponse)),
 )]
 #[debug_handler]
-pub async fn get_research_active(State(s): State<RouterState>) -> Json<ActiveResearchResponse> {
+pub async fn get_research_active(
+    ActiveRunsScope(auth): ActiveRunsScope,
+    State(s): State<RouterState>,
+) -> Json<ActiveResearchResponse> {
+    let visible = auth.visible_projects();
     let runs: Vec<ActiveResearchRun> = s
         .research_registry
         .snapshot()
         .into_iter()
+        // A live run names its project, its question and its model, so the list
+        // is content and is filtered. The two counts below are **capacity** and
+        // are not: this endpoint exists so a caller can tell that the slots are
+        // gone, and a per-caller count would answer "none of yours are running"
+        // to a caller about to queue behind somebody else's — the one question
+        // it was built to answer, given the wrong answer politely.
+        .filter(|r| {
+            visible.is_none_or(|v| v.iter().any(|p| p.eq_ignore_ascii_case(&r.project_guid)))
+        })
         .map(|r| ActiveResearchRun {
             age_ms: r.age_ms(),
             run_id: r.run_id,
@@ -7983,7 +8200,10 @@ pub async fn get_research_active(State(s): State<RouterState>) -> Json<ActiveRes
 
     Json(ActiveResearchResponse {
         slots_total: s.research_max_concurrent,
-        slots_busy: runs.len(),
+        // Deliberately the registry's own count, not `runs.len()`: after the
+        // filter above those differ, and this field must keep meaning "how many
+        // of this server's slots are occupied".
+        slots_busy: s.research_registry.len(),
         runs,
     })
 }
@@ -8017,13 +8237,27 @@ pub async fn get_research_active(State(s): State<RouterState>) -> Json<ActiveRes
 )]
 #[debug_handler]
 pub async fn delete_research_active(
+    ActiveRunsScope(auth): ActiveRunsScope,
     ApiPath(run_id): ApiPath<String>,
     State(s): State<RouterState>,
 ) -> StatusCode {
-    if s.research_registry.cancel(&run_id) {
+    // A run this caller cannot see is not cancelled — and is answered exactly as
+    // an unknown run id is. The endpoint is already documented idempotent either
+    // way, so the non-oracle costs nothing: "already finished", "never existed"
+    // and "not yours" are one observable state. What that makes invisible is the
+    // refusal itself, which is why it is logged, and why the guard test asserts
+    // on the target's token rather than on the 204.
+    let mine = s
+        .research_registry
+        .snapshot()
+        .into_iter()
+        .find(|r| r.run_id == run_id)
+        .is_some_and(|r| auth.covers_guid_str(&r.project_guid));
+
+    if mine && s.research_registry.cancel(&run_id) {
         info!(%run_id, "Cancelled a research run on request.");
     } else {
-        info!(%run_id, "No live research run with this id; nothing to cancel.");
+        info!(%run_id, "No live research run with this id in this caller's scope; nothing to cancel.");
     }
     StatusCode::NO_CONTENT
 }
@@ -9952,6 +10186,11 @@ mod tests {
             },
             research_models: Arc::new(tokio::sync::RwLock::new(Default::default())),
             metrics: Arc::new(crate::backend::metrics::Metrics::new()),
+            // Authorization off, which is what makes every test in this module a
+            // test of the handler rather than of the extractor in front of it.
+            // The tests that *do* exercise authorization build their own state
+            // with `router_state_with_auth`.
+            auth: None,
         }
     }
 
@@ -11388,7 +11627,7 @@ mod tests {
     // ── the service descriptor ───────────────────────────────────────────────
 
     fn test_descriptor() -> MindexDescriptor {
-        descriptor_document(llms_test_config(vec![], None, vec![]), 6)
+        descriptor_document(llms_test_config(vec![], None, vec![]), 6, false)
     }
 
     /// The sync guard, and the reason the inventory is derived rather than
@@ -11544,7 +11783,7 @@ mod tests {
     fn descriptor_config_is_the_config_endpoints_own_snapshot() {
         let snapshot = llms_test_config(vec!["glm-4:9b".into()], Some(1_700_000_000), vec![]);
         let expected = serde_json::to_value(&snapshot).expect("serializes");
-        let descriptor = descriptor_document(snapshot, 6);
+        let descriptor = descriptor_document(snapshot, 6, false);
         assert_eq!(
             serde_json::to_value(&descriptor.config).expect("serializes"),
             expected
@@ -11561,7 +11800,7 @@ mod tests {
     async fn descriptor_versions_agree() {
         let pool = pool_with_chunks(&[]).await;
         let s = router_state(pool);
-        let d = descriptor_document(config_snapshot(&s).await, s.db_schema_version);
+        let d = descriptor_document(config_snapshot(&s).await, s.db_schema_version, false);
 
         assert_eq!(d.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(d.config.version, env!("CARGO_PKG_VERSION"));
@@ -13337,5 +13576,1048 @@ mod tests {
             "an answering database reports a real count, not the unknown sentinel"
         );
         assert_eq!(out.checks.sqlite, CheckState::Ok);
+    }
+
+    // ── Authorization, through the extractors that enforce it ────────────────
+    //
+    // Driven through a real `Router` rather than by calling handlers directly:
+    // the whole mechanism lives in `FromRequestParts`, so a test that calls a
+    // handler with a value it constructed itself would exercise everything
+    // except the part under test.
+
+    mod authorization {
+        use super::*;
+        use crate::backend::auth::{Action, Keyring, mint};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        const SECRET: [u8; 32] = [42u8; 32];
+
+        /// A router over an in-memory database already holding `projects`.
+        ///
+        /// Seeded before the state is built rather than through an endpoint,
+        /// because every endpoint that could create one is itself behind the
+        /// mechanism under test.
+        async fn app(auth_on: bool, projects: &[uuid::Uuid]) -> axum::Router {
+            let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+            let guids: Vec<String> = projects.iter().map(|g| g.simple().to_string()).collect();
+            pool.transaction(CancellationToken::new(), move |tx| {
+                for (_, m) in crate::MIGRATIONS {
+                    tx.execute_batch(m)?;
+                }
+                for g in &guids {
+                    tx.execute(
+                        "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
+                        params![g],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seeds");
+
+            let mut state = router_state(pool);
+            state.auth = auth_on.then(|| {
+                Arc::new(crate::backend::http3::AuthState {
+                    keyring: Keyring::from_secret("test", SECRET.to_vec()),
+                    leeway_seconds: 60,
+                    max_token_days: 90,
+                })
+            });
+            axum::Router::new()
+                .route(
+                    "/projects/{project_guid}",
+                    axum::routing::get(get_project_stats),
+                )
+                .route("/projects", axum::routing::get(get_projects))
+                .route("/status", axum::routing::get(get_status))
+                .with_state(state)
+        }
+
+        fn token_for(projects: &[&str], actions: &[Action]) -> String {
+            let ring = Keyring::from_secret("test", SECRET.to_vec());
+            mint(
+                &ring,
+                "test",
+                projects.iter().map(|s| (*s).to_string()).collect(),
+                actions.to_vec(),
+                1,
+            )
+            .expect("mints")
+            .0
+        }
+
+        /// The production route table, with authorization on.
+        async fn full_router() -> axum::Router {
+            let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+            pool.transaction(CancellationToken::new(), |tx| {
+                for (_, m) in crate::MIGRATIONS {
+                    tx.execute_batch(m)?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("migrates");
+            let mut state = router_state(pool);
+            state.auth = Some(Arc::new(crate::backend::http3::AuthState {
+                keyring: Keyring::from_secret("test", SECRET.to_vec()),
+                leeway_seconds: 60,
+                max_token_days: 90,
+            }));
+            crate::backend::http3::production_router_for_test(state)
+        }
+
+        /// Like [`call`], for a route that is not a GET. An empty JSON body,
+        /// which is enough: every assertion here lands before the body is read.
+        async fn call_method(
+            app: &axum::Router,
+            method: &str,
+            uri: &str,
+            token: Option<&str>,
+        ) -> (StatusCode, String) {
+            let mut req = Request::builder().method(method).uri(uri);
+            if let Some(t) = token {
+                req = req.header("authorization", format!("Bearer {t}"));
+            }
+            let body = if method == "GET" || method == "DELETE" {
+                Body::empty()
+            } else {
+                req = req.header("content-type", "application/json");
+                Body::from("{}")
+            };
+            let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn call(app: &axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, String) {
+            let mut req = Request::builder().uri(uri);
+            if let Some(t) = token {
+                req = req.header("authorization", format!("Bearer {t}"));
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        /// The claim this whole design rests on: a project the token does not
+        /// cover is **indistinguishable** from one that was never indexed.
+        ///
+        /// Asserted on the response bytes, not the status code — a status-only
+        /// check passes with an oracle sitting in `detail` or `meta`, which is
+        /// precisely where one would end up if somebody later decided the
+        /// refusal ought to be more helpful.
+        #[tokio::test]
+        async fn an_out_of_scope_project_is_byte_identical_to_one_that_never_existed() {
+            let app = app(true, &[]).await;
+            let mine = uuid::Uuid::new_v4();
+            let theirs = uuid::Uuid::new_v4();
+            let nobodys = uuid::Uuid::new_v4();
+            let t = token_for(&[&mine.to_string()], &[Action::Search]);
+
+            let (s1, b1) = call(&app, &format!("/projects/{theirs}"), Some(&t)).await;
+            let (s2, b2) = call(&app, &format!("/projects/{nobodys}"), Some(&t)).await;
+
+            assert_eq!(s1, StatusCode::NOT_FOUND);
+            assert_eq!(s1, s2);
+            assert_eq!(
+                b1, b2,
+                "a foreign project and an absent one answer differently, which tells a \
+                 prober which GUIDs exist"
+            );
+            assert!(b1.contains("project.not_found"), "{b1}");
+        }
+
+        /// The missing *action* is named, unlike the missing project — and the
+        /// asymmetry is the reasoning. A caller that got here already proved it
+        /// holds the project, so naming the action tells it nothing it could not
+        /// read out of its own token, while hiding it would leave an
+        /// under-scoped credential indistinguishable from a wrong one.
+        #[tokio::test]
+        async fn a_missing_action_is_refused_distinguishably() {
+            let app = app(true, &[]).await;
+            let guid = uuid::Uuid::new_v4();
+            let t = token_for(&[&guid.to_string()], &[Action::Research]);
+
+            let (status, body) = call(&app, &format!("/projects/{guid}"), Some(&t)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("auth.action_not_permitted"), "{body}");
+            assert!(body.contains("search"), "must name the action: {body}");
+        }
+
+        /// The project check runs before the action check, so a caller that
+        /// cannot see the project learns nothing about the action vocabulary.
+        /// Reversing the two would turn every 403 into an existence oracle.
+        #[tokio::test]
+        async fn a_foreign_project_is_refused_before_the_action_is_considered() {
+            let app = app(true, &[]).await;
+            let theirs = uuid::Uuid::new_v4();
+            let t = token_for(&[&uuid::Uuid::new_v4().to_string()], &[Action::Research]);
+
+            let (status, body) = call(&app, &format!("/projects/{theirs}"), Some(&t)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(!body.contains("action"), "leaked the action check: {body}");
+        }
+
+        #[tokio::test]
+        async fn no_token_and_a_bad_token_are_each_their_own_code() {
+            let app = app(true, &[]).await;
+            let guid = uuid::Uuid::new_v4();
+
+            let (status, body) = call(&app, &format!("/projects/{guid}"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(body.contains("auth.token_missing"), "{body}");
+
+            let forged = mint(
+                &Keyring::from_secret("test", vec![9u8; 32]),
+                "x",
+                vec!["*".into()],
+                vec![Action::Search],
+                1,
+            )
+            .unwrap()
+            .0;
+            let (status, body) = call(&app, &format!("/projects/{guid}"), Some(&forged)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(body.contains("auth.token_invalid"), "{body}");
+        }
+
+        /// `GET /projects` is why authorization could not live in the gateway:
+        /// the GUIDs are in a response **body**, and a GUID is a bearer
+        /// identifier. A proxy cannot filter this without parsing JSON.
+        #[tokio::test]
+        async fn the_project_listing_shows_only_what_the_token_covers() {
+            let mine = uuid::Uuid::new_v4();
+            let theirs = uuid::Uuid::new_v4();
+            let app = app(true, &[mine, theirs]).await;
+
+            let t = token_for(&[&mine.to_string()], &[Action::Search]);
+            let (status, body) = call(&app, "/projects", Some(&t)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body.contains(&mine.simple().to_string()),
+                "own project missing: {body}"
+            );
+            assert!(
+                !body.contains(&theirs.simple().to_string()),
+                "another caller's project is listed: {body}"
+            );
+
+            let all = token_for(&["*"], &[Action::Search]);
+            let (_, body) = call(&app, "/projects", Some(&all)).await;
+            assert!(
+                body.contains(&theirs.simple().to_string()),
+                "a wildcard token must see everything: {body}"
+            );
+        }
+
+        /// `/status` is global — file counts across every project, the pool and
+        /// the claim table — so it takes `admin` and a project-scoped token
+        /// cannot reach it however many projects it names.
+        #[tokio::test]
+        async fn a_global_route_needs_admin_however_wide_the_project_list() {
+            let app = app(true, &[]).await;
+            let wide = token_for(
+                &["*"],
+                &[
+                    Action::Search,
+                    Action::Research,
+                    Action::Index,
+                    Action::Delete,
+                ],
+            );
+            let (status, body) = call(&app, "/status", Some(&wide)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("admin"), "{body}");
+
+            let admin = token_for(&["*"], &[Action::Admin]);
+            let (status, _) = call(&app, "/status", Some(&admin)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        /// **The guarantee for handlers that do not exist yet.**
+        ///
+        /// A route added to the table without a `ROUTE_POLICY` row is refused at
+        /// request time, not served. The build-time guard catches the same
+        /// mistake, but only when the suite runs; this is what stands between a
+        /// forgotten row and a live open endpoint.
+        ///
+        /// Written against a router carrying a *fabricated* route precisely
+        /// because the real table has no such hole — testing it any other way
+        /// would mean waiting for somebody to make the mistake.
+        #[tokio::test]
+        async fn a_route_with_no_policy_row_is_refused_rather_than_served() {
+            let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+            pool.transaction(CancellationToken::new(), |tx| {
+                for (_, m) in crate::MIGRATIONS {
+                    tx.execute_batch(m)?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("migrates");
+            let mut state = router_state(pool);
+            state.auth = Some(Arc::new(crate::backend::http3::AuthState {
+                keyring: Keyring::from_secret("test", SECRET.to_vec()),
+                leeway_seconds: 60,
+                max_token_days: 90,
+            }));
+
+            let app = crate::backend::http3::build_router_for_test(state);
+            let t = token_for(&["*"], Action::ALL);
+            let (status, body) = call(&app, "/a-future-endpoint", Some(&t)).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an unlisted route was served: {body}"
+            );
+            assert!(body.contains("auth.route_not_configured"), "{body}");
+        }
+
+        /// The same route, unauthenticated, must not be served either — the
+        /// refusal cannot depend on the caller having presented anything.
+        #[tokio::test]
+        async fn an_unlisted_route_is_refused_with_no_token_at_all() {
+            let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+            pool.transaction(CancellationToken::new(), |tx| {
+                for (_, m) in crate::MIGRATIONS {
+                    tx.execute_batch(m)?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("migrates");
+            let mut state = router_state(pool);
+            state.auth = Some(Arc::new(crate::backend::http3::AuthState {
+                keyring: Keyring::from_secret("test", SECRET.to_vec()),
+                leeway_seconds: 60,
+                max_token_days: 90,
+            }));
+
+            let app = crate::backend::http3::build_router_for_test(state);
+            let (status, _) = call(&app, "/a-future-endpoint", None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        /// **Every** non-public route, checked against every refusal, driven by
+        /// `ROUTE_POLICY` itself.
+        ///
+        /// The other tests in this module exercise the mechanism on three routes.
+        /// That proves the mechanism and says nothing about coverage, and
+        /// coverage is the whole question for a security rule: a suite of
+        /// hand-written per-endpoint tests is exhaustive on the day it is
+        /// written and silently incomplete on the day a route is added. Driving
+        /// it from the table means a new route is tested the moment it is
+        /// listed — and it must be listed, because
+        /// `every_route_is_named_by_the_authorization_policy` fails otherwise.
+        ///
+        /// Three assertions per route, and all three land **before** the
+        /// handler, which is why this can run against fixtures whose embedder
+        /// and vector store refuse everything:
+        ///
+        /// 1. no credential at all → 401
+        /// 2. a valid token carrying every action *except* the one this route
+        ///    needs → 403
+        /// 3. for project-keyed routes, a token with the right action but naming
+        ///    a different project → 404
+        #[tokio::test]
+        async fn every_route_refuses_every_way_it_should() {
+            use crate::backend::http3::{ROUTE_POLICY, RoutePolicy};
+
+            let app = full_router().await;
+            let other = uuid::Uuid::new_v4();
+            let mut checked = 0usize;
+
+            for (method, path, policy) in ROUTE_POLICY {
+                let Some(needed) = policy.action() else {
+                    continue;
+                };
+
+                // A concrete URI for this route template. `{run_id}` is opaque
+                // to authorization, so any string does.
+                let uri = path
+                    .replace("{project_guid}", &other.to_string())
+                    .replace("{run_id}", "00000000-0000-4000-8000-000000000000");
+
+                // 1. No credential.
+                let (status, body) = call_method(&app, method, &uri, None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path} answered without a token: {body}"
+                );
+                assert!(
+                    body.contains("auth.token_missing"),
+                    "{method} {path}: {body}"
+                );
+
+                // 2. Every action but the one it needs. A wildcard project, so
+                //    the *only* thing that can refuse is the action.
+                let others: Vec<Action> = Action::ALL
+                    .iter()
+                    .copied()
+                    .filter(|a| *a != needed)
+                    .collect();
+                let t = token_for(&["*"], &others);
+                let (status, body) = call_method(&app, method, &uri, Some(&t)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} needs `{needed}` but served a token without it: {body}"
+                );
+                assert!(
+                    body.contains("auth.action_not_permitted"),
+                    "{method} {path}: {body}"
+                );
+
+                // 3. Right action, wrong project. Skipped for the routes that
+                //    genuinely have no project: a global route cannot be out of
+                //    project scope, and `/drift` answers an out-of-scope project
+                //    as it answers an unknown one, by contract.
+                if path.contains("{project_guid}") && *policy != RoutePolicy::Drift {
+                    let t = token_for(&[&uuid::Uuid::new_v4().to_string()], &[needed]);
+                    let (status, body) = call_method(&app, method, &uri, Some(&t)).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::NOT_FOUND,
+                        "{method} {path} served a project the token does not name: {body}"
+                    );
+                    assert!(
+                        body.contains("project.not_found"),
+                        "{method} {path} refused a foreign project with a code that names \
+                         the reason — that is the enumeration oracle: {body}"
+                    );
+                }
+
+                checked += 1;
+            }
+
+            assert!(
+                checked >= 25,
+                "only {checked} routes were checked — the table or this loop is broken, \
+                 not the server"
+            );
+        }
+
+        /// `POST /drift` is the one route whose out-of-scope answer is a rewrite
+        /// rather than a refusal, so the loop above skips it and this states the
+        /// rule instead of leaving a hole.
+        ///
+        /// Its contract is that an unknown project is not a 404 — every posted
+        /// file simply comes back `missing`. A project the token cannot see must
+        /// answer identically, or `/drift` becomes the single endpoint where a
+        /// caller can tell "not mine" from "not there".
+        #[tokio::test]
+        async fn drift_answers_an_out_of_scope_project_as_an_unknown_one() {
+            let app = full_router().await;
+            let mine = uuid::Uuid::new_v4();
+            let theirs = uuid::Uuid::new_v4();
+            let t = token_for(&[&mine.to_string()], &[Action::Search]);
+
+            let body = serde_json::json!({ "files": { "a.rs": "0".repeat(64) } }).to_string();
+            let post = |guid: uuid::Uuid| {
+                let app = app.clone();
+                let t = t.clone();
+                let body = body.clone();
+                async move {
+                    let resp = app
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri(format!("/projects/{guid}/drift"))
+                                .header("authorization", format!("Bearer {t}"))
+                                .header("content-type", "application/json")
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = resp.status();
+                    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    (status, String::from_utf8_lossy(&bytes).into_owned())
+                }
+            };
+
+            let (s1, b1) = post(theirs).await;
+            let (s2, b2) = post(uuid::Uuid::new_v4()).await;
+            assert_eq!(s1, StatusCode::OK, "{b1}");
+            assert_eq!(s1, s2);
+            assert_eq!(
+                b1, b2,
+                "drift told an out-of-scope project apart from an unknown one"
+            );
+            assert!(b1.contains("missing"), "{b1}");
+        }
+
+        /// The five public routes stay reachable with no credential at all.
+        ///
+        /// `/health` and `/version` are liveness — a probe that needs a token
+        /// reports the token's health, not the server's. `/config`, `/llms.txt`
+        /// and the descriptor are discovery, and a document telling a caller it
+        /// needs a credential cannot itself require one; that circularity is the
+        /// failure this whole feature started from.
+        #[tokio::test]
+        async fn the_public_routes_need_no_token() {
+            let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
+            pool.transaction(CancellationToken::new(), |tx| {
+                for (_, m) in crate::MIGRATIONS {
+                    tx.execute_batch(m)?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("migrates");
+            let mut state = router_state(pool);
+            state.auth = Some(Arc::new(crate::backend::http3::AuthState {
+                keyring: Keyring::from_secret("test", SECRET.to_vec()),
+                leeway_seconds: 60,
+                max_token_days: 90,
+            }));
+
+            // Stub handlers rather than the real ones: what is under test is
+            // whether the layer lets these paths through, and the real `/health`
+            // would fail on the refusing fakes this fixture is built from —
+            // which would look like an authorization failure and is not one.
+            let app = axum::Router::new()
+                .route("/health", axum::routing::get(|| async { "ok" }))
+                .route("/version", axum::routing::get(|| async { "ok" }))
+                .route("/config", axum::routing::get(|| async { "ok" }))
+                .route("/llms.txt", axum::routing::get(|| async { "ok" }))
+                .route(
+                    "/.well-known/mindex.json",
+                    axum::routing::get(|| async { "ok" }),
+                )
+                .layer(axum::middleware::from_fn({
+                    let auth = state.auth.clone();
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let auth = auth.clone();
+                        async move {
+                            crate::backend::http3::enforce_route_policy_for_test(auth, req, next)
+                                .await
+                        }
+                    }
+                }))
+                .with_state(state);
+
+            for uri in [
+                "/health",
+                "/version",
+                "/config",
+                "/llms.txt",
+                "/.well-known/mindex.json",
+            ] {
+                let (status, _) = call(&app, uri, None).await;
+                assert!(
+                    status.is_success(),
+                    "{uri} demanded a credential; a probe that needs one reports the \
+                     credential's health, not the server's"
+                );
+            }
+        }
+
+        /// The Swagger UI and the raw spec are `merge`d rather than routed, so
+        /// they are absent from `ROUTE_POLICY` — and the default-deny layer would
+        /// refuse them as unconfigured routes, logging a build defect on every
+        /// visit to the documentation. `PUBLIC_PATH_PREFIXES` is what stops that,
+        /// and this is what stops somebody deleting it.
+        #[test]
+        fn the_specification_paths_are_public_by_prefix() {
+            for path in [
+                "/swagger-ui",
+                "/swagger-ui/index.html",
+                "/api-docs/openapi.json",
+            ] {
+                assert!(
+                    crate::backend::http3::PUBLIC_PATH_PREFIXES
+                        .iter()
+                        .any(|p| path.starts_with(p)),
+                    "{path} would be refused as an unconfigured route"
+                );
+            }
+            // And the exemption must stay narrow: a prefix that swallowed the
+            // data plane would be the whole feature undone by one string.
+            for path in ["/projects", "/v0/x/search", "/status", "/metrics", "/gc"] {
+                assert!(
+                    !crate::backend::http3::PUBLIC_PATH_PREFIXES
+                        .iter()
+                        .any(|p| path.starts_with(p)),
+                    "{path} is exempted from authorization by a public prefix"
+                );
+            }
+        }
+
+        /// A token whose `prj` is empty reaches nothing. The alternative reading
+        /// — "unrestricted" — is what turns a minter's omitted argument into
+        /// full access, so it is pinned on the wire rather than only in the
+        /// claim type.
+        #[tokio::test]
+        async fn an_empty_project_claim_reaches_no_project_at_all() {
+            let guid = uuid::Uuid::new_v4();
+            let app = app(true, &[guid]).await;
+            let t = token_for(&[], &[Action::Search]);
+
+            let (status, _) = call(&app, &format!("/projects/{guid}"), Some(&t)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            let (_, body) = call(&app, "/projects", Some(&t)).await;
+            assert!(
+                !body.contains(&guid.simple().to_string()),
+                "an empty claim listed a project: {body}"
+            );
+        }
+
+        /// Nothing about the credential may travel back to the caller. A token
+        /// echoed into a `detail`, a key id named in a refusal, a subject
+        /// reflected — each is a small leak that reads as helpfulness.
+        #[tokio::test]
+        async fn no_refusal_ever_echoes_the_credential() {
+            let app = app(true, &[]).await;
+            let guid = uuid::Uuid::new_v4();
+            let secret_ish = "test";
+
+            let forged = mint(
+                &Keyring::from_secret("rotated-out", vec![3u8; 32]),
+                "somebody",
+                vec!["*".into()],
+                vec![Action::Search],
+                1,
+            )
+            .unwrap()
+            .0;
+
+            for token in [Some(forged.as_str()), None] {
+                for uri in [
+                    format!("/projects/{guid}"),
+                    "/projects".into(),
+                    "/status".into(),
+                ] {
+                    let (_, body) = call(&app, &uri, token).await;
+                    assert!(
+                        !body.contains("rotated-out"),
+                        "a refusal named the key id: {body}"
+                    );
+                    assert!(
+                        !body.contains("somebody"),
+                        "a refusal echoed the token's subject: {body}"
+                    );
+                    assert!(
+                        !body.contains(secret_ish) || !body.contains("kid"),
+                        "a refusal leaked key material: {body}"
+                    );
+                    if let Some(t) = token {
+                        assert!(!body.contains(t), "a refusal echoed the token: {body}");
+                    }
+                }
+            }
+        }
+
+        /// An expired token is refused everywhere, and with its own code — the
+        /// one token failure whose remedy is obvious and whose distinguishability
+        /// leaks nothing, since the holder already proved it held a valid
+        /// signature.
+        #[tokio::test]
+        async fn an_expired_token_is_refused_on_every_route() {
+            let app = app(true, &[]).await;
+            let ring = Keyring::from_secret("test", SECRET.to_vec());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let claims = crate::backend::auth::Claims {
+                iss: "mindex".into(),
+                sub: "t".into(),
+                jti: "j".into(),
+                iat: now - 7200,
+                nbf: now - 7200,
+                exp: Some(now - 3600),
+                prj: vec!["*".into()],
+                act: Action::ALL.to_vec(),
+                aud: vec![],
+            };
+            let expired = crate::backend::auth::sign(&ring, &claims).unwrap();
+
+            for uri in [
+                format!("/projects/{}", uuid::Uuid::new_v4()),
+                "/projects".into(),
+                "/status".into(),
+            ] {
+                let (status, body) = call(&app, &uri, Some(&expired)).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+                assert!(body.contains("auth.token_expired"), "{uri}: {body}");
+            }
+        }
+
+        /// A token for the right project with the wrong action must not leak the
+        /// project's *existence* either way round — both answers are already
+        /// pinned above, so this pins the pair against each other: they must not
+        /// become distinguishable by status alone as the code evolves.
+        #[tokio::test]
+        async fn a_wrong_action_and_a_wrong_project_stay_different_answers() {
+            let mine = uuid::Uuid::new_v4();
+            let app = app(true, &[mine]).await;
+
+            let wrong_action = token_for(&[&mine.to_string()], &[Action::Delete]);
+            let (a, _) = call(&app, &format!("/projects/{mine}"), Some(&wrong_action)).await;
+
+            let wrong_project = token_for(&[&uuid::Uuid::new_v4().to_string()], &[Action::Search]);
+            let (b, _) = call(&app, &format!("/projects/{mine}"), Some(&wrong_project)).await;
+
+            assert_eq!(a, StatusCode::FORBIDDEN);
+            assert_eq!(b, StatusCode::NOT_FOUND);
+            assert_ne!(
+                a, b,
+                "these are different conditions and must stay so: 403 says `your token is too \
+                 narrow`, 404 says nothing at all"
+            );
+        }
+
+        /// With `[auth].enabled` off — every deployment that has not opted in —
+        /// the request path is what it always was, and a client-supplied
+        /// `Authorization` header decides nothing. Both halves are one claim, so
+        /// they are one test: a header that is *sometimes* honoured is worse
+        /// than one that never is.
+        #[tokio::test]
+        async fn authorization_off_ignores_the_header_entirely() {
+            let guid = uuid::Uuid::new_v4();
+            let app = app(false, &[guid]).await;
+
+            let (bare_status, bare) = call(&app, "/projects", None).await;
+            for header in [
+                token_for(&["*"], &[Action::Admin]),
+                "not-a-token".to_string(),
+                String::new(),
+            ] {
+                let (status, body) = call(&app, "/projects", Some(&header)).await;
+                assert_eq!(status, bare_status, "a header changed the status");
+                assert_eq!(body, bare, "a header changed the body");
+            }
+            assert!(
+                bare.contains(&guid.simple().to_string()),
+                "the unfiltered listing lost a project: {bare}"
+            );
+        }
+
+        // ── Minting over HTTP ────────────────────────────────────────────────
+        //
+        // `may_mint` has its own exhaustive table in `auth.rs`, over every axis
+        // and every action. These tests exist because that table proves nothing
+        // about the *endpoint*: the handler builds a `Claims` from a JSON body,
+        // caps the lifetime, chooses a key and only then consults the rule, and
+        // any of those four steps could hand `may_mint` something other than the
+        // token it is about to sign. What is checked here is therefore the seam,
+        // not the rule — including, in the first test, that the token which comes
+        // back out actually carries the narrowed scope rather than the requested
+        // one.
+
+        async fn post_json(
+            app: &axum::Router,
+            uri: &str,
+            token: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, String) {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        /// The happy path, and the only assertion that matters about it: the
+        /// token handed back verifies, and its scope is the one that was asked
+        /// for rather than the minter's.
+        #[tokio::test]
+        async fn a_minted_token_comes_back_verifiable_and_narrowed() {
+            let project = uuid::Uuid::new_v4();
+            let app = full_router().await;
+            let minter = token_for(
+                &[&project.to_string()],
+                &[
+                    Action::Mint,
+                    Action::Search,
+                    Action::Research,
+                    Action::Delete,
+                ],
+            );
+
+            let (status, body) = post_json(
+                &app,
+                "/auth/tokens",
+                &minter,
+                serde_json::json!({
+                    "sub": "agent:review",
+                    "projects": [project.to_string()],
+                    "actions": ["search", "research"],
+                    "days": 1,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            let issued: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let claims = crate::backend::auth::verify(
+                &crate::backend::auth::Keyring::from_secret("test", SECRET.to_vec()),
+                issued["token"].as_str().expect("a token"),
+                60,
+            )
+            .expect("the issued token must verify against this server's key");
+
+            assert!(claims.covers(&project));
+            assert!(claims.permits(Action::Search) && claims.permits(Action::Research));
+            for dropped in [Action::Delete, Action::Mint, Action::Admin, Action::Index] {
+                assert!(
+                    !claims.permits(dropped),
+                    "the issued token gained {dropped}, which was not requested"
+                );
+            }
+        }
+
+        /// Every way of asking for more than the minter holds, refused over the
+        /// wire. The pure rule is table-driven elsewhere; what this pins is that
+        /// none of these reach a 200 through the handler's own construction of
+        /// the claims — a bug that would be invisible to a unit test of
+        /// `may_mint`, because `may_mint` would never be handed the wider claim.
+        #[tokio::test]
+        async fn the_endpoint_refuses_every_way_of_exceeding_the_minter() {
+            let mine = uuid::Uuid::new_v4();
+            let other = uuid::Uuid::new_v4();
+            let app = full_router().await;
+            // One day, so a request for more days is a request for a later expiry.
+            let minter = token_for(&[&mine.to_string()], &[Action::Mint, Action::Search]);
+
+            for (name, body) in [
+                (
+                    "a wider action",
+                    serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                       "actions": ["admin"], "days": 1}),
+                ),
+                (
+                    "an action alongside held ones",
+                    serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                       "actions": ["search", "delete"], "days": 1}),
+                ),
+                (
+                    "a project the minter does not hold",
+                    serde_json::json!({"sub": "x", "projects": [other.to_string()],
+                                       "actions": ["search"], "days": 1}),
+                ),
+                (
+                    "the wildcard, from a named minter",
+                    serde_json::json!({"sub": "x", "projects": ["*"],
+                                       "actions": ["search"], "days": 1}),
+                ),
+                (
+                    "a later expiry",
+                    serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                       "actions": ["search"], "days": 30}),
+                ),
+                (
+                    // The eternal token is refused before the containment rule is
+                    // even consulted, and it must stay refused for both reasons:
+                    // over the network there is no such thing.
+                    "a token that never expires",
+                    serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                       "actions": ["search"], "days": 0}),
+                ),
+            ] {
+                let (status, out) = post_json(&app, "/auth/tokens", &minter, body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{name} was minted: {out}");
+                assert!(
+                    !out.contains("eyJ"),
+                    "{name} was refused but the response carried a token: {out}"
+                );
+            }
+        }
+
+        /// A token that cannot mint is refused by the *extractor*, before the
+        /// body is read — which is why this is a 403 naming the action rather
+        /// than a 400 about containment.
+        #[tokio::test]
+        async fn a_token_without_mint_cannot_reach_the_minting_endpoint() {
+            let mine = uuid::Uuid::new_v4();
+            let app = full_router().await;
+            let no_mint = token_for(
+                &[&mine.to_string()],
+                &[
+                    Action::Search,
+                    Action::Research,
+                    Action::Index,
+                    Action::Delete,
+                ],
+            );
+
+            let (status, body) = post_json(
+                &app,
+                "/auth/tokens",
+                &no_mint,
+                serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                   "actions": ["search"], "days": 1}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.contains("auth.action_not_permitted") && body.contains("mint"),
+                "the refusal must name the action, got: {body}"
+            );
+        }
+
+        /// The write actions are mintable over the network, and that is a
+        /// decision rather than an oversight.
+        ///
+        /// The alternative — a hard-coded read-only vocabulary at this endpoint —
+        /// does not prevent a write token existing; it moves the minting to a
+        /// shell on the server's host, where what gets issued is usually *wider*
+        /// than what was asked for here. What keeps this safe is that the request
+        /// is contained by the minting token, which the tests above establish
+        /// exhaustively. So a minter holding `index` may pass it on, and one that
+        /// does not may not — the same rule as every other action, with no
+        /// special case for the dangerous-sounding ones.
+        #[tokio::test]
+        async fn a_write_action_is_mintable_exactly_when_the_minter_holds_it() {
+            let mine = uuid::Uuid::new_v4();
+            let app = full_router().await;
+
+            for action in [Action::Index, Action::Delete] {
+                let body = serde_json::json!({
+                    "sub": "agent:writer",
+                    "projects": [mine.to_string()],
+                    "actions": ["search", action.as_str()],
+                    "days": 1,
+                });
+
+                let holder = token_for(
+                    &[&mine.to_string()],
+                    &[Action::Mint, Action::Search, action],
+                );
+                let (status, out) = post_json(&app, "/auth/tokens", &holder, body.clone()).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{action} was refused a holder: {out}"
+                );
+                let issued: serde_json::Value = serde_json::from_str(&out).unwrap();
+                let granted = issued["actions"].as_array().unwrap();
+                assert!(
+                    granted.iter().any(|a| a == action.as_str()),
+                    "{action} was asked for and not granted: {out}"
+                );
+
+                // And the same request from a minter without it is refused — so
+                // the grant above came from the minter's own scope and not from
+                // the endpoint being permissive about writes.
+                let reader = token_for(&[&mine.to_string()], &[Action::Mint, Action::Search]);
+                let (status, out) = post_json(&app, "/auth/tokens", &reader, body).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "a read-only minter issued {action}: {out}"
+                );
+            }
+        }
+
+        /// The audience rides through the endpoint and is echoed back — the echo
+        /// is what a client renders, and a client that displayed its *request*
+        /// would report a label the token does not carry.
+        #[tokio::test]
+        async fn the_audience_is_carried_into_the_token_and_echoed_back() {
+            let mine = uuid::Uuid::new_v4();
+            let app = full_router().await;
+            let minter = token_for(&[&mine.to_string()], &[Action::Mint, Action::Search]);
+
+            let (status, out) = post_json(
+                &app,
+                "/auth/tokens",
+                &minter,
+                serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                   "actions": ["search"], "audiences": ["agent", "cli"],
+                                   "days": 1}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{out}");
+            let issued: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                issued["audiences"],
+                serde_json::json!(["cli", "agent"].iter().collect::<Vec<_>>()).clone(),
+                "the echo must be the normalized list: {out}"
+            );
+
+            // And it is really in the token, not only in the envelope.
+            let ring = Keyring::from_secret("test", SECRET.to_vec());
+            let claims = crate::backend::auth::verify(&ring, issued["token"].as_str().unwrap(), 60)
+                .expect("verifies");
+            assert_eq!(
+                claims.aud,
+                vec![
+                    crate::backend::auth::Audience::Cli,
+                    crate::backend::auth::Audience::Agent
+                ]
+            );
+        }
+
+        /// An unlabelled request must produce an unlabelled token rather than one
+        /// nobody may use: this is the ordinary shape, and reading the omitted
+        /// field as "no audience" would break every client at once.
+        #[tokio::test]
+        async fn omitting_the_audience_mints_a_token_every_client_accepts() {
+            let mine = uuid::Uuid::new_v4();
+            let app = full_router().await;
+            let minter = token_for(&[&mine.to_string()], &[Action::Mint, Action::Search]);
+
+            let (status, out) = post_json(
+                &app,
+                "/auth/tokens",
+                &minter,
+                serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                   "actions": ["search"], "days": 1}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{out}");
+            let issued: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(issued["audiences"], serde_json::json!([]));
+        }
+
+        /// A typo'd audience must fail loudly. Silently dropping it would mint a
+        /// token that every client accepts while its holder believes it is
+        /// labelled — the failure being invisible is the whole problem.
+        #[tokio::test]
+        async fn an_unknown_audience_is_refused_rather_than_dropped() {
+            let mine = uuid::Uuid::new_v4();
+            let app = full_router().await;
+            let minter = token_for(&[&mine.to_string()], &[Action::Mint, Action::Search]);
+
+            for bad in ["ai", "vs-code", "VSCODE", "*"] {
+                let (status, out) = post_json(
+                    &app,
+                    "/auth/tokens",
+                    &minter,
+                    serde_json::json!({"sub": "x", "projects": [mine.to_string()],
+                                       "actions": ["search"], "audiences": [bad], "days": 1}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} was minted: {out}");
+                assert!(!out.contains("eyJ"), "{bad:?} produced a token: {out}");
+            }
+        }
     }
 }

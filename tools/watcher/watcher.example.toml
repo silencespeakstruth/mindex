@@ -19,3 +19,22 @@ debounce_ms = 1000
 # Seconds between full drift checks (walk + hash + compare to index).
 # The drift check catches changes that happened while the watcher was offline.
 drift_interval_secs = 300
+
+# --- authorization -------------------------------------------------------
+# The bearer token for a server running with [auth].enabled. It is the only
+# credential mindex checks; each one names the projects it reaches and the
+# actions it permits. Mint one on the server's host:
+#     mindex mint-token --sub cli@$(hostname) --project '*' \
+#       --can search,index,delete --for cli --days 90
+# `--for` is optional; it labels which kind of client the token is for, and this
+# one refuses to run with a token labelled for another (the server checks nothing).
+# token = "eyJhbGciOi..."          # prefer NOT to put it here, see below
+#
+# Four sources, first one wins: --token, $MINDEX_TOKEN, $MINDEX_TOKEN_FILE (a
+# 0600 file holding it), this key, then a per-server entry in
+# ~/.config/mindex/credentials.toml:
+#     ["https://127.0.0.1:11111"]
+#     token = "eyJhbGciOi..."
+# The credentials file is the better home for a long-lived credential: it is
+# keyed by server URL, so one machine can hold several, and it refuses to be
+# read at all unless it is mode 0600 — which this file is not held to.

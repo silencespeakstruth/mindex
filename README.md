@@ -193,14 +193,27 @@ intersected — because a sync only drops what your refs no longer reach.
 
 ## What else you should know
 
-- **No API auth.** TLS only; mindex is meant for a trusted local machine or network.
-  To reach it from anywhere else, terminate at a reverse proxy and let *that*
-  authenticate. Every client can send an optional `X-Api-Key` for such a proxy —
-  `--api-key` for the CLI tools, `MINDEX_API_KEY` for all of them (preferred: a
-  flag value is visible in `ps`), `api_key` in `indexer.toml`/`watcher.toml`, the
-  `mindex.apiKey` setting in VS Code. Unset means no header is sent, so a direct
-  `https://127.0.0.1:11111` connection is unchanged. mindex itself ignores the
-  header — it is entirely the proxy's business.
+- **Authorization is opt-in and off by default.** Without it, TLS is the only
+  transport security and mindex answers every caller that can reach the port — fine
+  for a trusted local machine, and the reason an unconfigured deployment must not
+  be exposed. Turning on `[auth]` makes the server mint and verify its own bearer
+  tokens: each names the projects it reaches and the actions it permits
+  (`search`, `research`, `index`, `delete`, `admin`, `mint`), and the check is one
+  HMAC with no server-side session state. Issue one with `mindex mint-token`.
+
+  Every client sends the same header, `Authorization: Bearer` — `--token` for the
+  CLI tools, `$MINDEX_TOKEN` for all of them, `$MINDEX_TOKEN_FILE` naming a 0600
+  file for anything configured through an environment block (an MCP server list),
+  `token` in `indexer.toml`/`watcher.toml`, a `credentials.toml` entry per server
+  URL, and the OS keychain in VS Code (**MINDex: Set Bearer Token**, never a
+  setting — Settings Sync would carry it between machines). Prefer the file or the
+  environment: a flag value is visible in `ps`. **MINDex: Issue a Token for an
+  Agent** derives a short-lived read-and-research token for the current project
+  from the one the extension holds, so handing an agent a credential does not
+  need a shell on the server's host; the server refuses anything the minting
+  token does not already hold. Unset sends no header, so a direct
+  `https://127.0.0.1:11111` connection to a server with `[auth]` off is unchanged.
+  Full rationale and runbook: `docs/claude/auth.md`.
 - **Certificates.** A CA the host already trusts needs nothing: every client reads
   the OS trust store, which is where mkcert and corporate roots install themselves.
   A CA that is *not* installed there is named explicitly — `--ca-cert` for the CLI

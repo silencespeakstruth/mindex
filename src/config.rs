@@ -356,6 +356,20 @@ const DEFAULT_METRICS_PER_PROJECT_HTTP_LABELS: bool = false;
 const MIN_METRICS_REFRESH_SECONDS: u64 = 5;
 const MAX_METRICS_REFRESH_SECONDS: u64 = 3600;
 
+/// Authorization is opt-in. The direct loopback path — every client in `tools/`,
+/// both MCP servers, the extension — must keep working untouched on an existing
+/// deployment that upgrades without changing its config.
+const DEFAULT_AUTH_ENABLED: bool = false;
+const DEFAULT_AUTH_SIGNING_KEY_FILE: &str = "mindex-signing-keys.toml";
+const DEFAULT_AUTH_MAX_TOKEN_DAYS: u64 = 90;
+const DEFAULT_AUTH_LEEWAY_SECONDS: u64 = 60;
+/// Above this a "clock skew tolerance" is an expiry extension: an hour of leeway
+/// on a token minted for a day is a quarter of its life spent already expired.
+const MAX_AUTH_LEEWAY_SECONDS: u64 = 600;
+/// A year. Longer is not a token, it is a password with extra steps — and with
+/// no denylist by design, its only remedy is deleting the key that signed it.
+const MAX_AUTH_MAX_TOKEN_DAYS: u64 = 365;
+
 const DEFAULT_GC_INTERVAL_SECONDS: u64 = 3600;
 const DEFAULT_STATUS_LOG_RETENTION_DAYS: u64 = 30;
 const DEFAULT_RETRY_INTERVAL_SECONDS: u64 = 60;
@@ -953,6 +967,42 @@ pub struct MetricsConfig {
     pub per_project_http_labels: bool,
 }
 
+/// Scoped bearer tokens (`backend/auth.rs`).
+///
+/// TOML-only, like `[limits]` and `[metrics]`: whether a deployment authorizes
+/// at all is its shape, not a per-invocation choice.
+///
+/// **Off by default, and that is load-bearing.** With `enabled = false` no
+/// header is read, no signature is checked and every request takes the path it
+/// takes today, byte for byte — which is what lets this ship without a flag day
+/// for the six clients and both MCP servers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// Require and verify a bearer token on every non-public route.
+    pub enabled: bool,
+    /// Where the signing keys live. Created with one generated key at mode 0600
+    /// on first start if absent; refused outright if any other account can read
+    /// it, since whatever can read it can mint a token for any project.
+    ///
+    /// Defaults beside the database rather than beside the config: it is state
+    /// the server owns and rewrites, not something an operator edits by hand,
+    /// and a config directory is routinely world-readable.
+    pub signing_key_file: PathBuf,
+    /// Longest lifetime `mint-token` and `POST /auth/tokens` will issue.
+    ///
+    /// A ceiling on the damage a leaked token can do, because there is no
+    /// denylist by design: a token is valid until it expires or until its `kid`
+    /// is deleted from the key file.
+    pub max_token_days: u64,
+    /// Clock-skew tolerance applied to `exp` and `nbf` alike.
+    ///
+    /// Both ends, deliberately: a token minted on another host whose clock is a
+    /// few seconds ahead is the ordinary case, not an attack, and refusing it
+    /// produces a failure that looks like a bad credential.
+    pub leeway_seconds: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerConfig {
@@ -977,6 +1027,7 @@ pub struct Config {
     pub workers: WorkerConfig,
     pub research: ResearchConfig,
     pub metrics: MetricsConfig,
+    pub auth: AuthConfig,
 }
 
 impl Default for ServerConfig {
@@ -1204,6 +1255,17 @@ impl Default for MetricsConfig {
     }
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_AUTH_ENABLED,
+            signing_key_file: PathBuf::from(DEFAULT_AUTH_SIGNING_KEY_FILE),
+            max_token_days: DEFAULT_AUTH_MAX_TOKEN_DAYS,
+            leeway_seconds: DEFAULT_AUTH_LEEWAY_SECONDS,
+        }
+    }
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -1235,6 +1297,11 @@ impl Default for WorkerConfig {
     )
 )]
 pub struct Cli {
+    /// Subcommand, if any. Absent — the overwhelmingly common case — runs the
+    /// server exactly as it always has; the flags below are the server's.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Path to a TOML config file. Overrides XDG discovery
     /// ($XDG_CONFIG_HOME/mindex/config.toml then $XDG_CONFIG_DIRS). If given and
     /// unreadable/invalid, startup fails.
@@ -1360,6 +1427,130 @@ fn candidate_paths(explicit: Option<PathBuf>) -> Vec<PathBuf> {
 /// checked, which file (if any) was loaded, and every value a flag overrode.
 /// Returns the effective config and its source, or a fatal [`ConfigError`]
 /// (already logged) on which the caller must refuse to start.
+/// Things this binary can do besides serve.
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Issue a scoped bearer token and print it.
+    ///
+    /// The bootstrap path, and the reason `POST /auth/tokens` is not the only
+    /// way: it reads `[auth].signing_key_file` straight off the disk, so it
+    /// works before any token exists and while the server is down — which is
+    /// exactly when a credential is most likely to be needed.
+    ///
+    /// The token is printed to **stdout** and nothing else is, so it pipes. It
+    /// is not logged anywhere, and it cannot be recovered afterwards: there is
+    /// no store of issued tokens by design.
+    MintToken {
+        /// Label naming the holder, e.g. `vscode@laptop` or `guest:review-bot`.
+        /// Appears in the token and in this server's logs when it is refused;
+        /// never used for a decision.
+        #[arg(long)]
+        sub: String,
+
+        /// Project GUID this token may reach. Repeatable.
+        ///
+        /// `*` means every project, and it must be spelled: an omitted list is
+        /// a token that reaches nothing, never one that reaches everything.
+        /// Reserve `*` for a working token on a machine holding the repositories
+        /// — never for one that will be pasted into a model's context.
+        #[arg(long = "project", value_name = "GUID|*", required = true)]
+        projects: Vec<String>,
+
+        /// Actions this token permits: search, research, index, delete, admin,
+        /// mint. Repeatable or comma-separated.
+        ///
+        /// A guest credential wants `search` alone, or `search,research`: an
+        /// agent reached over HTTP has no working tree, so it cannot reindex
+        /// anything and `index` buys it nothing while costing everything if the
+        /// token leaks.
+        #[arg(
+            long = "can",
+            value_name = "ACTION",
+            required = true,
+            value_delimiter = ','
+        )]
+        actions: Vec<String>,
+
+        /// Days until it expires (default 30, capped by `[auth].max_token_days`).
+        ///
+        /// **`0` means never**, and it is spelled rather than defaulted: an
+        /// omitted `--days` is 30. It exists for a machine-local credential
+        /// nothing would renew — the metrics scraper, whose expiry would blank
+        /// every dashboard at an hour nobody is watching — and is refused over
+        /// `POST /auth/tokens`, so issuing one requires shell access to the host.
+        ///
+        /// There is no revocation list, so this is otherwise the main bound on a
+        /// leak. The other is deleting the key id that signed it, which is what
+        /// `--key-id` is for.
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+
+        /// Which kinds of holder this token is for: cli, vscode, agent.
+        /// Repeatable or comma-separated; omitted means every kind.
+        ///
+        /// A label, not a permission. Nothing about an HTTP request says which
+        /// process sent it, so this server enforces none of it — the *clients*
+        /// do, and what it buys is that pasting an editor's credential into a
+        /// chat is refused by the thing that receives it instead of quietly
+        /// working. Anything that must actually be refused belongs in `--can`.
+        #[arg(
+            long = "for",
+            value_name = "AUDIENCE",
+            value_delimiter = ',',
+            default_values_t = Vec::<String>::new()
+        )]
+        audiences: Vec<String>,
+
+        /// Sign with this key id instead of the file's `active` one.
+        ///
+        /// The revocation mechanism: give a guest its own key id, and taking
+        /// that one line out of the key file kills its tokens and no others.
+        #[arg(long)]
+        key_id: Option<String>,
+
+        /// Create `--key-id` first, generating a fresh secret for it.
+        ///
+        /// Without this, `--key-id` must name a key the file already holds. The
+        /// split is deliberate: a typo'd id should fail rather than quietly mint
+        /// under a brand-new key nobody meant to create.
+        #[arg(long, requires = "key_id")]
+        new_key: bool,
+    },
+}
+
+/// Warns when the config file is one any account on the host can read.
+///
+/// A **warning, not a refusal**, and the asymmetry with the signing key file
+/// (which is refused outright) is the point. `config.toml` holds no secret
+/// today — paths, bounds and URLs — so refusing to start over its mode would
+/// break existing deployments to protect nothing. What it does hold is the shape
+/// of the deployment, including where the signing key lives, so it is said once,
+/// at startup, naming the file and the mode it found.
+///
+/// Unix-only because the mode is: elsewhere nothing is claimed rather than a
+/// value being approximated.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn warn_if_readable_by_others(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Ok(md) = std::fs::metadata(path) {
+            let mode = md.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:04o}"),
+                    "Config file is readable by other accounts on this host. \
+                     Hint for the sysadmin: it names the signing key file and every \
+                     dependency's address; run `chmod 600` on it unless this host is \
+                     single-user."
+                );
+            }
+        }
+    }
+}
+
 pub fn resolve(cli: &Cli) -> Result<(Config, ConfigSource), ConfigError> {
     let explicit = cli
         .config
@@ -1380,6 +1571,7 @@ pub fn resolve(cli: &Cli) -> Result<(Config, ConfigSource), ConfigError> {
 
     let (mut config, source) = match chosen {
         Some(path) => {
+            warn_if_readable_by_others(&path);
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 ConfigError(format!(
                     "could not read config file {}: {e}. \
@@ -2211,6 +2403,35 @@ impl Config {
             }
         }
 
+        // Every rule below fires only when authorization is on: a deployment that
+        // never enables it must not be refused startup over a knob it never set.
+        if self.auth.enabled {
+            if self.auth.signing_key_file.as_os_str().is_empty() {
+                e.push(
+                    "[auth].enabled is true but signing_key_file is empty, so no token could be \
+                     signed or verified and every request would be refused. Fix: set \
+                     signing_key_file to a path this server may create at mode 0600."
+                        .to_string(),
+                );
+            }
+            if self.auth.max_token_days < 1 || self.auth.max_token_days > MAX_AUTH_MAX_TOKEN_DAYS {
+                e.push(format!(
+                    "[auth].max_token_days = {} is out of range. Fix: use 1..={MAX_AUTH_MAX_TOKEN_DAYS}. \
+                     There is no revocation list by design, so this is the ceiling on how long a \
+                     leaked token stays usable without deleting the key that signed it.",
+                    self.auth.max_token_days
+                ));
+            }
+            if self.auth.leeway_seconds > MAX_AUTH_LEEWAY_SECONDS {
+                e.push(format!(
+                    "[auth].leeway_seconds = {} is too large to be clock-skew tolerance. Fix: use \
+                     0..={MAX_AUTH_LEEWAY_SECONDS}. Above that it stops correcting for skew and \
+                     starts extending every token's life past its own `exp`.",
+                    self.auth.leeway_seconds
+                ));
+            }
+        }
+
         if e.is_empty() { Ok(()) } else { Err(e) }
     }
 
@@ -2691,6 +2912,7 @@ mod tests {
         let mut cfg = parse("[indexing]\nembed_batch_chunks = 128\n").expect("valid");
         assert_eq!(cfg.indexing.embed_batch_chunks, 128); // file beats default (256)
         let cli = Cli {
+            command: None,
             config: None,
             bind: None,
             cert_path: None,

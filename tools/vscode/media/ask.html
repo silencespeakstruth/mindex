@@ -26,11 +26,18 @@
         </button>
     </div>
 
+    <!-- Research alone is unavailable. Two different causes reach this notice — the
+         server's optional Ollama is down, or the stored token does not carry
+         `research` — so the sentence is written by the host, not baked in here.
+         Ollama comes back by itself and a token does not, and a notice naming the
+         wrong one sends the user to restart a service that was never the problem. -->
     <div class="notice" id="ollama-notice" hidden>
         <span class="codicon codicon-warning codicon-sm"></span>
         <span>
-            The server's Ollama is not answering, so Research is unavailable. Search is
-            unaffected.
+            <span id="ollama-reason">
+                The server's Ollama is not answering, so Research is unavailable.
+            </span>
+            Search is unaffected.
             <button id="notice-status" class="linky" type="button">Open Server Status</button>
         </span>
     </div>

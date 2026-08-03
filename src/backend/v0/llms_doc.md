@@ -32,39 +32,58 @@ of it is grounded. That check is the thing a reader would otherwise have to
 perform by re-reading the files — which is the cost the whole design exists to
 avoid.
 
-## The required minimum: an API key and a project GUID
+## What a caller needs: a token and a project GUID
 
-This document is the only thing most deployments serve without credentials.
-Everything below it needs two values, and neither can be guessed or derived:
+A handful of routes answer anyone — this document, `GET /config`,
+`GET /version`, `GET /health` and `/.well-known/mindex.json`. They describe the
+API's shape and hold no code, no report and no project. Everything else needs
+two values, and neither can be guessed or derived:
 
-**1. An API key, sent as the `X-Api-Key` header on every request.** mindex has
-no authentication of its own, so where a deployment needs one it is enforced by
-a gateway in front of the server. That gateway typically does not answer a
-keyless request at all — it closes the connection with no status line and no
-body, which an HTTP client reports as a connection or protocol error rather
-than as `401`. **An empty reply from this host means a missing or wrong key far
-more often than it means the server is down.** The key is issued by whoever
-runs the deployment; there is no endpoint that hands one out and no default
-value.
+**1. A bearer token**, sent as `Authorization: Bearer <token>`. Deployments that
+run with authorization on issue these; the server signs them itself, and each one
+names the projects it reaches and the actions it permits (`search`, `research`,
+`index`, `delete`, `admin`, `mint`). There is no endpoint that hands one out
+without already holding one, and no default value — a token comes from whoever
+runs the deployment, minted with `mindex mint-token` on the server's host.
+
+A deployment reachable from outside a host usually also sits behind a gateway,
+and a gateway typically does not answer a credential-less request at all: it
+closes the connection with no status line and no body, which an HTTP client
+reports as a connection or protocol error rather than as `401`. **An empty reply
+from this host means a missing token far more often than it means the server is
+down.** Where the request does reach the server, the refusals are precise:
+`401 auth.token_missing`, `401 auth.token_invalid`, `401 auth.token_expired`,
+`403 auth.action_not_permitted` naming the action the token lacks.
+
+One refusal is deliberately imprecise and it is worth knowing about. A project a
+token does not cover answers **`404 project.not_found`, byte-identical to a
+project that was never indexed** — the distinction is withheld on purpose,
+because a distinguishable refusal would confirm which GUIDs exist. A caller
+seeing that code cannot tell the two apart and should not report it as either
+one; "this token does not reach that project, or there is no such project" is
+the whole of what is known.
 
 **2. A project GUID**, the `{project_guid}` in every data-plane path. It comes
-from `GET /projects`, which lists the indexed projects with their GUIDs — one
-request, and it needs the key. A repository being indexed also carries its GUID
-in a committed `.mindex` file at its root, under the `guid:` key.
+from `GET /projects`, which lists the projects the token reaches — one request,
+and the listing is filtered to the token's own scope, so it is also the cheapest
+way to see what a token is for. A repository being indexed carries its GUID in a
+committed `.mindex` file at its root, under the `guid:` key.
 
-With both in hand, `GET /health` is the cheapest confirmation that the pair
-works end to end: it answers 200 with a one-word `status` and touches nothing.
-A run of requests that all fail identically before that check has passed is
-almost always the credentials, not the API.
+`GET /health` is the cheapest confirmation that the server is up, though it
+answers without a token and so says nothing about whether one works. `GET
+/projects` is the check that covers both. A run of requests that all fail
+identically before that check has passed is almost always the credential, not
+the API.
 
 ## Transport and error model
 
-- Internal service: TLS is the only transport security and there is **no
-  authentication**. The certificate may be locally issued; a client that
-  refuses it has a trust-store problem rather than a server error. Some
-  deployments put a reverse proxy in front that requires an `X-Api-Key`
-  header — that check lives in the proxy, and this server never reads the
-  header.
+- Internal service. TLS is the only transport security, and the certificate may
+  be locally issued; a client that refuses it has a trust-store problem rather
+  than a server error. Authorization is optional and off by default — a
+  deployment that runs without it authorizes nothing and answers every caller
+  that can reach the port, which is why such a deployment belongs on a trusted
+  network. `/.well-known/mindex.json` says which of the two this one is, in its
+  `authentication` field.
 - Every non-2xx response is RFC 7807 `application/problem+json` carrying a
   stable machine `code` (`validation.top_k_out_of_range`, `research.busy`,
   and so on). The `code` is the contract and is pinned by a snapshot test;

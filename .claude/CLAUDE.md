@@ -5,7 +5,7 @@ Only what is **not obvious from reading the code**: invariants, non-trivial
 no language table (the `ProgrammingLanguage` enum + `Cargo.toml`), no struct/SQL
 dumps. Accepted limitations are stated next to the invariant they qualify.
 Detail companions live in `docs/claude/` (research, git history, VS Code,
-Qdrant) —
+Qdrant, auth) —
 this file keeps the invariants; read the matching companion before modifying
 that area.
 
@@ -13,8 +13,10 @@ that area.
 
 `mindex` is an async RAG indexing + search engine in Rust. HTTPS API →
 `tree-sitter` AST chunking → `BGE-M3` multi-vector embeddings
-(dense/sparse/ColBERT) → `Qdrant` vectors + `SQLite3` metadata. Internal
-service: TLS is the only transport security, no API auth.
+(dense/sparse/ColBERT) → `Qdrant` vectors + `SQLite3` metadata. TLS is the only
+transport security; authorization is opt-in (`[auth]`, below) and off by
+default, so an unconfigured deployment is still an internal service that must
+not be exposed.
 
 TLS verification is uniform across every client: **OS trust store** by default
 (where mkcert/corporate roots live), extra CA via `--ca-cert` / `ca_cert` /
@@ -27,14 +29,140 @@ both CLI tools once); and the MCP `drift` tool **shells out to `mindex-index`**,
 so a CA setting that misses the child process breaks one tool while the rest
 work.
 
-Remote access is a *proxy's* job; the server stays unauthenticated and
-loopback-bound. For such a proxy every client carries one optional header,
-`X-Api-Key` (`--api-key` / `api_key` / `$MINDEX_API_KEY` / `mindex.apiKey`).
-**Additive**: unset sends no header (direct path byte-for-byte unchanged;
-mindex never reads it), and it travels on the *client*, not per-request, so it
-reaches every endpoint — including `mindex-search.sh`'s `/config` probe, which
-behind a gate would otherwise quietly fall back to its built-in language list.
-Prefer the env var; a flag value is visible in `ps`.
+**There is one credential, and it is the token.** The shared `X-Api-Key` a
+gateway used to check and mindex ignored is *gone*, not deprecated: two
+credentials where one is strictly stronger is not defence in depth — the weaker
+one sets the floor, and that one had no scope, no expiry and no way to withdraw
+a single holder. The decisive argument is narrower: a token is worth pasting
+into a context because it is narrow, and a deployment demanding the API key
+*beside* it would put the shared secret back into that same context, which is
+the leak the token closes. So `deploy/gate/` admits on the token's **presence**
+(nginx cannot verify a signature and does not try) and every question of
+validity, scope and action is answered in the server. The consequence is written
+into that file and is not optional: **`[auth].enabled = true` is mandatory
+behind a gateway** — with authorization off, `Authorization: Bearer x` is
+admitted and served everything, so `enabled = false` now means exactly one
+thing, a server on a trusted network that authorizes nothing (the Docker test
+stack, a loopback-only install).
+
+Four sources per client, first wins: `--token` > `$MINDEX_TOKEN` >
+`$MINDEX_TOKEN_FILE` (a path to a 0600 file) > `token` in
+`indexer.toml`/`watcher.toml` > the per-server entry in
+`~/.config/mindex/credentials.toml`. `MINDEX_TOKEN_FILE` exists for a caller
+configured by an environment block inside somebody else's config file — an MCP
+server list lives in an editor's own JSON, where a token sits in plaintext under
+no permission check and a path does not; its trap is the precedence, since a
+shell exporting `MINDEX_TOKEN` passes it to every child, so such a block must
+also set `MINDEX_TOKEN=""`. The header travels on the *client*, not per
+request, so it reaches every endpoint — including `mindex-search.sh`'s `/config`
+probe, which behind a gateway would otherwise quietly fall back to its built-in
+language list. **VS Code is the one holder that keeps its own copy**, in
+`SecretStorage`: not because a keychain answers "who holds the credential" (it
+cannot — the CLI needs the same kind and no shell can read it), but because the
+alternative *inside the extension* was a settings string, which Settings Sync
+copies to every other machine. It also watches `exp` and warns in the status bar
+(`src/token.ts`), verifying nothing — a client asserting validity would claim a
+fact only the server establishes. It is also the one surface that *issues*
+tokens: `mindex.mintAgentToken` (`agentToken.ts`) derives a token for the open
+project, capped at seven days and labelled `agent`, over `POST /auth/tokens`.
+Its action list is **ticked, not fixed**: `search`+`research` start on,
+`index`/`delete` are offered off behind a second modal naming what they cost, and
+`admin`/`mint` are absent from the list by construction. Offering only reads was
+the earlier call and it was wrong in one direction — it does not prevent a write
+token, it moves the minting to a shell, where what gets issued is usually wider.
+Every one of those narrowings is **usability, not enforcement** — a command
+palette is not a security boundary and does not need to be, because `may_mint`
+refuses anything exceeding the minting token regardless of what the client
+asked for.
+
+## Authorization (`[auth]`, opt-in)
+
+**The server used to authenticate nothing, and now optionally does.** That
+sentence was an invariant in four places and is retired here rather than left to
+rot. The break is bounded and the bound is the point: no user table, no
+password, no session, no per-request server-side state. One HMAC check, and
+every fact the decision needs rides inside the credential. **Full rationale,
+the refusal table, the revocation story and the runbook live in
+`docs/claude/auth.md` — read it before modifying `backend/auth.rs`, the scope
+extractors or `ROUTE_POLICY`.** The hard invariants:
+
+- **The token is the mapping; there is no schema change.** `prj` (dashless
+  GUIDs, or exactly `["*"]`, which must be *spelled* — an empty list reaches
+  nothing) and `act` (`search`/`research`/`index`/`delete`/`admin`/`mint`) are
+  signed into it. The rejected alternative was a `tenant_id` column, and it cost
+  a table rebuild, a trigger pinning one tenant per GUID, an in-process cache, a
+  startup warm, a rule for pre-existing rows and an in-transaction re-read
+  against `ON CONFLICT DO NOTHING` — none of which survives, along with one bug
+  class: only a caller whose token already names a GUID can create that project,
+  so `POST /index` stops being an existence oracle.
+- **Gateway-only was never possible.** `GET /projects` enumerates every GUID in
+  a response *body*, which no proxy filters without parsing, and a GUID is a
+  bearer identifier. That listing is why this lives in the server.
+- **An out-of-scope project answers 404 `project.not_found`, byte-identical to
+  one that never existed.** A distinguishable refusal confirms which GUIDs
+  exist, and an error `code` is the field clients are told to key on — so
+  `auth.forbidden` cannot exist on that path however much better it reads in a
+  log. The missing *action* **is** named (403): the caller already proved it
+  holds the project. Pinned on response bytes, not status, by
+  `an_out_of_scope_project_is_byte_identical_to_one_that_never_existed`.
+- **Two enforcement layers, deliberately overlapping.** Typed extractors
+  (`SearchScope`/`IndexScope`/…) are the mechanism — a **type** is what a
+  source-text guard can see, which a `RouterState` helper is not (the
+  `set_file_status` lesson) — and they check `covers(guid)` **then**
+  `permits(action)`, in that order, so a caller that cannot see the project
+  learns nothing about the action vocabulary. `enforce_route_policy` is the
+  runtime half and **fails closed**: a routed path with no `ROUTE_POLICY` row is
+  refused, not served. The layer deliberately does *not* do the project check —
+  `/drift` must answer an out-of-scope project as it answers an unknown one,
+  `/index` must create, and two listings filter a body, so a blanket answer
+  needs a per-route exception table, the fifth copy nothing checks.
+- **`ROUTE_POLICY` names every route**, in the `UNDOCUMENTED_ROUTES` idiom, with
+  three guards: `every_route_is_named_by_the_authorization_policy` (both
+  directions), `every_scoped_handler_takes_the_extractor_its_policy_names`, and
+  `every_route_refuses_every_way_it_should` — the last drives the *table* and so
+  stays exhaustive as routes are added, which a hand-written per-endpoint suite
+  cannot. Public: `/health`, `/version`, `/config`, `/llms.txt`, the descriptor,
+  plus `PUBLIC_PATH_PREFIXES` (`/swagger-ui`, `/api-docs/` — `merge`d, not
+  routed, so absent from the table and otherwise refused as build defects).
+  Liveness must not report the credential's health; discovery telling a caller
+  it needs a credential cannot itself require one.
+- **`admin` covers `/gc`, `/status`, `/metrics`; there is no `gc` action** —
+  `POST /gc` holds the process-wide guard and walks every collection, so a
+  project list cannot describe it. Consequence for this host: with `[auth]` on,
+  the VictoriaMetrics scrape needs its own admin token (`bearer_token_file`),
+  because mindex cannot tell a loopback scraper from a gated one.
+- **HS256, written here rather than taken from a crate**, so every copy of the
+  secret is owned (no `Debug`, zeroized, key file 0600 with `O_EXCL`) — and so
+  algorithm confusion is closed *by construction*: `verify` reads `kid` and
+  nothing else before checking the MAC, pinned by
+  `the_algorithm_header_cannot_select_the_algorithm`. The TLS key is not reused.
+- **Revocation is expiry or deleting a `kid`** — no denylist, by design, since
+  that is the per-request state this removes. `--key-id … --new-key` is what
+  makes per-holder ids one flag rather than hand-edited base64.
+- **`--days 0` mints a non-expiring token, and only the local CLI may.**
+  `POST /auth/tokens` refuses it: a network-reachable way to issue an eternal
+  credential is a different and worse thing. A minted token can never exceed its
+  minter (actions, projects, expiry) — without that, a read-only `mint`
+  credential becomes `admin` one call later.
+- **`aud` is the one claim nothing in the server reads, and that is the design.**
+  `--for cli,vscode,agent` labels which kind of holder a token is for; no part of
+  an HTTP request identifies the process behind it, so a server-side check would
+  be theatre. The **clients** refuse — `mindexfile::token::audience_refusal` for
+  the Rust CLIs (called once where the token is fully resolved, and it refuses
+  rather than warns, since the request would otherwise succeed), `token.ts`'s
+  `audienceRefusal` for the extension (overridable through a modal). It stops the
+  editor's credential landing in a shell profile; it stops no attacker. Absent or
+  empty means **every** audience — `skip_serializing_if` keeps the key off an
+  unlabelled token so a client keying on presence never meets `"aud": []` and
+  reads it as reaching nobody. **`may_mint` deliberately does not contain it**:
+  audience is not authority, delegation is a change of holder, and containment
+  would refuse the VS Code button minting an `agent` token from a `vscode` one —
+  pinned by `the_audience_is_not_an_authority_axis_and_does_not_bind_delegation`,
+  which exists because the inconsistency with the other three axes reads as a bug.
+  There is no `Claims::intended_for`: a predicate with no production caller reads
+  as a check the server performs.
+- **Off by default**, and `authorization_off_ignores_the_header_entirely` pins
+  that a client-supplied `Authorization` decides nothing when it is.
 
 ## Configuration (TOML file + CLI flags)
 
@@ -1971,6 +2099,30 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   resetting handles **before** any notification (its thenable resolves only
   on dismissal), reported as a failure, not a cancellation; none of it is
   observable without `[mindex.statusPollSeconds]` (default 30, `0` = off).
+  **The stored token is the second input to that same `Availability`**, folded in
+  by `mergeAvailability` at the point of use rather than inside `fetchStatus` —
+  the two have different lifetimes, and merging late is what lets a token stored
+  now repaint the form without waiting for the next poll. So a `search`-only
+  credential is a *supported way to run the extension*, not a broken one: it
+  never refuses to activate (a read-only client is what a narrow token is for),
+  it freezes the Research controls and names the missing action, and the tabs
+  stay live under the same rule as above. It is a **hint** — `tokenAvailability`
+  reads an unverified payload, so it decides what to offer while the server
+  decides what to serve, the language-picker stance. The token reason **wins**
+  over the health reason for the mode it kills: a dependency comes back by
+  itself, a missing action does not. `#ollama-notice` therefore takes its
+  sentence from the host (`#ollama-reason`) instead of naming Ollama in markup,
+  since the same notice now has two causes with different remedies.
+  `reindex()` checks `index` up front for the same reason — without it a batch
+  403s file by file and renders as a partial reindex.
+  **A brand-new project is the sharp case**: `createProjectFile` writes a fresh
+  UUID no token names, and every later request answers 404 `project.not_found`,
+  byte-identical to a GUID nobody indexed. Nothing downstream can tell them
+  apart, so `createProjectFile` hands the GUID to its caller and the caller says
+  so. Deliberately **no button on that message**: a wildcard token already covers
+  the GUID and never gets there, and a named-project token is refused by
+  `may_mint` for a project it does not hold — the remedy is genuinely on the
+  host.
   **Every server-touching button single-flights through `BusyKeys`**
   (`src/busy.ts`; `[data-busy-key]` + `applyBusy`/`setEnabled` in the
   webview) — supersede reads, **refuse** writes and paging, and the greyed

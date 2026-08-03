@@ -2063,12 +2063,16 @@ pub struct MindexDescriptor {
     /// without the descriptor's shape moving.
     pub descriptor_version: u32,
     pub documents: DescriptorDocuments,
-    /// Always `null`. An explicit statement rather than an omission: mindex
-    /// authenticates nothing at all, and a caller that finds the field missing
-    /// cannot tell that from a server too old to report it. Where a deployment
-    /// requires a key, the check lives in a reverse proxy in front of this
-    /// server, which never sees the header.
-    pub authentication: Option<()>,
+    /// `null` when this deployment authorizes nothing, a description of the
+    /// scheme when it does.
+    ///
+    /// Serialized either way rather than skipped: "authorizes nothing" and "too
+    /// old to say" must not look the same on the wire, which is why the field
+    /// existed as an always-`null` `Option<()>` before there was anything to put
+    /// in it. Now that there is, a caller handed only a URL can learn that it
+    /// needs a credential — instead of reading a closed connection or a 401 and
+    /// guessing.
+    pub authentication: Option<DescriptorAuthentication>,
     pub transport: DescriptorTransport,
     /// Every endpoint this build serves, derived from the OpenAPI spec rather
     /// than written by hand — see [`DescriptorEndpoint`].
@@ -2091,6 +2095,26 @@ pub struct MindexDescriptor {
 }
 
 /// Where the human- and machine-readable descriptions of this API live.
+/// How a caller proves it may do something, when this deployment requires it.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DescriptorAuthentication {
+    /// Always `"bearer-jwt"` today. Named rather than implied so a second scheme
+    /// can be added without a caller having to infer which one it is looking at.
+    pub kind: &'static str,
+    /// The header, spelled out. `Authorization: Bearer <token>`.
+    pub scheme: &'static str,
+    /// The action vocabulary a token may carry. Published because a caller
+    /// requesting one has to name what it needs, and guessing at the spelling is
+    /// a 400 it cannot debug from the outside.
+    pub actions: Vec<&'static str>,
+    /// The one thing a caller must be told and cannot discover: this server
+    /// answers **404** for a project outside the token's scope, exactly as it
+    /// does for a project that never existed. A client that renders that as
+    /// "no such project" will send its user hunting for an indexing problem
+    /// that does not exist.
+    pub note: &'static str,
+}
+
 #[derive(Serialize, Debug, ToSchema)]
 pub struct DescriptorDocuments {
     /// Full request/response schemas for every documented endpoint.
@@ -2147,6 +2171,68 @@ pub struct DescriptorEndpoint {
     /// deliberately undocumented ones (the narrative, the spec itself, the UI),
     /// which are real routes with no JSON contract to describe.
     pub documented: bool,
+}
+
+/// `POST /auth/tokens` — issue a scoped bearer token.
+#[derive(Deserialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MintTokenRequest {
+    /// Label naming the holder. Appears in the token and in this server's logs;
+    /// never a decision input.
+    pub sub: String,
+    /// Project GUIDs the token may reach, or exactly `["*"]` for all of them.
+    ///
+    /// The wildcard must be spelled: an empty list is a token that reaches
+    /// nothing, and reading an omitted field as "everything" is how a minter
+    /// hands out full access by accident.
+    pub projects: Vec<String>,
+    /// `search` / `research` / `index` / `delete` / `admin` / `mint`.
+    ///
+    /// Every one of them is mintable here, write actions included — a token that
+    /// may index is an ordinary thing to need, and refusing to issue one would
+    /// only move that work to a shell on the server's host. What stops it being
+    /// an escalation is that the request is contained by the minting token, not
+    /// that some actions are unspeakable. The *asking* is what should be
+    /// deliberate, and a caller naming `index` in a JSON body has been.
+    pub actions: Vec<String>,
+    /// `cli` / `vscode` / `agent`: which kinds of holder this token is for.
+    ///
+    /// Optional, and an omitted or empty list means **every** kind. It is a label
+    /// clients honour, never something this server enforces — nothing about a
+    /// request identifies the process behind it. See `auth::Audience`.
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    /// Lifetime in days, capped by `[auth].max_token_days` **and** by the
+    /// minting token's own remaining life.
+    pub days: u64,
+    /// Sign under this key id rather than the active one, so revoking this
+    /// credential later is one line deleted from the key file instead of a
+    /// rotation that logs out every client.
+    #[serde(default)]
+    pub key_id: Option<String>,
+}
+
+/// The issued token. Returned once and stored nowhere.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct MintTokenResponse {
+    pub token: String,
+    /// Unix seconds. Echoed so a caller can schedule a renewal without parsing
+    /// the token it was just handed.
+    ///
+    /// Never `null` from this endpoint: a non-expiring token is mintable only by
+    /// the local `mint-token` command, deliberately. The field is nullable all
+    /// the same, so that a client reading it does not have to be rewritten if
+    /// that ever changes.
+    pub expires_at: Option<u64>,
+    /// The normalized project list actually written into the token — dashless,
+    /// lowercased. Echoed because it is what the server will compare against,
+    /// and a caller that spelled a GUID differently should be able to see that
+    /// its request was understood.
+    pub projects: Vec<String>,
+    pub actions: Vec<String>,
+    /// The audiences written into the token, sorted and deduplicated. Empty means
+    /// it is labelled for no particular holder and every client will accept it.
+    pub audiences: Vec<String>,
 }
 
 #[cfg(test)]

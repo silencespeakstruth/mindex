@@ -1,4 +1,11 @@
-//! Parser for the repo-root `.mindex` project marker.
+//! The file formats every Rust mindex client shares.
+//!
+//! Two of them: the repo-root `.mindex` project marker (this module) and the
+//! per-server credentials file ([`credentials`]). Both live here for the same
+//! reason — a second copy of either parser in the watcher would be a copy that
+//! drifts, and for the credentials one the drift would be in a permission check.
+//!
+//! # The `.mindex` project marker
 //!
 //! This crate is the **reference implementation** of the format: the indexer
 //! (`mindex-index`), the watcher (`mindex-watch`) and — via a mirrored parser in
@@ -18,6 +25,9 @@
 //! Unknown keys are a hard error, the same choice the server's TOML config makes: a
 //! mistyped `exclude_path:` that is silently ignored means the excluded tree gets
 //! indexed, which is the failure this format exists to prevent.
+
+pub mod credentials;
+pub mod token;
 
 use anyhow::{Context, Result, bail};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};

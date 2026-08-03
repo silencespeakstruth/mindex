@@ -56,7 +56,49 @@ pub enum ApiError {
     /// it is never returned to the client.
     FileInFlight,
     /// The project has never been seen. 404.
+    ///
+    /// **Also what a caller holding a valid token gets for a project that token
+    /// does not cover**, byte for byte. Not an oversight and not laziness: a
+    /// distinguishable refusal confirms the project exists, and an error `code`
+    /// is precisely the field clients are told to key on, so a `auth.forbidden`
+    /// here would be the enumeration oracle written into the contract. The two
+    /// must stay indistinguishable, which is what
+    /// `an_out_of_scope_project_is_not_found_not_forbidden` pins.
     ProjectNotFound,
+    /// `[auth].enabled` and the request carried no bearer token. 401.
+    TokenMissing,
+    /// The token did not verify: bad signature, unknown key id, or malformed.
+    /// 401. The three are deliberately one code — telling a caller *which* is
+    /// how a probe learns which key ids exist. The reason goes to a `warn!` at
+    /// the extractor instead.
+    TokenInvalid,
+    /// The token verified but has expired. 401.
+    ///
+    /// Its own code, unlike the three above, because it is the one token failure
+    /// with an obvious remedy and no information to leak: the holder already
+    /// proved it held a validly signed token, and "mint a new one" is a different
+    /// instruction from "your credential is wrong".
+    TokenExpired,
+    /// The token is valid and covers the project, but does not carry the action
+    /// this route needs. 403.
+    ///
+    /// Distinguishable on purpose, and the asymmetry with [`Self::ProjectNotFound`]
+    /// is the reasoning rather than an inconsistency: the caller has already
+    /// proved it holds this project, so naming the missing action tells it
+    /// nothing it could not enumerate from its own token, and hiding it would
+    /// leave a legitimate caller unable to tell an under-scoped credential from
+    /// a wrong one.
+    ActionNotPermitted { action: &'static str },
+    /// A routed endpoint that `ROUTE_POLICY` does not name. 403.
+    ///
+    /// **A server bug, reported as a refusal.** It exists because the guard test
+    /// that catches a missing policy row runs at build time, and defence in
+    /// depth for "somebody added a route and forgot" has to act at request time.
+    /// Failing closed is the only safe direction: an unlisted route is one
+    /// nobody decided the authorization of, and serving it would be deciding by
+    /// omission. Logged at `error!`, because unlike every other variant here
+    /// nothing the client did caused it.
+    RouteNotConfigured,
     /// Search matched no active chunks (empty project or over-narrow filter). 404.
     NoMatch,
     /// The request body could not be deserialized (bad JSON / unknown enum / bad glob).
@@ -209,6 +251,11 @@ impl ApiError {
             ApiError::GcRunning => "gc.already_running",
             ApiError::FileInFlight => "index.file_in_flight",
             ApiError::ProjectNotFound => "project.not_found",
+            ApiError::TokenMissing => "auth.token_missing",
+            ApiError::TokenInvalid => "auth.token_invalid",
+            ApiError::TokenExpired => "auth.token_expired",
+            ApiError::ActionNotPermitted { .. } => "auth.action_not_permitted",
+            ApiError::RouteNotConfigured => "auth.route_not_configured",
             ApiError::NoMatch => "search.no_match",
             ApiError::MalformedBody(_) => "request.malformed_body",
             ApiError::MalformedPath(_) => "request.malformed_path",
@@ -264,6 +311,12 @@ impl ApiError {
             | ApiError::NoMatch
             | ApiError::ResearchRunNotFound { .. } => StatusCode::NOT_FOUND,
             ApiError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::TokenMissing | ApiError::TokenInvalid | ApiError::TokenExpired => {
+                StatusCode::UNAUTHORIZED
+            }
+            ApiError::ActionNotPermitted { .. } | ApiError::RouteNotConfigured => {
+                StatusCode::FORBIDDEN
+            }
             // Everything else is a client input error.
             _ => StatusCode::BAD_REQUEST,
         }
@@ -280,6 +333,11 @@ impl ApiError {
             ApiError::GcRunning => "Garbage collection already running",
             ApiError::FileInFlight => "File already being indexed",
             ApiError::ProjectNotFound => "Project not found",
+            ApiError::TokenMissing => "No bearer token",
+            ApiError::TokenInvalid => "Invalid bearer token",
+            ApiError::TokenExpired => "Bearer token expired",
+            ApiError::ActionNotPermitted { .. } => "Action not permitted by this token",
+            ApiError::RouteNotConfigured => "Endpoint has no authorization policy",
             ApiError::NoMatch => "No matching results",
             ApiError::MalformedBody(_) => "Malformed request body",
             ApiError::MalformedPath(_) => "Malformed path parameter",
@@ -377,6 +435,24 @@ impl ApiError {
                 "The same file is already being indexed by another in-flight request; retry.".into()
             }
             ApiError::ProjectNotFound => "The project has never been seen.".into(),
+            ApiError::TokenMissing => {
+                "This server requires a bearer token; send it as `Authorization: Bearer <token>`."
+                    .into()
+            }
+            ApiError::TokenInvalid => {
+                "The bearer token could not be verified. Obtain a new one from whoever runs this \
+                 deployment."
+                    .into()
+            }
+            ApiError::TokenExpired => "The bearer token has expired; mint a new one.".into(),
+            ApiError::ActionNotPermitted { action } => format!(
+                "The bearer token does not carry the `{action}` action this endpoint requires."
+            ),
+            ApiError::RouteNotConfigured => {
+                "This endpoint has no authorization policy on this server and is refused rather \
+                 than served. Report it: it is a defect in the server, not in the request."
+                    .into()
+            }
             ApiError::NoMatch => {
                 "No active chunks match (empty project or over-narrow filter).".into()
             }
@@ -699,6 +775,11 @@ mod tests {
             ApiError::GcRunning,
             ApiError::FileInFlight,
             ApiError::ProjectNotFound,
+            ApiError::TokenMissing,
+            ApiError::TokenInvalid,
+            ApiError::TokenExpired,
+            ApiError::ActionNotPermitted { action: "search" },
+            ApiError::RouteNotConfigured,
             ApiError::NoMatch,
             ApiError::MalformedBody(String::new()),
             ApiError::MalformedPath(String::new()),
@@ -784,6 +865,11 @@ mod tests {
         codes.sort_unstable();
 
         let expected = [
+            "auth.action_not_permitted",
+            "auth.route_not_configured",
+            "auth.token_expired",
+            "auth.token_invalid",
+            "auth.token_missing",
             "database.busy",
             "embedder.unavailable",
             "gc.already_running",

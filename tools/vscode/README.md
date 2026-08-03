@@ -89,7 +89,35 @@ Nothing runs in the background — every action is explicit.
   re-checks health, so the two agree without a manual refresh.
 - **Settings** are one click away from either sidebar view's toolbar and from the
   Server Status panel — which is where an unreachable server sends you, since
-  `mindex.serverUrl` / `mindex.noVerify` / `mindex.apiKey` are usually the answer.
+  `mindex.serverUrl` / `mindex.noVerify` / `mindex.caCert` are usually the answer.
+
+- **The bearer token** lives in the OS keychain, set by **MINDex: Set Bearer
+  Token** — never in a setting, which Settings Sync would copy to every other
+  machine. A status-bar entry appears as it nears expiry (`mindex.tokenWarningHours`,
+  24 by default) and turns red under an hour or once expired; it is absent while
+  the token is healthy, which is what makes its appearance mean something.
+  **MINDex: Issue a Token for an Agent** derives a short-lived token for the
+  current project and copies it to the clipboard — for pasting into an agent's
+  context, which is the one place a credential legitimately goes by hand. Its
+  actions are ticked rather than fixed: read and research start on, `index` and
+  `delete` are offered off behind a confirmation naming what they cost. It cannot
+  widen what the extension's own token holds; the server refuses that, and the
+  choices here only keep the dangerous shapes behind a deliberate tick.
+
+- **A read-only token is a supported way to run this extension.** Nothing refuses
+  to start. A token without `research` freezes that tab's controls and says so in
+  the notice inside it — the tab itself stays live, because the explanation is
+  behind it; a token without `index` turns a reindex into one sentence instead of
+  a batch of per-file refusals. What the token says is treated as a *hint* about
+  what to offer; the server remains what decides. A token minted `--for` another
+  kind of client is refused when you paste it, naming both audiences — the server
+  does not check that label, which is exactly why the check is here.
+
+- **A project the token does not name** answers 404 for everything, identically
+  to a project nobody has ever indexed — deliberately, so nothing can enumerate
+  GUIDs. So the extension says so at the one moment it can: right after
+  **Create a .mindex Project File** writes a GUID your token does not cover. Mint
+  a token naming it on the server's host.
 
 Errors surface as the server's `code — detail`; infra failures offer *Retry*.
 
@@ -138,7 +166,7 @@ and nested ones are ignored.
 | `mindex.serverUrl` | `https://127.0.0.1:11111` | Server base URL |
 | `mindex.noVerify` | `false` | Skip TLS verification (self-signed cert) |
 | `mindex.caCert` | — | PEM CA to trust instead (e.g. the mkcert root CA) |
-| `mindex.apiKey` | — | Sent as `X-Api-Key`; only needed behind a reverse proxy |
+| `mindex.tokenWarningHours` | `24` | How long before the bearer token expires to start warning in the status bar; `0` disables the early notice, and under an hour it turns red regardless. The **token itself is not a setting** — run **MINDex: Set Bearer Token**, which stores it in the OS keychain, so Settings Sync cannot carry a credential between machines |
 | `mindex.researchModel` | — | Pre-fills the Research model field (empty = server default) |
 | `mindex.topK` | `10` | Where the Search results slider starts (its ceiling comes from the server) |
 | `mindex.batchSize` | `10` | Files per `/index` request |

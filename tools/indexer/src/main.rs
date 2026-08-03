@@ -99,15 +99,18 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     ca_cert: Option<PathBuf>,
 
-    /// API key sent as `X-Api-Key` on every request; or $MINDEX_API_KEY, or config
-    /// api_key. mindex itself has no authentication — set this only when a reverse
-    /// proxy in front of it demands a key. Prefer the environment variable: a flag
-    /// value is visible in `ps` to every user on the machine.
+    /// Bearer token for a server running with `[auth].enabled`; or $MINDEX_TOKEN,
+    /// or the config `token`, or the `token` entry for this server in
+    /// ~/.config/mindex/credentials.toml.
     ///
-    /// $MINDEX_API_KEY is read in `main` rather than via clap's `env` attribute,
+    /// It is the one credential mindex checks. Issue it with `mindex mint-token`.
+    /// Prefer the environment variable or the credentials file — a flag value is
+    /// visible in `ps` to every user on the machine.
+    ///
+    /// $MINDEX_TOKEN is read in `main` rather than via clap's `env` attribute,
     /// which needs clap's non-default `env` feature.
-    #[arg(long, value_name = "KEY")]
-    api_key: Option<String>,
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 
     /// API protocol version embedded in the URL path (default: v0; or config protocol)
     #[arg(long)]
@@ -326,13 +329,11 @@ async fn main() -> Result<()> {
         no_verify: cli.no_verify,
         ca_cert: cli.ca_cert.clone(),
         // Same precedence as every other setting: flag beats environment beats
-        // file. `MINDEX_API_KEY` is the spelling the MCP servers and
-        // mindex-search.sh already use.
-        api_key: cli.api_key.clone().or_else(|| {
-            std::env::var("MINDEX_API_KEY")
-                .ok()
-                .filter(|v| !v.is_empty())
-        }),
+        // file, and the shared credentials file is the last resort below that.
+        token: match cli.token.clone() {
+            Some(t) => Some(t),
+            None => mindexfile::credentials::token_from_env()?,
+        },
         // Two flags for one setting: the file default is `false`, so `--history`
         // alone could never express "off" and a config that enabled it would be
         // unoverridable from the command line.
@@ -1059,8 +1060,8 @@ fn path_tail(path: &str, max_chars: usize) -> String {
 /// hatch for the self-signed certificate `scripts/entrypoint.sh` generates, which
 /// no store can vouch for.
 ///
-/// `api_key`, when set, rides on every request as `X-Api-Key`. It is for a proxy
-/// in front of mindex; the server ignores the header.
+/// `token`, when set, rides on every request as `Authorization: Bearer`. It is
+/// the only credential mindex reads.
 fn build_http_client(cfg: &config::IndexerConfig) -> Result<reqwest::Client> {
     let mut builder = reqwest::ClientBuilder::new().danger_accept_invalid_certs(cfg.no_verify);
     if let Some(path) = &cfg.ca_cert {
@@ -1072,13 +1073,17 @@ fn build_http_client(cfg: &config::IndexerConfig) -> Result<reqwest::Client> {
             builder = builder.add_root_certificate(cert);
         }
     }
-    if let Some(key) = &cfg.api_key {
-        let mut value = reqwest::header::HeaderValue::from_str(key)
-            .context("api_key contains characters that are not valid in an HTTP header")?;
-        // Keeps the key out of reqwest's Debug output, which error paths print.
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &cfg.token {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("token contains characters that are not valid in an HTTP header")?;
+        // Keeps the credential out of reqwest's Debug output, which error paths print.
         value.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("x-api-key", value);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    // Default headers rather than per-request, so they reach every endpoint —
+    // including the ones added later by somebody who never read this function.
+    if !headers.is_empty() {
         builder = builder.default_headers(headers);
     }
     Ok(builder.build()?)

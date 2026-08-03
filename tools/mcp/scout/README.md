@@ -132,8 +132,9 @@ should show it connected; there is no network at handshake.
 
 ## Configuration (env vars)
 
-`MINDEX_SERVER`, `MINDEX_PROTOCOL`, `MINDEX_NO_VERIFY`, `MINDEX_CACERT` — same meanings
-and defaults as [`tools/mcp/mindex`](../mindex/README.md). Research-specific, all
+`MINDEX_SERVER`, `MINDEX_PROTOCOL`, `MINDEX_NO_VERIFY`, `MINDEX_CACERT`, `MINDEX_TOKEN`,
+`MINDEX_TOKEN_FILE` — same meanings and defaults as
+[`tools/mcp/mindex`](../mindex/README.md). Research-specific, all
 optional: `RESEARCH_DEFAULT_EFFORT` (`medium`), `RESEARCH_CONNECT_TIMEOUT` (`10`),
 `RESEARCH_READ_TIMEOUT` (`120`), `RESEARCH_TOTAL_TIMEOUT` (`4200`) — seconds — and
 `RESEARCH_EXCERPT_AUTO_BYTES` (`32768`), the size below which excerpts come back
@@ -143,6 +144,22 @@ unasked.
 `effort.high.max_seconds + report_timeout_ms` (3600 + 300 s at the shipped defaults,
 published per level as `research.effort.*.worst_case_seconds`). It was `1800` here
 once, which killed every high-effort run in flight.
+
+**The credential, and why a path rather than a value.** A server running with
+`[auth]` on refuses every request that carries no token; issue one on its host with
+`mindex mint-token --sub mcp@$(hostname) --project '*' --can research --for agent --days 0`,
+then name it here with **`MINDEX_TOKEN_FILE`** (a 0600 file holding the token) or
+`MINDEX_TOKEN` (the token itself). The file is the one to use for an MCP server:
+the environment block that launches one lives in an editor's own configuration
+file, so putting the token there puts a bearer credential into plaintext JSON that
+no permission check governs. `MINDEX_TOKEN` wins when both are set — a trap worth
+naming, since a shell that exports it for the CLI passes it down to this process
+too; set `MINDEX_TOKEN` to the empty string in the same block to keep the narrow
+token in force.
+
+Mint one token per server rather than sharing one, and give each its own
+`--key-id`: deleting that key id from the server's key file withdraws exactly that
+server's access. This server needs `research` and nothing else: both its tools post a research run, and every other route it might reach is one it never calls.
 
 ## What else you should know
 

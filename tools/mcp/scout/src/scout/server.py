@@ -258,14 +258,37 @@ def _verify() -> bool | str:
 
 
 def _headers() -> dict[str, str]:
-    """``X-Api-Key`` when ``MINDEX_API_KEY`` is set, nothing otherwise.
+    """The bearer token as a header, and nothing when none is configured.
 
-    mindex has no authentication of its own and ignores the header; it exists for
-    a reverse proxy in front of it (the nginx gate) that refuses requests without
-    a known key. Unset means "talking to mindex directly", the local default.
-    Mirrors tools/mcp/mindex."""
-    key = os.environ.get("MINDEX_API_KEY")
-    return {"X-Api-Key": key} if key else {}
+    It is the one credential mindex reads: a token it signed itself, naming the
+    projects and actions it permits. Issue one with ``mindex mint-token``. Nothing
+    configured means "talking to a server that authorizes nothing", the local
+    default — sending an empty header instead would turn that into a 401.
+
+    Two spellings, and the second is the one to use here. ``MINDEX_TOKEN`` carries
+    the token itself, which is right for a shell. ``MINDEX_TOKEN_FILE`` names a
+    file holding it, which is right for an MCP server: the environment block that
+    launches one lives in an editor's own configuration file, and putting a bearer
+    credential there puts it in plaintext JSON that no permission check governs.
+    A path leaves the credential in a 0600 file. The same two spellings, in the
+    same order, are read by ``mindex-index`` — which matters because ``drift``
+    shells out to it and inherits this process's environment.
+
+    Stripped, and the file's trailing newline with it: every way of writing that
+    file produces one, and it is not part of the token — sent as-is it makes a
+    header value the server rejects, and a 401 nobody can explain is worse than no
+    header at all.
+    """
+    token = (os.environ.get("MINDEX_TOKEN") or "").strip()
+    if not token:
+        path = (os.environ.get("MINDEX_TOKEN_FILE") or "").strip()
+        if path:
+            # A named file that cannot be read is an error, never a silent
+            # fallback to "no token": the 401 that would follow names neither
+            # the file nor the mistake.
+            with open(path, encoding="utf-8") as fh:
+                token = fh.read().strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 _INSTRUCTIONS = """\

@@ -20,8 +20,17 @@ import { BRAND } from "./brand";
  * editor opens, rather than racing the file watcher that will also fire.
  *
  * Never overwrites: an existing file is opened instead, valid or not.
+ *
+ * `announce` is handed the GUID that was just written, so a caller holding the
+ * bearer token can say whether that GUID is reachable with it. This is the only
+ * moment at which that can be said: the server answers 404 `project.not_found`
+ * for an out-of-scope project and for one that never existed, byte-identically
+ * and deliberately, so from any later response the two are indistinguishable.
  */
-export async function createProjectFile(reload: () => Promise<void>): Promise<void> {
+export async function createProjectFile(
+    reload: () => Promise<void>,
+    announce: (guid: string) => void = () => {}
+): Promise<void> {
     try {
         const folder = await pickFolder();
         if (folder === undefined) {
@@ -36,11 +45,12 @@ export async function createProjectFile(reload: () => Promise<void>): Promise<vo
             return;
         }
 
+        const guid = randomUUID();
         const { activeDotDirs, otherDotDirs } = await scanDotDirs(folder.uri);
         const dotDirGlobs = activeDotDirs.map((dir) => `${dir}/**`);
         const { sections, truncated } = await collectGitignores(folder.uri, dotDirGlobs);
         const text = renderMindexTemplate({
-            guid: randomUUID(),
+            guid,
             activeDotDirs,
             otherDotDirs,
             gitignoreSections: reconcileSections(sections, dotDirGlobs),
@@ -58,6 +68,9 @@ export async function createProjectFile(reload: () => Promise<void>): Promise<vo
                 : `Created .mindex with excludes from ${sections.length} .gitignore ` +
                       "file(s). Review exclude_paths, save, then run Check Drift."
         );
+        // After the success message, not instead of it: the file was created, and
+        // the scope problem is about the credential rather than about the file.
+        announce(guid);
     } catch (e) {
         await reportError("Creating .mindex failed", e);
     }

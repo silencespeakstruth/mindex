@@ -10,7 +10,7 @@ import { challengeGuard } from "./shared/runsFormat";
 import { MindexFile, parseMindexFile } from "./mindexFile";
 import { buildManifest, scanWorkspace } from "./scanner";
 import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
-import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
+import { Availability, StatusMonitor, UNAVAILABLE } from "./statusMonitor";
 import { StatusPanel } from "./statusPanel";
 import { ResearchRunsPanel } from "./researchRunsPanel";
 import { pickContextRuns } from "./researchContextPick";
@@ -21,6 +21,16 @@ import {
     runIdOf,
 } from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
+import { mintAgentToken } from "./agentToken";
+import {
+    audienceRefusal,
+    describeToken,
+    mergeAvailability,
+    tokenAvailability,
+    tokenCovers,
+    tokenPermits,
+} from "./token";
+import { TokenStatusBar } from "./tokenStatusBar";
 import { IndexStatusBar } from "./indexStatusBar";
 import { IndexingPanel, IndexingPanelPlacement } from "./indexingPanel";
 import { reindexPaths, showReindexSummary } from "./indexer";
@@ -44,12 +54,76 @@ interface Project {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-    let api = createApi();
+    // The bearer token, cached here because `SecretStorage` is async and
+    // `createApi` is called from a dozen synchronous places. The cache is the only
+    // copy the extension keeps in memory, and it is kept in step by exactly two
+    // things: the load below and `onDidChange`, which fires for writes made in
+    // *this* window and in every other one sharing the store.
+    let token: string | undefined;
+    let api = createApi(token);
+    const rebuildApi = (): void => {
+        api.dispose();
+        api = createApi(token);
+    };
+
+    const tokenStatus = new TokenStatusBar(
+        vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 89),
+        config().get<number>("tokenWarningHours", 24) * 60 * 60 * 1000
+    );
+    context.subscriptions.push(tokenStatus);
+
+    // What the last health refresh said, kept so the token layer can be re-applied
+    // without waiting for the next poll. A token stored at 12:00 must not leave the
+    // form frozen until 12:00:30.
+    let healthAvailability: Availability = { ask: true, research: true };
+    const pushAvailability = (): void => {
+        const merged = mergeAvailability(
+            healthAvailability,
+            tokenAvailability(describeToken(token), project?.mindex.guid)
+        );
+        askProvider.setAvailability(merged);
+        if (!merged.ask) {
+            abortRunsForDegradation(merged.reason);
+        }
+    };
+
+    const reloadToken = async (): Promise<void> => {
+        try {
+            token = await context.secrets.get(TOKEN_SECRET_KEY);
+        } catch (e) {
+            // A keychain that cannot be read is not a reason to have no extension:
+            // an unauthenticated server needs no token at all, so this degrades to
+            // "no credential" with a line in the log rather than a failed activation.
+            logError("read the stored token", e);
+            token = undefined;
+        }
+        rebuildApi();
+        tokenStatus.setToken(token);
+        pushAvailability();
+    };
+    void reloadToken();
+
     context.subscriptions.push(
+        context.secrets.onDidChange((e) => {
+            if (e.key === TOKEN_SECRET_KEY) {
+                void reloadToken();
+            }
+        }),
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration("mindex")) {
-                api.dispose();
-                api = createApi();
+                rebuildApi();
+            }
+            if (e.affectsConfiguration("mindex.tokenWarningHours")) {
+                tokenStatus.setQuietBefore(
+                    config().get<number>("tokenWarningHours", 24) * 60 * 60 * 1000
+                );
+            }
+        }),
+        // A machine that slept through the scheduled tick wakes with a stale
+        // reading; regaining focus is the moment someone is about to look at it.
+        vscode.window.onDidChangeWindowState((st) => {
+            if (st.focused) {
+                tokenStatus.refresh();
             }
         }),
         new vscode.Disposable(() => api.dispose())
@@ -114,6 +188,9 @@ export function activate(context: vscode.ExtensionContext): void {
             "mindex.hasProject",
             project !== undefined
         );
+        // A different GUID can be a different answer to "does your token reach
+        // this?" — most sharply right after the welcome button writes a fresh one.
+        pushAvailability();
     };
 
     // Async purely to keep every call site unchanged; the read now happens in
@@ -158,11 +235,13 @@ export function activate(context: vscode.ExtensionContext): void {
         () => config().get<string>("serverUrl", "https://127.0.0.1:11111"),
         // The health refresh is the only thing that knows what the server can still
         // do; the Ask view is where that costs the user something.
+        // The token's own grant is folded in here rather than inside the fetch: the
+        // two have different lifetimes (health is polled, a token changes when
+        // someone stores one), and merging at the point of use is what lets either
+        // one repaint the form on its own.
         (availability) => {
-            askProvider.setAvailability(availability);
-            if (!availability.ask) {
-                abortRunsForDegradation(availability.reason);
-            }
+            healthAvailability = availability;
+            pushAvailability();
         },
         // Same shape, and for the same reason: the refresh is what knows what the
         // index holds, the Ask view is what has to stop offering the rest.
@@ -700,6 +779,21 @@ export function activate(context: vscode.ExtensionContext): void {
             }
             return;
         }
+        // A read-only token is a legitimate way to run this extension, and the
+        // cost of not saying so here is a batch of uploads that each 403 halfway
+        // through — a partial reindex reported as a failure per file, when the
+        // single true sentence is that this credential does not index. The button
+        // stays live: the explanation lives behind it, and a dead button with no
+        // reason is what this replaces.
+        if (!tokenPermits(describeToken(token), "index")) {
+            void vscode.window.showWarningMessage(
+                say(
+                    "your token does not carry `index`, so the server would refuse these " +
+                        "uploads. Search and Research are unaffected."
+                )
+            );
+            return;
+        }
         const proj = await currentProject();
         if (proj === undefined) {
             return;
@@ -741,7 +835,30 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         // The one command that works *without* a project: it is how you get one.
         vscode.commands.registerCommand("mindex.createProjectFile", () =>
-            createProjectFile(reloadProject)
+            createProjectFile(reloadProject, (guid) => {
+                // A GUID nobody has ever indexed and one this token may not reach
+                // are the same 404 by design, so nothing the server says later can
+                // tell them apart. Here they can be: the token is in hand and the
+                // GUID was written a line ago.
+                //
+                // No offer to mint a covering token, because there is never one to
+                // make: a token that already reaches everything covers this GUID
+                // too and never gets here, and one scoped to named projects is
+                // refused by `may_mint` when it asks for a project it does not
+                // hold. The remedy is genuinely on the server's host.
+                if (tokenCovers(describeToken(token), guid)) {
+                    return;
+                }
+                void vscode.window.showWarningMessage(
+                    say(
+                        `this project's GUID is not in your token, so the server will answer ` +
+                            `every request about it as though it did not exist — which is what ` +
+                            `it answers for a project nobody has indexed, deliberately, so the ` +
+                            `two cannot be told apart. Mint a token naming ${guid} (or one ` +
+                            `covering "*") on the server's host.`
+                    )
+                );
+            })
         ),
 
         vscode.commands.registerCommand("mindex.checkDrift", checkDrift),
@@ -1033,6 +1150,73 @@ export function activate(context: vscode.ExtensionContext): void {
 
         vscode.commands.registerCommand("mindex.openSettings", () => openSettings()),
 
+        vscode.commands.registerCommand("mindex.mintAgentToken", async () => {
+            const proj = await currentProject();
+            if (proj === undefined) {
+                return;
+            }
+            try {
+                await mintAgentToken(api, proj.mindex.guid, path.basename(proj.root));
+            } catch (e) {
+                // The likely failure is specific and worth naming here rather than
+                // leaving to the generic sentence: this extension's own token must
+                // carry `mint`, and a token that does not is refused with 403
+                // `auth.action_not_permitted`. Nothing about the request was wrong.
+                await reportError(
+                    e instanceof ProblemError && e.code === "auth.action_not_permitted"
+                        ? say("cannot issue a token: the stored token does not carry `mint`")
+                        : say("could not issue a token"),
+                    e
+                );
+            }
+        }),
+
+        vscode.commands.registerCommand("mindex.setToken", async () => {
+            const entered = await promptForToken(token);
+            // `undefined` is a dismissed box and must leave the stored token alone;
+            // an empty string is a deliberate clear. The same distinction the
+            // research-context picker makes, for the same reason.
+            if (entered === undefined) {
+                return;
+            }
+            if (entered === "") {
+                await context.secrets.delete(TOKEN_SECRET_KEY);
+                void vscode.window.showInformationMessage(say("stored token cleared."));
+                return;
+            }
+            const facts = describeToken(entered);
+            // Refused before it is stored, not after: the server does not check
+            // `aud`, so this token would work, and the mistake it catches — the
+            // agent's credential pasted into the editor's keychain — is invisible
+            // from every other surface. Overridable, because the label is a hint
+            // and the person holding the token may know better than it does.
+            const wrongAudience = audienceRefusal(facts);
+            if (wrongAudience !== undefined) {
+                const STORE = "Store it anyway";
+                const choice = await vscode.window.showWarningMessage(
+                    say(wrongAudience),
+                    { modal: true },
+                    STORE
+                );
+                if (choice !== STORE) {
+                    return;
+                }
+            }
+            await context.secrets.store(TOKEN_SECRET_KEY, entered);
+            // `onDidChange` refreshes the cache and the indicator; this only says
+            // what the token turned out to be, which is the half a paste can get
+            // wrong without any error — the wrong token is a perfectly valid one.
+            const scope =
+                facts.projects === undefined
+                    ? ""
+                    : ` — ${facts.projects.join(", ")} / ${(facts.actions ?? []).join(", ")}`;
+            const life =
+                facts.expiresAtMs === undefined
+                    ? " It does not expire."
+                    : ` It expires ${new Date(facts.expiresAtMs).toLocaleString()}.`;
+            void vscode.window.showInformationMessage(say(`token stored${scope}.${life}`));
+        }),
+
         vscode.commands.registerCommand("mindex.retryAllFailed", async () => {
             try {
                 const proj = await loadProject();
@@ -1171,9 +1355,10 @@ function config(): vscode.WorkspaceConfiguration {
  *
  * The `@ext:` filter is `publisher.name` from `package.json` — the *identifier*, so
  * it stays lowercase while everything the user reads says MINDex. Everything the
- * server needs to be reachable (`serverUrl`, `noVerify`, `caCert`, `apiKey`) lives
- * there, and the panel that reports "unreachable" is exactly where a link to it
- * belongs.
+ * server needs to be reachable (`serverUrl`, `noVerify`, `caCert`) lives there,
+ * and the panel that reports "unreachable" is exactly where a link to it belongs.
+ * The bearer token is the one exception and is deliberately not a setting — see
+ * `mindex.setToken`.
  */
 function openSettings(): void {
     void vscode.commands.executeCommand(
@@ -1193,10 +1378,59 @@ function openSettings(): void {
  * unreadable CA leaves the connection to succeed by whatever other means is
  * configured, and says out loud which path was ignored.
  */
-function createApi(): MindexApi {
+/**
+ * Where the bearer token lives, and the reason it is not a setting.
+ *
+ * `SecretStorage` is the platform keychain. A `mindex.token` setting would sit in
+ * a plaintext `settings.json` and — being a string setting — would be carried to
+ * every other machine by Settings Sync, which for a credential is a copy nobody
+ * decided to make. That is what `mindex.apiKey` used to do, and removing it is
+ * half of why this key exists.
+ *
+ * It is deliberately **not** the only home for a credential on this machine: the
+ * CLI tools read `~/.config/mindex/credentials.toml`, which no extension's
+ * keychain can be, since a store one application can read is not an answer to
+ * "who holds the credential". The two are separate copies on purpose, and the
+ * runbook says to mint one token per holder rather than share one.
+ */
+const TOKEN_SECRET_KEY = "mindex.token";
+
+/**
+ * The paste box. Returns `undefined` when dismissed, `""` to clear.
+ *
+ * `password: true` keeps the value out of the screen and out of the input's own
+ * history. The validation is deliberately shallow — shape, never validity: this
+ * process cannot check a signature, and a box that refused a token the server
+ * would have accepted is a worse failure than one that lets a bad paste through
+ * to a 401 that says exactly what is wrong.
+ */
+async function promptForToken(current: string | undefined): Promise<string | undefined> {
+    const facts = describeToken(current);
+    const held =
+        current === undefined
+            ? "none stored"
+            : facts.subject !== undefined
+              ? `replacing the one issued to ${facts.subject}`
+              : "replacing the stored one";
+    const entered = await vscode.window.showInputBox({
+        title: say("set the bearer token"),
+        prompt: `Mint one on the server's host with \`mindex mint-token\` (${held}). Leave empty to clear.`,
+        password: true,
+        ignoreFocusOut: true,
+        validateInput: (value) => {
+            const v = value.trim();
+            if (v === "" || v.split(".").length === 3) {
+                return undefined;
+            }
+            return "that does not look like a token — mindex mint-token prints one line of three dot-separated parts";
+        },
+    });
+    return entered?.trim();
+}
+
+function createApi(token: string | undefined): MindexApi {
     const cfg = config();
     const caCert = cfg.get<string>("caCert", "").trim();
-    const apiKey = cfg.get<string>("apiKey", "").trim();
     const noVerify = cfg.get<boolean>("noVerify", false);
     let ca: Buffer | undefined;
     if (caCert !== "" && !noVerify) {
@@ -1217,7 +1451,7 @@ function createApi(): MindexApi {
         serverUrl: cfg.get<string>("serverUrl", "https://127.0.0.1:11111"),
         noVerify,
         ca,
-        apiKey: apiKey === "" ? undefined : apiKey,
+        token,
         timeoutMs: cfg.get<number>("requestTimeoutSeconds", 15) * 1000,
         streamIdleMs: cfg.get<number>("streamIdleTimeoutSeconds", 180) * 1000,
     });
