@@ -1,0 +1,90 @@
+<main class="page">
+    <header class="head">
+        <div class="title-row">
+            <h3 class="title">
+                <span class="state-dot codicon" id="state-icon"></span>
+                <span id="title-text">MINDex</span>
+            </h3>
+            <div class="row">
+                <span class="checked dim" id="checked"></span>
+                <button
+                    id="refresh"
+                    class="ghost"
+                    data-busy-key="refresh"
+                    title="Re-check the server"
+                >
+                    <span class="codicon codicon-refresh" data-busy-icon></span>
+                </button>
+                <button id="settings" class="ghost" title="Open MINDex settings">
+                    <span class="codicon codicon-gear"></span>
+                </button>
+            </div>
+        </div>
+        <div class="subtitle dim" id="subtitle"></div>
+    </header>
+
+    <div class="notice" id="unreachable" hidden>
+        <span class="codicon codicon-error"></span>
+        <div>
+            <div id="unreachable-detail"></div>
+            <div class="unreachable-hint">
+                Check <code>mindex.serverUrl</code> and <code>mindex.noVerify</code>, and that
+                the server is running.
+            </div>
+            <button id="unreachable-settings" class="secondary">
+                <span class="codicon codicon-gear codicon-sm"></span>Open settings
+            </button>
+        </div>
+    </div>
+
+    <section class="card" id="health-card">
+        <h4 class="card-title">
+            <span class="codicon codicon-pulse codicon-sm"></span>Health
+            <!--
+                The same key as the head refresh: they run the same re-check, so
+                they grey together. Both exist because they answer different
+                moments — the head one sits beside the "checked HH:MM" stamp it
+                explains, and this one is where the eye already is when a row
+                below has gone red.
+            -->
+            <button
+                id="health-refresh"
+                class="ghost"
+                data-busy-key="refresh"
+                title="Re-check every dependency now"
+            >
+                <span class="codicon codicon-refresh codicon-sm" data-busy-icon></span>
+            </button>
+        </h4>
+        <div class="checks" id="checks"></div>
+    </section>
+
+    <section class="card" id="runtime-card">
+        <h4 class="card-title">
+            <span class="codicon codicon-server codicon-sm"></span>Runtime
+        </h4>
+        <div id="runtime"></div>
+    </section>
+
+    <section class="card" id="inventory-card">
+        <h4 class="card-title">
+            <span class="codicon codicon-library codicon-sm"></span>Indexed
+            <span class="card-note dim" id="inventory-total"></span>
+        </h4>
+        <div id="inventory"></div>
+        <p class="hint">
+            Only languages with searchable chunks are offered as filters in the Ask view.
+        </p>
+    </section>
+
+    <section class="card" id="failed-card">
+        <h4 class="card-title">
+            <span class="codicon codicon-flame codicon-sm"></span>Failed files
+            <span class="card-note dim" id="failed-total"></span>
+            <button id="retry-all" class="secondary" hidden>
+                <span class="codicon codicon-debug-restart codicon-sm"></span>Retry all
+            </button>
+        </h4>
+        <div id="failed"></div>
+    </section>
+</main>

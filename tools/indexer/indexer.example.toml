@@ -21,3 +21,21 @@ no_verify = false                      # skip TLS verification (needed for the d
                                        # needed when the server's CA is NOT installed
                                        # system-wide; mkcert and corporate roots usually are.
                                        # Prefer this over no_verify: it still verifies.
+
+# --- git history (the second content channel) -----------------------------
+# Off by default. When on, each run also reconciles the project's commit history:
+# the client posts the commits reachable from git_refs within the window below,
+# and the server inserts what it lacks and drops what was not named. A sha is its
+# own content hash, so a force-push or a rebase needs no special handling — it is
+# one reconciliation in which many shas orphan at once.
+history = false                        # --history / --no-history
+# git_refs = ["HEAD"]                  # ref PATTERNS bounding the walk, e.g.
+                                       # ["master", "dev", "feat/*"]. .mindex's
+                                       # git_refs overrides this; --git-ref
+                                       # overrides both (it replaces, never extends).
+history_max_age_days = 730             # --history-since-days; omit for no age bound
+history_max_commits = 5000             # --history-max-commits; applied together with
+                                       # the age bound, stricter one binds
+history_min_message_bytes = 40         # drop commits whose whole message is shorter
+                                       # ("wip", "fix", "."): no information, but they
+                                       # still occupy a file_history slot

@@ -1,0 +1,284 @@
+/* The Ask sidebar form.
+ *
+ * Everything here is sized for a ~300px column, which is the constraint that decides
+ * most of it: labels sit on a fixed 58px gutter so four different rows line up on one
+ * edge, disclosures carry their state in their own header, and every button is at
+ * least 30px tall. */
+
+body {
+    padding: 12px 12px 18px;
+}
+
+/* ── option rows ─────────────────────────────────────────────────────────── */
+
+.options {
+    display: flex;
+    flex-direction: column;
+    gap: var(--mx-gap-tight);
+}
+.options:empty {
+    display: none;
+}
+
+/* One shared gutter for every labelled row — sliders, the model picker, the glob
+ * fields. Without it each block finds its own left edge and the form reads as three
+ * unrelated forms stacked up. */
+.field {
+    display: flex;
+    align-items: center;
+    gap: var(--mx-gap-tight);
+}
+.field > label {
+    flex: none;
+    width: 58px;
+    font-size: var(--mx-fs-sm);
+    color: var(--mx-dim);
+    white-space: nowrap;
+}
+.field > .control {
+    flex: 1;
+    min-width: 0;
+}
+
+/* ── disclosures ─────────────────────────────────────────────────────────── */
+/* Collapsed by default, but never silent: the summary carries the block's current
+ * state, so "preset" or "src/*, rust" is visible without opening anything. */
+
+.panel {
+    border: 1px solid var(--mx-border);
+    border-radius: var(--mx-radius-lg);
+    background: var(--mx-surface);
+}
+.panel > summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 9px;
+    min-height: 30px;
+    box-sizing: border-box;
+    cursor: pointer;
+    font-size: var(--mx-fs-sm);
+    list-style: none;
+    border-radius: var(--mx-radius-lg);
+}
+.panel > summary::-webkit-details-marker {
+    display: none;
+}
+.panel > summary:hover {
+    background: var(--vscode-toolbar-hoverBackground);
+}
+.panel[open] > summary {
+    border-bottom: 1px solid var(--mx-border);
+    border-radius: var(--mx-radius-lg) var(--mx-radius-lg) 0 0;
+}
+.panel-name {
+    font-weight: 600;
+}
+.panel-summary {
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 9px 9px 0;
+}
+.panel .hint {
+    padding: 8px 9px 9px;
+    margin: 0;
+}
+.scope-actions {
+    display: flex;
+    gap: 5px;
+    padding: 9px 9px 0;
+}
+.scope-actions button {
+    flex: 1;
+    height: 30px;
+    padding: 0 6px;
+    font-size: var(--mx-fs-sm);
+    font-weight: 400;
+    min-width: 0;
+}
+
+/* ── slider ──────────────────────────────────────────────────────────────── */
+
+.slider {
+    display: flex;
+    align-items: center;
+    gap: var(--mx-gap-tight);
+}
+.slider-label {
+    flex: none;
+    width: 58px;
+    font-size: var(--mx-fs-sm);
+    color: var(--mx-dim);
+    white-space: nowrap;
+}
+.slider-range {
+    flex: 1;
+    min-width: 0;
+    height: 18px;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: none;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+}
+.slider-range::-webkit-slider-runnable-track {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--mx-border-strong);
+}
+.slider-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 13px;
+    height: 13px;
+    margin-top: -5px;
+    border-radius: 50%;
+    background: var(--vscode-button-background);
+    border: 1px solid var(--vscode-editor-background);
+}
+.slider-range:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 2px;
+}
+.slider-box {
+    flex: none;
+    width: 62px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.slider-reset {
+    flex: none;
+    width: 24px;
+    height: 24px;
+}
+
+/* Unset: the axis is showing the effort preset, not a choice. Dimming the track is
+ * what makes "the box is empty" read as deliberate rather than as a missing value. */
+.slider.preset .slider-range {
+    opacity: 0.45;
+}
+.slider.preset .slider-box {
+    color: var(--mx-dim);
+}
+
+/* ── language pills ──────────────────────────────────────────────────────── */
+
+.pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 24px;
+    padding: 0 9px 0 7px;
+    border-radius: 12px;
+    font-size: var(--mx-fs-sm);
+    font-weight: 400;
+    background: transparent;
+    color: var(--vscode-foreground);
+    border: 1px solid var(--mx-border-strong);
+    opacity: 0.8;
+}
+.pill:hover:not(:disabled) {
+    background: var(--vscode-toolbar-hoverBackground);
+    opacity: 1;
+}
+.pill[aria-pressed="true"] {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-color: transparent;
+    opacity: 1;
+}
+/* On a filled chip the brand colour is decoration competing with the button's own
+ * background, and it is the *selected* state that carries the meaning — so the mark
+ * gives up its colour and joins the label. */
+.pill[aria-pressed="true"] .lang-glyph {
+    color: currentColor;
+}
+
+/* ── actions ─────────────────────────────────────────────────────────────── */
+
+.actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+}
+.actions button {
+    height: 34px;
+}
+
+/* The form is NOT dimmed when the server is down, and that is a reversal worth
+ * recording. It used to grey out the question box, the filters and the budget —
+ * which was honest while those controls were also disabled, and became a lie the
+ * moment they stopped being: dimming a control the user can still type into says
+ * "this does nothing", about the one part of the view that still does.
+ *
+ * What is unavailable is the *act*, and that is where the signal lives now: the
+ * red notice above says so, and Submit is disabled and says why. */
+
+/* A button that reads as a link, for the one inside the Ollama notice. */
+.linky {
+    height: auto;
+    padding: 0;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+.linky:hover {
+    background: none;
+    opacity: 0.8;
+}
+
+/*
+ * Earlier reports handed to the next question as background, picked in Research
+ * History. Research only — /search takes no prior context, and a control that does
+ * nothing in the active mode is worse than an absent one.
+ */
+.context-runs {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.context-runs-head {
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.context-runs-head .linky {
+    margin-left: auto;
+}
+
+/*
+ * A chip for a report whose files have moved. Marked because staleness is the one
+ * thing that changes what a report is worth, and it can change after the user picked
+ * it. The colour is the theme's, so it reads in light and dark alike.
+ */
+.pill.pill-stale {
+    border-color: var(--vscode-inputValidation-warningBorder);
+}
+
+/*
+ * A chip for a report the server will refuse as context: it went invalid (its own
+ * files, or a report it built on, moved or was deleted) after the user picked it.
+ * Error palette, not warning — the submit will 400 while it is attached.
+ */
+.pill.pill-invalid {
+    border-color: var(--vscode-inputValidation-errorBorder);
+    color: var(--vscode-inputValidation-errorForeground, inherit);
+}

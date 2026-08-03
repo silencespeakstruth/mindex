@@ -158,6 +158,14 @@ LEGEND_LIST = {
     "placement": "bottom",
     "calcs": [],
 }
+# For counted events the useful legend column is the range total, not the last
+# bar — a panel showing three bars in six hours has no meaningful "last value".
+LEGEND_TABLE_SUM = {
+    "showLegend": True,
+    "displayMode": "table",
+    "placement": "bottom",
+    "calcs": ["sum", "max"],
+}
 
 # Thin marks, recessive fills: the line carries the series, the fill only groups.
 TS_CUSTOM = {
@@ -171,6 +179,28 @@ TS_CUSTOM = {
 STACK_CUSTOM = dict(
     TS_CUSTOM, fillOpacity=55, lineWidth=1, stacking={"mode": "normal", "group": "A"}
 )
+# Per-run events are COUNTED, never rated, and that is a correctness matter
+# rather than a taste one. Every research family is a labelled `Family` created
+# lazily by the first run carrying that label set, so its first scraped sample
+# is already 1: there is no preceding 0 for `rate()` to subtract from, and a
+# label set that sees exactly one run in a process lifetime — the normal case
+# for {model, done_reason} — stays flat at 1 until restart. `rate()` over that
+# is 0 for the whole life of the series, which is how a row of research panels
+# reads as empty while `research_runs` plainly holds the runs. `increase()`
+# counts the first sample of a newly-appearing counter, so it sees them.
+# Bars, because a handful of runs a day drawn as a per-second line is a needle.
+BARS_CUSTOM = dict(
+    TS_CUSTOM, drawStyle="bars", fillOpacity=70, lineWidth=1, barAlignment=0
+)
+BARS_STACK_CUSTOM = dict(BARS_CUSTOM, stacking={"mode": "normal", "group": "A"})
+# A quantile over a rare histogram is defined only in the windows that contain a
+# run, so the marks must be points and the gaps must stay gaps.
+POINTS_CUSTOM = dict(TS_CUSTOM, showPoints="always", pointSize=7, spanNulls=False)
+
+
+def ev(expr, window="$__rate_interval"):
+    """Counted-event form of a counter — see BARS_CUSTOM for why not `rate`."""
+    return f"increase({expr}[{window}])"
 
 
 def ts(
@@ -307,7 +337,17 @@ P += [
         desc="Since the process started serving. A sawtooth here is a crash loop.",
     ),
     stat(
-        "Projects", gp(4, 3, 6, y), "mindex_projects", desc="Projects in the database."
+        "Projects",
+        gp(4, 3, 6, y),
+        # Counted over per-project series, not `mindex_projects`: that gauge counts
+        # database rows, and a project with zero files emits no series at all — so
+        # the stat read 3 while the dropdown and the Projects table both showed 2,
+        # which looked like "All" being counted as a project. This form always
+        # agrees with the rest of the dashboard and respects the filter.
+        'count(count by (project_guid) (mindex_project_files{project_guid=~"$project"}))',
+        desc="Projects with at least one file, matching $project. "
+        "`mindex_projects` (the raw DB row count) can be higher when a "
+        "project exists but holds no files.",
     ),
     stat(
         "Indexed files",
@@ -441,9 +481,10 @@ P += [
             ),
         ),
         unit="cps",
-        desc="Pool exhaustion is otherwise invisible — it collapses into an "
-        "opaque 500. A claim conflict is two writers on one file; the "
-        "request still succeeds for the rest of its batch.",
+        desc="Pool exhaustion answers 503 `database.busy` and logs a hint, so "
+        "this is the trend rather than the only evidence. A claim conflict is "
+        "two writers on one file; the request still succeeds for the rest of "
+        "its batch.",
         overrides=by_name_overrides({"pool empty": "red", "claim conflict": "orange"}),
     ),
     ts(
@@ -453,15 +494,114 @@ P += [
             ("mindex_indexing_claims", "indexing claims"),
             ("mindex_research_active", "research active"),
             ("mindex_gc_running", "gc running"),
+            # Minutes rather than raw seconds: the number matters only when it is
+            # large, and at panel scale a healthy run's seconds would flatten the
+            # lock lines beside it.
+            ("mindex_research_inflight_oldest_age_seconds / 60", "oldest run (min)"),
+            # Expected to stay absent (a never-incremented counter has no series):
+            # any point here means a run outlived every deadline it had and the
+            # watchdog freed its slot.
+            (
+                "increase(mindex_research_watchdog_cancels_total[$__rate_interval])",
+                "watchdog cancel",
+            ),
         ),
-        desc="The three in-process locks. `research_active` is derived from the "
-        "semaphore rather than counted, because a run's normal exit is a "
-        "dropped stream that no decrement would survive.",
+        desc="The three in-process locks, plus the two research-slot pathology "
+        "signals. `research_active` is derived from the semaphore rather than "
+        "counted, because a run's normal exit is a dropped stream that no "
+        "decrement would survive; `oldest run` is what tells a busy slot from a "
+        "wedged one, and `watchdog cancel` should never fire.",
         overrides=by_name_overrides(
             {
                 "indexing claims": "blue",
                 "research active": "purple",
                 "gc running": "yellow",
+                "oldest run (min)": "green",
+                "watchdog cancel": "red",
+            }
+        ),
+    ),
+]
+y += 6
+
+P += [
+    ts(
+        "Background workers alive",
+        gp(6, 12, 0, y),
+        targets(("mindex_worker_running", "{{worker}}")),
+        desc="Every worker is a detached task: a panic inside one stops it "
+        "permanently, and the only other symptom is some unrelated gauge "
+        "quietly ceasing to move. A line that drops to 0 while the process "
+        "keeps serving is that, and it needs a restart.",
+    ),
+    ts(
+        "Worker deaths",
+        gp(6, 12, 12, y),
+        targets(
+            (
+                (
+                    'increase(mindex_worker_exits_total{outcome="panic"}'
+                    "[$__rate_interval])"
+                ),
+                "{{worker}}",
+            ),
+        ),
+        unit="short",
+        desc="`increase`, not `rate`: a worker dies at most once per process "
+        "lifetime, so the series is flat at 1 forever and a rate over it reads "
+        "as zero. Expected to stay empty.",
+    ),
+]
+y += 6
+
+P += [
+    ts(
+        "Index vs vector store",
+        gp(6, 12, 0, y),
+        targets(
+            (
+                "sum by (project_guid) (mindex_project_chunks_active)",
+                "{{project_guid}} sqlite",
+            ),
+            ("mindex_project_vectors", "{{project_guid}} qdrant"),
+        ),
+        desc="The two must track each other. Qdrant dropping to zero while "
+        "SQLite holds steady is the failure with no error anywhere: every file "
+        "still reads `indexed` and search answers 404 for ever. Needs "
+        "`[metrics].probe_dependencies`; a project Qdrant cannot be asked about "
+        "is absent rather than zero.",
+    ),
+    ts(
+        "Divergence & staleness",
+        gp(6, 12, 12, y),
+        targets(
+            (
+                "increase(mindex_search_orphaned_winners_total[$__rate_interval])",
+                "orphaned winners",
+            ),
+            (
+                ("increase(mindex_search_unscorable_winners_total[$__rate_interval])"),
+                "unscorable winners",
+            ),
+            (
+                "time() - mindex_state_refreshed_timestamp_seconds",
+                "state age (s)",
+            ),
+        ),
+        desc="An orphaned winner is a chunk Qdrant scored and SQLite no longer "
+        "has; a few mean a reindex raced a search, a steady rate means "
+        "divergence. An unscorable winner is one the reranker scored NaN — it "
+        "is ranked last instead of first, and any value at all means the "
+        "embedding path is misconfigured (mismatched precision between a split "
+        "pair, or the XPU attention kernel that returns NaN for padded fp16 "
+        "rows). `state age` climbing means the collector's snapshot is "
+        "failing and every gauge on this dashboard is frozen at its last good "
+        "value.",
+        overrides=by_name_overrides(
+            {
+                "orphaned winners": "orange",
+                "unscorable winners": "red",
+                "state age (s)": "yellow",
             }
         ),
     ),
@@ -874,76 +1014,139 @@ P += [
         gp(8, 12, 0, y),
         targets(
             (
-                'sum by (done_reason) (rate(mindex_research_runs_total{model=~"$model"}[$__rate_interval]))',
+                "sum by (done_reason) ("
+                + ev('mindex_research_runs_total{model=~"$model"}')
+                + ")",
                 "{{done_reason}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="The 'is a budget binding?' panel. `finalized` means the model judged "
-        "the evidence sufficient; anything else is a wall it hit.",
-        custom=STACK_CUSTOM,
+        "the evidence sufficient; anything else is a wall it hit. Counted, not "
+        "rated: one run per label set per process lifetime is invisible to "
+        "`rate()`.",
+        custom=BARS_STACK_CUSTOM,
         overrides=by_name_overrides(DONE_REASON),
-        legend=LEGEND_TABLE,
+        legend=LEGEND_TABLE_SUM,
     ),
     ts(
         "Run duration",
         gp(8, 12, 12, y),
         targets(
             (
-                'histogram_quantile(0.50, sum by (le, model) (rate(mindex_research_duration_seconds_bucket{model=~"$model"}[$__rate_interval])))',
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_duration_seconds_bucket{model=~"$model"}')
+                + "))",
                 "p50 {{model}}",
             ),
             (
-                'histogram_quantile(0.95, sum by (le, model) (rate(mindex_research_duration_seconds_bucket{model=~"$model"}[$__rate_interval])))',
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_duration_seconds_bucket{model=~"$model"}')
+                + "))",
                 "p95 {{model}}",
             ),
         ),
         unit="s",
+        desc="One point per window that actually contained a run — with a few "
+        "runs a day there is nothing to join into a line.",
+        custom=POINTS_CUSTOM,
     ),
 ]
 y += 8
 
+# These three were heatmaps and read as permanently empty: a handful of runs a
+# day paints isolated one-interval columns, and the bucket axis runs to 8192
+# while real values sit in the tens — the cells were invisible twice over. A
+# rare histogram is a quantile-points panel here (the Run duration precedent),
+# where the axis follows the data instead of the bucket table.
 P += [
-    heat(
+    ts(
         "Steps per run",
         gp(7, 8, 0, y),
-        'sum by (le) (rate(mindex_research_steps_bucket{model=~"$model"}[$__rate_interval]))',
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_steps_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_steps_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
+        unit="short",
         desc="A step is a poor unit — one turn may execute several, and `outline` "
         "is one indexed SELECT while `search` is a GPU embed plus a vector "
-        "query. That is why it is the backstop and not the budget.",
+        "query. That is why it is the backstop and not the budget. One point "
+        "per window that contained a run; the gaps are real.",
+        custom=POINTS_CUSTOM,
     ),
-    heat(
+    ts(
         "Turns per run",
         gp(7, 8, 8, y),
-        'sum by (le) (rate(mindex_research_turns_bucket{model=~"$model"}[$__rate_interval]))',
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_turns_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_turns_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
+        unit="short",
         desc="Turns above steps means turns that produced no step: rejected "
         "duplicates, or a model rephrasing instead of learning a name.",
+        custom=POINTS_CUSTOM,
     ),
-    heat(
+    ts(
         "Context used",
         gp(7, 8, 16, y),
-        'sum by (le) (rate(mindex_research_context_used_ratio_bucket{model=~"$model"}[$__rate_interval]))',
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_context_used_ratio_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_context_used_ratio_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
         unit="percentunit",
         desc="Peak prompt tokens over the run's num_ctx. Approaching 1.0 means "
         "Ollama is about to trim the transcript in silence.",
+        custom=dict(POINTS_CUSTOM, axisSoftMax=1),
     ),
 ]
 y += 7
 
 P += [
     ts(
-        "Token throughput",
+        "Tokens processed",
         gp(7, 8, 0, y),
         targets(
             (
-                'sum by (kind) (rate(mindex_research_tokens_total{model=~"$model"}[$__rate_interval]))',
+                "sum by (kind) ("
+                + ev('mindex_research_tokens_total{model=~"$model"}')
+                + ")",
                 "{{kind}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="The whole transcript is resent every turn, so prompt tokens grow "
         "super-linearly with turns. This is the real cost axis.",
-        custom=STACK_CUSTOM,
+        custom=BARS_STACK_CUSTOM,
         overrides=by_name_overrides({"prompt": "blue", "eval": "purple"}),
     ),
     ts(
@@ -951,26 +1154,29 @@ P += [
         gp(7, 8, 8, y),
         targets(
             (
-                "sum by (tool) (rate(mindex_research_tool_calls_total[$__rate_interval]))",
+                "sum by (tool) (" + ev("mindex_research_tool_calls_total") + ")",
                 "{{tool}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="The intended path is list_files -> outline -> symbols/search/callers "
         "-> read_chunks. A run that only ever calls `search` never learned a name.",
-        custom=STACK_CUSTOM,
-        legend=LEGEND_TABLE,
+        custom=BARS_STACK_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
     ),
     ts(
         "Tool latency (p95)",
         gp(7, 8, 16, y),
         targets(
             (
-                "histogram_quantile(0.95, sum by (le, tool) (rate(mindex_research_tool_duration_seconds_bucket[$__rate_interval])))",
+                "histogram_quantile(0.95, sum by (le, tool) ("
+                + ev("mindex_research_tool_duration_seconds_bucket")
+                + "))",
                 "{{tool}}",
             ),
         ),
         unit="s",
+        custom=POINTS_CUSTOM,
     ),
 ]
 y += 7
@@ -981,22 +1187,26 @@ P += [
         gp(7, 12, 0, y),
         targets(
             (
-                "sum by (class) (rate(mindex_research_citations_total[$__rate_interval]))",
+                "sum by (class) (" + ev("mindex_research_citations_total") + ")",
                 "{{class}}",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="`unverified` = a path no tool returned this run, i.e. invented. "
         "`stale` is orthogonal to the other three: a citation can be "
         "impeccably verified and stale.",
-        custom=STACK_CUSTOM,
+        custom=BARS_STACK_CUSTOM,
         overrides=by_name_overrides(CITATION_CLASS),
-        legend=LEGEND_TABLE,
+        legend=LEGEND_TABLE_SUM,
     ),
     stat(
         "Unverified citation share",
         gp(7, 4, 12, y),
-        'sum(increase(mindex_research_citations_total{class="unverified"}[$__range])) / clamp_min(sum(increase(mindex_research_citations_total[$__range])), 1)',
+        # `or vector(0)` because the healthy case is that no `unverified` series
+        # exists at all — without it the best possible reading renders as "No
+        # data", which is indistinguishable from a broken query.
+        '(sum(increase(mindex_research_citations_total{class="unverified"}[$__range])) or vector(0))'
+        " / clamp_min(sum(increase(mindex_research_citations_total[$__range])), 1)",
         unit="percentunit",
         thresholds=[
             {"color": "green", "value": None},
@@ -1012,19 +1222,19 @@ P += [
         gp(7, 8, 16, y),
         targets(
             (
-                "rate(mindex_research_revalidations_total[$__rate_interval])",
+                ev("mindex_research_revalidations_total"),
                 "revalidations",
             ),
             (
-                "rate(mindex_research_tool_call_parse_retries_total[$__rate_interval])",
+                ev("mindex_research_tool_call_parse_retries_total"),
                 "ollama parse retries",
             ),
             (
-                "rate(mindex_research_transcript_truncations_total[$__rate_interval])",
+                ev("mindex_research_transcript_truncations_total"),
                 "transcript truncations",
             ),
         ),
-        unit="cps",
+        unit="short",
         desc="A revalidation is a draft sent back because its citations did not "
         "check out. A truncation means Ollama trimmed the transcript and "
         "streamed on — otherwise a completely silent failure.",
@@ -1035,6 +1245,172 @@ P += [
                 "transcript truncations": "red",
             }
         ),
+        custom=BARS_CUSTOM,
+    ),
+]
+y += 7
+
+# The report phase, which is where runs were measured to fail: retrieval found the
+# right files every time and the writing did not survive. These four families exist
+# to answer whether bounding and sectioning the output changed that.
+P += [
+    ts(
+        "Report length (words)",
+        gp(7, 8, 0, y),
+        targets(
+            (
+                "histogram_quantile(0.50, sum by (le, model) ("
+                + ev('mindex_research_report_words_bucket{model=~"$model"}')
+                + "))",
+                "p50 {{model}}",
+            ),
+            (
+                "histogram_quantile(0.95, sum by (le, model) ("
+                + ev('mindex_research_report_words_bucket{model=~"$model"}')
+                + "))",
+                "p95 {{model}}",
+            ),
+        ),
+        unit="short",
+        custom=POINTS_CUSTOM,
+        desc="Granted versus actual is the whole measurement: the per-effort "
+        "max_report_words is announced to the model as a ceiling, and nothing "
+        "makes it obey. If this sits wherever it likes regardless of the grant, "
+        "the prompt half of that knob is dead weight and only num_predict earns "
+        "its place.",
+    ),
+    ts(
+        "Report sections",
+        gp(7, 8, 8, y),
+        targets(
+            (
+                "sum by (outcome) ("
+                + ev("mindex_research_report_sections_total")
+                + ")",
+                "{{outcome}}",
+            ),
+        ),
+        unit="short",
+        desc="A report of 3+ plan items is written one section per turn, so one "
+        "failing costs a section rather than the document. This says how often "
+        "that trade is actually made. Rising `empty` means the per-section word "
+        "budget or the model is wrong; `timed_out`/`skipped` mean "
+        "report_timeout_ms is too tight for the plans being produced.",
+        custom=BARS_STACK_CUSTOM,
+        overrides=by_name_overrides(
+            {
+                "written": "green",
+                "empty": "red",
+                "timed_out": "orange",
+                "skipped": "yellow",
+            }
+        ),
+        legend=LEGEND_TABLE_SUM,
+    ),
+    ts(
+        "Report-phase faults",
+        gp(7, 8, 16, y),
+        targets(
+            (ev("mindex_research_report_length_caps_total"), "generation cut off"),
+            (ev("mindex_research_report_context_sheds_total"), "prompt shed to fit"),
+            (ev("mindex_research_forced_syntheses_total"), "server wrote the report"),
+        ),
+        unit="short",
+        desc="All three are expected to stay at zero. `generation cut off` means "
+        "num_predict fired, so REPORT_WORDS_TO_TOKENS or the model is wrong and "
+        "a cut landed mid-token — which can sever a fence and cost a rewrite. "
+        "`prompt shed` means the report turn's transcript was over the context "
+        "ceiling and the server dropped old tool output rather than letting "
+        "Ollama trim it in silence; on this hardware it may never fire, in which "
+        "case it is insurance. `server wrote the report` means the report window "
+        "expired first — those runs cite nothing, which is why the citation "
+        "panels beside this one must be read together with it.",
+        overrides=by_name_overrides(
+            {
+                "generation cut off": "red",
+                "prompt shed to fit": "orange",
+                "server wrote the report": "yellow",
+            }
+        ),
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
+    ),
+]
+y += 7
+
+P += [
+    ts(
+        "Runs that stored nothing",
+        gp(6, 12, 0, y),
+        targets(
+            (
+                ev('mindex_research_unjournalled_runs_total{model=~"$model"}'),
+                "{{outcome}}",
+            ),
+        ),
+        unit="short",
+        desc="Every other research metric is recorded by the journal decorator, "
+        "so a run that never journals is missing from all of them at once — the "
+        "GPU hour was spent and the dashboard says it never happened, which also "
+        "leaves every success rate computed from `research_runs` without a "
+        "denominator. `cancelled` is a client hanging up or a slot being reaped; "
+        "`failed` sent an error event instead of a report; `report_rejected` "
+        "produced a report that failed the Markdown gate.",
+        overrides=by_name_overrides(
+            {"cancelled": "yellow", "failed": "red", "report_rejected": "orange"}
+        ),
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
+    ),
+]
+y += 6
+
+P += [
+    ts(
+        "Stored research",
+        gp(7, 12, 0, y),
+        targets(
+            ("sum(mindex_project_research_runs)", "stored"),
+            ("sum(mindex_project_research_stale)", "outdated"),
+            ("sum(mindex_project_research_pinned)", "pinned"),
+        ),
+        unit="short",
+        desc="The corpus a new run can be given as context. `outdated` counts runs "
+        "at least one of whose files has changed since — still useful for names, "
+        "unreliable on specifics. `pinned` runs have no expiry and GC never "
+        "reaps them, so a rising pinned count is the thing that stops retention "
+        "from bounding this table.",
+        overrides=by_name_overrides(
+            {"stored": "blue", "outdated": "yellow", "pinned": "green"}
+        ),
+    ),
+    ts(
+        "Context reuse",
+        gp(7, 12, 12, y),
+        targets(
+            (
+                "sum(" + ev("mindex_research_runs_with_context_total") + ")",
+                "runs given context",
+            ),
+            (ev("mindex_research_context_runs_used_total"), "reports injected"),
+            (ev("mindex_research_context_truncations_total"), "truncated to fit"),
+            (ev("mindex_gc_research_pruned_total"), "reaped by GC"),
+        ),
+        unit="short",
+        desc="Does prior research get reused, and does the character cap bite? "
+        "Counted with increase() and drawn as bars: these are a handful of "
+        "events a day, and a label set seeing one event in a process lifetime "
+        "is flat at 1 under rate() forever.",
+        overrides=by_name_overrides(
+            {
+                "runs given context": "blue",
+                "reports injected": "purple",
+                "truncated to fit": "orange",
+                "reaped by GC": "text",
+            }
+        ),
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
     ),
 ]
 y += 7
@@ -1078,12 +1454,29 @@ P += [
         gp(7, 8, 16, y),
         targets(
             (
-                "sum by (trigger) (rate(mindex_gc_runs_total[$__rate_interval]))",
-                "{{trigger}}",
+                (
+                    "sum by (trigger, outcome) "
+                    "(rate(mindex_gc_runs_total[$__rate_interval]))"
+                ),
+                "{{trigger}} {{outcome}}",
             ),
         ),
         unit="cps",
-        overrides=by_name_overrides({"worker": "blue", "manual": "purple"}),
+        desc="Split by outcome, because `ok` used to be recorded even when every "
+        "phase had failed: each phase mapped its errors to zero removals, so a "
+        "GC broken for days was indistinguishable from an idle one. Any "
+        "`error` series means a phase could not run and its backlog is still "
+        "there.",
+        overrides=by_name_overrides(
+            {
+                "worker ok": "blue",
+                "manual ok": "purple",
+                "worker error": "red",
+                "manual error": "red",
+                "worker cancelled": "yellow",
+                "manual cancelled": "yellow",
+            }
+        ),
     ),
 ]
 y += 7

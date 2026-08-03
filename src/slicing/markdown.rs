@@ -44,7 +44,9 @@
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
-use crate::slicing::traits::{SlicedChunk, SlicerError, Tokenizing};
+use crate::slicing::traits::{
+    MAX_STORABLE_TOKENS, SlicedChunk, SlicerError, Tokenizing, token_boundary,
+};
 
 /// Blocks that stand on their own as a unit of meaning.
 ///
@@ -106,10 +108,29 @@ impl DocumentPlan {
     }
 
     /// The text of each block, in order — what to embed for the semantic term.
+    ///
+    /// Truncated to what a chunk may hold, because a block is not: one
+    /// unwrapped paragraph can be the whole document. The vector is only ever
+    /// compared against its neighbours' to price a boundary, and a block this
+    /// long is going to be cut regardless — so its opening is enough, and
+    /// sending the rest costs an attention matrix over the embedder's whole
+    /// input window. That was measured to exhaust GPU memory, which the slicer
+    /// survives (the semantic term degrades to structure alone, with a `warn!`)
+    /// but the embedder pays for by dropping and reloading its model.
     pub fn block_texts<'c>(&self, code: &'c str) -> Vec<&'c str> {
         self.blocks
             .iter()
-            .map(|b| &code[b.start_byte..b.end_byte])
+            .map(|b| {
+                let end = token_boundary(
+                    code,
+                    &self.offsets,
+                    b.start_byte,
+                    b.end_byte,
+                    MAX_STORABLE_TOKENS,
+                )
+                .unwrap_or(b.end_byte);
+                &code[b.start_byte..end]
+            })
             .collect()
     }
 }
@@ -141,7 +162,9 @@ impl<'a> MarkdownSlicer<'a> {
         Ok(Self {
             tokenizer,
             parser,
-            max_tokens,
+            // Clamped, not validated: the ceiling is a property of the storage,
+            // and the documentation cap's own default sits above it.
+            max_tokens: max_tokens.min(MAX_STORABLE_TOKENS),
             semantic_weight,
         })
     }
@@ -202,7 +225,7 @@ impl<'a> MarkdownSlicer<'a> {
             if tokens_between(first.start_byte, last.end_byte) > self.max_tokens {
                 // A single block over the cap. Measured: 2 of 138 blocks in this
                 // repo's largest document, so this is a fallback, not the path.
-                self.split_by_lines(code, first, last, &tokens_between, &mut out);
+                self.split_by_lines(code, &plan.offsets, first, last, &tokens_between, &mut out);
                 continue;
             }
             push_chunk(&mut out, code, first, last);
@@ -295,10 +318,19 @@ impl<'a> MarkdownSlicer<'a> {
         Some(CHUNK_COST + penalty + shift)
     }
 
-    /// Last resort for one block above the cap: cut on line boundaries.
+    /// Last resort for one block above the cap: cut on line boundaries, and on
+    /// token boundaries where there is no line boundary to cut at.
+    ///
+    /// The second half is not a refinement of the first. Prose wraps where its
+    /// author chose to, so one paragraph on one line is ordinary, and a block
+    /// like that used to leave here still over the cap — which downstream is not
+    /// a coarse chunk but an unstorable one (see the code slicer's
+    /// [`pack_window`](crate::slicing::traits) note on the 1 048 576-element
+    /// multivector limit).
     fn split_by_lines(
         &self,
         code: &str,
+        offsets: &[(usize, usize)],
         first: &Block,
         last: &Block,
         tokens_between: &dyn Fn(usize, usize) -> usize,
@@ -314,9 +346,19 @@ impl<'a> MarkdownSlicer<'a> {
         let mut w_start = start;
         let mut last_fit = start;
         for &le in &line_ends {
-            if tokens_between(w_start, le) > self.max_tokens && last_fit > w_start {
-                push_span(out, code, w_start, last_fit);
-                w_start = last_fit;
+            if tokens_between(w_start, le) > self.max_tokens {
+                if last_fit > w_start {
+                    push_span(out, code, w_start, last_fit);
+                    w_start = last_fit;
+                }
+                while tokens_between(w_start, le) > self.max_tokens {
+                    let Some(cut) = token_boundary(code, offsets, w_start, le, self.max_tokens)
+                    else {
+                        break;
+                    };
+                    push_span(out, code, w_start, cut);
+                    w_start = cut;
+                }
             }
             last_fit = le;
         }
@@ -503,6 +545,7 @@ fn push_span(out: &mut Vec<SlicedChunk>, code: &str, start: usize, end: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slicing::traits::STORABLE_TOKENS_CEILING;
     use std::sync::OnceLock;
     use tokenizers::Tokenizer;
 
@@ -656,6 +699,52 @@ mod tests {
                     c.start_line
                 );
             }
+        }
+    }
+
+    /// One paragraph on one line — prose wraps where its author chose to, and
+    /// plenty of authors choose never — leaves the line-splitting fallback
+    /// nothing to cut at. It must still come out under the cap: a chunk above
+    /// 1024 ColBERT tokens is one Qdrant refuses to store, so an unenforced cap
+    /// here fails the whole batch the document travelled in.
+    #[test]
+    fn a_block_on_a_single_line_is_cut_to_the_cap() {
+        let cap = 64;
+        let src = format!(
+            "# Title\n\n{}\n",
+            (0..600).map(|i| format!("word{i} ")).collect::<String>()
+        );
+        let out = chunks(&src, cap);
+        assert!(out.len() > 5, "a long line produced {} chunks", out.len());
+        for c in &out {
+            let n = tokenizer().encode(c.code.as_str(), false).unwrap().len();
+            assert!(
+                n <= cap + 8,
+                "chunk at line {} has {n} tokens (cap {cap})",
+                c.start_line
+            );
+        }
+    }
+
+    /// The cap is a knob; what Qdrant will store is not. `max_doc_chunk_tokens`
+    /// defaults to exactly 1024, which is [`SPECIAL_TOKENS`] rows over the
+    /// 1 048 576-element multivector limit, so a chunk packed right up to the
+    /// configured cap has to come out under the structural one instead.
+    #[test]
+    fn a_cap_above_the_storable_ceiling_is_clamped() {
+        let src = format!(
+            "# Title\n\n{}\n",
+            (0..4000).map(|i| format!("word{i} ")).collect::<String>()
+        );
+        for c in chunks(&src, 4096) {
+            let n = tokenizer().encode(c.code.as_str(), false).unwrap().len();
+            // Against the ceiling, not against what the slicer aims for: what
+            // has to hold is that the embedder's own count of this chunk fits.
+            assert!(
+                n <= STORABLE_TOKENS_CEILING,
+                "chunk at line {} has {n} tokens (ceiling {STORABLE_TOKENS_CEILING})",
+                c.start_line
+            );
         }
     }
 

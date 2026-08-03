@@ -2,6 +2,30 @@ import * as vscode from "vscode";
 import * as path from "node:path";
 import { MindexApi, SearchResult } from "./api";
 import { ProblemError, isCancellation, reportError } from "./errors";
+import { BRAND, say } from "./brand";
+import { describeScope, isScoped, Scope } from "./scope";
+
+/**
+ * Where an in-flight search registers itself so something else can end it.
+ *
+ * A `Set<AbortController>` satisfies this structurally; the interface exists so this
+ * module does not take a whole collection type as an argument for two method calls.
+ * Registration covers the **request only** — once results are in hand the search is no
+ * longer something that can be interrupted, and leaving it registered would make a
+ * later health collapse claim it aborted a run that had already finished.
+ */
+export interface RunRegistry {
+    add(run: AbortController): void;
+    delete(run: AbortController): void;
+}
+
+/** What a search run is given. `query` preset = no prompt (the Ask form typed it). */
+export interface SearchOptions extends Scope {
+    topK: number;
+    query?: string;
+    /** Registered for the duration of the request; see [`RunRegistry`]. */
+    registry?: RunRegistry;
+}
 
 /**
  * Prompt for a query, POST /search, and show every result in a QuickPick in
@@ -14,16 +38,15 @@ export async function runSearch(
     api: MindexApi,
     guid: string,
     workspaceRoot: string,
-    topK: number,
-    presetQuery?: string,
-    language?: string
+    opts: SearchOptions
 ): Promise<void> {
+    const { topK, query: presetQuery, registry, ...scope } = opts;
     // Invoked from the Ask view the query is already typed; from the command palette
     // there is nothing to type into, so prompt.
     const query =
         presetQuery ??
         (await vscode.window.showInputBox({
-            title: "mindex search",
+            title: `${BRAND} search`,
             prompt: "Semantic code search query",
             placeHolder: "e.g. where are Qdrant collection names derived?",
             ignoreFocusOut: true,
@@ -38,23 +61,31 @@ export async function runSearch(
             await vscode.window.withProgress(
                 {
                     location: vscode.ProgressLocation.Notification,
-                    title: "mindex: searching…",
+                    title: say("searching…"),
                     cancellable: true,
                 },
-                (_p, token) => {
+                async (_p, token) => {
                     const abort = new AbortController();
                     token.onCancellationRequested(() => abort.abort());
-                    return api.search(
-                        guid,
-                        {
-                            query,
-                            top_k: topK,
-                            ...(language === undefined
-                                ? {}
-                                : { include: { programming_languages: [language] } }),
-                        },
-                        abort.signal
-                    );
+                    registry?.add(abort);
+                    try {
+                        return await api.search(
+                            guid,
+                            {
+                                query,
+                                top_k: topK,
+                                ...(scope.include === undefined
+                                    ? {}
+                                    : { include: scope.include }),
+                                ...(scope.exclude === undefined
+                                    ? {}
+                                    : { exclude: scope.exclude }),
+                            },
+                            abort.signal
+                        );
+                    } finally {
+                        registry?.delete(abort);
+                    }
                 }
             )
         ).results;
@@ -63,21 +94,21 @@ export async function runSearch(
             return;
         }
         if (e instanceof ProblemError && e.code === "search.no_match") {
-            void vscode.window.showInformationMessage("mindex: no matches.");
+            void vscode.window.showInformationMessage(say("no matches."));
             return;
         }
         await reportError("Search failed", e, () =>
-            runSearch(api, guid, workspaceRoot, topK, query, language)
+            runSearch(api, guid, workspaceRoot, { ...opts, query })
         );
         return;
     }
 
     if (results.length === 0) {
-        void vscode.window.showInformationMessage("mindex: no matches.");
+        void vscode.window.showInformationMessage(say("no matches."));
         return;
     }
 
-    showResultsPicker(workspaceRoot, query, results);
+    showResultsPicker(workspaceRoot, query, results, scope);
 }
 
 interface ResultItem extends vscode.QuickPickItem {
@@ -92,7 +123,8 @@ interface ResultItem extends vscode.QuickPickItem {
 function showResultsPicker(
     workspaceRoot: string,
     query: string,
-    results: SearchResult[]
+    results: SearchResult[],
+    scope: Scope
 ): void {
     // Remember where the user was so Esc puts them back.
     const before = vscode.window.activeTextEditor;
@@ -107,7 +139,13 @@ function showResultsPicker(
     }));
 
     const picker = vscode.window.createQuickPick<ResultItem>();
-    picker.title = `mindex: ${results.length} result(s) for “${query}”`;
+    // The scope rides in the title because a scoped search that returns three hits
+    // and an unscoped one that returns three hits look identical, and only one of them
+    // means "there are three".
+    picker.title = say(
+        `${results.length} result(s) for “${query}”` +
+            (isScoped(scope) ? ` — ${describeScope(scope)}` : "")
+    );
     picker.placeholder = "↑/↓ preview · Enter open · Esc back";
     picker.matchOnDescription = true;
     picker.matchOnDetail = true;
@@ -177,7 +215,9 @@ async function openResult(
     } catch {
         if (!opts.quiet) {
             void vscode.window.showWarningMessage(
-                `mindex: ${r.path} not found in the working tree (index may be stale — run Check Drift).`
+                say(
+                    `${r.path} not found in the working tree (index may be stale — run Check Drift).`
+                )
             );
         }
     }

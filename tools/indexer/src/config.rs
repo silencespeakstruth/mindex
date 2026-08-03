@@ -11,6 +11,16 @@ use std::path::PathBuf;
 const DEFAULT_SERVER_URL: &str = "https://127.0.0.1:11111";
 const DEFAULT_PROTOCOL: &str = "v0";
 const DEFAULT_BATCH_SIZE_FILES: usize = 100;
+/// Two years. A window is needed at all because a commit's value decays while
+/// its cost does not, and one bound alone is not enough: an age bound alone
+/// indexes nothing on a repository idle for a year, a count bound alone reaches
+/// back a fortnight on a repository having a furious month. Both apply, and the
+/// stricter one binds.
+const DEFAULT_HISTORY_MAX_AGE_DAYS: u64 = 730;
+const DEFAULT_HISTORY_MAX_COMMITS: usize = 5_000;
+/// "wip", "fix", "." — a message this short carries no information but still
+/// occupies one of `file_history`'s slots on every lookup that touches it.
+const DEFAULT_HISTORY_MIN_MESSAGE_BYTES: usize = 40;
 
 /// File-backed settings (only the truly operational knobs; per-invocation flags
 /// like `--project`/`--root`/`--check` are never in the file).
@@ -31,6 +41,22 @@ pub struct IndexerConfig {
     /// this exists for a reverse proxy in front of it that does. `None` sends no
     /// header at all, which is what a direct `https://127.0.0.1:11111` wants.
     pub api_key: Option<String>,
+
+    /// Reconcile the project's git history alongside the working tree.
+    ///
+    /// **Off by default**, deliberately: an existing deployment must behave
+    /// byte-for-byte as it did until someone asks for the second channel.
+    pub history: bool,
+    /// Which refs bound the history walk. Overridden by `.mindex`'s `git_refs`
+    /// and then by `--git-ref`; the fallback here is the current branch alone.
+    pub git_refs: Vec<String>,
+    /// Age bound on the walk. `None` = no age bound (the count bound still
+    /// applies).
+    pub history_max_age_days: Option<u64>,
+    /// Count bound on the walk, applied together with the age bound.
+    pub history_max_commits: usize,
+    /// Commits whose whole message is shorter than this are not posted.
+    pub history_min_message_bytes: usize,
 }
 
 impl Default for IndexerConfig {
@@ -43,6 +69,11 @@ impl Default for IndexerConfig {
             no_verify: false,
             ca_cert: None,
             api_key: None,
+            history: false,
+            git_refs: vec!["HEAD".to_string()],
+            history_max_age_days: Some(DEFAULT_HISTORY_MAX_AGE_DAYS),
+            history_max_commits: DEFAULT_HISTORY_MAX_COMMITS,
+            history_min_message_bytes: DEFAULT_HISTORY_MIN_MESSAGE_BYTES,
         }
     }
 }
@@ -58,6 +89,12 @@ pub struct Overrides {
     pub no_verify: bool,
     pub ca_cert: Option<PathBuf>,
     pub api_key: Option<String>,
+    /// `Some(true)` from `--history`, `Some(false)` from `--no-history`, `None`
+    /// when neither was passed. A plain bool cannot express "explicitly off",
+    /// and the file default being `false` makes that distinction necessary.
+    pub history: Option<bool>,
+    pub history_since_days: Option<u64>,
+    pub history_max_commits: Option<usize>,
 }
 
 fn candidate_paths(explicit: Option<PathBuf>) -> Vec<PathBuf> {
@@ -155,6 +192,21 @@ pub fn resolve(ov: Overrides) -> Result<IndexerConfig> {
         eprintln!("config: api_key overridden by --api-key / $MINDEX_API_KEY (value hidden)");
         cfg.api_key = Some(v);
     }
+    if let Some(v) = ov.history {
+        eprintln!(
+            "config: history overridden by --{} ({v})",
+            if v { "history" } else { "no-history" }
+        );
+        cfg.history = v;
+    }
+    if let Some(v) = ov.history_since_days {
+        eprintln!("config: history_max_age_days overridden by --history-since-days ({v})");
+        cfg.history_max_age_days = Some(v);
+    }
+    if let Some(v) = ov.history_max_commits {
+        eprintln!("config: history_max_commits overridden by --history-max-commits ({v})");
+        cfg.history_max_commits = v;
+    }
 
     // Validation: collect all problems, fail with the full list.
     let mut errs = Vec::new();
@@ -171,6 +223,22 @@ pub fn resolve(ov: Overrides) -> Result<IndexerConfig> {
         && c < 1
     {
         errs.push("concurrency must be >= 1".to_string());
+    }
+    if cfg.history_max_commits < 1 {
+        errs.push("history_max_commits must be >= 1 (default 5000)".to_string());
+    }
+    if let Some(d) = cfg.history_max_age_days
+        && d < 1
+    {
+        errs.push(
+            "history_max_age_days must be >= 1; omit the key entirely for no age bound".to_string(),
+        );
+    }
+    if cfg.history && cfg.git_refs.iter().all(|r| r.trim().is_empty()) {
+        errs.push(
+            "history is enabled but git_refs is empty; name at least one ref pattern (default \"HEAD\")"
+                .to_string(),
+        );
     }
     // Checked here rather than at connect time: a mistyped CA path would otherwise
     // surface as a TLS handshake failure, which reads as a server problem.

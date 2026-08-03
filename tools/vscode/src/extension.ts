@@ -1,17 +1,42 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
-import { MindexApi } from "./api";
+import { ConfigResponse, MindexApi, ResearchRunSummary, SearchFilter } from "./api";
+import { BusyKeys } from "./busy";
+import { pickChallengeOptions } from "./challengeFlow";
+import { showActiveResearchRuns } from "./activeRunsPick";
+import { challengeGuard } from "./shared/runsFormat";
 import { MindexFile, parseMindexFile } from "./mindexFile";
 import { buildManifest, scanWorkspace } from "./scanner";
-import { DriftTreeProvider } from "./driftView";
-import { StatusTreeProvider, failedFilePath } from "./statusView";
+import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
+import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
+import { StatusPanel } from "./statusPanel";
+import { ResearchRunsPanel } from "./researchRunsPanel";
+import { pickContextRuns } from "./researchContextPick";
+import {
+    openResearchReport,
+    RESEARCH_SCHEME,
+    ResearchDocumentProvider,
+    runIdOf,
+} from "./researchDocs";
+import { paintStatusBar } from "./statusBar";
+import { IndexStatusBar } from "./indexStatusBar";
+import { IndexingPanel, IndexingPanelPlacement } from "./indexingPanel";
 import { reindexPaths, showReindexSummary } from "./indexer";
 import { runSearch } from "./search";
 import { ResearchPanel, ResearchSubmission } from "./researchView";
 import { AskSubmission, AskViewProvider } from "./askView";
 import { createProjectFile } from "./createProject";
-import { isCancellation, reportError } from "./errors";
+import {
+    disposeErrorLog,
+    humanize,
+    isCancellation,
+    logError,
+    ProblemError,
+    reportError,
+} from "./errors";
+import { BRAND, say } from "./brand";
 
 interface Project {
     root: string;
@@ -31,9 +56,22 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
-    statusBar.command = "mindex.refreshStatus";
-    statusBar.tooltip = "mindex server health — click to refresh";
+    // Clicking opens the panel rather than refreshing invisibly: a click that changes
+    // nothing on screen reads as a dead control, and the refresh happens on the way
+    // to the panel anyway.
+    statusBar.command = "mindex.openStatus";
     context.subscriptions.push(statusBar);
+    paintStatusBar(statusBar);
+
+    // The live indexing feed, shown only while a reindex runs. A priority above the
+    // health indicator's puts it immediately to its left, so the two read as one
+    // group; it is a separate item because it is transient and the other is not.
+    const indexStatusItem = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Right,
+        91
+    );
+    context.subscriptions.push(indexStatusItem);
+    const indexStatusBar = new IndexStatusBar(indexStatusItem);
 
     // ── Project marker: one .mindex at a workspace root, cached and watched ──────
     // The file is the extension's whole reason to be active, so it is read once and
@@ -69,7 +107,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (project === undefined && projectError === undefined) {
             projectError =
                 "no .mindex file found at a workspace root — run " +
-                "“mindex: Create a .mindex Project File” to generate one";
+                `“${BRAND}: Create a .mindex Project File” to generate one`;
         }
         await vscode.commands.executeCommand(
             "setContext",
@@ -94,7 +132,7 @@ export function activate(context: vscode.ExtensionContext): void {
         try {
             return await loadProject();
         } catch (e) {
-            await reportError("mindex", e);
+            await reportError(BRAND, e);
             return undefined;
         }
     };
@@ -109,13 +147,23 @@ export function activate(context: vscode.ExtensionContext): void {
     driftView.onDidChangeCheckboxState((e) => driftProvider.applyCheckboxChanges(e.items));
     context.subscriptions.push(driftView);
 
-    const statusProvider = new StatusTreeProvider(
+    // The last `GET /config` the monitor saw — what the challenge QuickPick reads
+    // its effort/model inventory from. Same offering-vs-validating stance as the
+    // Ask form: undefined degrades the pick to bare labels, never blocks it.
+    let serverConfig: ConfigResponse | undefined;
+
+    const statusProvider = new StatusMonitor(
         () => api,
         () => project?.mindex.guid,
-        statusBar,
-        // The health refresh is the only thing that knows the server's optional
-        // Ollama is down; the Ask view is where that costs the user something.
-        (available) => askProvider.setResearchAvailable(available),
+        () => config().get<string>("serverUrl", "https://127.0.0.1:11111"),
+        // The health refresh is the only thing that knows what the server can still
+        // do; the Ask view is where that costs the user something.
+        (availability) => {
+            askProvider.setAvailability(availability);
+            if (!availability.ask) {
+                abortRunsForDegradation(availability.reason);
+            }
+        },
         // Same shape, and for the same reason: the refresh is what knows what the
         // index holds, the Ask view is what has to stop offering the rest.
         (languages) => askProvider.setLanguageInventory(languages),
@@ -123,18 +171,59 @@ export function activate(context: vscode.ExtensionContext): void {
         // activation, because `research.models` is no longer static: a model pulled
         // after the window opened has to reach the picker without a reload.
         (cfg) => {
-            if (cfg.research !== undefined) {
-                askProvider.setResearchConfig(cfg.research);
-            }
+            serverConfig = cfg;
+            askProvider.setServerConfig(cfg);
         }
     );
     context.subscriptions.push(
-        vscode.window.createTreeView("mindexStatus", { treeDataProvider: statusProvider })
+        statusProvider,
+        // The status bar is the monitor's only unconditional subscriber; the panel is
+        // optional and subscribes for itself when it exists.
+        statusProvider.onDidChangeSnapshot((snapshot) => paintStatusBar(statusBar, snapshot)),
+        // Drift is the second: the server's claim count is what decides whether a
+        // reindex would do anything, and it is the only place the user can see that
+        // work is in flight that this window did not start.
+        statusProvider.onDidChangeSnapshot((snapshot) =>
+            driftProvider.setServerClaims(
+                snapshot.runtime !== undefined && snapshot.runtime !== UNAVAILABLE
+                    ? snapshot.runtime.indexing_claims
+                    : 0
+            )
+        )
     );
+
+    /**
+     * What the Status panel's buttons do. Every one of them is an existing command,
+     * so the panel adds a surface and not a second implementation — and the palette
+     * keeps working for anyone who prefers it.
+     */
+    const statusActions = {
+        refresh: () => void statusProvider.refresh(),
+        retryAll: () => void vscode.commands.executeCommand("mindex.retryAllFailed"),
+        retryFile: (p: string) => void vscode.commands.executeCommand("mindex.retryFile", p),
+        openFile: (p: string) => {
+            if (project !== undefined) {
+                void vscode.window.showTextDocument(
+                    vscode.Uri.file(path.join(project.root, p))
+                );
+            }
+        },
+        openSettings: () => openSettings(),
+    };
 
     // ── Research: sidebar form → SSE stream → output tab ─────────────────────
     let researchAbort: AbortController | undefined;
     let researchPanel: ResearchPanel | undefined;
+
+    /**
+     * Searches currently in flight, so a health collapse can end them.
+     *
+     * Research is tracked separately above because it owns a panel and a running flag;
+     * a search owns only its request and the quick pick it is about to open, which is
+     * what this abstracts to. Entries remove themselves — a `finally` in `runSearch` —
+     * so a completed search cannot be aborted twice or hold a reference forever.
+     */
+    const liveSearches = new Set<AbortController>();
 
     const cancelResearch = (): void => {
         researchAbort?.abort(); // closing the connection IS the server-side cancel
@@ -144,10 +233,77 @@ export function activate(context: vscode.ExtensionContext): void {
         researchPanel = undefined;
     };
 
+    /**
+     * A required dependency went away while something was running.
+     *
+     * Order matters and is the whole of this function. **Reset first**: the form is
+     * released and the handles cleared before anything is reported, because a
+     * notification's thenable resolves only when the user dismisses it — the same trap
+     * that once left Research disabled behind an un-clicked toast (see `startResearch`).
+     * Then abort, then report it as a *failure* rather than as a cancellation: the user
+     * did not stop this, and a run that ends looking like their own Stop is a run they
+     * will assume produced nothing worth keeping.
+     */
+    const abortRunsForDegradation = (reason?: string): void => {
+        const panel = researchPanel;
+        const abort = researchAbort;
+        const searches = [...liveSearches];
+        if (abort === undefined && searches.length === 0) {
+            return;
+        }
+
+        researchAbort = undefined;
+        researchPanel = undefined;
+        askProvider.setRunning(false);
+        liveSearches.clear();
+
+        abort?.abort();
+        for (const search of searches) {
+            search.abort();
+        }
+
+        const detail = reason ?? "a required dependency stopped answering";
+        panel?.error(`mindex.degraded: ${detail} — the run was aborted.`);
+        void vscode.window.showErrorMessage(
+            say(`server health degraded — ${detail}. The run in progress was aborted.`)
+        );
+    };
+
+    /**
+     * The one callback block for both research and challenge streams — extracted
+     * so the two entrances cannot drift: a challenge is the same stream with one
+     * extra `verdict` frame, which `panel.verdict` already renders.
+     */
+    const researchCallbacks = (panel: ResearchPanel) => ({
+        onThinking: (text: string) => panel.thinking(text),
+        onStep: (step: Parameters<ResearchPanel["step"]>[0]) => panel.step(step),
+        onProgress: (progress: Parameters<ResearchPanel["progress"]>[0]) =>
+            panel.progress(progress),
+        onSummary: (text: string) => panel.summary(text),
+        onCitations: (citations: Parameters<ResearchPanel["citations"]>[0]) =>
+            panel.citations(citations),
+        onExcerpts: (excerpts: Parameters<ResearchPanel["excerpts"]>[0]) =>
+            panel.excerpts(excerpts),
+        onVerdict: (verdict: Parameters<ResearchPanel["verdict"]>[0]) =>
+            panel.verdict(verdict),
+        onDone: (info: Parameters<ResearchPanel["done"]>[0]) => panel.done(info),
+        onError: (code: string, detail: string) => {
+            panel.error(`${code}: ${detail}`, code);
+            // The run just proved Ollama is unreachable — re-read health
+            // so the status bar and the Ask notice say so too. Deliberately not
+            // `ollama.error`, which is Ollama answering *with* an error (usually a
+            // model that is not pulled): health comes back green every time, so the
+            // refresh would only replace the useful message with a reassuring one.
+            if (code === "ollama.unavailable") {
+                void statusProvider.refresh();
+            }
+        },
+    });
+
     const startResearch = async (s: ResearchSubmission): Promise<void> => {
         if (researchAbort !== undefined) {
             void vscode.window.showInformationMessage(
-                "mindex: a research run is already in progress — cancel it first."
+                say("a research run is already in progress — cancel it first.")
             );
             return;
         }
@@ -171,7 +327,13 @@ export function activate(context: vscode.ExtensionContext): void {
                     cancelResearch();
                 }
             },
-            { include: s.include, exclude: s.exclude }
+            { include: s.include, exclude: s.exclude },
+            // Titles come from the form's own cache — `contextRunIds` on the
+            // submission is ids only, and a header reading "#7, #9" would name the
+            // provenance without saying what it is.
+            askProvider.currentContextRuns.filter((r) =>
+                (s.contextRunIds ?? []).includes(r.id)
+            )
         );
         researchPanel = panel;
 
@@ -189,28 +351,18 @@ export function activate(context: vscode.ExtensionContext): void {
                     budget: s.budget,
                     include: s.include,
                     exclude: s.exclude,
+                    context_run_ids:
+                        s.contextRunIds !== undefined && s.contextRunIds.length > 0
+                            ? s.contextRunIds
+                            : undefined,
                 },
-                {
-                    onThinking: (text) => panel.thinking(text),
-                    onStep: (step) => panel.step(step),
-                    onProgress: (progress) => panel.progress(progress),
-                    onSummary: (text) => panel.summary(text),
-                    onCitations: (citations) => panel.citations(citations),
-                    onDone: (info) => panel.done(info),
-                    onError: (code, detail) => {
-                        panel.error(`${code}: ${detail}`, code);
-                        // The run just proved Ollama is unreachable — re-read health
-                        // so the status tree and the Ask notice say so too.
-                        if (code === "ollama.unavailable") {
-                            void statusProvider.refresh();
-                        }
-                    },
-                },
+                researchCallbacks(panel),
                 abort.signal
             );
         } catch (e) {
             if (!isCancellation(e)) {
-                panel.error(e instanceof Error ? e.message : String(e));
+                logError("Research run", e);
+                panel.error(humanize(e).text);
                 failure = e;
             }
         } finally {
@@ -236,6 +388,101 @@ export function activate(context: vscode.ExtensionContext): void {
     };
 
     /**
+     * Launch a challenge against a stored run's report. Shares everything with
+     * `startResearch` deliberately: the same single-flight handles (so
+     * degradation-abort and Cancel cover challenges for free), the same panel,
+     * the same callback block. What differs is the request — the server takes
+     * only effort/model/budget/seed; question, scope and context come from the
+     * subject.
+     */
+    const startChallenge = async (subject: ResearchRunSummary): Promise<void> => {
+        if (researchAbort !== undefined) {
+            void vscode.window.showInformationMessage(
+                say("a research run is already in progress — cancel it first.")
+            );
+            return;
+        }
+        // The server would refuse both of these with a 400; refusing here spares
+        // the QuickPick chain. The summary can be stale, so the server's answer
+        // still lands in the panel when it disagrees.
+        const guard = challengeGuard(subject);
+        if (!guard.ok) {
+            void vscode.window.showInformationMessage(say(guard.reason));
+            return;
+        }
+        let proj: Project;
+        try {
+            proj = await loadProject();
+        } catch (e) {
+            await reportError("Challenge failed", e);
+            return;
+        }
+        const req = await pickChallengeOptions(subject, serverConfig);
+        if (req === undefined) {
+            return;
+        }
+
+        const panel = new ResearchPanel(
+            context.extensionUri,
+            `Challenge research #${subject.seq}: ${subject.question}`,
+            () => {
+                if (researchPanel === panel) {
+                    cancelResearch();
+                }
+            },
+            undefined,
+            [],
+            {
+                tabTitle: `Challenge #${subject.seq}: ${subject.title}`,
+                isChallenge: true,
+            }
+        );
+        researchPanel = panel;
+
+        const abort = new AbortController();
+        researchAbort = abort;
+        askProvider.setRunning(true);
+        let failure: unknown;
+        try {
+            await api.challenge(
+                proj.mindex.guid,
+                subject.id,
+                req,
+                researchCallbacks(panel),
+                abort.signal
+            );
+        } catch (e) {
+            if (!isCancellation(e)) {
+                logError("Research run", e);
+                panel.error(humanize(e).text);
+                failure = e;
+            }
+        } finally {
+            if (researchAbort === abort) {
+                researchAbort = undefined;
+                askProvider.setRunning(false);
+                if (researchPanel === panel) {
+                    researchPanel = undefined;
+                }
+            }
+        }
+        // After the handles are released, like `startResearch` — see the comment
+        // there for the un-clicked-toast trap.
+        if (failure !== undefined) {
+            if (failure instanceof ProblemError && failure.code === "research.busy") {
+                await vscode.window.showErrorMessage(
+                    say(
+                        "all research slots are busy — “MINDex: Active Research Runs” " +
+                            "lists them and can cancel one."
+                    )
+                );
+                return;
+            }
+            await reportError("Challenge failed", failure);
+        }
+    };
+
+    /**
      * The submission with `include` narrowed to the folder of the active editor.
      *
      * `dir/*` rather than `dir/**`: the server evaluates SQLite `GLOB`, where `*`
@@ -244,11 +491,14 @@ export function activate(context: vscode.ExtensionContext): void {
      * or the file lies outside the project — silently narrowing to the wrong subtree
      * would be worse than not narrowing.
      */
-    const scopeToCurrentFolder = (s: AskSubmission): AskSubmission => {
+    const scopeToCurrentFolder = (s: {
+        include?: SearchFilter;
+        exclude?: SearchFilter;
+    }): { include?: SearchFilter; exclude?: SearchFilter } => {
         const doc = vscode.window.activeTextEditor?.document;
         if (doc === undefined || project === undefined || doc.uri.scheme !== "file") {
             void vscode.window.showInformationMessage(
-                "mindex: open a file in this project first — there is no folder to scope to."
+                say("open a file in this project first — there is no folder to scope to.")
             );
             return s;
         }
@@ -258,51 +508,62 @@ export function activate(context: vscode.ExtensionContext): void {
             .join("/");
         if (rel === "" || rel.startsWith("..")) {
             void vscode.window.showInformationMessage(
-                "mindex: that file is not inside the project, or is at its root."
+                say("that file is not inside the project, or is at its root.")
             );
             return s;
         }
         return { ...s, include: { ...s.include, paths: [`${rel}/*`] } };
     };
 
+    /**
+     * One search at a time, refused rather than queued.
+     *
+     * The button greys itself the moment this takes the key, but the refusal has
+     * to live here: five fast clicks used to be five concurrent requests, five
+     * entries in `liveSearches` and five quick picks racing to be the one on
+     * screen. Shared with the palette command, so the form and the palette cannot
+     * start two either.
+     */
+    const askKeys = new BusyKeys((m) => {
+        const msg = m as { key?: string; busy?: boolean };
+        if (typeof msg.key === "string") {
+            askProvider.setBusy(msg.key, msg.busy === true);
+        }
+    });
+
     const onAsk = async (s: AskSubmission): Promise<void> => {
         if (s.mode === "research") {
-            // "this folder" is resolved here, not in the webview: the webview has no
-            // editor API, and mirroring the active editor into it would be a second
-            // channel to keep fresh for one button.
-            const scoped = s.scopeCurrentFolder === true ? scopeToCurrentFolder(s) : s;
-            if (s.scopeCurrentFolder === true) {
-                askProvider.setScope(scoped.include, scoped.exclude);
-                return;
-            }
-            await startResearch({
-                question: s.text,
-                effort: s.effort,
-                model: s.model,
-                budget: s.budget,
-                include: scoped.include,
-                exclude: scoped.exclude,
-            });
+            // Spread the whole submission minus the fields a research run has no
+            // use for, rather than naming the ones it does: `ResearchSubmission` is
+            // `AskSubmission` less exactly these three, so a field the form grows
+            // arrives here by construction. Copied field by field, `contextRunIds`
+            // was simply never listed — the picked reports reached the panel header
+            // and the request went out without them, so every run the user gave
+            // context to ran with none and said so in its report.
+            const { mode: _mode, text, topK: _topK, ...research } = s;
+            await startResearch({ question: text, ...research });
             return;
         }
-        try {
-            const proj = await loadProject();
-            await runSearch(
-                api,
-                proj.mindex.guid,
-                proj.root,
-                s.topK,
-                s.text,
-                s.language === "" ? undefined : s.language
-            );
-        } catch (e) {
-            if (!isCancellation(e)) {
-                await reportError("Search failed", e);
+        await askKeys.run("submit", async () => {
+            try {
+                const proj = await loadProject();
+                await runSearch(api, proj.mindex.guid, proj.root, {
+                    topK: s.topK,
+                    query: s.text,
+                    include: s.include,
+                    exclude: s.exclude,
+                    registry: liveSearches,
+                });
+            } catch (e) {
+                if (!isCancellation(e)) {
+                    await reportError("Search failed", e);
+                }
             }
-        }
+        });
     };
 
     const askProvider = new AskViewProvider(
+        context.extensionUri,
         () => config().get<string>("researchModel", ""),
         () => config().get<number>("topK", 10),
         // The project's standing scope, for prefilling the Scope panel. Read live
@@ -313,11 +574,23 @@ export function activate(context: vscode.ExtensionContext): void {
             exclude: project?.mindex.excludePaths ?? [],
             languages: project?.mindex.languages ?? [],
         }),
-        (s) => void onAsk(s),
-        cancelResearch
+        (s: AskSubmission) => void onAsk(s),
+        cancelResearch,
+        () => void vscode.commands.executeCommand("mindex.openStatus"),
+        () => void vscode.commands.executeCommand("mindex.pickResearchContext"),
+        (current) => {
+            const scoped = scopeToCurrentFolder(current);
+            askProvider.setScope(scoped.include, scoped.exclude);
+        }
     );
+    // Stored reports are served as read-only Markdown documents, so a report can be
+    // opened in a tab from anywhere that knows its id — the picker, the History
+    // rows, a dependency chip in a live run's header.
+    const researchDocs = new ResearchDocumentProvider(() => api);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(AskViewProvider.viewId, askProvider),
+        vscode.workspace.registerTextDocumentContentProvider(RESEARCH_SCHEME, researchDocs),
+        researchDocs,
         new vscode.Disposable(cancelResearch)
     );
 
@@ -336,9 +609,14 @@ export function activate(context: vscode.ExtensionContext): void {
                     } files`;
                     const actionable =
                         drift.stale.length + drift.missing.length + drift.orphaned.length;
+                    // Only while there is something to say something about: VS Code
+                    // shows `message` *instead of* the welcome view when the tree is
+                    // empty, and the welcome text is what explains drift in the first
+                    // place. Setting this unconditionally would replace it.
+                    driftView.message = actionable === 0 ? undefined : DRIFT_MESSAGE;
                     if (actionable === 0) {
                         void vscode.window.setStatusBarMessage(
-                            "mindex: index is in sync with the working tree",
+                            say("index is in sync with the working tree"),
                             5000
                         );
                     }
@@ -349,13 +627,77 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     };
 
+    /**
+     * The one confirm for dropping files from the index, shared by the two commands
+     * that do it. Worth stating that files on disk are untouched: "delete" beside a
+     * list of paths reads as a filesystem operation until it says otherwise.
+     */
+    const confirmOrphanDelete = async (count: number): Promise<boolean> => {
+        const confirm = await vscode.window.showWarningMessage(
+            `Delete ${count} orphaned file(s) from the index? They are already gone from the working tree; nothing on disk is touched. (Soft delete; GC removes vectors later.)`,
+            { modal: true },
+            "Delete"
+        );
+        return confirm === "Delete";
+    };
+
+    /** Drop paths from the index. Assumes the caller has already confirmed. */
+    const deleteOrphans = async (paths: string[]): Promise<void> => {
+        try {
+            const proj = await loadProject();
+            const n = await api.deleteFiles(proj.mindex.guid, { include: { paths } });
+            void vscode.window.showInformationMessage(
+                say(`${n} file(s) deleted from the index.`)
+            );
+            await checkDrift();
+            // Same reason as after a reindex, in the other direction: a language may
+            // have just lost its last searchable chunk.
+            await statusProvider.refresh();
+        } catch (e) {
+            await reportError("Delete from index failed", e);
+        }
+    };
+
+    /** Whether *this* window is mid-upload, so a second run can be refused. */
+    let reindexRunning = false;
+
     const reindex = async (
         paths: string[],
         noneMessage: string,
         force = false
     ): Promise<void> => {
+        // Re-entry guard. Every reindex entry point funnels through here, and without
+        // it a second press starts a *concurrent* run over the same paths: both post
+        // the same files, the server's keyed claim answers the loser with a conflict it
+        // swallows, and the drift check each one queues at the end races the other's
+        // uploads — so the view can settle showing files as still stale that were in
+        // fact just indexed. Pressing again looked like the only recourse, which
+        // started a third.
+        if (reindexRunning) {
+            void vscode.window.showInformationMessage(
+                say("a reindex is already running — watch the status bar for progress.")
+            );
+            return;
+        }
+        // The server is still holding claims. Posting now is not merely redundant: the
+        // handler answers 200 with every claimed file *absent* from the response, so the
+        // upload finishes instantly, the files are counted "unchanged", and the user is
+        // told nothing happened — which is exactly what it looks like, because nothing
+        // did. Refusing up front and pointing at the progress row is the honest version.
+        if (driftProvider.busyClaims > 0) {
+            void vscode.window.showInformationMessage(
+                say(
+                    `the server is still indexing ${driftProvider.busyClaims} file(s) — ` +
+                        "they would be refused as in-flight. Watch the Drift view; it " +
+                        "clears when they settle."
+                )
+            );
+            return;
+        }
         if (paths.length === 0) {
-            void vscode.window.showInformationMessage(noneMessage);
+            if (noneMessage !== "") {
+                void vscode.window.showInformationMessage(noneMessage);
+            }
             return;
         }
         const proj = await currentProject();
@@ -363,17 +705,33 @@ export function activate(context: vscode.ExtensionContext): void {
             return;
         }
         const batch = config().get<number>("batchSize", 100);
-        const summary = await reindexPaths(
-            api,
-            proj.mindex.guid,
-            proj.root,
-            paths,
-            batch,
-            force
-        );
+        reindexRunning = true;
+        let summary;
+        try {
+            summary = await reindexPaths(api, proj.mindex.guid, proj.root, paths, {
+                statusBar: indexStatusBar,
+                extensionUri: context.extensionUri,
+                placement: config().get<IndexingPanelPlacement>("indexingPanel", "beside"),
+                openFile: statusActions.openFile,
+                batchSize: batch,
+                force,
+            });
+        } finally {
+            // Cleared before the drift check below, which draws its own progress in
+            // the view title — two indicators for one operation reads as two
+            // operations.
+            reindexRunning = false;
+        }
         if (summary !== undefined) {
-            showReindexSummary(summary);
+            // The drift check runs *before* the summary, not after: it is the only
+            // thing that can tell a hash-skipped file from one the server refused as
+            // in-flight, and the summary is a claim about which of the two happened.
             await checkDrift();
+            const inFlight = driftProvider.allPaths("indexing").length;
+            showReindexSummary(summary, inFlight);
+            // The same number, from the same source, so the panel's summary and the
+            // toast cannot disagree about what the server actually refused.
+            IndexingPanel.current?.finishedWithInFlight(inFlight);
             // The inventory just changed: a language may have gained its first
             // searchable chunk, which is what the Ask view's pickers offer.
             await statusProvider.refresh();
@@ -391,14 +749,16 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand("mindex.reindexSelected", () =>
             reindex(
                 driftProvider.selectedPaths("stale", "missing"),
-                "mindex: nothing selected in Stale/Missing — tick checkboxes first (or run Check Drift)."
+                say(
+                    "nothing selected in Stale/Missing — tick checkboxes first (or run Check Drift)."
+                )
             )
         ),
 
         vscode.commands.registerCommand("mindex.reindexAllDrift", () =>
             reindex(
                 driftProvider.allPaths("stale", "missing"),
-                "mindex: no stale or missing files — index is in sync."
+                say("no stale or missing files — index is in sync.")
             )
         ),
 
@@ -409,9 +769,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 return;
             }
             if (doc === undefined || !doc.uri.fsPath.startsWith(proj.root)) {
-                void vscode.window.showInformationMessage(
-                    "mindex: no project file is active."
-                );
+                void vscode.window.showInformationMessage(say("no project file is active."));
                 return;
             }
             const rel = path.relative(proj.root, doc.uri.fsPath).replaceAll("\\", "/");
@@ -429,9 +787,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 return;
             }
             if (doc === undefined || !doc.uri.fsPath.startsWith(proj.root)) {
-                void vscode.window.showInformationMessage(
-                    "mindex: no project file is active."
-                );
+                void vscode.window.showInformationMessage(say("no project file is active."));
                 return;
             }
             const rel = path.relative(proj.root, doc.uri.fsPath).replaceAll("\\", "/");
@@ -445,7 +801,7 @@ export function activate(context: vscode.ExtensionContext): void {
             }
             const files = await scanWorkspace(proj.root, proj.mindex);
             if (files.length === 0) {
-                void vscode.window.showInformationMessage("mindex: nothing to index.");
+                void vscode.window.showInformationMessage(say("nothing to index."));
                 return;
             }
             // Modal: this re-slices and re-embeds every file in the project, which is
@@ -469,44 +825,58 @@ export function activate(context: vscode.ExtensionContext): void {
             const paths = driftProvider.selectedPaths("orphaned");
             if (paths.length === 0) {
                 void vscode.window.showInformationMessage(
-                    "mindex: nothing selected in Orphaned."
+                    say("nothing selected in Orphaned.")
                 );
                 return;
             }
-            const confirm = await vscode.window.showWarningMessage(
-                `Delete ${paths.length} orphaned file(s) from the index? (Soft delete; GC removes vectors later.)`,
-                { modal: true },
-                "Delete"
-            );
-            if (confirm !== "Delete") {
+            if (!(await confirmOrphanDelete(paths.length))) {
                 return;
             }
-            try {
-                const proj = await loadProject();
-                const n = await api.deleteFiles(proj.mindex.guid, { include: { paths } });
+            await deleteOrphans(paths);
+        }),
+
+        /**
+         * Everything Check Drift found, in one press: reindex what is stale or
+         * missing, then drop what is orphaned.
+         *
+         * The order is not arbitrary. Reindexing first means that if the delete half
+         * fails (or the user cancels at the confirm), the run still left the index
+         * strictly better off — whereas deleting first and then failing to reindex
+         * would leave the project with *less* indexed than before it was pressed.
+         */
+        vscode.commands.registerCommand("mindex.syncAll", async () => {
+            const toReindex = driftProvider.allPaths("stale", "missing");
+            const orphans = driftProvider.allPaths("orphaned");
+            if (toReindex.length === 0 && orphans.length === 0) {
                 void vscode.window.showInformationMessage(
-                    `mindex: ${n} file(s) deleted from the index.`
+                    say("nothing to sync — the index matches the working tree.")
                 );
-                await checkDrift();
-                // Same reason as after a reindex, in the other direction: a language
-                // may have just lost its last searchable chunk.
-                await statusProvider.refresh();
-            } catch (e) {
-                await reportError("Delete from index failed", e);
+                return;
+            }
+            // Confirmed only for the destructive half. A reindex is idempotent and
+            // costs time; a delete removes what the server holds, and that is the one
+            // thing worth a modal — asking about the whole operation would train the
+            // user to click through the dialog that actually matters.
+            const deleting = orphans.length > 0 && (await confirmOrphanDelete(orphans.length));
+            if (toReindex.length > 0) {
+                await reindex(toReindex, "");
+            }
+            if (deleting) {
+                await deleteOrphans(orphans);
             }
         }),
 
         vscode.commands.registerCommand("mindex.cancelIndexing", async () => {
             const paths = driftProvider.allPaths("indexing");
             if (paths.length === 0) {
-                void vscode.window.showInformationMessage("mindex: nothing is in flight.");
+                void vscode.window.showInformationMessage(say("nothing is in flight."));
                 return;
             }
             try {
                 const proj = await loadProject();
                 const n = await api.cancel(proj.mindex.guid, { include: { paths } });
                 void vscode.window.showInformationMessage(
-                    `mindex: cancelled ${n} in-flight file(s) (best-effort).`
+                    say(`cancelled ${n} in-flight file(s) (best-effort).`)
                 );
                 await checkDrift();
             } catch (e) {
@@ -518,14 +888,161 @@ export function activate(context: vscode.ExtensionContext): void {
             statusProvider.refresh()
         ),
 
+        vscode.commands.registerCommand("mindex.openStatus", () => {
+            // Revealed first, so the panel shows the previous snapshot while the fetch
+            // is in flight rather than a blank tab.
+            StatusPanel.showOrReveal(context.extensionUri, statusProvider, statusActions);
+            void statusProvider.refresh();
+        }),
+
+        // How a panel closed mid-run is brought back, and the only way in at all
+        // when `mindex.indexingPanel` is set to `manual`. It renders whatever the
+        // last run left, which is the summary until the next one starts.
+        vscode.commands.registerCommand("mindex.openIndexing", () =>
+            IndexingPanel.showOrReveal(context.extensionUri, statusActions.openFile)
+        ),
+
+        vscode.commands.registerCommand("mindex.openResearchHistory", () => {
+            ResearchRunsPanel.showOrReveal(
+                context.extensionUri,
+                () => api,
+                () => project?.mindex.guid,
+                {
+                    useAsContext: (runs) => {
+                        askProvider.setContextRuns(runs);
+                        // Reveal the form and switch it to Research: a selection made
+                        // here is only useful to the mode that can spend it.
+                        askProvider.focus("research");
+                    },
+                    openReport: (run) => {
+                        const guid = project?.mindex.guid;
+                        if (guid !== undefined) {
+                            void openResearchReport(guid, run);
+                        }
+                    },
+                    challenge: (run) => {
+                        void startChallenge(run);
+                    },
+                    reAsk: (run) => {
+                        const effort =
+                            run.effort === "low" || run.effort === "high"
+                                ? run.effort
+                                : "medium";
+                        askProvider.prefill(run.question, effort, run.model);
+                        // Attach the report being followed up, which is the point of
+                        // re-asking: the next run starts from what this one found
+                        // instead of rediscovering it.
+                        askProvider.setContextRuns(run.valid ? [run] : []);
+                        askProvider.focus("research");
+                        if (run.scope !== null) {
+                            // See `AskViewProvider.prefill`: the stored scope is prose,
+                            // not a selector, so it cannot be restored — say so rather
+                            // than silently widening the question.
+                            void vscode.window.showInformationMessage(
+                                say(
+                                    `report #${run.seq} was scoped to ${run.scope}. ` +
+                                        "Set the scope again if it mattered."
+                                )
+                            );
+                        }
+                    },
+                },
+                // The panel needs the server's own page ceiling and batch-delete
+                // cap to size its paging loops, and reads it live: `/config` is
+                // re-read on every status poll, so a restart with new limits
+                // reaches the panel without one here.
+                () => serverConfig
+            );
+        }),
+
+        vscode.commands.registerCommand("mindex.pickResearchContext", async () => {
+            const guid = project?.mindex.guid;
+            if (guid === undefined) {
+                await vscode.window.showInformationMessage(
+                    say("no project here yet — create a .mindex file first.")
+                );
+                return;
+            }
+            const picked = await pickContextRuns(
+                api,
+                guid,
+                askProvider.currentContextRuns,
+                () => void vscode.commands.executeCommand("mindex.openResearchHistory")
+            );
+            // `undefined` is a dismissed picker and must leave the form alone; an
+            // empty array is a deliberate "no context" and must clear it.
+            if (picked !== undefined) {
+                askProvider.setContextRuns(picked);
+                askProvider.focus("research");
+            }
+        }),
+
+        vscode.commands.registerCommand("mindex.openResearchReport", async (arg: unknown) => {
+            const guid = project?.mindex.guid;
+            const run = arg as { id?: unknown; seq?: unknown; title?: unknown } | undefined;
+            if (guid === undefined || typeof run?.id !== "string") {
+                return;
+            }
+            await openResearchReport(guid, {
+                id: run.id,
+                seq: typeof run.seq === "number" ? run.seq : 0,
+                title: typeof run.title === "string" ? run.title : "report",
+            });
+        }),
+
+        vscode.commands.registerCommand(
+            "mindex.challengeResearchRun",
+            async (arg: unknown) => {
+                const guid = project?.mindex.guid;
+                if (guid === undefined) {
+                    await vscode.window.showInformationMessage(
+                        say("no project here yet — create a .mindex file first.")
+                    );
+                    return;
+                }
+                // Three entry points, three argument shapes: the History panel passes a
+                // summary, the streaming panel a run id, the report tab's editor/title
+                // button nothing (the id is in the active editor's URI).
+                let runId: string | undefined;
+                if (typeof arg === "string" && arg !== "") {
+                    runId = arg;
+                } else if (typeof (arg as { id?: unknown } | undefined)?.id === "string") {
+                    runId = (arg as { id: string }).id;
+                } else {
+                    const uri = vscode.window.activeTextEditor?.document.uri;
+                    if (uri?.scheme === RESEARCH_SCHEME) {
+                        runId = runIdOf(uri);
+                    }
+                }
+                if (runId === undefined) {
+                    return;
+                }
+                try {
+                    // The detail refreshes kind/valid/trust — the pre-check must not
+                    // run on whatever stale shape the caller happened to hold.
+                    await startChallenge(await api.getResearchRun(guid, runId));
+                } catch (e) {
+                    await reportError("Challenge failed", e);
+                }
+            }
+        ),
+
+        vscode.commands.registerCommand("mindex.activeResearchRuns", () =>
+            showActiveResearchRuns(api)
+        ),
+
+        vscode.commands.registerCommand("mindex.openSettings", () => openSettings()),
+
         vscode.commands.registerCommand("mindex.retryAllFailed", async () => {
             try {
                 const proj = await loadProject();
                 const n = await api.retry(proj.mindex.guid);
                 void vscode.window.showInformationMessage(
                     n > 0
-                        ? `mindex: requeued ${n} failed file(s) — the retry worker picks them up within ~60 s.`
-                        : "mindex: no failed files in this project to retry."
+                        ? say(
+                              `requeued ${n} failed file(s) — the retry worker picks them up within ~60 s.`
+                          )
+                        : say("no failed files in this project to retry.")
                 );
                 await statusProvider.refresh();
             } catch (e) {
@@ -533,9 +1050,11 @@ export function activate(context: vscode.ExtensionContext): void {
             }
         }),
 
-        vscode.commands.registerCommand("mindex.retryFile", async (node: unknown) => {
-            const filePath = failedFilePath(node);
-            if (filePath === undefined) {
+        vscode.commands.registerCommand("mindex.retryFile", async (arg: unknown) => {
+            // A plain path now: the tree node that used to carry it is gone, and the
+            // Status panel posts the string it rendered.
+            const filePath = typeof arg === "string" ? arg : undefined;
+            if (filePath === undefined || filePath === "") {
                 return;
             }
             try {
@@ -545,8 +1064,8 @@ export function activate(context: vscode.ExtensionContext): void {
                 });
                 void vscode.window.showInformationMessage(
                     n > 0
-                        ? `mindex: requeued ${filePath}.`
-                        : `mindex: ${filePath} is not failed anymore.`
+                        ? say(`requeued ${filePath}.`)
+                        : say(`${filePath} is not failed anymore.`)
                 );
                 await statusProvider.refresh();
             } catch (e) {
@@ -561,15 +1080,22 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand("mindex.ask", () => askProvider.focus()),
 
         vscode.commands.registerCommand("mindex.search", async () => {
-            try {
-                const proj = await loadProject();
-                const topK = config().get<number>("topK", 10);
-                await runSearch(api, proj.mindex.guid, proj.root, topK);
-            } catch (e) {
-                if (!isCancellation(e)) {
-                    await reportError("Search failed", e);
+            // The same key the form's Submit takes: the palette and the form are
+            // two doors into one search, and a keybinding pressed while the form's
+            // search is in flight must not open a second quick pick.
+            await askKeys.run("submit", async () => {
+                try {
+                    const proj = await loadProject();
+                    // The palette entry point stays deliberately scope-free: it
+                    // prompts for a query and has no form to read a scope from.
+                    const topK = config().get<number>("topK", 10);
+                    await runSearch(api, proj.mindex.guid, proj.root, { topK });
+                } catch (e) {
+                    if (!isCancellation(e)) {
+                        await reportError("Search failed", e);
+                    }
                 }
-            }
+            });
         })
     );
 
@@ -610,25 +1136,89 @@ export function activate(context: vscode.ExtensionContext): void {
         })
     );
 
+    // The background health poll. Everything that already triggers a refresh still
+    // does; this only covers the idle window between them, which is precisely when a
+    // dependency dies unobserved and the Ask form goes on offering work against it.
+    const applyPollInterval = (): void =>
+        statusProvider.setPollInterval(config().get<number>("statusPollSeconds", 30));
+    applyPollInterval();
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration("mindex.statusPollSeconds")) {
+                applyPollInterval();
+            }
+        })
+    );
+
     // Initial, non-blocking load + status refresh so the views and the status bar
     // reflect reality as soon as the extension activates.
     void reloadProject().then(() => statusProvider.refresh());
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+    // Everything else is a `context.subscriptions` entry; the error log is not,
+    // because it is created lazily by the first failure and most sessions never
+    // have one.
+    disposeErrorLog();
+}
 
 function config(): vscode.WorkspaceConfiguration {
     return vscode.workspace.getConfiguration("mindex");
 }
 
+/**
+ * The extension's own page in VS Code's Settings editor.
+ *
+ * The `@ext:` filter is `publisher.name` from `package.json` — the *identifier*, so
+ * it stays lowercase while everything the user reads says MINDex. Everything the
+ * server needs to be reachable (`serverUrl`, `noVerify`, `caCert`, `apiKey`) lives
+ * there, and the panel that reports "unreachable" is exactly where a link to it
+ * belongs.
+ */
+function openSettings(): void {
+    void vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "@ext:mindex.mindex-vscode"
+    );
+}
+
+/**
+ * Build the client from the settings.
+ *
+ * The CA is read here, and a failure is a *warning* — never a throw. This runs at
+ * activation and again on every settings change, so a `caCert` naming a file that
+ * is not on this machine (a settings profile synced from another one is the way it
+ * happens) used to abort activation with a bare ENOENT: every command dead, and
+ * `noVerify` unable to help, since the read that failed came first. Skipping the
+ * unreadable CA leaves the connection to succeed by whatever other means is
+ * configured, and says out loud which path was ignored.
+ */
 function createApi(): MindexApi {
     const cfg = config();
     const caCert = cfg.get<string>("caCert", "").trim();
     const apiKey = cfg.get<string>("apiKey", "").trim();
+    const noVerify = cfg.get<boolean>("noVerify", false);
+    let ca: Buffer | undefined;
+    if (caCert !== "" && !noVerify) {
+        try {
+            ca = fsSync.readFileSync(caCert);
+        } catch (e) {
+            void vscode.window.showWarningMessage(
+                say(
+                    `cannot read the CA certificate at ${caCert} — ignoring it. ` +
+                        `${e instanceof Error ? e.message : String(e)}. ` +
+                        "Clear mindex.caCert, point it at a file that exists on this " +
+                        "machine, or turn on mindex.noVerify."
+                )
+            );
+        }
+    }
     return new MindexApi({
         serverUrl: cfg.get<string>("serverUrl", "https://127.0.0.1:11111"),
-        noVerify: cfg.get<boolean>("noVerify", false),
-        caCertPath: caCert === "" ? undefined : caCert,
+        noVerify,
+        ca,
         apiKey: apiKey === "" ? undefined : apiKey,
+        timeoutMs: cfg.get<number>("requestTimeoutSeconds", 15) * 1000,
+        streamIdleMs: cfg.get<number>("streamIdleTimeoutSeconds", 180) * 1000,
     });
 }

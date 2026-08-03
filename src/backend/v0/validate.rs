@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use crate::backend::error::ApiError;
-use crate::backend::v0::models::{Code, DriftRequest, IndexRequest, SearchFilter};
+use crate::backend::v0::models::{
+    Code, DriftRequest, HistoryPruneQuery, HistoryRequest, IndexRequest, SearchFilter,
+};
 
 /// Mirror of the `project_files.path` CHECK plus a `..`-traversal guard: non-empty,
 /// repo-relative (no leading `/`), no empty component (`//`), no backslash, no `..`.
@@ -63,19 +65,32 @@ pub fn validate_query(query: &str, max_bytes: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Ceilings for a research `budget` override (`[research].max_request_*`).
+/// Ceilings for a research `budget` override (`[research].max_request_*` +
+/// `[research].max_evidence_width`).
 pub struct ResearchBudgetCaps {
     pub max_seconds: u64,
     pub max_tokens: u64,
     pub max_steps: usize,
+    pub max_report_sections: usize,
+    pub max_report_words: usize,
+    pub max_evidence_width: u64,
 }
 
-/// A research `budget` override: every present axis must be within `1..=cap`.
+/// A research `budget` override: every present axis must be within its range.
 ///
-/// Zero is rejected rather than clamped — `max_steps = 0` would let the model report
-/// on no evidence at all, and `max_seconds = 0` would end the run before its first
-/// turn. Both are far more likely to be a client bug than an intent, and a budget
-/// silently rounded up to 1 is worse than a 400 that says so.
+/// The spend axes (`max_seconds`/`max_tokens`/`max_steps`) and `evidence_width`
+/// are `1..=cap`: zero is rejected rather than clamped — `max_steps = 0` would
+/// let the model report on no evidence at all, and `max_seconds = 0` would end
+/// the run before its first turn. Both are far more likely to be a client bug
+/// than an intent, and a budget silently rounded up to 1 is worse than a 400
+/// that says so.
+///
+/// The shape axes carry floors instead, mirroring the config validation on
+/// their presets: `max_report_sections` is `MIN_REPORT_SECTIONS..=cap` (below
+/// the sectioning threshold the grant names a shape the mechanism cannot
+/// produce), while `max_report_words` and `checkpoint_every_steps` admit `0`
+/// as the sanctioned "off" spelling and reject the small non-zero values that
+/// only look like tight settings.
 pub fn research_budget(
     budget: &Option<crate::backend::v0::models::ResearchBudgetOverride>,
     caps: &ResearchBudgetCaps,
@@ -89,6 +104,11 @@ pub fn research_budget(
             b.max_steps.map(|v| v as u64),
             Some(caps.max_steps as u64),
         ),
+        (
+            "evidence_width",
+            b.evidence_width,
+            Some(caps.max_evidence_width),
+        ),
     ] {
         let (Some(got), Some(max)) = (got, max) else {
             continue;
@@ -96,6 +116,106 @@ pub fn research_budget(
         if got < 1 || got > max {
             return Err(ApiError::ResearchBudgetOutOfRange { field, got, max });
         }
+    }
+    for (field, got, min, max, zero_ok) in [
+        (
+            "max_report_sections",
+            b.max_report_sections,
+            crate::config::MIN_REPORT_SECTIONS as u64,
+            caps.max_report_sections as u64,
+            false,
+        ),
+        (
+            "max_report_words",
+            b.max_report_words,
+            crate::config::MIN_REPORT_WORDS as u64,
+            caps.max_report_words as u64,
+            true,
+        ),
+        (
+            "checkpoint_every_steps",
+            b.checkpoint_every_steps,
+            crate::config::MIN_RESEARCH_CHECKPOINT_EVERY_STEPS as u64,
+            caps.max_steps as u64,
+            true,
+        ),
+    ] {
+        let Some(got) = got.map(|v| v as u64) else {
+            continue;
+        };
+        if zero_ok && got == 0 {
+            continue;
+        }
+        if got < min || got > max {
+            return Err(ApiError::ResearchShapeOutOfRange {
+                field,
+                got,
+                min,
+                max,
+                zero_ok,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `context_run_ids` count, against `[research].max_context_runs`.
+///
+/// Count only — whether the ids exist and belong to this project needs the database
+/// and so happens in the handler.
+///
+/// Repeats are dropped rather than rejected, and the **de-duplicated** list is what
+/// the run is given and what it journals, so nothing downstream can disagree about
+/// what the run was shown. Injecting one report twice would cost its characters twice
+/// against `max_context_chars` for no information, and a 400 would fail a request
+/// whose intent is unambiguous. The cap is applied to what actually gets used.
+///
+/// A cap of `0` switches the feature off, so any id is then a rejection — which is
+/// why the empty case returns early rather than comparing against the cap.
+pub fn research_context(ids: &mut Vec<String>, max: usize) -> Result<(), ApiError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    ids.retain(|id| seen.insert(id.clone()));
+    if ids.len() > max {
+        return Err(ApiError::ResearchContextTooMany {
+            got: ids.len(),
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// The `limit` on the stored-research list, against `[research].list_page_limit`.
+/// Absent = the server's own page size, so only an explicit value is checked.
+pub fn research_list_limit(limit: Option<usize>, max: usize) -> Result<(), ApiError> {
+    let Some(got) = limit else { return Ok(()) };
+    if got < 1 || got > max {
+        return Err(ApiError::ResearchListLimitOutOfRange { got, max });
+    }
+    Ok(())
+}
+
+/// A batch research delete: a non-empty id list within `[limits].max_research_delete_ids`.
+///
+/// The empty case is the `require_nonempty_selector` rule for a resource whose
+/// selector is a list — clearing a project's whole corpus must be *asked* for by
+/// naming the ids, never reached by posting `{}`. Duplicates are dropped rather
+/// than rejected (the ids become one `IN (…)` set, where a repeat means nothing),
+/// and the cap is applied to what is left, so a caller cannot exceed it with
+/// repetition alone.
+pub fn research_delete_ids(ids: &mut Vec<String>, max: usize) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    ids.retain(|id| seen.insert(id.clone()));
+    if ids.is_empty() {
+        return Err(ApiError::SelectorEmpty { field: "ids" });
+    }
+    if ids.len() > max {
+        return Err(ApiError::ResearchDeleteTooMany {
+            got: ids.len(),
+            max,
+        });
     }
     Ok(())
 }
@@ -165,7 +285,9 @@ pub fn require_nonempty_selector(
     if nonempty(include) || nonempty(exclude) {
         Ok(())
     } else {
-        Err(ApiError::SelectorEmpty)
+        Err(ApiError::SelectorEmpty {
+            field: "include/exclude",
+        })
     }
 }
 
@@ -213,10 +335,98 @@ pub fn validate_drift_request(req: &DriftRequest, max_files: usize) -> Result<()
     Ok(())
 }
 
+/// A commit sha must be 40 (SHA-1) or 64 (SHA-256) hexadecimal characters.
+/// Mirrors the schema's length CHECK and adds the alphabet, which SQLite does
+/// not check — the same split as `validate_sha256_hex`.
+pub fn validate_git_sha(sha: &str) -> Result<(), ApiError> {
+    if matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ApiError::CommitInvalid {
+            sha: sha.to_string(),
+            reason: "a sha must be 40 or 64 hexadecimal characters",
+        })
+    }
+}
+
+/// Validate a `/history` body: commit-count cap, then per commit its sha, its
+/// message size, and every path it names.
+///
+/// The `old_path` rule is a biconditional rather than a "required for renames"
+/// check: a rename with no source is unusable (the lookup that follows the move
+/// is exactly what the column exists for), and a modification carrying one is a
+/// client that mis-parsed git's raw output — the arity trap in `--raw -z`, where
+/// a rename emits two paths and everything else emits one. Silently accepting
+/// the second would store a whole desynchronised stream.
+pub fn validate_history_request(
+    req: &HistoryRequest,
+    max_commits: usize,
+    max_message_bytes: usize,
+) -> Result<(), ApiError> {
+    if req.commits.len() > max_commits {
+        return Err(ApiError::TooManyCommits {
+            got: req.commits.len(),
+            max: max_commits,
+        });
+    }
+    for c in &req.commits {
+        validate_git_sha(&c.sha)?;
+        if c.subject.trim().is_empty() {
+            return Err(ApiError::CommitInvalid {
+                sha: c.sha.clone(),
+                reason: "the subject must not be empty",
+            });
+        }
+        let message_bytes = c.subject.len() + c.body.len();
+        if message_bytes > max_message_bytes {
+            return Err(ApiError::CommitMessageTooLarge {
+                sha: c.sha.clone(),
+                got: message_bytes,
+                max: max_message_bytes,
+            });
+        }
+        for p in &c.paths {
+            validate_path(&p.path)?;
+            match (&p.old_path, p.change_type.requires_old_path()) {
+                (Some(old), true) => validate_path(old)?,
+                (None, false) => {}
+                (None, true) => {
+                    return Err(ApiError::CommitInvalid {
+                        sha: c.sha.clone(),
+                        reason: "a renamed or copied path must carry its old_path",
+                    });
+                }
+                (Some(_), false) => {
+                    return Err(ApiError::CommitInvalid {
+                        sha: c.sha.clone(),
+                        reason: "old_path is only meaningful for a rename or a copy",
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `DELETE /v0/{guid}/history` — refuse a prune that names no bound.
+///
+/// The `require_nonempty_selector` rule, for a resource whose bounds are scalars
+/// rather than globs: a request that forgot its parameters and a request that
+/// means "drop everything" must not be the same request. `?keep_last=0` is the
+/// explicit spelling of the second.
+pub fn validate_history_prune(q: &HistoryPruneQuery) -> Result<(), ApiError> {
+    if q.keep_last.is_none() && q.older_than.is_none() {
+        return Err(ApiError::HistoryBoundMissing);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::v0::models::{GlobPattern, ProgrammingLanguage};
+    use crate::backend::v0::models::{
+        ChangeType, CommitEntry, CommitPath, GlobPattern, ProgrammingLanguage,
+    };
     use glob::Pattern;
 
     fn err_code(e: ApiError) -> &'static str {
@@ -256,6 +466,9 @@ mod tests {
             max_seconds: 1800,
             max_tokens: 4_000_000,
             max_steps: 200,
+            max_report_sections: 12,
+            max_report_words: 4000,
+            max_evidence_width: 3,
         };
         assert!(research_budget(&None, &caps).is_ok());
         // A partial override is normal: absent axes keep the effort preset.
@@ -286,6 +499,14 @@ mod tests {
                 max_steps: Some(201),
                 ..Default::default()
             },
+            ResearchBudgetOverride {
+                evidence_width: Some(0),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                evidence_width: Some(4),
+                ..Default::default()
+            },
         ] {
             assert_eq!(
                 err_code(research_budget(&Some(bad), &caps).unwrap_err()),
@@ -312,6 +533,134 @@ mod tests {
         assert!(
             problem.detail.contains("[research].max_request_steps"),
             "the fix-it hint must name a key that exists: {}",
+            problem.detail
+        );
+    }
+
+    #[test]
+    fn research_shape_bounds() {
+        use crate::backend::v0::models::ResearchBudgetOverride;
+        let caps = ResearchBudgetCaps {
+            max_seconds: 1800,
+            max_tokens: 4_000_000,
+            max_steps: 200,
+            max_report_sections: 12,
+            max_report_words: 4000,
+            max_evidence_width: 3,
+        };
+        // The whole legal surface: floors, ceilings, and 0 where 0 means "off".
+        for ok in [
+            ResearchBudgetOverride {
+                max_report_sections: Some(3),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_sections: Some(12),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_words: Some(0),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_words: Some(150),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                max_report_words: Some(4000),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                checkpoint_every_steps: Some(0),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                checkpoint_every_steps: Some(2),
+                ..Default::default()
+            },
+            ResearchBudgetOverride {
+                checkpoint_every_steps: Some(200),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                research_budget(&Some(ok), &caps).is_ok(),
+                "{ok:?} is within range and must pass"
+            );
+        }
+        for (bad, field) in [
+            (
+                ResearchBudgetOverride {
+                    max_report_sections: Some(0),
+                    ..Default::default()
+                },
+                "max_report_sections",
+            ),
+            (
+                ResearchBudgetOverride {
+                    max_report_sections: Some(2),
+                    ..Default::default()
+                },
+                "max_report_sections",
+            ),
+            (
+                ResearchBudgetOverride {
+                    max_report_sections: Some(13),
+                    ..Default::default()
+                },
+                "max_report_sections",
+            ),
+            // The trap the floor exists for: a small non-zero word count is a
+            // stub instruction, not a tight setting. 0 is the off switch.
+            (
+                ResearchBudgetOverride {
+                    max_report_words: Some(149),
+                    ..Default::default()
+                },
+                "max_report_words",
+            ),
+            (
+                ResearchBudgetOverride {
+                    max_report_words: Some(4001),
+                    ..Default::default()
+                },
+                "max_report_words",
+            ),
+            (
+                ResearchBudgetOverride {
+                    checkpoint_every_steps: Some(1),
+                    ..Default::default()
+                },
+                "checkpoint_every_steps",
+            ),
+            (
+                ResearchBudgetOverride {
+                    checkpoint_every_steps: Some(201),
+                    ..Default::default()
+                },
+                "checkpoint_every_steps",
+            ),
+        ] {
+            let e = research_budget(&Some(bad), &caps).unwrap_err();
+            assert!(
+                matches!(&e, ApiError::ResearchShapeOutOfRange { field: f, .. } if *f == field),
+                "{bad:?} must name {field}, got {e:?}"
+            );
+            assert_eq!(err_code(e), "validation.research_shape_out_of_range");
+        }
+        // The zero-accepting detail names the off switch; the sections one must not.
+        let words = research_budget(
+            &Some(ResearchBudgetOverride {
+                max_report_words: Some(10),
+                ..Default::default()
+            }),
+            &caps,
+        )
+        .unwrap_err();
+        let problem = crate::backend::error::ProblemDetails::from(&words);
+        assert!(
+            problem.detail.contains("0"),
+            "a zero-accepting axis must offer the off switch: {}",
             problem.detail
         );
     }
@@ -393,6 +742,30 @@ mod tests {
         assert!(require_nonempty_selector(&Some(lang), &None).is_ok());
     }
 
+    /// The batch delete's selector is a list, so it needs the `selector.empty`
+    /// rule in its own shape: `{"ids": []}` must be a refusal, not a whole-corpus
+    /// wipe. Duplicates collapse first, so repetition cannot be used to clear the
+    /// cap either — and a list that is *only* duplicates of one id is one delete,
+    /// not an empty request.
+    #[test]
+    fn a_batch_delete_needs_ids_and_stays_within_the_cap() {
+        let mut none: Vec<String> = Vec::new();
+        assert_eq!(
+            err_code(research_delete_ids(&mut none, 10).unwrap_err()),
+            "selector.empty"
+        );
+
+        let mut dupes = vec!["a".to_string(), "a".to_string(), "a".to_string()];
+        assert!(research_delete_ids(&mut dupes, 2).is_ok());
+        assert_eq!(dupes, vec!["a".to_string()], "duplicates collapse");
+
+        let mut many = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            err_code(research_delete_ids(&mut many, 2).unwrap_err()),
+            "validation.research_delete_too_many"
+        );
+    }
+
     #[test]
     fn index_request_caps() {
         let mut files = HashMap::new();
@@ -418,6 +791,252 @@ mod tests {
         assert_eq!(
             err_code(validate_index_request(&req, 10, 5).unwrap_err()),
             "validation.code_too_large"
+        );
+    }
+
+    fn commit(paths: Vec<CommitPath>) -> CommitEntry {
+        CommitEntry {
+            sha: "a".repeat(40),
+            author_name: "T".into(),
+            author_email: "t@example.com".into(),
+            authored_at: 1,
+            committed_at: 1,
+            parent_count: 1,
+            subject: "subject".into(),
+            body: "body".into(),
+            paths,
+        }
+    }
+
+    fn touch(path: &str, change_type: ChangeType, old_path: Option<&str>) -> CommitPath {
+        CommitPath {
+            path: path.to_string(),
+            change_type,
+            old_path: old_path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn git_sha_must_be_40_or_64_hex() {
+        assert!(validate_git_sha(&"a".repeat(40)).is_ok());
+        assert!(validate_git_sha(&"F".repeat(64)).is_ok());
+        for bad in [
+            "a".repeat(39),
+            "a".repeat(41),
+            "a".repeat(63),
+            "g".repeat(40),
+            String::new(),
+        ] {
+            assert_eq!(
+                err_code(validate_git_sha(&bad).unwrap_err()),
+                "validation.commit_invalid",
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn history_request_caps() {
+        let req = HistoryRequest {
+            since: None,
+            commits: vec![commit(vec![touch("src/a.rs", ChangeType::Modified, None)])],
+        };
+        assert!(validate_history_request(&req, 10, 100).is_ok());
+        assert_eq!(
+            err_code(validate_history_request(&req, 0, 100).unwrap_err()),
+            "validation.too_many_commits"
+        );
+        assert_eq!(
+            err_code(validate_history_request(&req, 10, 3).unwrap_err()),
+            "validation.commit_message_too_large"
+        );
+    }
+
+    /// A prune with no bound is refused, and `keep_last=0` is how "everything"
+    /// is spelled — the two must not be the same request, which is exactly the
+    /// argument `require_nonempty_selector` makes for the file endpoints.
+    #[test]
+    fn a_history_prune_must_name_at_least_one_bound() {
+        assert_eq!(
+            err_code(validate_history_prune(&HistoryPruneQuery::default()).unwrap_err()),
+            "validation.history_bound_missing"
+        );
+        assert!(
+            validate_history_prune(&HistoryPruneQuery {
+                keep_last: Some(0),
+                older_than: None,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_history_prune(&HistoryPruneQuery {
+                keep_last: None,
+                older_than: Some(0),
+            })
+            .is_ok()
+        );
+    }
+
+    /// The `old_path` biconditional. The `Some`-on-a-modification half is the one
+    /// worth pinning: it is how a client that mis-parsed git's `--raw -z` arity
+    /// (a rename emits two paths, everything else emits one) is caught at the
+    /// edge rather than storing a whole desynchronised stream.
+    #[test]
+    fn old_path_is_required_exactly_for_renames_and_copies() {
+        let cases = [
+            (touch("b.rs", ChangeType::Renamed, Some("a.rs")), true),
+            (touch("b.rs", ChangeType::Copied, Some("a.rs")), true),
+            (touch("a.rs", ChangeType::Modified, None), true),
+            (touch("b.rs", ChangeType::Renamed, None), false),
+            (touch("a.rs", ChangeType::Modified, Some("z.rs")), false),
+            (touch("a.rs", ChangeType::Added, Some("z.rs")), false),
+        ];
+        for (path, ok) in cases {
+            let label = format!("{:?} old_path={:?}", path.change_type, path.old_path);
+            let req = HistoryRequest {
+                since: None,
+                commits: vec![commit(vec![path])],
+            };
+            let got = validate_history_request(&req, 10, 1000);
+            if ok {
+                assert!(got.is_ok(), "{label} should be accepted");
+            } else {
+                assert_eq!(
+                    err_code(got.unwrap_err()),
+                    "validation.commit_invalid",
+                    "{label} should be rejected"
+                );
+            }
+        }
+    }
+
+    /// `context_run_ids` dedups **before** the cap, like the batch delete beside it:
+    /// the ids become one lookup set where a repeat means nothing, so rejecting a
+    /// request that names three runs eleven times each would refuse work the server
+    /// is perfectly able to do, over a cap the request does not actually exceed.
+    #[test]
+    fn research_context_dedups_before_it_counts() {
+        let mut ids = vec!["a".to_string(); 20];
+        assert!(research_context(&mut ids, 3).is_ok());
+        assert_eq!(ids, vec!["a".to_string()], "the list was not deduplicated");
+
+        // Order is preserved — the ids are injected as prior reports, and the caller's
+        // ordering is the only thing that says which context comes first.
+        let mut ids = vec![
+            "c".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+        ];
+        assert!(research_context(&mut ids, 3).is_ok());
+        assert_eq!(ids, vec!["c".to_string(), "a".to_string(), "b".to_string()]);
+
+        // Genuinely over the cap after deduplication.
+        let mut ids: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+        assert_eq!(
+            err_code(research_context(&mut ids, 3).unwrap_err()),
+            "validation.research_context_too_many"
+        );
+
+        // Empty is the ordinary case — a run with no ancestry — not a refusal. This
+        // is the one place it differs from the batch delete, where an empty list is
+        // a whole corpus reached by omission.
+        let mut ids: Vec<String> = vec![];
+        assert!(research_context(&mut ids, 0).is_ok());
+    }
+
+    /// `max_context_runs = 0` switches the feature off, and it must actually refuse
+    /// rather than silently ignoring what the request named.
+    #[test]
+    fn context_is_refused_outright_when_the_feature_is_off() {
+        let mut ids = vec!["a".to_string()];
+        assert_eq!(
+            err_code(research_context(&mut ids, 0).unwrap_err()),
+            "validation.research_context_too_many"
+        );
+    }
+
+    /// The page limit is what a client sizes a paging loop by, and the loop's
+    /// termination rests on "a short page means no more". An accepted `0` would
+    /// return an empty page for ever.
+    #[test]
+    fn a_research_list_limit_must_be_a_usable_page_size() {
+        assert!(
+            research_list_limit(None, 100).is_ok(),
+            "absent = the default"
+        );
+        assert!(research_list_limit(Some(1), 100).is_ok());
+        assert!(
+            research_list_limit(Some(100), 100).is_ok(),
+            "the cap itself"
+        );
+
+        for got in [0, 101] {
+            assert_eq!(
+                err_code(research_list_limit(Some(got), 100).unwrap_err()),
+                "validation.research_list_limit_out_of_range",
+                "limit {got} was accepted"
+            );
+        }
+    }
+
+    /// `/drift` is read-only, but it is the widest request the server takes — the
+    /// whole tree's manifest — so its per-entry validation is what stops a bad path
+    /// or a bad hash reaching the SQL. It must reject on the *entry*, naming it,
+    /// rather than failing the batch anonymously.
+    #[test]
+    fn drift_validates_every_entry_and_respects_its_cap() {
+        let ok = DriftRequest {
+            files: std::collections::HashMap::from([
+                ("src/a.rs".to_string(), "a".repeat(64)),
+                ("src/b.rs".to_string(), "b".repeat(64)),
+            ]),
+        };
+        assert!(validate_drift_request(&ok, 10).is_ok());
+        assert_eq!(
+            err_code(validate_drift_request(&ok, 1).unwrap_err()),
+            "validation.too_many_files"
+        );
+
+        // A traversal in the manifest.
+        let bad_path = DriftRequest {
+            files: std::collections::HashMap::from([("../etc/passwd".to_string(), "a".repeat(64))]),
+        };
+        assert_eq!(
+            err_code(validate_drift_request(&bad_path, 10).unwrap_err()),
+            "validation.path_invalid"
+        );
+
+        // A hash that is the right length but not hex — the case SQLite's own CHECK
+        // does not cover.
+        let bad_sha = DriftRequest {
+            files: std::collections::HashMap::from([("src/a.rs".to_string(), "z".repeat(64))]),
+        };
+        assert_eq!(
+            err_code(validate_drift_request(&bad_sha, 10).unwrap_err()),
+            "validation.sha256_invalid"
+        );
+
+        // An empty manifest is legitimate: every indexed file is `orphaned`, which
+        // is a real answer about an emptied working tree, not a malformed request.
+        let empty = DriftRequest {
+            files: std::collections::HashMap::new(),
+        };
+        assert!(validate_drift_request(&empty, 10).is_ok());
+    }
+
+    #[test]
+    fn history_request_rejects_an_empty_subject() {
+        let mut c = commit(vec![]);
+        c.subject = "   ".into();
+        let req = HistoryRequest {
+            since: None,
+            commits: vec![c],
+        };
+        assert_eq!(
+            err_code(validate_history_request(&req, 10, 1000).unwrap_err()),
+            "validation.commit_invalid"
         );
     }
 }

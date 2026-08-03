@@ -19,6 +19,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::Deserialize;
@@ -43,6 +44,31 @@ const DEFAULT_UPSERT_BATCH_POINTS: usize = 256;
 const DEFAULT_DENSE_PREFETCH_LIMIT: u32 = 200;
 const DEFAULT_SPARSE_PREFETCH_LIMIT: u32 = 200;
 const DEFAULT_FUSION_LIMIT: u32 = 200;
+/// HNSW `ef` for the **dense** prefetch — how wide Qdrant's graph search keeps its
+/// candidate beam.
+///
+/// A genuine tuning knob (recall against latency), unlike the collection's own HNSW
+/// settings, which are structural consts beside the code that writes them: `ef` is a
+/// *query* parameter and changing it needs no reindex.
+///
+/// 256 rather than the client's implicit default of 128, because the beam must not be
+/// narrower than the pool the query asks for: `dense_prefetch_limit` is 200, and an
+/// `ef` under that returns fewer good candidates than were requested with no error.
+///
+/// Honest caveat: on a collection under `optimizers_config.indexing_threshold`
+/// (10 000 points by Qdrant's default) no HNSW index exists yet, the prefetch is an
+/// exact scan and this value changes nothing. It is set now so that a project growing
+/// past that threshold does not walk off a silent recall cliff on the day it does.
+const DEFAULT_SEARCH_HNSW_EF: u64 = 256;
+/// Whole-request ceiling for one Qdrant call. The client's own default is **5 s**,
+/// which nothing in this repo set or could override: a project whose candidate set is
+/// large enough that fusion + ColBERT rerank exceeds it failed *every* search with
+/// `qdrant.unavailable` 503, untunably. 30 s is generous for a query and still short
+/// enough to fail a wedged connection rather than hold a request open.
+const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 30_000;
+/// Establishing the connection, as opposed to answering. Separate because a Qdrant
+/// that is down should be reported in seconds, whatever the request ceiling above is.
+const DEFAULT_QDRANT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 
 const DEFAULT_DB_PATH: &str = "mindex.db";
 const DEFAULT_DB_POOL_SIZE: usize = 4;
@@ -109,6 +135,9 @@ const DEFAULT_MAX_DRIFT_FILES: usize = 200_000;
 const DEFAULT_MAX_SELECTOR_PATTERNS: usize = 256;
 const DEFAULT_MAX_SYMBOL_NAME_BYTES: usize = 512;
 const DEFAULT_MAX_SYMBOL_RESULTS: usize = 50;
+const DEFAULT_MAX_HISTORY_COMMITS: usize = 20_000;
+const DEFAULT_MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_RESEARCH_DELETE_IDS: usize = 500;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_RESEARCH_WORKER_THREADS: usize = 2;
@@ -126,11 +155,62 @@ const DEFAULT_RESEARCH_MAX_NUM_CTX: u64 = 131072;
 const DEFAULT_RESEARCH_MAX_REQUEST_SECONDS: u64 = 3600;
 const DEFAULT_RESEARCH_MAX_REQUEST_TOKENS: u64 = 8_000_000;
 const DEFAULT_RESEARCH_MAX_REQUEST_STEPS: usize = 200;
+/// Ceiling on a request's `budget.max_report_sections` override. Twelve is
+/// deliberately conservative: sections are report turns, each retried up to
+/// once, all inside `[research].report_timeout_ms` — a caller asking for the
+/// ceiling should expect stubs, not a wider window.
+const DEFAULT_RESEARCH_MAX_REQUEST_REPORT_SECTIONS: usize = 12;
+/// Ceiling on a request's `budget.max_report_words` override. Validated at
+/// startup against `max_num_ctx_tokens` exactly like the effort presets, which
+/// is what keeps the `num_predict` arming safe for any value a request may pass.
+const DEFAULT_RESEARCH_MAX_REQUEST_REPORT_WORDS: usize = 4000;
+/// Ceiling on a request's `budget.evidence_width` override. Three because the
+/// widened rows are resent on every later turn: width is paid in prompt tokens
+/// each turn, not once, so a small integer is the whole useful range.
+const DEFAULT_RESEARCH_MAX_EVIDENCE_WIDTH: u64 = 3;
+/// Report sections one run may write, at every effort level. Six matches what
+/// `PLAN_REQUEST` historically asked for ("3-6 sub-questions"); the plan turn's
+/// prompt is templated from the resolved value, so raising this genuinely asks
+/// the model for a longer plan rather than silently truncating one.
+const DEFAULT_RESEARCH_MAX_REPORT_SECTIONS: usize = 6;
+/// Multiplier on the per-call evidence widths (`read_chunks`, `grep`,
+/// `file_history`, `symbols`), at every effort level. One — the historical
+/// widths — because width compounds into the token budget (every widened result
+/// is resent on every later turn); this exists for a caller who knows the
+/// question needs breadth, not as a default to raise.
+const DEFAULT_RESEARCH_EVIDENCE_WIDTH: u64 = 1;
+/// Floor on `max_report_sections`, preset and request alike.
+///
+/// This is `MIN_SECTIONED_PLAN_ITEMS` (research.rs derives its const from this
+/// one): below three plan items the sectioned path does not engage at all, so a
+/// smaller grant would name a report shape the mechanism cannot produce — and
+/// the templated plan request "3-N" would be malformed. A caller wanting a
+/// short report has `max_report_words`.
+pub const MIN_REPORT_SECTIONS: usize = 3;
 /// Chunks per `search` tool call, at every effort level. Same at all three
 /// because widening it was measured *not* to be the fix: the runs that missed an
 /// answer were already getting five hits per search and losing on query
 /// formulation, not on evidence width. Kept as a knob so a harness can sweep it.
 const DEFAULT_RESEARCH_SEARCH_TOP_K: u64 = 5;
+/// Floor on a non-zero `[research.effort.*].max_report_words`.
+///
+/// Below this the instruction stops shaping a report and starts forbidding one:
+/// the model writes a stub, the run's whole cost is spent, and the caller gets
+/// less than the plan it already had. `0` — announce no length at all — is the
+/// supported way to disable the ceiling; a tiny number is a mistake.
+pub const MIN_REPORT_WORDS: usize = 150;
+/// Tokens reserved per granted report word when arming `num_predict` on the
+/// report turn.
+///
+/// Deliberately ~3× the honest prose ratio (~1.3-1.5 tokens/word, higher inside
+/// code fences). `num_predict` is a **runaway** backstop, not the ceiling — the
+/// ceiling is the word count in the prompt. Sizing it tight would make a report
+/// that merely overshoots get cut mid-fence, which fails
+/// `validate_report_markdown` and buys a full-volume rewrite of the document
+/// that just failed: a long run turned into a lost one. So it must be
+/// unreachable by anything but a genuine runaway, and `research_report_length_caps`
+/// firing at all means this number (or the model) is wrong.
+pub const REPORT_WORDS_TO_TOKENS: u64 = 4;
 /// Per-turn transport ceiling, set **above every research budget on purpose** so it
 /// can never fire first.
 ///
@@ -152,16 +232,72 @@ const DEFAULT_RESEARCH_SEARCH_TOP_K: u64 = 5;
 /// connection that has died in a way neither notices. `validate` enforces that it
 /// exceeds `max_request_seconds`, so a config cannot recreate the inversion.
 const DEFAULT_RESEARCH_TURN_TIMEOUT_MS: u64 = 3_900_000;
+/// How long a turn may produce **nothing at all** — not one thinking or content
+/// token — before it is abandoned.
+///
+/// The gap [`DEFAULT_RESEARCH_TURN_TIMEOUT_MS`] deliberately leaves open. That one is
+/// a dead-*socket* guard and must sit above every budget; a socket that is alive and
+/// simply silent falls to nothing but `max_seconds`, which means an Ollama that never
+/// starts answering spends the entire run and the client watches an empty stream for
+/// as long as the budget allows. Measured here 2026-08-01: one run burned 300 s of a
+/// 300 s budget at `steps: 0, turns: 0, prompt_tokens: 0` — Ollama was thrashing
+/// between two context sizes (`Load failed … timed out waiting for llama-server to
+/// start`) and mindex said nothing, because from its side the request had simply not
+/// answered yet.
+///
+/// Two minutes, because the thing it must not preempt is a legitimately slow *first*
+/// token: prompt evaluation of a long transcript on a loaded GPU is minutes of silence
+/// by nature, and this fires only when even that has not begun. It bounds the silent
+/// prefix of a turn, never the turn — once tokens flow, `turn_timeout_ms` is again the
+/// only ceiling. `0` disables it, for a host where a cold load of a huge model is
+/// normal and expected.
+const DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS: u64 = 120_000;
 /// How long the report phase gets *after* the investigation deadline. The whole
 /// point of a separate window is that a run which hits the wall still gets to
 /// synthesise what it found, so this cannot come out of the investigation's budget —
 /// which makes `max_seconds + report_timeout_ms` the true worst-case wait.
-const DEFAULT_RESEARCH_REPORT_TIMEOUT_MS: u64 = 120_000;
+///
+/// Raised 120 s → 300 s when the report stopped being one turn: it now covers up to
+/// `max_report_sections` generations plus a per-section repair pass. The window's
+/// *meaning* is unchanged — the tail a caller waits after the investigation — but
+/// what has to fit inside it is not. Anything reading the worst-case wait
+/// (scout's `RESEARCH_TOTAL_TIMEOUT`) moves with it.
+const DEFAULT_RESEARCH_REPORT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS: u64 = 2000;
+/// Steps between checkpoint turns. Six against `medium`'s 20 gives three chances to
+/// bank before the budget binds, at a cost of ~15% of the run's lookups — the number
+/// most in need of measurement in this file.
+const DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 6;
+/// Floor on a non-zero `checkpoint_every_steps`. At 1 the run writes as often as it
+/// looks, which is not an investigation. Shared with the request validator: the
+/// per-request override obeys the same floor and the same `0 = off` spelling.
+pub(crate) const MIN_RESEARCH_CHECKPOINT_EVERY_STEPS: usize = 2;
+/// Checkpoint turns one run may take, whatever the interval says. A backstop on a
+/// mis-set interval, not a tuning knob: eight banked drafts is already more than
+/// the default section grant (`max_report_sections`, 6) can use.
+pub const MAX_CHECKPOINTS: usize = 8;
 /// How often the local Ollama model registry is re-read for `GET /config`. Five
 /// minutes because the catalog changes only when a human runs `ollama pull`/`rm`,
 /// and one tick is a single GET bounded by [`DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS`].
 const DEFAULT_RESEARCH_MODELS_REFRESH_SECONDS: u64 = 300;
+/// Ninety days, against thirty for the status log: a stored report is the corpus a
+/// later run reads, not an audit trail, and a question worth asking once tends to be
+/// worth re-reading a season later. Pinning is the escape hatch for anything that
+/// should outlive it.
+const DEFAULT_RESEARCH_RETENTION_DAYS: u64 = 90;
+/// Three earlier reports. More is not obviously better: each is resent every turn, and
+/// the failure the feature addresses (not knowing the names) is usually cured by one.
+const DEFAULT_RESEARCH_MAX_CONTEXT_RUNS: usize = 3;
+/// ~6k tokens at four characters each — under a tenth of the smallest window the
+/// server asks Ollama for, so an injected block cannot on its own crowd out the
+/// investigation it is meant to accelerate.
+const DEFAULT_RESEARCH_MAX_CONTEXT_CHARS: usize = 24_000;
+/// A page of runs. Large enough that the common project never pages at all, small
+/// enough that a page is one screen and one cheap query.
+const DEFAULT_RESEARCH_LIST_PAGE_LIMIT: usize = 50;
+/// Below this a context block cannot hold one useful report, so a cap under it is a
+/// misconfiguration rather than a tight setting.
+const MIN_RESEARCH_MAX_CONTEXT_CHARS: usize = 1000;
 /// Thinking characters after which one turn is abandoned: twice
 /// [`MIN_RESEARCH_MAX_TURN_THINKING_CHARS`], which is the smallest value that is still
 /// clear of ordinary thinking.
@@ -186,6 +322,27 @@ const DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS: usize = 2 * MIN_RESEARCH_MAX_TUR
 /// characters, so anything in the low thousands is a guard on ordinary thinking.
 /// Use `0` to disable rather than a small number.
 const MIN_RESEARCH_MAX_TURN_THINKING_CHARS: usize = 4096;
+/// Ceiling on `slow_turn_tokens_per_second`. No local model on any hardware this
+/// service targets generates a thousand tokens a second, so a threshold at or above
+/// it fires on every turn — and a warning that always fires is one nobody reads.
+const MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND: f64 = 1000.0;
+/// Default floor for `slow_turn_tokens_per_second`. See the field: a diagnostic that
+/// stops nothing has no business shipping disabled, and 3 tok/s is an order of
+/// magnitude under any GPU-resident local model.
+const DEFAULT_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND: f64 = 3.0;
+/// Default for `slow_turn_unaccounted_ms`: a full minute of a turn spent outside the
+/// inference server's own clock. Chosen to be unmistakable rather than sensitive —
+/// HTTP, TLS and NDJSON parsing also land in `unaccounted_ms`, and they are
+/// milliseconds, so a minute cannot be them. The event this exists for measured 890
+/// seconds, an order of magnitude past this.
+const DEFAULT_RESEARCH_SLOW_TURN_UNACCOUNTED_MS: u64 = 60_000;
+/// Floor for a non-zero `slow_turn_unaccounted_ms`. Under a second the field is
+/// dominated by transport overhead, so the warning would fire on healthy turns and
+/// stop being read. `0` is how it is switched off.
+const MIN_RESEARCH_SLOW_TURN_UNACCOUNTED_MS: u64 = 1000;
+/// Default for `max_turn_seconds`: above `report_timeout_ms` and an order of
+/// magnitude above a healthy tool turn.
+const DEFAULT_RESEARCH_MAX_TURN_SECONDS: u64 = 300;
 /// Floor on `report_timeout_ms`: below this the report turn cannot finish and every
 /// truncated run would ship the server-written notice instead of a real report.
 const MIN_RESEARCH_REPORT_TIMEOUT_MS: u64 = 5000;
@@ -254,7 +411,8 @@ pub struct ModelConfig {
     pub max_429_retries: u32,
     /// First 429 backoff; doubles each retry.
     pub backoff_base_ms: u64,
-    /// Whole-request timeout for one `/encode` call, applied per attempt.
+    /// Ceiling on one `/encode` call, its 429 retries and their backoffs included —
+    /// not per attempt. See `BGEm3Tuning::encode_timeout_ms`.
     pub encode_timeout_ms: u64,
 }
 
@@ -266,6 +424,12 @@ pub struct QdrantConfig {
     pub dense_prefetch_limit: u32,
     pub sparse_prefetch_limit: u32,
     pub fusion_limit: u32,
+    /// HNSW `ef` for the dense prefetch stage.
+    pub search_hnsw_ef: u64,
+    /// Whole-request timeout for one Qdrant call.
+    pub timeout_ms: u64,
+    /// Connection-establishment timeout for one Qdrant call.
+    pub connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,6 +499,17 @@ pub struct LimitsConfig {
     pub max_symbol_name_bytes: usize,
     /// Upper bound a `/symbols` request may set for `limit` (per role).
     pub max_symbol_results: usize,
+    /// Maximum number of commits in one `/history` reconciliation request.
+    pub max_history_commits: usize,
+    /// Maximum size of one commit's `subject` + `body` in bytes. A commit
+    /// message is unbounded in git, so this is the `max_code_bytes` analogue for
+    /// the history channel.
+    pub max_commit_message_bytes: usize,
+    /// Maximum number of run ids in one `DELETE /projects/{guid}/research` body.
+    /// The ids become one `IN (…)` list, so this is what keeps a batch clear of
+    /// SQLite's bind-variable limit — the `max_history_commits` argument, at the
+    /// scale a research corpus actually reaches.
+    pub max_research_delete_ids: usize,
 }
 
 /// `/research` — the Ollama-driven iterative research endpoint. All TOML-only:
@@ -347,6 +522,16 @@ pub struct ResearchConfig {
     /// Model used when a request omits `model`. Empty = no default: a request
     /// without an explicit model is then rejected (400 `research.model_missing`).
     pub default_model: String,
+    /// Glob whitelist of models `/research` may run (e.g. `["gemma4:*"]`). Empty =
+    /// any model. Matched case-sensitively against the *resolved* model — request
+    /// `model` or `default_model`, tag included, so `"gemma4:*"` matches
+    /// `"gemma4:27b"` but not bare `"gemma4"`; list both, or use `"gemma4*"`. A
+    /// request naming anything outside the list is refused with 400
+    /// `research.model_not_allowed`, and `GET /config` publishes `research.models`
+    /// already filtered to the allowed set. A non-empty list must cover a
+    /// non-empty `default_model` (startup refuses otherwise — every defaulted
+    /// request would be a 400).
+    pub allowed_models: Vec<String>,
     /// Threads in the dedicated research runtime (research is rare — keep small).
     pub worker_threads: usize,
     /// Concurrent research jobs; beyond this a request gets 429 `research.busy`.
@@ -361,6 +546,17 @@ pub struct ResearchConfig {
     /// backstop against a wedged server, not the run's budget: `max_seconds` is the
     /// budget and it is enforced by cancelling the turn in flight.
     pub turn_timeout_ms: u64,
+    /// Abandon one turn if Ollama has not produced a single token within this many
+    /// milliseconds of the request going out. `0` disables the guard.
+    ///
+    /// The complement of the two guards around it: `turn_timeout_ms` catches a socket
+    /// that died, `max_turn_thinking_chars` catches a model that will not stop talking,
+    /// and this catches the case both are blind to — a live connection that says
+    /// nothing at all, which on this host means Ollama reloading a model it keeps
+    /// evicting. It bounds only the **silent prefix** of a turn: the moment any token
+    /// arrives, thinking or content, the guard is spent and `turn_timeout_ms` is again
+    /// the only ceiling.
+    pub first_token_timeout_ms: u64,
     /// Abandon one turn once its **thinking** channel has streamed this many
     /// characters. `0` disables the guard.
     ///
@@ -382,6 +578,79 @@ pub struct ResearchConfig {
     /// Characters rather than tokens because that is what a delta carries — and it is
     /// the more model-neutral unit of the two, since tokenizers differ.
     pub max_turn_thinking_chars: usize,
+    /// Below this generation rate — tokens per second of Ollama's own
+    /// `eval_duration` — a turn is logged as contention. `0` disables it.
+    ///
+    /// The third member of the per-turn guard family, and the only one that does not
+    /// *stop* anything: it names a diagnosis. A run inching along at a token a second
+    /// is the same symptom as a broken model, a bad prompt and a wedged server, and
+    /// on a host whose GPU is shared with whatever else the operator is running, the
+    /// answer is usually none of those — one measured run spent 985 s at ~1.5 tok/s
+    /// with nothing anywhere able to say why.
+    ///
+    /// **Ships ON, at a floor no healthy GPU deployment reaches.** It used to default
+    /// to `0` on the argument that a healthy rate is a fact about one model on one
+    /// host, which is true and was the wrong conclusion: this check *stops nothing*,
+    /// so a false positive costs one log line, while the default-off cost the
+    /// operator two multi-hour investigations of a symptom the code could already
+    /// name. A guard that ships disabled is not a guard.
+    ///
+    /// 3 tok/s is an order of magnitude under any GPU-resident local model (measured
+    /// here: 220 turns, none below 32) and under the pathologies it exists for (1.5
+    /// and 0.77). **CPU-only deployments of a large model legitimately run this
+    /// slowly** — that is the one case to set it to `0`, or to raise it once
+    /// `mindex_research_turn_tokens_per_second` shows the healthy population.
+    ///
+    /// **It answers only half the question**, which is why the knob below exists.
+    /// This rate is over Ollama's *own* generation clock, so a turn that was slow
+    /// because it waited scores perfectly well here — see
+    /// [`Self::slow_turn_unaccounted_ms`].
+    pub slow_turn_tokens_per_second: f64,
+    /// Warn when a turn spent more than this many milliseconds **outside Ollama's own
+    /// accounting**; `0` disables it.
+    ///
+    /// The other half of the contention question, and the half that catches the
+    /// failure the rate check above was written for and cannot see.
+    /// `unaccounted_ms` is wall clock minus Ollama's `total_duration`. Ollama times
+    /// itself inside its own handler, so a request queued behind another client on
+    /// the same GPU is *not* in that figure — during exactly the contention being
+    /// hunted, every number Ollama reports looks healthy and the waiting is invisible.
+    ///
+    /// Measured on this host, 2026-08-03: a plan turn took **912 seconds** of wall
+    /// clock to produce 702 tokens, and `mindex_research_turn_tokens_per_second` put
+    /// all 220 turns of the preceding week between 32 and 128 tok/s — none below 32.
+    /// The rate check would have returned early at any threshold. The 890 lost
+    /// seconds were in `unaccounted_ms`, which until now was reported nowhere: it
+    /// appeared only as a *field on the warning the rate check emits*, i.e. only once
+    /// the rate check had already fired, which is precisely when it is not needed.
+    ///
+    /// **Unlike the rate, this has a defensible default**, because it is not a fact
+    /// about a model or a host: unaccounted time is time nobody was computing for
+    /// this request. HTTP, TLS and NDJSON parsing live here too, so small values are
+    /// noise — but a full minute of a turn spent outside the inference server's own
+    /// clock means waiting on every host there is.
+    pub slow_turn_unaccounted_ms: u64,
+    /// Abandon one turn once it has streamed for this many seconds; `0` disables it.
+    ///
+    /// **The only one of the three that stops anything.** The two above name a
+    /// diagnosis and let the turn run; this ends it, as an empty `ChatOutcome` —
+    /// the runaway-thinking guard's mechanism, which every phase already recovers
+    /// from — so the run continues with the budget that is left instead of ending
+    /// with nothing.
+    ///
+    /// It closes a hole every other bound leaves open. `turn_timeout_ms` is a
+    /// dead-socket guard and is deliberately set *above* every budget;
+    /// `first_token_timeout_ms` is spent by the first delta and cannot see a turn that
+    /// starts fine and then dribbles; `max_turn_thinking_chars` counts characters, and
+    /// a stalled turn produces few. Measured twice on this host — 985 s at ~1.5 tok/s,
+    /// and 912 s producing 702 tokens — one plan turn consumed a whole run's wall
+    /// clock and the run finished with **zero steps**.
+    ///
+    /// 300 s is above `report_timeout_ms` (120 s, the longest legitimately long turn)
+    /// and an order of magnitude above a healthy tool turn (10-30 s measured here).
+    /// Startup refuses a value that would cut the report window short, or one at or
+    /// above `turn_timeout_ms`, where it could never fire.
+    pub max_turn_seconds: u64,
     /// How long the report phase gets after the investigation ends, in milliseconds.
     ///
     /// A window of its own rather than a slice of `max_seconds`, because a run
@@ -391,6 +660,24 @@ pub struct ResearchConfig {
     /// nothing does, the server writes an honest notice saying the run was cut short.
     /// So the longest a caller can wait is `max_seconds + report_timeout_ms`.
     pub report_timeout_ms: u64,
+    /// Investigate this many steps, then spend one turn banking what is answerable.
+    /// `0` switches checkpoints off.
+    ///
+    /// The insurance policy on a run that does not finish. A deadline,
+    /// `repeated_calls` or `unparseable` stop used to reach the report phase with
+    /// nothing banked, and the caller got a server-written stub after fifteen
+    /// minutes — the failure a real field report measured. A checkpoint turn writes
+    /// the sections that are already answerable into the run's state, so that same
+    /// stop ships findings instead.
+    ///
+    /// It **costs a step**, deliberately: charging it is what makes it visible in
+    /// the budget the operator set, and "price the refusal as a step" is what every
+    /// other turn-consuming addition here does. That is also its cost — at 6 against
+    /// `medium`'s 20 steps, roughly 15% of the run's lookups become writing turns,
+    /// which is a pure loss for a run that would have finished anyway. Measure
+    /// coverage with it on and off at the same seeds before trusting this default;
+    /// the honest possible answer is "0, except at `low`".
+    pub checkpoint_every_steps: usize,
     /// Liveness-ping timeout for the Ollama check in `GET /health`. Ollama is an
     /// optional dependency, so the ping is short and never fails the health verdict.
     pub health_timeout_ms: u64,
@@ -413,8 +700,31 @@ pub struct ResearchConfig {
     pub max_request_seconds: u64,
     /// Ceiling on a request's `budget.max_tokens` override — the GPU-work cap.
     pub max_request_tokens: u64,
-    /// Ceiling on a request's `budget.max_steps` override.
+    /// Ceiling on a request's `budget.max_steps` override. Also caps the
+    /// `budget.checkpoint_every_steps` override: an interval above the step
+    /// budget is equivalent to `0` (off), so a dedicated ceiling would guard
+    /// nothing.
     pub max_request_steps: usize,
+    /// Ceiling on a request's `budget.max_report_sections` override.
+    ///
+    /// Sections are report turns inside one fixed `report_timeout_ms` window,
+    /// so this bounds wall-clock spent writing, not report quality: past the
+    /// window's capacity extra sections ship as stubs. The floor is
+    /// [`MIN_REPORT_SECTIONS`] — below it the sectioned path does not engage.
+    pub max_request_report_sections: usize,
+    /// Ceiling on a request's `budget.max_report_words` override.
+    ///
+    /// Held to the same startup check as the effort presets (`words ×`
+    /// [`REPORT_WORDS_TO_TOKENS`] must stay under half of `max_num_ctx_tokens`),
+    /// which is what makes any request-supplied value safe to arm `num_predict`
+    /// with — there is no per-request window check.
+    pub max_request_report_words: usize,
+    /// Ceiling on a request's `budget.evidence_width` override.
+    ///
+    /// Width is paid in prompt tokens on **every** later turn (the transcript is
+    /// resent), so the useful range is a small integer; past it a request is
+    /// buying context exhaustion, not evidence.
+    pub max_evidence_width: u64,
     /// Sampling temperature for every research turn. Absent = **the model's own
     /// Modelfile default**, which is the honest production default but makes model
     /// comparison meaningless: those defaults differ per model (measured here:
@@ -428,6 +738,82 @@ pub struct ResearchConfig {
     /// question differ. A request's `seed` overrides this; that is the axis a
     /// measurement harness varies to get repetitions worth averaging.
     pub seed: Option<i64>,
+    /// How long a finished run is kept before `/gc` reaps it.
+    ///
+    /// Stamped onto the row as `expires_at` at insert, **not** compared against this
+    /// value at sweep time — so changing it affects future runs only, and a run's
+    /// deadline is a property of the run rather than of the config it outlived. A
+    /// **pinned** run has `expires_at IS NULL` and is never reaped, which is how a
+    /// report worth keeping outlives any retention an operator picks.
+    ///
+    /// Not the `[workers].status_log_retention_days` case despite the shape: that is
+    /// an audit log nobody reads twice, this is the corpus a later run is given as
+    /// context. Hence the far longer default.
+    pub retention_days: u64,
+    /// How many earlier runs a request may name in `context_run_ids`.
+    ///
+    /// A cap on hearsay. Each injected report is prompt tokens on *every* turn (the
+    /// whole transcript is resent), so this multiplies against `max_tokens` and
+    /// `context_fraction` rather than being paid once. `0` disables the feature and
+    /// makes any `context_run_ids` a 400.
+    pub max_context_runs: usize,
+    /// Total characters of prior reports injected into one run, across all of them.
+    ///
+    /// The last report included is truncated to fit, with a visible marker — a
+    /// silently clipped report would let the model reason from half a conclusion,
+    /// which is the `note`-cap argument. ~4 chars per token, so the default is of
+    /// order 6k tokens: under a tenth of the smallest window the server asks for.
+    pub max_context_chars: usize,
+    /// Ceiling on `limit` for `GET /projects/{guid}/research`.
+    ///
+    /// A request-shape limit, so TOML-only like `[limits]` — tuning it in a container
+    /// means mounting a `config.toml`.
+    pub list_page_limit: usize,
+}
+
+/// The compiled form of `[research].allowed_models`: the glob patterns, parsed
+/// once at startup and shared by `Arc` so cloning `RouterState` per request stays
+/// free. Empty = unrestricted — the compiled default, so an absent key changes
+/// nothing.
+#[derive(Debug, Clone, Default)]
+pub struct AllowedModels(Arc<[glob::Pattern]>);
+
+impl AllowedModels {
+    /// Compile every pattern, collecting one message per invalid glob (the
+    /// config-validation contract: all problems at once, never fail-fast).
+    pub fn compile(patterns: &[String]) -> Result<Self, Vec<String>> {
+        let mut errors = Vec::new();
+        let mut compiled = Vec::with_capacity(patterns.len());
+        for (i, pat) in patterns.iter().enumerate() {
+            match glob::Pattern::new(pat) {
+                Ok(p) => compiled.push(p),
+                Err(err) => errors.push(format!(
+                    "[research].allowed_models[{i}] = {pat:?} is not a valid glob: {err}. \
+                     Fix: correct the pattern (glob syntax: `*`, `?`, `[..]`)."
+                )),
+            }
+        }
+        if errors.is_empty() {
+            Ok(Self(compiled.into()))
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// An empty list means the whitelist is off, not that nothing is allowed.
+    pub fn is_unrestricted(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Case-sensitive match against the resolved model name, tag included.
+    pub fn allows(&self, model: &str) -> bool {
+        self.is_unrestricted() || self.0.iter().any(|p| p.matches(model))
+    }
+
+    /// The raw pattern strings, for `GET /config`.
+    pub fn patterns(&self) -> Vec<String> {
+        self.0.iter().map(|p| p.as_str().to_string()).collect()
+    }
 }
 
 /// The budgets per effort level. A run stops at whichever is reached first, and
@@ -489,6 +875,49 @@ pub struct EffortBudget {
     /// research loop inside that cap: it builds `SearchRequest` directly and never
     /// passes through the request-validation layer.
     pub search_top_k: u64,
+    /// Ceiling, in words, announced to the model for the final report. `0` = say
+    /// nothing about length (the behaviour before this knob existed).
+    ///
+    /// The one axis that is about **output** rather than input. It exists because
+    /// retrieval is not where a research run fails: a field report over a real
+    /// project found the loop locating the right files every time and failing at
+    /// the report turn, deterministically by request shape — a broad question with
+    /// five sub-questions failed, the same question narrowed to one file with a
+    /// word limit succeeded in minutes. Nothing in the prompt had ever mentioned
+    /// length, so the de-facto size of a report was `PLAN_REQUEST`'s "3-6
+    /// sub-questions" multiplied by whatever the model felt like writing.
+    ///
+    /// A ceiling, not a target — the prompt says so — and it also drives
+    /// `num_predict` on the report turn as a runaway backstop. Overridable per
+    /// request (`budget.max_report_words`, `0` = off), capped by
+    /// `[research].max_request_report_words`: the original "every value a caller
+    /// would pick is bigger" objection is answered by the cap being held to the
+    /// same window check as these presets.
+    ///
+    /// The numbers are unmeasured. `0` is what makes that honest: the whole
+    /// mechanism reverts from config while a harness sweeps for where the cliff
+    /// actually is, which is certainly per-model.
+    pub max_report_words: usize,
+    /// Report sections one run may write (the sectioned report's `.take()` cap,
+    /// and the upper bound the plan turn's prompt asks for: "3-N sub-questions").
+    ///
+    /// Overridable per request (`budget.max_report_sections`), floor
+    /// [`MIN_REPORT_SECTIONS`], capped by
+    /// `[research].max_request_report_sections`. Sections trade depth per
+    /// section for coverage inside one fixed `report_timeout_ms` window — more
+    /// sections is not more report, past the window it is more stubs.
+    pub max_report_sections: usize,
+    /// Multiplier on the per-call evidence widths: `read_chunks`, `grep`,
+    /// `file_history`, `symbols`. `1` = the historical widths.
+    ///
+    /// Overridable per request (`budget.evidence_width`), capped by
+    /// `[research].max_evidence_width`. Deliberately **not** applied to the
+    /// navigation tools (`outline`, `list_files` — when 300 rows bind, the fix
+    /// is a narrower glob), to `search` (its own axis, `search_top_k`), or to
+    /// the excerpt channel (a response cap, not an evidence width). Width
+    /// compounds into `max_tokens`: every widened result is resent on every
+    /// later turn.
+    pub evidence_width: u64,
 }
 
 /// Prometheus exposition and the state-gauge collector.
@@ -589,6 +1018,9 @@ impl Default for QdrantConfig {
             dense_prefetch_limit: DEFAULT_DENSE_PREFETCH_LIMIT,
             sparse_prefetch_limit: DEFAULT_SPARSE_PREFETCH_LIMIT,
             fusion_limit: DEFAULT_FUSION_LIMIT,
+            search_hnsw_ef: DEFAULT_SEARCH_HNSW_EF,
+            timeout_ms: DEFAULT_QDRANT_TIMEOUT_MS,
+            connect_timeout_ms: DEFAULT_QDRANT_CONNECT_TIMEOUT_MS,
         }
     }
 }
@@ -646,6 +1078,9 @@ impl Default for LimitsConfig {
             max_selector_patterns: DEFAULT_MAX_SELECTOR_PATTERNS,
             max_symbol_name_bytes: DEFAULT_MAX_SYMBOL_NAME_BYTES,
             max_symbol_results: DEFAULT_MAX_SYMBOL_RESULTS,
+            max_history_commits: DEFAULT_MAX_HISTORY_COMMITS,
+            max_commit_message_bytes: DEFAULT_MAX_COMMIT_MESSAGE_BYTES,
+            max_research_delete_ids: DEFAULT_MAX_RESEARCH_DELETE_IDS,
         }
     }
 }
@@ -657,6 +1092,7 @@ impl Default for ResearchConfig {
                 .parse()
                 .expect("valid default ollama url"),
             default_model: String::new(),
+            allowed_models: Vec::new(),
             worker_threads: DEFAULT_RESEARCH_WORKER_THREADS,
             max_concurrent: DEFAULT_RESEARCH_MAX_CONCURRENT,
             max_num_ctx_tokens: DEFAULT_RESEARCH_MAX_NUM_CTX,
@@ -664,9 +1100,17 @@ impl Default for ResearchConfig {
             max_request_seconds: DEFAULT_RESEARCH_MAX_REQUEST_SECONDS,
             max_request_tokens: DEFAULT_RESEARCH_MAX_REQUEST_TOKENS,
             max_request_steps: DEFAULT_RESEARCH_MAX_REQUEST_STEPS,
+            max_request_report_sections: DEFAULT_RESEARCH_MAX_REQUEST_REPORT_SECTIONS,
+            max_request_report_words: DEFAULT_RESEARCH_MAX_REQUEST_REPORT_WORDS,
+            max_evidence_width: DEFAULT_RESEARCH_MAX_EVIDENCE_WIDTH,
             turn_timeout_ms: DEFAULT_RESEARCH_TURN_TIMEOUT_MS,
+            first_token_timeout_ms: DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS,
             max_turn_thinking_chars: DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS,
+            slow_turn_tokens_per_second: DEFAULT_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND,
+            slow_turn_unaccounted_ms: DEFAULT_RESEARCH_SLOW_TURN_UNACCOUNTED_MS,
+            max_turn_seconds: DEFAULT_RESEARCH_MAX_TURN_SECONDS,
             report_timeout_ms: DEFAULT_RESEARCH_REPORT_TIMEOUT_MS,
+            checkpoint_every_steps: DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS,
             health_timeout_ms: DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS,
             models_refresh_interval_seconds: DEFAULT_RESEARCH_MODELS_REFRESH_SECONDS,
             // Unset = the model's own Modelfile defaults. Deliberately not pinned
@@ -675,6 +1119,10 @@ impl Default for ResearchConfig {
             temperature: None,
             top_p: None,
             seed: None,
+            retention_days: DEFAULT_RESEARCH_RETENTION_DAYS,
+            max_context_runs: DEFAULT_RESEARCH_MAX_CONTEXT_RUNS,
+            max_context_chars: DEFAULT_RESEARCH_MAX_CONTEXT_CHARS,
+            list_page_limit: DEFAULT_RESEARCH_LIST_PAGE_LIMIT,
         }
     }
 }
@@ -698,6 +1146,12 @@ impl Default for EffortBudgets {
         // 20 → 48 was measured to change nothing (median depth 16 → 16, citations
         // 60 → 32), which is precisely why time and tokens are the budgets and a step
         // is not.
+        //
+        // `max_report_words` is the newest axis and the only unmeasured one. It rises
+        // with the ladder because a deeper run has more to say, not because 1800 was
+        // observed anywhere; the field report that motivated it establishes only the
+        // direction (shrinking the required answer is what worked) and not the cliff.
+        // Sweep it per model before trusting any of these three numbers.
         Self {
             low: EffortBudget {
                 max_seconds: 300,
@@ -705,6 +1159,9 @@ impl Default for EffortBudgets {
                 context_fraction: 0.5,
                 max_steps: 8,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
+                max_report_words: 400,
+                max_report_sections: DEFAULT_RESEARCH_MAX_REPORT_SECTIONS,
+                evidence_width: DEFAULT_RESEARCH_EVIDENCE_WIDTH,
             },
             medium: EffortBudget {
                 max_seconds: 900,
@@ -712,6 +1169,9 @@ impl Default for EffortBudgets {
                 context_fraction: 0.7,
                 max_steps: 20,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
+                max_report_words: 900,
+                max_report_sections: DEFAULT_RESEARCH_MAX_REPORT_SECTIONS,
+                evidence_width: DEFAULT_RESEARCH_EVIDENCE_WIDTH,
             },
             high: EffortBudget {
                 max_seconds: 3600,
@@ -719,6 +1179,9 @@ impl Default for EffortBudgets {
                 context_fraction: 0.85,
                 max_steps: 64,
                 search_top_k: DEFAULT_RESEARCH_SEARCH_TOP_K,
+                max_report_words: 1800,
+                max_report_sections: DEFAULT_RESEARCH_MAX_REPORT_SECTIONS,
+                evidence_width: DEFAULT_RESEARCH_EVIDENCE_WIDTH,
             },
         }
     }
@@ -1076,12 +1539,32 @@ impl Config {
         if self.qdrant.upsert_batch_points < 1 {
             e.push("[qdrant].upsert_batch_points = 0 would never upsert. Fix: use at least 1 (e.g. 256).".to_string());
         }
-        if self.qdrant.fusion_limit < self.search.default_top_k as u32 {
+        // Checked against `max_top_k`, not `default_top_k`: the default is only what a
+        // request gets when it asks for nothing, while the maximum is what a request is
+        // *permitted* to ask for. With the looser check a caller asking for the
+        // documented maximum got a silently short result set — no warning at startup,
+        // none at query time, and a correct-looking response.
+        if self.qdrant.fusion_limit < self.search.max_top_k as u32 {
             e.push(format!(
-                "[qdrant].fusion_limit = {} is below [search].default_top_k = {}; the reranker \
-                 cannot return top_k results. Fix: set fusion_limit >= default_top_k.",
-                self.qdrant.fusion_limit, self.search.default_top_k
+                "[qdrant].fusion_limit = {} is below [search].max_top_k = {}; a request \
+                 asking for max_top_k results would be silently truncated by the reranker. \
+                 Fix: set fusion_limit >= max_top_k.",
+                self.qdrant.fusion_limit, self.search.max_top_k
             ));
+        }
+        if self.qdrant.timeout_ms < 1 {
+            e.push(
+                "[qdrant].timeout_ms = 0 would time out every call immediately. \
+                 Fix: use at least 1000 (e.g. 30000)."
+                    .to_string(),
+            );
+        }
+        if self.qdrant.connect_timeout_ms < 1 {
+            e.push(
+                "[qdrant].connect_timeout_ms = 0 would fail every connection attempt. \
+                 Fix: use at least 1000 (e.g. 5000)."
+                    .to_string(),
+            );
         }
         if self.qdrant.dense_prefetch_limit < self.qdrant.fusion_limit {
             e.push(format!(
@@ -1095,6 +1578,19 @@ impl Config {
                 "[qdrant].sparse_prefetch_limit = {} is below fusion_limit = {}; fusion starves. \
                  Fix: set sparse_prefetch_limit >= fusion_limit.",
                 self.qdrant.sparse_prefetch_limit, self.qdrant.fusion_limit
+            ));
+        }
+        // Checked against the pool the prefetch is *asked* for, not against
+        // `dense_prefetch_limit` alone: a beam narrower than the requested pool returns
+        // fewer candidates than were asked for, silently, and the shortfall then
+        // propagates through fusion into a short result set that looks like a genuinely
+        // thin index.
+        if self.qdrant.search_hnsw_ef < self.qdrant.dense_prefetch_limit as u64 {
+            e.push(format!(
+                "[qdrant].search_hnsw_ef = {} is below dense_prefetch_limit = {}; the graph \
+                 search would return fewer candidates than the prefetch asks for, with no \
+                 error. Fix: set search_hnsw_ef >= dense_prefetch_limit.",
+                self.qdrant.search_hnsw_ef, self.qdrant.dense_prefetch_limit
             ));
         }
 
@@ -1229,11 +1725,41 @@ impl Config {
         if self.limits.max_symbol_results < 1 {
             e.push("[limits].max_symbol_results = 0 rejects every symbol lookup. Fix: use at least 1 (default 50).".to_string());
         }
+        if self.limits.max_research_delete_ids < 1 {
+            e.push("[limits].max_research_delete_ids = 0 rejects every batch delete. Fix: use at least 1 (default 500).".to_string());
+        }
+        if self.limits.max_history_commits < 1 {
+            e.push("[limits].max_history_commits = 0 rejects every history reconciliation. Fix: use at least 1 (default 20000).".to_string());
+        }
+        if self.limits.max_commit_message_bytes < 1 {
+            e.push("[limits].max_commit_message_bytes = 0 rejects every commit. Fix: use at least 1 (default 64 KiB).".to_string());
+        }
         if self.research.worker_threads < 1 {
             e.push("[research].worker_threads = 0 leaves no thread to run research on. Fix: use at least 1 (default 2).".to_string());
         }
         if self.research.max_concurrent < 1 {
             e.push("[research].max_concurrent = 0 rejects every research request. Fix: use at least 1 (default 2).".to_string());
+        }
+        match AllowedModels::compile(&self.research.allowed_models) {
+            Ok(allowed) => {
+                // Only cross-check against a list that compiled whole: a broken
+                // glob already has its own error, and a verdict from the partial
+                // list would be a cascading second complaint about the same key.
+                if !allowed.is_unrestricted()
+                    && !self.research.default_model.is_empty()
+                    && !allowed.allows(&self.research.default_model)
+                {
+                    e.push(format!(
+                        "[research].default_model = {:?} matches no pattern in \
+                         [research].allowed_models, so every request relying on the default \
+                         would be refused with 400 research.model_not_allowed. Fix: add a \
+                         matching pattern (note `\"name:*\"` does not match a bare `\"name\"`) \
+                         or change default_model.",
+                        self.research.default_model
+                    ));
+                }
+            }
+            Err(errors) => e.extend(errors),
         }
         for (level, b) in [
             ("low", &self.research.effort.low),
@@ -1290,6 +1816,93 @@ impl Config {
                     b.search_top_k, self.search.max_top_k
                 ));
             }
+            // Zero is the sanctioned "say nothing about length" setting, so only a
+            // small *non-zero* value is a mistake.
+            if b.max_report_words > 0 && b.max_report_words < MIN_REPORT_WORDS {
+                e.push(format!(
+                    "[research.effort.{level}].max_report_words = {} cannot hold an answer to a \
+                     research question, so the run would spend its whole budget investigating and \
+                     then be told to write a stub. Fix: use at least {MIN_REPORT_WORDS} (defaults \
+                     400/900/1800), or 0 to announce no length at all.",
+                    b.max_report_words
+                ));
+            }
+            // The report turn shares one window with the transcript it is written
+            // from. Reserving more than half of it for generation means the evidence
+            // cannot fit beside the report it is supposed to produce.
+            let report_tokens = b.max_report_words as u64 * REPORT_WORDS_TO_TOKENS;
+            if report_tokens >= self.research.max_num_ctx_tokens / 2 {
+                e.push(format!(
+                    "[research.effort.{level}].max_report_words = {} reserves about {} tokens for \
+                     generation, which is at least half of [research].max_num_ctx_tokens = {} — \
+                     the evidence would not fit in the window it has to share with the report. \
+                     Fix: lower max_report_words, or raise max_num_ctx_tokens.",
+                    b.max_report_words, report_tokens, self.research.max_num_ctx_tokens
+                ));
+            }
+            // Below the sectioning threshold the grant names a report shape the
+            // mechanism cannot produce: the sectioned path never engages under
+            // MIN_REPORT_SECTIONS plan items, and the templated plan request
+            // "3-N" would be malformed.
+            if b.max_report_sections < MIN_REPORT_SECTIONS {
+                e.push(format!(
+                    "[research.effort.{level}].max_report_sections = {} is below the sectioning \
+                     threshold, so the sectioned report could never engage. Fix: use at least \
+                     {MIN_REPORT_SECTIONS} (default {DEFAULT_RESEARCH_MAX_REPORT_SECTIONS}).",
+                    b.max_report_sections
+                ));
+            }
+            if b.evidence_width < 1 {
+                e.push(format!(
+                    "[research.effort.{level}].evidence_width = 0 makes every evidence tool \
+                     return nothing. Fix: use at least 1 (default \
+                     {DEFAULT_RESEARCH_EVIDENCE_WIDTH}); it is a multiplier, not a row count."
+                ));
+            }
+        }
+        if self.research.retention_days < 1 {
+            e.push(
+                "[research].retention_days = 0 would let the first GC pass reap every run as \
+                 soon as it is written, so no report could ever be reused as context. Fix: use \
+                 at least 1 (default 90), and pin the runs that must outlive it."
+                    .to_string(),
+            );
+        }
+        if self.research.list_page_limit < 1 {
+            e.push(
+                "[research].list_page_limit = 0 makes every page of the research list empty. \
+                 Fix: use at least 1 (default 50)."
+                    .to_string(),
+            );
+        }
+        // Zero runs is a legal way to switch the feature off; a zero *budget* for a
+        // feature that is on is not, since the first report would be truncated to
+        // nothing and the model would be handed an empty section it cannot use.
+        if self.research.max_context_runs > 0
+            && self.research.max_context_chars < MIN_RESEARCH_MAX_CONTEXT_CHARS
+        {
+            e.push(format!(
+                "[research].max_context_chars = {} is too small to carry one useful report, but \
+                 [research].max_context_runs = {} still offers the feature. Fix: raise it to at \
+                 least {MIN_RESEARCH_MAX_CONTEXT_CHARS} (default {DEFAULT_RESEARCH_MAX_CONTEXT_CHARS}), \
+                 or set max_context_runs = 0 to switch prior-research context off.",
+                self.research.max_context_chars, self.research.max_context_runs
+            ));
+        }
+        // The `search_top_k` trap again, one level up: an injected block is prompt
+        // tokens on EVERY turn, so a cap larger than the window makes every run that
+        // uses the feature die of context exhaustion before its first tool call — and
+        // the edge validator never sees these two keys together. ~4 chars per token.
+        let context_tokens = (self.research.max_context_chars as u64) / 4;
+        if self.research.max_context_runs > 0 && context_tokens >= self.research.max_num_ctx_tokens
+        {
+            e.push(format!(
+                "[research].max_context_chars = {} is about {context_tokens} tokens, which does not \
+                 fit [research].max_num_ctx_tokens = {}; a run given prior context would exhaust its \
+                 window before its first tool call. Fix: lower max_context_chars, or raise \
+                 max_num_ctx_tokens.",
+                self.research.max_context_chars, self.research.max_num_ctx_tokens
+            ));
         }
         if let Some(t) = self.research.temperature
             && !(0.0..=2.0).contains(&t)
@@ -1325,6 +1938,21 @@ impl Config {
                 self.research.max_request_steps as u64,
                 self.research.effort.high.max_steps as u64,
             ),
+            (
+                "max_request_report_sections",
+                self.research.max_request_report_sections as u64,
+                self.research.effort.high.max_report_sections as u64,
+            ),
+            (
+                "max_request_report_words",
+                self.research.max_request_report_words as u64,
+                self.research.effort.high.max_report_words as u64,
+            ),
+            (
+                "max_evidence_width",
+                self.research.max_evidence_width,
+                self.research.effort.high.evidence_width,
+            ),
         ] {
             if ceiling < highest {
                 e.push(format!(
@@ -1333,6 +1961,32 @@ impl Config {
                      Fix: raise it to at least {highest}."
                 ));
             }
+        }
+        // The same window check the effort presets get, applied to the request
+        // ceiling: it is what makes ANY value a request may pass safe to arm
+        // `num_predict` with — there is no per-request window check.
+        let ceiling_report_tokens =
+            self.research.max_request_report_words as u64 * REPORT_WORDS_TO_TOKENS;
+        if ceiling_report_tokens >= self.research.max_num_ctx_tokens / 2 {
+            e.push(format!(
+                "[research].max_request_report_words = {} would let a request reserve about \
+                 {ceiling_report_tokens} tokens for generation, at least half of \
+                 [research].max_num_ctx_tokens = {} — the evidence would not fit in the window \
+                 it has to share with the report. Fix: lower max_request_report_words, or raise \
+                 max_num_ctx_tokens.",
+                self.research.max_request_report_words, self.research.max_num_ctx_tokens
+            ));
+        }
+        // A ceiling below the floor would make every non-zero override invalid
+        // while the field still reads as offered.
+        if self.research.max_request_report_words < MIN_REPORT_WORDS {
+            e.push(format!(
+                "[research].max_request_report_words = {} is below the floor a non-zero \
+                 override must clear ({MIN_REPORT_WORDS}), so every override but 0 would be \
+                 rejected. Fix: use at least {MIN_REPORT_WORDS} (default \
+                 {DEFAULT_RESEARCH_MAX_REQUEST_REPORT_WORDS}).",
+                self.research.max_request_report_words
+            ));
         }
         if self.research.max_num_ctx_tokens < 1024 {
             e.push(format!(
@@ -1368,10 +2022,46 @@ impl Config {
                 self.research.max_request_seconds * 1000,
             ));
         }
+        // The silence guard must stay *under* the dead-socket one, or it is not a
+        // guard at all: above it, the transport timeout always fires first and the
+        // setting reads as enabled while never doing anything. A too-small value is
+        // the other trap — it would abandon turns whose prompt evaluation is merely
+        // long, so the floor is generous.
+        if self.research.first_token_timeout_ms > 0 {
+            if self.research.first_token_timeout_ms < 5000 {
+                e.push(format!(
+                    "[research].first_token_timeout_ms = {} would abandon a turn whose prompt \
+                     evaluation is merely long — a big transcript is minutes of silence before \
+                     the first token. Fix: use at least 5000 (default \
+                     {DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS}), or 0 to disable it.",
+                    self.research.first_token_timeout_ms
+                ));
+            }
+            if self.research.first_token_timeout_ms >= self.research.turn_timeout_ms {
+                e.push(format!(
+                    "[research].first_token_timeout_ms = {} is not below \
+                     [research].turn_timeout_ms = {}, so the whole-turn timeout would always \
+                     fire first and the silence guard would never catch anything. Fix: lower it \
+                     (default {DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS}), or 0 to disable it.",
+                    self.research.first_token_timeout_ms, self.research.turn_timeout_ms,
+                ));
+            }
+        }
         // A small non-zero value is the trap here, not a large one: the guard would
         // start abandoning turns that were only thinking, which is the same class of
         // mistake as a tight `turn_timeout_ms` and would look identical from outside
         // (runs that end early having found nothing). Disabling is spelled `0`.
+        if self.research.checkpoint_every_steps > 0
+            && self.research.checkpoint_every_steps < MIN_RESEARCH_CHECKPOINT_EVERY_STEPS
+        {
+            e.push(format!(
+                "[research].checkpoint_every_steps = {} would spend most of the run writing \
+                 instead of looking. Fix: use at least {MIN_RESEARCH_CHECKPOINT_EVERY_STEPS} \
+                 (default {DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS}), or 0 to switch \
+                 checkpoints off.",
+                self.research.checkpoint_every_steps
+            ));
+        }
         if self.research.max_turn_thinking_chars > 0
             && self.research.max_turn_thinking_chars < MIN_RESEARCH_MAX_TURN_THINKING_CHARS
         {
@@ -1383,6 +2073,62 @@ impl Config {
                  (default {DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS}), or 0 to disable \
                  the guard.",
                 self.research.max_turn_thinking_chars
+            ));
+        }
+        // Both ends, because both make the log useless in opposite ways: a negative
+        // (or NaN) threshold is nonsense a float lets you write, and a threshold
+        // above what any local model reaches warns on every healthy turn — a warning
+        // that fires always is a warning nobody reads.
+        let slow = self.research.slow_turn_tokens_per_second;
+        if slow < 0.0 || slow.is_nan() || slow >= MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND {
+            e.push(format!(
+                "[research].slow_turn_tokens_per_second = {slow} is not a usable rate: it \
+                 must be at least 0 and below {MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND} \
+                 tokens/s, or every turn of a healthy run would be logged as \
+                 contention. Fix: set it just under the low end of what \
+                 mindex_research_turn_tokens_per_second shows for your model, or 0 to \
+                 disable the check (the default)."
+            ));
+        }
+        // `0` is how this one is switched off, so any other too-small value is a
+        // mistake: under a second the field is transport overhead, and a warning that
+        // fires on healthy turns is a warning nobody reads — the same failure the
+        // ceiling above guards against, from the other end.
+        let unacc = self.research.slow_turn_unaccounted_ms;
+        if unacc > 0 && unacc < MIN_RESEARCH_SLOW_TURN_UNACCOUNTED_MS {
+            e.push(format!(
+                "[research].slow_turn_unaccounted_ms = {unacc} is below the transport \
+                 overhead every healthy turn carries, so it would report contention on \
+                 all of them. Fix: use at least {MIN_RESEARCH_SLOW_TURN_UNACCOUNTED_MS} \
+                 (default {DEFAULT_RESEARCH_SLOW_TURN_UNACCOUNTED_MS}), or 0 to disable \
+                 the check."
+            ));
+        }
+        // Both ends, and both are silent failures rather than loud ones. Under the
+        // report window the guard cuts short the one turn that is legitimately long,
+        // so every run would ship a truncated report and nothing would say why. At or
+        // above `turn_timeout_ms` the socket guard always wins and this can never
+        // fire — a protection that is present, configured, and dead.
+        let turn_cap = self.research.max_turn_seconds;
+        if turn_cap > 0 && turn_cap * 1000 < self.research.report_timeout_ms {
+            e.push(format!(
+                "[research].max_turn_seconds = {turn_cap} is below report_timeout_ms = {} \
+                 (i.e. {} s), so the guard would abandon the report turn — the one turn \
+                 that is legitimately long — and every run would ship a cut-short report. \
+                 Fix: set max_turn_seconds >= report_timeout_ms / 1000 (default \
+                 {DEFAULT_RESEARCH_MAX_TURN_SECONDS}), or 0 to disable the guard.",
+                self.research.report_timeout_ms,
+                self.research.report_timeout_ms / 1000
+            ));
+        }
+        if turn_cap > 0 && turn_cap * 1000 >= self.research.turn_timeout_ms {
+            e.push(format!(
+                "[research].max_turn_seconds = {turn_cap} is at or above turn_timeout_ms = \
+                 {} (i.e. {} s), so the socket timeout always fires first and this guard \
+                 can never do anything. Fix: set max_turn_seconds well under \
+                 turn_timeout_ms / 1000 (default {DEFAULT_RESEARCH_MAX_TURN_SECONDS}).",
+                self.research.turn_timeout_ms,
+                self.research.turn_timeout_ms / 1000
             ));
         }
         if self.research.report_timeout_ms < MIN_RESEARCH_REPORT_TIMEOUT_MS {
@@ -1522,6 +2268,240 @@ mod tests {
         assert_eq!(cfg.research.seed, None);
     }
 
+    /// Prior-research context is paid on every turn, so its cap and the context
+    /// window are two halves of one setting — and nothing at the request edge ever
+    /// sees them together. Startup is the only place that can catch the combination.
+    #[test]
+    fn a_context_block_that_cannot_fit_the_window_is_rejected() {
+        let cfg = parse(
+            "[research]\nmax_num_ctx_tokens = 4096\nmax_context_runs = 2\n\
+             max_context_chars = 65536\n",
+        )
+        .expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter().any(|m| m.contains("max_context_chars")),
+            "the error must name the key: {err:?}"
+        );
+
+        // Switching the feature off makes the same numbers harmless.
+        //
+        // The report budgets go with it, and that is the new rule working rather
+        // than a fixture patched to be quiet: a 4096-token window genuinely cannot
+        // hold the default 900-word report *and* the evidence it is written from, so
+        // an operator who shrinks the window for VRAM is told to shrink this too —
+        // including the request ceiling, which is held to the same window check so
+        // that no *override* can reserve what the presets may not.
+        let off = parse(
+            "[research]\nmax_num_ctx_tokens = 4096\nmax_context_runs = 0\n\
+             max_context_chars = 65536\nmax_request_report_words = 150\n\
+             [research.effort.low]\nmax_report_words = 0\n\
+             [research.effort.medium]\nmax_report_words = 0\n\
+             [research.effort.high]\nmax_report_words = 0\n",
+        )
+        .expect("parses");
+        off.validate()
+            .expect("an unused context cap must not fail startup");
+    }
+
+    /// The report-shape and evidence-width knobs get the same startup guardrails
+    /// as the budget axes: a ceiling below what `effort = "high"` already grants
+    /// is a contradiction, and so is a preset the mechanism cannot honour.
+    #[test]
+    fn report_shape_ceilings_and_floors_are_enforced_at_startup() {
+        // Ceiling below effort.high, for each new pair.
+        for (key, toml) in [
+            (
+                "max_request_report_sections",
+                // The default high preset (6) already exceeds a ceiling of 4.
+                "[research]\nmax_request_report_sections = 4\n".to_string(),
+            ),
+            (
+                "max_request_report_words",
+                // 150 clears the non-zero floor, so the only complaint left is
+                // the ceiling sitting under high's 1800.
+                "[research]\nmax_request_report_words = 150\n".to_string(),
+            ),
+            (
+                "max_evidence_width",
+                "[research]\nmax_evidence_width = 1\n[research.effort.high]\nevidence_width = 2\n"
+                    .to_string(),
+            ),
+        ] {
+            let cfg = parse(&toml).expect("parses");
+            let err = cfg.validate().expect_err("must be rejected");
+            assert!(
+                err.iter().any(|m| m.contains(key)),
+                "{key} below effort.high must be named: {err:?}"
+            );
+        }
+        // Preset floors: sections below the sectioning threshold, width of zero.
+        let cfg = parse("[research.effort.low]\nmax_report_sections = 2\nevidence_width = 0\n")
+            .expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter().any(|m| m.contains("max_report_sections")),
+            "{err:?}"
+        );
+        assert!(err.iter().any(|m| m.contains("evidence_width")), "{err:?}");
+        // A words ceiling below the non-zero floor would offer a field on which
+        // every override but 0 is rejected.
+        let cfg = parse("[research]\nmax_request_report_words = 100\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_request_report_words") && m.contains("150")),
+            "{err:?}"
+        );
+    }
+
+    /// A window this small cannot hold the report *and* what the report is written
+    /// from, and the two keys are set in different places by different people — an
+    /// operator lowering `max_num_ctx_tokens` for VRAM has no reason to look at the
+    /// effort ladder. Startup is where that collision is cheap to find.
+    #[test]
+    fn a_report_budget_that_cannot_share_the_window_is_refused() {
+        let cfg = parse("[research]\nmax_num_ctx_tokens = 4096\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_report_words") && m.contains("max_num_ctx_tokens")),
+            "the error must name both keys: {err:?}"
+        );
+    }
+
+    /// Below the floor the instruction stops shaping a report and starts forbidding
+    /// one: the run spends its whole budget investigating and is then told to write
+    /// a stub. `0` is the supported way to say "announce no length"; a tiny number
+    /// is a mistake, and the message has to say which of the two the operator wants.
+    #[test]
+    fn a_report_word_budget_too_small_is_refused() {
+        let cfg = parse("[research.effort.low]\nmax_report_words = 20\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_report_words = 20") && m.contains("or 0 to announce")),
+            "{err:?}"
+        );
+        // Zero is not a small number here, it is the off switch.
+        let off = parse("[research.effort.low]\nmax_report_words = 0\n").expect("parses");
+        off.validate().expect("0 switches the ceiling off");
+    }
+
+    /// A contention threshold is refused at both ends, and for the same reason each
+    /// way: a warning that cannot fire and a warning that always fires are equally
+    /// useless, and the second is worse because it buries the ones that matter.
+    #[test]
+    fn a_slow_turn_threshold_outside_the_usable_range_is_refused() {
+        for spelling in ["-1.0", "1000.0", "5000.0"] {
+            let cfg = parse(&format!(
+                "[research]\nslow_turn_tokens_per_second = {spelling}\n"
+            ))
+            .expect("parses");
+            let err = cfg.validate().expect_err("must be rejected");
+            assert!(
+                err.iter()
+                    .any(|m| m.contains("slow_turn_tokens_per_second")),
+                "{spelling}: {err:?}"
+            );
+        }
+        // Zero is still the off switch — for the CPU-only deployment that genuinely
+        // runs this slowly — but it is no longer the default. See below.
+        let off = parse("[research]\nslow_turn_tokens_per_second = 0\n").expect("parses");
+        off.validate().expect("0 disables the check");
+        assert_eq!(off.research.slow_turn_tokens_per_second, 0.0);
+        let set = parse("[research]\nslow_turn_tokens_per_second = 8.5\n").expect("parses");
+        set.validate().expect("a plausible rate is accepted");
+    }
+
+    /// **Every contention guard ships armed.**
+    ///
+    /// This is a policy assertion, not a value assertion: a guard that defaults to
+    /// off is one nobody turns on, and this repository has now paid for that twice —
+    /// two multi-hour investigations of a stalled run whose symptom the code could
+    /// already name and whose remedy it already contained. Changing any of these back
+    /// to `0` should have to argue with this test.
+    #[test]
+    fn the_contention_guards_are_armed_out_of_the_box() {
+        let d = Config::default().research;
+        assert!(
+            d.slow_turn_tokens_per_second > 0.0,
+            "the generation-rate diagnostic ships disabled"
+        );
+        assert!(
+            d.slow_turn_unaccounted_ms > 0,
+            "the queueing diagnostic ships disabled — and it is the only one that can \
+             see a turn that waited rather than crawled"
+        );
+        assert!(
+            d.max_turn_seconds > 0,
+            "the one guard that STOPS a stalled turn ships disabled; a run can again \
+             spend its whole budget on a single turn and finish with zero steps"
+        );
+        Config::default()
+            .validate()
+            .expect("the shipped defaults must be self-consistent");
+    }
+
+    /// Both walls of the stall guard, and both are silent failures. Under the report
+    /// window it truncates the one turn that is legitimately long; at or above the
+    /// socket timeout it can never fire, which reads as protection and is not.
+    #[test]
+    fn a_stall_ceiling_that_could_not_work_is_refused_at_startup() {
+        // report_timeout_ms defaults to 120000, so 60 s cuts the report turn short.
+        let cfg = parse("[research]\nmax_turn_seconds = 60\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_turn_seconds") && m.contains("report_timeout_ms")),
+            "the error must name both keys: {err:?}"
+        );
+
+        let cfg = parse("[research]\nmax_turn_seconds = 100000\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_turn_seconds") && m.contains("turn_timeout_ms")),
+            "a ceiling above the socket timeout is dead, and must not read as armed: {err:?}"
+        );
+
+        let off = parse("[research]\nmax_turn_seconds = 0\n").expect("parses");
+        off.validate().expect("0 remains an explicit off switch");
+    }
+
+    /// The silence guard has to sit strictly between "long prompt evaluation" and
+    /// "dead socket", and both walls are rejected at startup rather than discovered
+    /// as runs that end early or a setting that reads as on and never fires.
+    #[test]
+    fn a_silence_guard_that_could_never_fire_is_rejected() {
+        // At or above the dead-socket timeout the transport always wins.
+        let cfg = parse("[research]\nfirst_token_timeout_ms = 3900000\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("first_token_timeout_ms") && m.contains("turn_timeout_ms")),
+            "{err:?}"
+        );
+
+        // Too small preempts a turn that was merely thinking about a long transcript.
+        let cfg = parse("[research]\nfirst_token_timeout_ms = 500\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(err.iter().any(|m| m.contains("at least 5000")), "{err:?}");
+
+        // Off is a legal setting, for a host where a cold load is expected.
+        let cfg = parse("[research]\nfirst_token_timeout_ms = 0\n").expect("parses");
+        cfg.validate().expect("0 disables the guard");
+    }
+
+    /// Zero retention is not a tight setting, it is a corpus that cannot exist: the
+    /// next GC pass reaps every run before anything can reference it.
+    #[test]
+    fn zero_research_retention_is_rejected() {
+        let cfg = parse("[research]\nretention_days = 0\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(err.iter().any(|m| m.contains("retention_days")), "{err:?}");
+    }
+
     /// The research loop builds its `SearchRequest` directly and so never passes
     /// through `validate::search_request`; startup is the only place that can hold
     /// it to the same cap every other client obeys.
@@ -1535,6 +2515,100 @@ mod tests {
                 .any(|m| m.contains("search_top_k = 11") && m.contains("[search].max_top_k")),
             "{err:?}"
         );
+    }
+
+    /// The realistic mis-set: an operator raises `[search].max_top_k` and touches
+    /// nothing else. The reranker only ever sees `fusion_limit` candidates, so a
+    /// request asking for the documented maximum comes back silently short — no
+    /// warning at startup, none at query time, and a correct-looking 200. The check
+    /// was against `default_top_k`, which a raised maximum does not move, so this
+    /// whole configuration passed validation.
+    #[test]
+    fn raising_max_top_k_past_the_fusion_limit_is_refused_at_startup() {
+        let cfg = parse("[search]\nmax_top_k = 500\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("fusion_limit") && m.contains("max_top_k")),
+            "{err:?}"
+        );
+
+        // Raising the whole chain together is the correct fix, and must be accepted.
+        // `search_hnsw_ef` is part of that chain: a beam narrower than the prefetch
+        // pool truncates it just as silently as a fusion limit below `max_top_k`.
+        let cfg = parse(
+            "[search]\nmax_top_k = 500\n\n[qdrant]\nfusion_limit = 500\n\
+             dense_prefetch_limit = 500\nsparse_prefetch_limit = 500\nsearch_hnsw_ef = 500\n",
+        )
+        .expect("parses");
+        cfg.validate().expect("a consistently raised set is valid");
+    }
+
+    /// `max_top_k` exactly equal to `fusion_limit` is the boundary the rule is
+    /// written on, and the one an operator sizing the two together will land on.
+    #[test]
+    fn max_top_k_equal_to_the_fusion_limit_is_accepted() {
+        let cfg = parse("[search]\nmax_top_k = 200\n").expect("parses");
+        cfg.validate()
+            .expect("max_top_k == the default fusion_limit must be valid");
+    }
+
+    /// The prefetch → fusion → top_k chain has to hold end to end. A prefetch below
+    /// fusion starves the reranker in exactly the same silent way, and the three rules
+    /// must all fire rather than the first one masking the rest — `validate` collects
+    /// every problem precisely so one startup tells the operator the whole story.
+    #[test]
+    fn every_broken_link_in_the_retrieval_chain_is_named_at_once() {
+        let cfg = parse(
+            "[search]\nmax_top_k = 300\n\n\
+             [qdrant]\nfusion_limit = 200\ndense_prefetch_limit = 10\nsparse_prefetch_limit = 10\n",
+        )
+        .expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+
+        assert!(
+            err.iter().any(|m| m.contains("fusion_limit = 200")
+                && m.contains("[search].max_top_k = 300")),
+            "the top_k link was not reported: {err:?}"
+        );
+        assert!(
+            err.iter().any(|m| m.contains("dense_prefetch_limit = 10")),
+            "the dense prefetch link was not reported: {err:?}"
+        );
+        assert!(
+            err.iter().any(|m| m.contains("sparse_prefetch_limit = 10")),
+            "the sparse prefetch link was not reported: {err:?}"
+        );
+    }
+
+    /// The Qdrant client's own default is 5 s and no key reached it, so a project
+    /// whose fusion + ColBERT rerank ran past that failed **every** search with
+    /// `qdrant.unavailable` and there was nothing to tune. Now there is — and a zero,
+    /// which would fail every call instantly, must not be spellable.
+    #[test]
+    fn a_zero_qdrant_timeout_is_rejected() {
+        let cfg = parse("[qdrant]\ntimeout_ms = 0\nconnect_timeout_ms = 0\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter().any(|m| m.contains("[qdrant].timeout_ms")),
+            "{err:?}"
+        );
+        assert!(
+            err.iter()
+                .any(|m| m.contains("[qdrant].connect_timeout_ms")),
+            "{err:?}"
+        );
+    }
+
+    /// A long call timeout with a short connect timeout is the *correct* shape —
+    /// reaching an unreachable host must fail fast even when a reached one is allowed
+    /// to think — so the two must not be validated against each other.
+    #[test]
+    fn a_connect_timeout_shorter_than_the_call_timeout_is_the_normal_case() {
+        let cfg =
+            parse("[qdrant]\ntimeout_ms = 120000\nconnect_timeout_ms = 1000\n").expect("parses");
+        cfg.validate()
+            .expect("a short connect timeout under a long call timeout is valid");
     }
 
     #[test]
@@ -1655,6 +2729,64 @@ mod tests {
         assert!(errs.iter().any(|m| m.contains("max_chunk_tokens")));
         assert!(errs.iter().any(|m| m.contains("synchronous")));
         assert!(errs.iter().any(|m| m.contains("fusion_limit")));
+    }
+
+    /// Each broken glob gets its own collected error naming index and pattern —
+    /// the collect-all contract, not fail-fast at the first one.
+    #[test]
+    fn every_invalid_allowed_models_glob_is_named_with_its_index() {
+        let mut cfg = Config::default();
+        cfg.research.allowed_models = vec!["gemma4:*".into(), "a[".into(), "b[".into()];
+        let errs = cfg.validate().expect_err("should be invalid");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("allowed_models[1]") && m.contains("a[")),
+            "first broken glob must be named: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("allowed_models[2]") && m.contains("b[")),
+            "second broken glob must be named: {errs:?}"
+        );
+    }
+
+    /// A default model the whitelist does not cover would turn every defaulted
+    /// request into a 400 — startup is the only place that sees both keys together.
+    #[test]
+    fn a_default_model_outside_the_whitelist_is_rejected_at_startup() {
+        let mut cfg = Config::default();
+        cfg.research.default_model = "qwen3.6".into();
+        cfg.research.allowed_models = vec!["gemma4:*".into()];
+        let errs = cfg.validate().expect_err("should be invalid");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("default_model") && m.contains("allowed_models")),
+            "the error must name both keys: {errs:?}"
+        );
+
+        // A covered default passes; so does any default with the whitelist off.
+        cfg.research.allowed_models = vec!["gemma4:*".into(), "qwen3.6".into()];
+        cfg.validate().expect("a covered default_model must pass");
+        cfg.research.allowed_models = Vec::new();
+        cfg.validate()
+            .expect("an empty whitelist restricts nothing");
+    }
+
+    /// The matching semantics callers rely on: case-sensitive, tag included —
+    /// `"gemma4:*"` covers tagged variants but not the bare name — and an empty
+    /// list means unrestricted, not "nothing allowed".
+    #[test]
+    fn allowed_models_matches_case_sensitively_with_the_tag() {
+        let allowed = AllowedModels::compile(&["gemma4:*".to_string()]).expect("valid globs");
+        assert!(!allowed.is_unrestricted());
+        assert!(allowed.allows("gemma4:27b"));
+        assert!(!allowed.allows("gemma4"), "the tag separator is literal");
+        assert!(!allowed.allows("Gemma4:27b"), "matching is case-sensitive");
+        assert_eq!(allowed.patterns(), vec!["gemma4:*".to_string()]);
+
+        let unrestricted = AllowedModels::compile(&[]).expect("empty list compiles");
+        assert!(unrestricted.is_unrestricted());
+        assert!(unrestricted.allows("anything-at-all"));
     }
 
     #[test]

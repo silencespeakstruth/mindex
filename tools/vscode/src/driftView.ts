@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "node:path";
 import { DriftResponse } from "./api";
+import { ICON } from "./icons";
 
 export type Bucket = "stale" | "missing" | "orphaned" | "indexing";
 
@@ -9,35 +10,53 @@ const BUCKETS: { id: Bucket; label: string; icon: string; tooltip: string }[] = 
         id: "stale",
         label: "Stale",
         icon: "diff-modified",
-        tooltip: "Indexed, but the working-tree content differs — needs reindex",
+        tooltip:
+            "Indexed, but the working-tree content differs — needs reindex.\n" +
+            "Sync all reindexes these.",
     },
     {
         id: "missing",
         label: "Missing",
         icon: "diff-added",
-        tooltip: "Present locally but not indexed (never indexed or failed) — needs reindex",
+        tooltip:
+            "Present locally but not indexed (never indexed or failed) — needs reindex.\n" +
+            "Sync all reindexes these.",
     },
     {
         id: "orphaned",
         label: "Orphaned",
         icon: "diff-removed",
         tooltip:
-            "Indexed, but absent from the working tree — should be deleted from the index",
+            "Indexed, but absent from the working tree — should be deleted from the index.\n" +
+            "Sync all deletes these from the index. Your files are not touched.",
     },
     {
         id: "indexing",
         label: "Indexing",
         icon: "sync",
-        tooltip: "In flight on the server — no action needed",
+        tooltip:
+            "In flight on the server — no action needed.\n" +
+            "Sync all leaves these alone; check again once they settle.",
     },
 ];
+
+/**
+ * What the view says once it has something to show.
+ *
+ * Deliberately short and only ever set when the tree is non-empty: VS Code renders
+ * `TreeView.message` *instead of* `viewsWelcome` when there are no items, and the
+ * welcome text is the better copy for that case — it explains what drift is and offers
+ * the button that produces some. A message set unconditionally would replace it.
+ */
+export const DRIFT_MESSAGE =
+    "Tick files and reindex, or press Sync all to clear every difference at once.";
 
 /** A bucket whose files can be checkbox-selected (indexing is read-only). */
 const SELECTABLE: ReadonlySet<Bucket> = new Set(["stale", "missing", "orphaned"]);
 
 export class DriftNode {
     constructor(
-        public readonly kind: "bucket" | "dir" | "file",
+        public readonly kind: "action" | "claims" | "bucket" | "dir" | "file",
         public readonly bucket: Bucket,
         /** dir: the rel prefix; file: the full rel path; bucket: "". */
         public readonly relPath: string,
@@ -63,6 +82,18 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
     private selected: Record<Bucket, Set<string>> = emptySelection();
     /** When the last drift check ran, for the view description. */
     private checkedAt: Date | undefined;
+    /**
+     * Files the *server* currently holds a claim on — `/status`'s `indexing_claims`.
+     *
+     * Tracked separately from [`progress`] because it is the half this view could not
+     * see, and the half that actually bites: a claim outlives the request that made it
+     * (the retry worker, another client, `mindex-index`), and a `POST /index` naming a
+     * claimed file is refused server-side by a conflict the handler **swallows** — the
+     * request still answers 200 with that file simply absent from the response. So the
+     * upload returned instantly, the file was reported "unchanged", and nothing at all
+     * had happened. Showing the claims is what makes that state visible instead.
+     */
+    private serverClaims = 0;
 
     constructor(private readonly workspaceRoot: string) {}
 
@@ -71,6 +102,34 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
         this.selected = emptySelection();
         this.checkedAt = new Date();
         this.changed.fire(undefined);
+    }
+
+    /** How many files the server is working on right now; 0 when it is idle. */
+    setServerClaims(claims: number): void {
+        if (claims === this.serverClaims) {
+            return; // The status poll fires on a timer; only a change is worth a redraw.
+        }
+        this.serverClaims = claims;
+        this.changed.fire(undefined);
+    }
+
+    /** Whether the server is busy, whoever asked it to be. */
+    get busyClaims(): number {
+        return this.serverClaims;
+    }
+
+    /** What `Sync all` would do: files to reindex, and files to drop from the index. */
+    get pendingWork(): { reindex: number; delete: number } {
+        return {
+            reindex: this.allPaths("stale", "missing").length,
+            delete: this.allPaths("orphaned").length,
+        };
+    }
+
+    /** Whether there is anything at all to act on — what `Sync all` is offered for. */
+    get hasActionableDrift(): boolean {
+        const work = this.pendingWork;
+        return work.reindex + work.delete > 0;
     }
 
     clear(): void {
@@ -115,10 +174,75 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
     }
 
     getChildren(element?: DriftNode): DriftNode[] {
-        return element === undefined ? this.roots : element.children;
+        if (element !== undefined) {
+            return element.children;
+        }
+        // While the server holds claims that row takes the first place: the buckets
+        // below are the *previous* check's answer and are about to be wrong, so
+        // offering the button that starts a reindex there would be offering one the
+        // server is about to refuse as in-flight.
+        //
+        // Otherwise the action row exists only while there is something for it to do,
+        // so "the list is empty" and "there is nothing to press" are the same statement
+        // — a permanently present Sync all that does nothing on most days is a button
+        // people learn to ignore.
+        if (this.serverClaims > 0) {
+            return [new DriftNode("claims", "stale", "", "Indexing", []), ...this.roots];
+        }
+        return this.hasActionableDrift
+            ? [new DriftNode("action", "stale", "", "Sync all", []), ...this.roots]
+            : this.roots;
     }
 
     getTreeItem(node: DriftNode): vscode.TreeItem {
+        if (node.kind === "claims") {
+            // The server's claim count only ever goes down and there is no total to
+            // divide it by, so this is a countdown and not a bar. This window's own
+            // upload is not drawn here at all: it reports itself in the status bar,
+            // where a live feed of paths and chunks-per-second fits and a tree row
+            // does not.
+            const item = new vscode.TreeItem(
+                "Server is indexing",
+                vscode.TreeItemCollapsibleState.None
+            );
+            item.description = `${this.serverClaims} file(s) in flight`;
+            // `~spin` animates the codicon, which is what says "still working" during
+            // the long silent stretch while a batch is on the GPU.
+            item.iconPath = new vscode.ThemeIcon(`${ICON.sync}~spin`);
+            item.tooltip =
+                "The server holds an indexing claim on these files — this window, " +
+                "another client, mindex-index or the retry worker.\n\n" +
+                "Reindexing them now would be refused as in-flight and would look " +
+                "like it did nothing, so wait for this to drain.";
+            item.contextValue = "claims";
+            return item;
+        }
+
+        if (node.kind === "action") {
+            const work = this.pendingWork;
+            const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.None);
+            item.description = [
+                work.reindex > 0 ? `${work.reindex} to reindex` : "",
+                work.delete > 0 ? `${work.delete} to delete` : "",
+            ]
+                .filter((s) => s !== "")
+                .join(" · ");
+            item.iconPath = new vscode.ThemeIcon(ICON.sync);
+            item.tooltip = new vscode.MarkdownString(
+                "**Bring the index back in sync with the working tree.**\n\n" +
+                    `Reindexes ${work.reindex} stale/missing file(s) and removes ` +
+                    `${work.delete} orphaned file(s) from the index. Your files on ` +
+                    "disk are never touched — only what the server holds about them.\n\n" +
+                    "Files already indexing are left alone."
+            );
+            item.contextValue = "action-sync";
+            item.command = {
+                command: "mindex.syncAll",
+                title: "Sync all",
+            };
+            return item;
+        }
+
         if (node.kind === "bucket") {
             const meta = BUCKETS.find((b) => b.id === node.bucket)!;
             const count = [...node.files()].length;

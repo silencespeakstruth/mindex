@@ -19,13 +19,24 @@ pub struct OllamaTuning {
     /// Whole-turn timeout (connect + full streamed reply). Thinking models can
     /// legitimately think for minutes, so this is generous.
     pub turn_timeout_ms: u64,
+    /// How long a turn may stay completely silent — no thinking, no content — before
+    /// it is abandoned. Bounds the silent prefix only; `0` disables it.
+    pub first_token_timeout_ms: u64,
     /// Liveness-ping timeout for `/health`'s optional Ollama check. Short: a
     /// health probe must not hold the response hostage to a wedged Ollama.
     pub health_timeout_ms: u64,
+    /// Below this generation rate (tokens per second of *generation* time) a turn
+    /// is logged as contention. `0` disables it, and is the default — the healthy
+    /// rate is a fact about a model on a host, not about this code.
+    pub slow_turn_tokens_per_second: f64,
+    /// Above this many milliseconds of wall clock left unaccounted for by Ollama, a
+    /// turn is logged as waiting. `0` disables it. The companion to the rate above,
+    /// and the one that sees queueing — see `[research].slow_turn_unaccounted_ms`.
+    pub slow_turn_unaccounted_ms: u64,
 }
 
-/// Sampling parameters for one chat turn, from `[research]` config plus the
-/// request's optional `seed`.
+/// Per-turn generation options, from `[research]` config plus the request's
+/// optional `seed`.
 ///
 /// Every field is optional and is **omitted** from the request when `None`, so the
 /// model's own Modelfile defaults stay in force — which is the right production
@@ -35,11 +46,24 @@ pub struct OllamaTuning {
 /// `gemma4` top_k 64), so an unpinned bake-off compares Modelfiles and sampling
 /// noise rather than models. `seed` is the axis a measurement harness varies to
 /// get repetitions that mean something.
+///
+/// Three of the four are sampling; `num_predict` is not, which is why the struct
+/// no longer calls itself that. It is set on the **report turn only**, so every
+/// other turn's request body is byte-for-byte what it was before the field
+/// existed.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Sampling {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub seed: Option<i64>,
+    /// Hard ceiling on generated tokens for this turn.
+    ///
+    /// A **runaway backstop**, not the report's length ceiling — that is the word
+    /// count the prompt announces. Ollama cuts at a token, so a tight value would
+    /// sever a code fence, fail `validate_report_markdown`, and buy a full-volume
+    /// rewrite of the document that just failed. Size it out of reach
+    /// (`REPORT_WORDS_TO_TOKENS`) and treat it firing as a defect worth a `warn!`.
+    pub num_predict: Option<u64>,
 }
 
 impl Sampling {
@@ -54,6 +78,9 @@ impl Sampling {
         }
         if let Some(s) = self.seed {
             options.insert("seed".into(), serde_json::json!(s));
+        }
+        if let Some(n) = self.num_predict {
+            options.insert("num_predict".into(), serde_json::json!(n));
         }
     }
 }
@@ -203,6 +230,54 @@ pub struct ChatOutcome {
     /// against the real window instead of the configured one; on a 32k model with a
     /// 64k setting they differ twofold.
     pub num_ctx: u64,
+    /// Ollama's own accounting for the turn, in **nanoseconds**, exactly as it
+    /// reports it. `None` means the server did not say — never zero, and here the
+    /// distinction bites twice as hard as it does for the counts, because a zero
+    /// `load_duration` is itself a fact (the model was already resident).
+    ///
+    /// This exists to tell a slow *model* from a busy *GPU*, which are the same
+    /// symptom — a run inching along at a token or two a second — and opposite
+    /// diagnoses. One measured run spent 985 seconds at ~1.5 tok/s and read as a
+    /// wedged model; nothing in the reply, the log or the metrics could say
+    /// otherwise, because none of these numbers were parsed.
+    pub load_nanos: Option<u64>,
+    pub prompt_eval_nanos: Option<u64>,
+    pub eval_nanos: Option<u64>,
+    /// Ollama's own end-to-end figure for the turn.
+    pub total_nanos: Option<u64>,
+    /// Wall clock this client measured around the same turn, in **milliseconds**.
+    ///
+    /// Not redundant with `total_nanos`, and the only field that can see the thing
+    /// this set exists to find: `total_duration` is measured inside Ollama's
+    /// handler, so time the request spends queued behind another client's
+    /// generation on the same GPU falls entirely outside it. During exactly the
+    /// contention we are hunting, Ollama's own numbers look healthy.
+    pub wall_ms: u64,
+}
+
+impl ChatOutcome {
+    /// Tokens generated per second of generation time, or `None` when either half
+    /// is unknown or zero.
+    ///
+    /// Deliberately over `eval_nanos` and not over the wall clock: this is meant to
+    /// answer "how fast did the model run *while it had the device*", so that the
+    /// queueing it was slow *because of* shows up in [`Self::unaccounted_ms`]
+    /// instead of being averaged into the rate and hidden.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        let (tokens, nanos) = (self.eval_tokens?, self.eval_nanos?);
+        (tokens > 0 && nanos > 0).then(|| tokens as f64 * 1e9 / nanos as f64)
+    }
+
+    /// Wall clock this turn took that Ollama did not account for, in milliseconds.
+    ///
+    /// Named for what it measures, not for what it usually means: it also contains
+    /// HTTP, TLS and NDJSON parsing, so a small value is noise. A *large* one is
+    /// dominated by queueing — the request sat in front of a busy GPU — but this
+    /// field states the measurement and leaves the inference to the reader.
+    pub fn unaccounted_ms(&self) -> Option<u64> {
+        let total_ms = self.total_nanos? / 1_000_000;
+        Some(self.wall_ms.saturating_sub(total_ms))
+    }
 }
 
 #[derive(Debug)]
@@ -216,6 +291,14 @@ pub enum OllamaError {
     /// discards it, and for months that turned Ollama's own explanation of a
     /// failed turn into a bare "500", which is unactionable.
     Decode(String),
+    /// The connection was alive and produced nothing for `ms` — no thinking, no
+    /// content. Separate from [`Self::Request`] because the diagnosis is different
+    /// and specific: the socket did not die, Ollama simply never began answering,
+    /// which on a single-GPU host means it is loading (or repeatedly reloading) a
+    /// model. Carrying it as its own variant is what lets the run say so.
+    Silent {
+        ms: u64,
+    },
 }
 
 impl From<reqwest::Error> for OllamaError {
@@ -230,6 +313,11 @@ impl std::fmt::Display for OllamaError {
             OllamaError::Cancelled => write!(f, "cancelled"),
             OllamaError::Request(e) => write!(f, "{e}"),
             OllamaError::Decode(msg) => write!(f, "{msg}"),
+            OllamaError::Silent { ms } => write!(
+                f,
+                "ollama produced no token within {ms} ms — it is most likely still \
+                 loading the model (check `journalctl -u ollama` for repeated loads)"
+            ),
         }
     }
 }
@@ -260,6 +348,43 @@ pub trait OllamaModel: Send + Sync {
     /// exactly the set a `/research` request may legally name.
     async fn list_models(&self) -> Result<Vec<String>, OllamaError>;
 
+    /// [`Self::list_models`] with each model's identity attached: blob digest and
+    /// the details object (parameter size, quantization, family), for the run
+    /// journal. A provided method deriving from `list_models` so every fake keeps
+    /// compiling; the HTTP client overrides it to read the fields `/api/tags`
+    /// already carries. A default-derived descriptor has no digest — which reads
+    /// as "not recorded", never as a wrong one.
+    async fn list_model_descriptors(&self) -> Result<Vec<ModelDescriptor>, OllamaError> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|name| ModelDescriptor {
+                name,
+                digest: None,
+                details_json: None,
+            })
+            .collect())
+    }
+
+    /// Whether the model declares Ollama's `tools` capability — the pre-flight half
+    /// of the `research.model_lacks_tools` diagnosis.
+    ///
+    /// **Three-valued, and the third value is the load-bearing one.** `Some(false)`
+    /// is the only answer a caller may refuse on; `None` means the question could not
+    /// be asked (Ollama unreachable, or too old to report capabilities) and must let
+    /// the run proceed. The default impl returns `None` so every fake — and any
+    /// future non-Ollama backend — keeps working without opting into a refusal it
+    /// cannot substantiate.
+    ///
+    /// `Some(true)` is not a promise: a model can declare `tools` and still have a
+    /// template that never emits them, which is why the mid-run symptom check
+    /// (`looks_like_tool_call_attempt`) stays. This method only catches the case
+    /// that is knowable before a slot is spent.
+    async fn supports_tools(&self, _model: &str) -> Option<bool> {
+        None
+    }
+
     /// Liveness ping of the Ollama server (used by `GET /health`). Ollama is an
     /// *optional* dependency — a failure here is reported, never fatal.
     ///
@@ -287,6 +412,24 @@ struct TagsResponse {
 struct TagEntry {
     #[serde(default)]
     name: String,
+    /// The model's blob digest — what makes a mutable tag name comparable across
+    /// re-pulls. Missing on old Ollamas: degrade to None, never to an error.
+    #[serde(default)]
+    digest: Option<String>,
+    /// Ollama's details object (parameter size, quantization, family), kept as
+    /// raw JSON: the journal stores it whole, nothing in this crate reads inside.
+    #[serde(default)]
+    details: Option<serde_json::Value>,
+}
+
+/// One locally-available model with its identity, for the run journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDescriptor {
+    pub name: String,
+    pub digest: Option<String>,
+    /// The details object serialized back to a JSON string, or `None` when
+    /// Ollama sent none.
+    pub details_json: Option<String>,
 }
 
 /// The slice of `POST /api/show` this client needs.
@@ -294,6 +437,29 @@ struct TagEntry {
 struct ShowResponse {
     #[serde(default)]
     model_info: HashMap<String, serde_json::Value>,
+    /// What the model declares it can do (`tools`, `thinking`, `vision`, …).
+    /// Absent on old Ollamas — hence `default`, and hence [`ShowFacts`] reading
+    /// "no `capabilities` key at all" as unknown rather than as "cannot".
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+/// Ollama's name for the capability a research run is made of.
+const TOOLS_CAPABILITY: &str = "tools";
+
+/// What one `/api/show` answers, cached per model for the process.
+///
+/// One struct rather than two caches because it is one request: asking twice for
+/// two fields of the same response is how the two would disagree about a model
+/// re-pulled between them.
+#[derive(Debug, Clone, Copy, Default)]
+struct ShowFacts {
+    /// The model's own trained context length, `None` when Ollama does not say.
+    context_limit: Option<u64>,
+    /// Whether the model declares the `tools` capability. **`None` is not `false`**
+    /// — it means Ollama did not answer, or is too old to have the field, and a
+    /// missing answer must never refuse a run that would have worked.
+    supports_tools: Option<bool>,
 }
 
 /// One NDJSON line of `POST /api/chat` with `stream: true`.
@@ -312,6 +478,17 @@ struct ChatChunk {
     prompt_eval_count: Option<u64>,
     #[serde(default)]
     eval_count: Option<u64>,
+    /// Ollama's own timings, nanoseconds, likewise only on the `done` line. Kept in
+    /// its units all the way to `ChatOutcome`: converting at the seam would mean
+    /// two places knew what a nanosecond was.
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
+    #[serde(default)]
+    total_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -361,11 +538,10 @@ pub struct OllamaHttpClient {
     /// normal reply. Set by `with_metrics`; `None` in tests that build a bare
     /// client.
     metrics: Option<Arc<Metrics>>,
-    /// `model → its own trained context length`, from `/api/show`. Cached because
-    /// it is a property of the model file, asked once per model per process.
-    /// `None` = asked and unknowable (old Ollama, odd model_info), so it is not
-    /// re-asked every turn.
-    context_limits: tokio::sync::Mutex<HashMap<String, Option<u64>>>,
+    /// `model → what /api/show said about it`. Cached because these are properties
+    /// of the model file, asked once per model per process; an unreachable or
+    /// unhelpful answer caches as all-`None` rather than being re-asked every turn.
+    show_facts: tokio::sync::Mutex<HashMap<String, ShowFacts>>,
 }
 
 impl OllamaHttpClient {
@@ -374,7 +550,7 @@ impl OllamaHttpClient {
             client: reqwest::Client::new(),
             base_url,
             tuning,
-            context_limits: tokio::sync::Mutex::new(HashMap::new()),
+            show_facts: tokio::sync::Mutex::new(HashMap::new()),
             metrics: None,
         }
     }
@@ -388,17 +564,28 @@ impl OllamaHttpClient {
         self
     }
 
-    /// The model's own trained context length, or `None` when Ollama does not say.
+    /// What `/api/show` says about one model, asked once per process.
     ///
-    /// `/api/show`'s `model_info` keys are namespaced per architecture
-    /// (`glm4moelite.context_length`, `qwen3.context_length`, …), so the key is
-    /// found by suffix rather than named.
-    async fn model_context_limit(&self, model: &str) -> Option<u64> {
-        if let Some(cached) = self.context_limits.lock().await.get(model) {
+    /// `model_info`'s keys are namespaced per architecture
+    /// (`glm4moelite.context_length`, `qwen3.context_length`, …), so the context
+    /// length is found by suffix rather than named.
+    ///
+    /// Every failure path yields [`ShowFacts::default`] — all fields `None`, which
+    /// each consumer reads as "no hint", never as a negative answer. That is the
+    /// difference between an unreachable Ollama costing a run its full window and
+    /// an unreachable Ollama refusing the run outright.
+    ///
+    /// **Only successes are cached.** Caching the failure made one transient blip
+    /// permanent for the life of the process: every later run of that model silently
+    /// used the configured ceiling instead of the model's own window, and its tool
+    /// support stayed unknown, with the first `warn!` as the only evidence. The retry
+    /// costs one bounded request per run, which is what the fact is worth.
+    async fn show_facts(&self, model: &str) -> ShowFacts {
+        if let Some(cached) = self.show_facts.lock().await.get(model) {
             return *cached;
         }
         let url = self.base_url.join("api/show").unwrap(); // join of a literal cannot fail
-        let limit = match self
+        let facts = match self
             .client
             .post(url)
             .timeout(Duration::from_millis(self.tuning.health_timeout_ms))
@@ -407,26 +594,31 @@ impl OllamaHttpClient {
             .await
         {
             Ok(resp) => match resp.json::<ShowResponse>().await {
-                Ok(show) => show
-                    .model_info
-                    .iter()
-                    .find(|(k, _)| k.ends_with(".context_length"))
-                    .and_then(|(_, v)| v.as_u64()),
+                Ok(show) => ShowFacts {
+                    context_limit: show
+                        .model_info
+                        .iter()
+                        .find(|(k, _)| k.ends_with(".context_length"))
+                        .and_then(|(_, v)| v.as_u64()),
+                    supports_tools: show
+                        .capabilities
+                        .map(|caps| caps.iter().any(|c| c == TOOLS_CAPABILITY)),
+                },
                 Err(e) => {
-                    warn!(%model, error = %e, "Could not read the model's context length from Ollama /api/show; leaving the configured num_ctx as-is.");
-                    None
+                    warn!(%model, error = %e, "Could not read Ollama /api/show for this model; leaving the configured num_ctx as-is and making no claim about its tool support. The next run re-asks.");
+                    return ShowFacts::default();
                 }
             },
             Err(e) => {
-                warn!(%model, error = %e, "Ollama /api/show is unreachable; leaving the configured num_ctx as-is.");
-                None
+                warn!(%model, error = %e, "Ollama /api/show is unreachable; leaving the configured num_ctx as-is and making no claim about the model's tool support. The next run re-asks.");
+                return ShowFacts::default();
             }
         };
-        self.context_limits
+        self.show_facts
             .lock()
             .await
-            .insert(model.to_string(), limit);
-        limit
+            .insert(model.to_string(), facts);
+        facts
     }
 
     /// The `num_ctx` to actually request: **the model's own trained length**, capped
@@ -443,7 +635,7 @@ impl OllamaHttpClient {
     /// ceiling is used as-is — a missing hint must not fail a run.
     async fn effective_num_ctx(&self, model: &str) -> u64 {
         let ceiling = self.tuning.max_num_ctx_tokens;
-        match self.model_context_limit(model).await {
+        match self.show_facts(model).await.context_limit {
             Some(limit) if limit > ceiling => {
                 info!(
                     %model,
@@ -543,6 +735,25 @@ impl OllamaHttpClient {
         }
     }
 
+    /// Report an abandoned silent turn once, in the one place that knows why.
+    ///
+    /// A `warn!` rather than a bare error return because this failure is almost never
+    /// mindex's: the run will report `ollama.unavailable` to its client, and the line
+    /// that says the connection was *alive and mute* — with the model name — is what
+    /// points at the right log next.
+    fn silent_turn(&self, model: &str, ms: u64) -> OllamaError {
+        warn!(
+            %model,
+            first_token_timeout_ms = ms,
+            "Ollama accepted the turn and produced no token at all within the silence \
+             window; abandoning it rather than spending the run's budget waiting. The \
+             usual cause is a model being loaded or repeatedly evicted and reloaded — \
+             check `journalctl -u ollama` for `Load failed` and for other clients \
+             asking the same model for a different context size."
+        );
+        OllamaError::Silent { ms }
+    }
+
     /// One `/api/chat` request body.
     fn chat_body(
         &self,
@@ -601,6 +812,102 @@ impl OllamaHttpClient {
             );
         }
     }
+
+    /// Record what this turn's generation rate was, and say so when it is far below
+    /// what the host can do.
+    ///
+    /// Here rather than in the research loop for the same reason
+    /// [`Self::warn_if_context_exhausted`] is: this is a per-turn pathology that is
+    /// invisible in the returned value, and this is the one place that has the model
+    /// name, the metrics handle and the timings at once. The loop would need the
+    /// threshold threaded through ten call sites to say the same thing later.
+    ///
+    /// The wording names the diagnosis on purpose. A run inching along at a token a
+    /// second is the *same symptom* as a broken model, a bad prompt and a wedged
+    /// server, and the operator who reads this log is about to pick one of those.
+    /// On this host the answer is usually the fourth: one GPU, shared with whatever
+    /// else the user is running.
+    fn warn_if_slow_turn(&self, model: &str, outcome: &ChatOutcome) {
+        let labels = || crate::backend::metrics::ModelLabels {
+            model: model.to_string(),
+        };
+        let rate = outcome.tokens_per_second();
+        let unaccounted = outcome.unaccounted_ms();
+
+        if let Some(m) = &self.metrics {
+            if let Some(rate) = rate {
+                m.research
+                    .turn_tokens_per_second
+                    .get_or_create(&labels())
+                    .observe(rate);
+            }
+            if let Some(load) = outcome.load_nanos {
+                m.research
+                    .turn_load_seconds
+                    .get_or_create(&labels())
+                    .observe(load as f64 / 1e9);
+            }
+            if let Some(ms) = unaccounted {
+                m.research
+                    .turn_unaccounted_seconds
+                    .get_or_create(&labels())
+                    .observe(ms as f64 / 1000.0);
+            }
+        }
+
+        // **Two independent checks, and neither may gate the other.** They were one,
+        // with the rate tested first and an early `return` under it, which made the
+        // second unreachable in the only case it exists for: a turn slowed by
+        // *queueing* generates at full speed while it holds the device, so the rate
+        // is healthy, the early return fires, and the wait is never reported. Measured
+        // on this host — a 912-second turn whose week of neighbours all sat between 32
+        // and 128 tok/s — the rate check would have returned early at any threshold
+        // anyone would set.
+        let floor = self.tuning.slow_turn_tokens_per_second;
+        if let Some(rate) = rate
+            && floor > 0.0
+            && rate < floor
+        {
+            warn!(
+                %model,
+                tokens_per_second = format!("{rate:.1}"),
+                eval_tokens = outcome.eval_tokens.unwrap_or(0),
+                load_ms = outcome.load_nanos.unwrap_or(0) / 1_000_000,
+                unaccounted_ms = unaccounted.unwrap_or(0),
+                threshold = format!("{floor:.1}"),
+                "Ollama generated this turn far below the configured healthy rate for \
+                 this host — it was slow while it held the device. Sysadmin: check \
+                 load_ms (a reload means something else wanted the GPU) and the \
+                 model's own quantization; this is not a bad prompt."
+            );
+        }
+
+        // The half that catches waiting. `unaccounted_ms` is wall clock minus
+        // Ollama's `total_duration`, and Ollama times itself inside its own handler,
+        // so this is the only number in the system that can see a request sitting in
+        // front of a busy device.
+        let ceiling = self.tuning.slow_turn_unaccounted_ms;
+        if let Some(ms) = unaccounted
+            && ceiling > 0
+            && ms > ceiling
+        {
+            warn!(
+                %model,
+                unaccounted_ms = ms,
+                wall_ms = outcome.wall_ms,
+                tokens_per_second = rate.map(|r| format!("{r:.1}")),
+                eval_tokens = outcome.eval_tokens.unwrap_or(0),
+                threshold_ms = ceiling,
+                "This turn spent most of its wall clock outside Ollama's own \
+                 accounting: it was waiting, not generating. Every timing Ollama \
+                 reports for it will look healthy, because Ollama's clock starts when \
+                 the request reaches its handler. Sysadmin: something else is using \
+                 the device — check `ollama ps` for a second resident model, and any \
+                 other client asking this GPU for work. A run in this state will spend \
+                 its whole budget and may finish with no steps at all."
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -615,19 +922,51 @@ impl OllamaModel for OllamaHttpClient {
         token: &CancellationToken,
     ) -> Result<ChatOutcome, OllamaError> {
         let num_ctx = self.effective_num_ctx(model).await;
-        let response = self
-            .post_chat(model, messages, tools, sampling, num_ctx, token)
-            .await?;
+        // Started before the request, not after it: the queue this is meant to see
+        // forms in front of Ollama, so a clock started once the response headers
+        // arrive would miss precisely the wait it exists to measure.
+        let wall = std::time::Instant::now();
+        // The silence guard spans the request *and* the wait for the first token,
+        // because the two are one silence from the caller's side and the stall can
+        // land in either: Ollama holds the connection open while it loads, so the
+        // response headers themselves may be what never arrives. It is armed here,
+        // once, and disarmed by the first delta of any channel — after that a turn is
+        // bounded by `turn_timeout_ms` and the run's own deadline, as before.
+        let silence = self.tuning.first_token_timeout_ms;
+        let silent_until =
+            (silence > 0).then(|| tokio::time::Instant::now() + Duration::from_millis(silence));
+        let post = self.post_chat(model, messages, tools, sampling, num_ctx, token);
+        let response = match silent_until {
+            Some(deadline) => match tokio::time::timeout_at(deadline, post).await {
+                Ok(r) => r?,
+                Err(_) => return Err(self.silent_turn(model, silence)),
+            },
+            None => post.await?,
+        };
 
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         let mut content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Disarmed by the first delta, not by the first *chunk*: Ollama's stream can
+        // open with keep-alive-ish lines carrying an empty message, and a byte that
+        // says nothing is not the model answering.
+        let mut spoke = false;
 
         loop {
-            let chunk = tokio::select! {
-                _ = token.cancelled() => return Err(OllamaError::Cancelled),
-                chunk = tokio_stream::StreamExt::next(&mut stream) => chunk,
+            let next = tokio_stream::StreamExt::next(&mut stream);
+            let chunk = match silent_until.filter(|_| !spoke) {
+                Some(deadline) => tokio::select! {
+                    _ = token.cancelled() => return Err(OllamaError::Cancelled),
+                    chunk = tokio::time::timeout_at(deadline, next) => match chunk {
+                        Ok(c) => c,
+                        Err(_) => return Err(self.silent_turn(model, silence)),
+                    },
+                },
+                None => tokio::select! {
+                    _ = token.cancelled() => return Err(OllamaError::Cancelled),
+                    chunk = next => chunk,
+                },
             };
             let Some(chunk) = chunk else { break };
             let chunk = chunk?;
@@ -650,13 +989,18 @@ impl OllamaModel for OllamaHttpClient {
                     if let Some(t) = msg.thinking
                         && !t.is_empty()
                     {
+                        spoke = true;
                         on_delta(ChatDelta::Thinking(t));
                     }
                     if !msg.content.is_empty() {
+                        spoke = true;
                         content.push_str(&msg.content);
                         on_delta(ChatDelta::Content(msg.content));
                     }
-                    // A turn may carry several calls, spread over chunks.
+                    // A turn may carry several calls, spread over chunks. A tool call
+                    // is the model answering as much as prose is — a turn that emits
+                    // one and nothing else must not read as silence.
+                    spoke |= !msg.tool_calls.is_empty();
                     tool_calls.extend(msg.tool_calls);
                 }
                 if parsed.done {
@@ -666,8 +1010,14 @@ impl OllamaModel for OllamaHttpClient {
                         prompt_tokens: parsed.prompt_eval_count,
                         eval_tokens: parsed.eval_count,
                         num_ctx,
+                        load_nanos: parsed.load_duration,
+                        prompt_eval_nanos: parsed.prompt_eval_duration,
+                        eval_nanos: parsed.eval_duration,
+                        total_nanos: parsed.total_duration,
+                        wall_ms: wall.elapsed().as_millis() as u64,
                     };
                     self.warn_if_context_exhausted(model, num_ctx, &outcome);
+                    self.warn_if_slow_turn(model, &outcome);
                     return Ok(outcome);
                 }
             }
@@ -699,6 +1049,38 @@ impl OllamaModel for OllamaHttpClient {
             .map(|m| m.name)
             .filter(|n| !n.is_empty())
             .collect())
+    }
+
+    async fn list_model_descriptors(&self) -> Result<Vec<ModelDescriptor>, OllamaError> {
+        // The same `/api/tags` read as `list_models`, keeping the fields that
+        // identify the artifact behind the name.
+        let url = self.base_url.join("api/tags").unwrap(); // join of a literal cannot fail
+        let tags: TagsResponse = self
+            .client
+            .get(url)
+            .timeout(Duration::from_millis(self.tuning.health_timeout_ms))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(tags
+            .models
+            .into_iter()
+            .filter(|m| !m.name.is_empty())
+            .map(|m| ModelDescriptor {
+                name: m.name,
+                digest: m.digest.filter(|d| !d.is_empty()),
+                details_json: m
+                    .details
+                    .as_ref()
+                    .and_then(|d| serde_json::to_string(d).ok()),
+            })
+            .collect())
+    }
+
+    async fn supports_tools(&self, model: &str) -> Option<bool> {
+        self.show_facts(model).await.supports_tools
     }
 }
 
@@ -747,6 +1129,9 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         )
@@ -812,6 +1197,9 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -874,6 +1262,9 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -978,6 +1369,9 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         )
@@ -1009,6 +1403,10 @@ mod tests {
         assert!(opts.get("temperature").is_none(), "{opts}");
         assert!(opts.get("top_p").is_none(), "{opts}");
         assert!(opts.get("seed").is_none(), "{opts}");
+        // The report turn is the only one that arms this. Its absence everywhere
+        // else is what keeps every non-report request byte-for-byte what it was
+        // before the field existed.
+        assert!(opts.get("num_predict").is_none(), "{opts}");
     }
 
     /// Pinned sampling is what makes a model comparison a comparison: without it
@@ -1020,12 +1418,16 @@ mod tests {
             temperature: Some(0.2),
             top_p: Some(0.9),
             seed: Some(7),
+            num_predict: Some(3600),
         })
         .await;
         assert_eq!(opts["temperature"], 0.2);
         assert_eq!(opts["top_p"], 0.9);
         assert_eq!(opts["seed"], 7);
+        assert_eq!(opts["num_predict"], 3600);
         // The window is still decided by the model/ceiling logic, not by sampling.
+        // `num_predict` bounds what is *generated* into that window; it is not the
+        // window.
         assert_eq!(opts["num_ctx"], 4096);
     }
 
@@ -1071,6 +1473,101 @@ mod tests {
         assert_eq!(outcome.eval_tokens, None);
     }
 
+    /// Ollama's own timings, which for the whole life of this client were parsed by
+    /// nothing and dropped by serde. They are the only thing that can say whether a
+    /// slow run was a slow model or a busy device.
+    #[tokio::test]
+    async fn a_done_line_carries_the_turns_durations_through_to_the_outcome() {
+        let client = stub_ollama(&[
+            r#"{"message":{"role":"assistant","content":"hi"},"done":false}"#,
+            r#"{"message":{"content":""},"done":true,"eval_count":60,"load_duration":500000000,"prompt_eval_duration":300000000,"eval_duration":3000000000,"total_duration":3900000000}"#,
+        ])
+        .await;
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(outcome.load_nanos, Some(500_000_000));
+        assert_eq!(outcome.prompt_eval_nanos, Some(300_000_000));
+        assert_eq!(outcome.eval_nanos, Some(3_000_000_000));
+        assert_eq!(outcome.total_nanos, Some(3_900_000_000));
+        // 60 tokens over 3 s of generation, measured over generation time so that
+        // waiting shows up as unaccounted rather than dragging the rate down.
+        assert_eq!(outcome.tokens_per_second(), Some(20.0));
+        // Wall clock is measured, not scripted, so only the direction is assertable:
+        // it covers the whole request and cannot be less than what Ollama accounts
+        // for by more than rounding.
+        assert!(outcome.unaccounted_ms().is_some());
+    }
+
+    /// A zero `load_duration` is a fact — the model was already resident — so the
+    /// unknown case must not be spelled the same way.
+    #[tokio::test]
+    async fn a_done_line_without_durations_is_unknown_not_zero() {
+        let client =
+            stub_ollama(&[r#"{"message":{"role":"assistant","content":"hi"},"done":true}"#]).await;
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(outcome.load_nanos, None);
+        assert_eq!(outcome.eval_nanos, None);
+        assert_eq!(outcome.total_nanos, None);
+        assert_eq!(outcome.tokens_per_second(), None);
+        assert_eq!(outcome.unaccounted_ms(), None);
+    }
+
+    /// **The regression guard for a turn that waited rather than crawled.**
+    ///
+    /// The two contention signals used to be one check, with the generation rate
+    /// tested first and an early `return` under it — so a turn that reported no token
+    /// counts recorded *nothing at all*, and a turn slowed by queueing recorded a
+    /// healthy rate and no wait. That is not a corner case, it is the common one on a
+    /// shared device: Ollama times itself inside its own handler, so a request sitting
+    /// in front of a busy GPU is absent from every figure it returns, and the whole
+    /// wait lands in `unaccounted_ms`. Measured on this host — a 912-second turn while
+    /// the preceding week's 220 turns all sat between 32 and 128 tok/s — the rate
+    /// check would have returned early at any threshold anyone would set, and the one
+    /// number that could have named the failure reached no log and no metric.
+    ///
+    /// Driven through the no-token-counts case because that is the shape the early
+    /// return silenced completely, and because it is assertable without a slow stub.
+    #[tokio::test]
+    async fn a_turn_that_reports_no_rate_still_records_the_time_ollama_did_not_account_for() {
+        let metrics = Arc::new(Metrics::new());
+        // `total_duration` present, no `eval_count`/`eval_duration`: `tokens_per_second()`
+        // is `None`, which is exactly what used to end the function on its first line.
+        let client =
+            stub_ollama(&[r#"{"message":{"content":"x"},"done":true,"total_duration":1000000}"#])
+                .await
+                .with_metrics(Arc::clone(&metrics));
+
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(
+            outcome.tokens_per_second(),
+            None,
+            "the fixture must exercise the branch that used to return early"
+        );
+        assert!(outcome.unaccounted_ms().is_some());
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains("mindex_research_turn_unaccounted_seconds_count"),
+            "a turn's unaccounted wall clock was not measured, so queueing — the one \
+             contention shape Ollama's own timings cannot show — is invisible again: \
+             {text}"
+        );
+    }
+
+    /// The threshold defaults to off, because a healthy rate is a fact about one
+    /// model on one host rather than about this code. Off must mean silent — not
+    /// "warn on everything below zero", which is how a float default goes wrong.
+    #[tokio::test]
+    async fn a_slow_turn_threshold_of_zero_never_warns() {
+        let client = stub_ollama(&[
+            r#"{"message":{"content":"x"},"done":true,"eval_count":2,"eval_duration":10000000000,"total_duration":10000000000}"#,
+        ])
+        .await;
+        // 0.2 tok/s — as slow as anything gets — and the default tuning is 0.0.
+        assert_eq!(client.tuning.slow_turn_tokens_per_second, 0.0);
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(outcome.tokens_per_second(), Some(0.2));
+    }
+
     #[tokio::test]
     async fn in_band_error_line_is_surfaced() {
         let client = stub_ollama(&[r#"{"error":"model 'nope' not found"}"#]).await;
@@ -1104,13 +1601,21 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 8192,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
         assert_eq!(big.effective_num_ctx("test-model").await, 4096);
         // Cached: the second call must not need the server.
         assert_eq!(
-            *big.context_limits.lock().await.get("test-model").unwrap(),
+            big.show_facts
+                .lock()
+                .await
+                .get("test-model")
+                .unwrap()
+                .context_limit,
             Some(4096)
         );
     }
@@ -1125,10 +1630,197 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 2048,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
         assert_eq!(small.effective_num_ctx("test-model").await, 2048);
+    }
+
+    /// An `/api/show` stub answering one fixed body, for the capability reads.
+    async fn show_stub(body: &'static str) -> OllamaHttpClient {
+        let app = Router::new().route("/api/show", post(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
+                health_timeout_ms: 2000,
+            },
+        )
+    }
+
+    /// The three answers, and the third is why this is an `Option`.
+    ///
+    /// `Some(false)` is the only one a caller may refuse a run on. A model that lists
+    /// `tools` says so; a model that lists other capabilities and not `tools` says
+    /// so too; and an Ollama that reports no capabilities at all — the stub above,
+    /// and every Ollama older than the field — says nothing, which must not be read
+    /// as "cannot".
+    #[tokio::test]
+    async fn tool_support_is_read_from_the_model_and_absence_is_not_a_no() {
+        let yes = show_stub(r#"{"capabilities":["completion","tools","thinking"]}"#).await;
+        assert_eq!(yes.supports_tools("m").await, Some(true));
+
+        // Measured on this host: `qwen2.5vl:7b` reports exactly this.
+        let no = show_stub(r#"{"capabilities":["completion","vision"]}"#).await;
+        assert_eq!(no.supports_tools("m").await, Some(false));
+
+        let silent = show_stub(r#"{"model_info":{"testarch.context_length":4096}}"#).await;
+        assert_eq!(silent.supports_tools("m").await, None);
+    }
+
+    /// An Ollama that cannot be reached answers `None`, not `Some(false)` — a
+    /// pre-flight check that cannot be performed must never become a refusal.
+    #[tokio::test]
+    async fn an_unreachable_ollama_makes_no_claim_about_tool_support() {
+        // A port nothing is listening on: the request fails, and the failure caches.
+        let client = OllamaHttpClient::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
+                health_timeout_ms: 500,
+            },
+        );
+        assert_eq!(client.supports_tools("m").await, None);
+        // And the ceiling still applies, from the same all-`None` answer.
+        assert_eq!(client.effective_num_ctx("m").await, 4096);
+    }
+
+    /// `show_facts` caches **successes only**. Caching the failure made one blip
+    /// permanent for the life of the process: every later run of that model silently
+    /// used the configured ceiling instead of the model's own window — so a 32k model
+    /// was asked for 65k, which llama.cpp allocates and the model degrades past,
+    /// silently — and `supports_tools` stayed unknown, disarming the pre-flight check
+    /// for good. One unlucky restart of Ollama poisoned mindex until mindex restarted
+    /// too, with nothing after the first `warn!` to say so.
+    #[tokio::test]
+    async fn a_transient_show_failure_is_not_cached_for_the_life_of_the_process() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let calls = Arc::clone(&calls);
+            Router::new().route(
+                "/api/show",
+                post(move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        // The first ask fails; every one after it answers properly.
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            "not json at all — a truncated or proxied reply"
+                        } else {
+                            r#"{"capabilities":["completion","tools"],
+                                "model_info":{"testarch.context_length":2048}}"#
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 65536,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        // The blip: no claim either way. Nothing is written to the cache.
+        assert_eq!(client.supports_tools("m").await, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The very next ask must reach Ollama again and get the real answers — both
+        // of them, since one request answers both questions.
+        assert_eq!(
+            client.supports_tools("m").await,
+            Some(true),
+            "a transient /api/show failure was cached; this model's tool support is \
+             now permanently unknown and the pre-flight check is disarmed for good"
+        );
+        assert_eq!(
+            client.effective_num_ctx("m").await,
+            2048,
+            "a transient /api/show failure was cached; every later run of this model \
+             asks for the ceiling instead of its own window"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the retry happened, and the success that followed it was cached"
+        );
+    }
+
+    /// The other half: a *successful* answer is cached, so `/api/show` is asked once
+    /// per model per process. Both facts come from one request and are cached
+    /// together — two caches could disagree about a model re-pulled between them.
+    #[tokio::test]
+    async fn a_successful_show_is_asked_once_and_answers_both_questions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let calls = Arc::clone(&calls);
+            Router::new().route(
+                "/api/show",
+                post(move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        r#"{"capabilities":["completion","tools"],
+                            "model_info":{"testarch.context_length":2048}}"#
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 65536,
+                turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        for _ in 0..5 {
+            assert_eq!(client.supports_tools("m").await, Some(true));
+            assert_eq!(client.effective_num_ctx("m").await, 2048);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "/api/show was asked more than once per model per process"
+        );
+
+        // A different model is a different cache entry, and asks again.
+        assert_eq!(client.supports_tools("other").await, Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1140,6 +1832,9 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 32768,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -1170,6 +1865,9 @@ mod tests {
             OllamaTuning {
                 max_num_ctx_tokens: 4096,
                 turn_timeout_ms: 5000,
+                first_token_timeout_ms: 0,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1195,5 +1893,115 @@ mod tests {
             )
             .await;
         assert!(matches!(res, Err(OllamaError::Cancelled)));
+    }
+
+    /// An Ollama that accepts the turn and says nothing — a model being loaded, or
+    /// evicted and reloaded under a second client. The socket is healthy, so
+    /// `turn_timeout_ms` never fires and, before this guard, the run's own deadline
+    /// was the first thing to notice: a whole budget spent producing nothing.
+    ///
+    /// Real time in small increments, deliberately: `start_paused` would auto-advance
+    /// past the guard and prove only that `timeout_at` exists.
+    #[tokio::test]
+    async fn a_turn_that_never_answers_is_abandoned_long_before_the_turn_timeout() {
+        let app = Router::new()
+            .route(
+                "/api/chat",
+                post(|| async {
+                    // Longer than the guard, shorter than the test's patience.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    r#"{"message":{"content":"too late"},"done":true}"#
+                }),
+            )
+            .route(
+                "/api/show",
+                post(|| async { r#"{"model_info":{"testarch.context_length":4096}}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                // The whole point: the dead-socket timeout is far above the silence
+                // window, exactly as the config validation requires.
+                turn_timeout_ms: 30_000,
+                first_token_timeout_ms: 200,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let (res, deltas) = run(&client).await;
+        assert!(
+            matches!(res, Err(OllamaError::Silent { ms: 200 })),
+            "a mute turn must be abandoned as silent, got {res:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the guard must fire on its own window, not on the turn timeout"
+        );
+        assert!(deltas.is_empty(), "nothing was said: {deltas:?}");
+    }
+
+    /// The other half: the guard bounds the silent *prefix* only. A model that starts
+    /// answering and then thinks for a long stretch is healthy, and abandoning it
+    /// would be the tight-timeout mistake the whole design avoids.
+    #[tokio::test]
+    async fn the_silence_guard_is_spent_by_the_first_token() {
+        let app = Router::new()
+            .route(
+                "/api/chat",
+                post(|| async {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Result<_, std::io::Error>>(2);
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(
+                                "{\"message\":{\"thinking\":\"hm\"}}\n",
+                            )))
+                            .await;
+                        // Well past the guard: it must already be disarmed.
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(
+                                "{\"message\":{\"content\":\"answer\"},\"done\":true}\n",
+                            )))
+                            .await;
+                    });
+                    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+                }),
+            )
+            .route(
+                "/api/show",
+                post(|| async { r#"{"model_info":{"testarch.context_length":4096}}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OllamaHttpClient::new(
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            OllamaTuning {
+                max_num_ctx_tokens: 4096,
+                turn_timeout_ms: 30_000,
+                first_token_timeout_ms: 200,
+                slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
+                health_timeout_ms: 2000,
+            },
+        );
+
+        let (res, deltas) = run(&client).await;
+        let outcome = res.expect("a turn that spoke must not be abandoned");
+        assert_eq!(outcome.content, "answer");
+        assert_eq!(
+            deltas,
+            vec![
+                ChatDelta::Thinking("hm".into()),
+                ChatDelta::Content("answer".into())
+            ]
+        );
     }
 }

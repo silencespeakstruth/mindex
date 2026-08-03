@@ -5,6 +5,7 @@
   "singleQuote": false,
   "trailingComma": "es5",
   "arrowParens": "always",
+  "endOfLine": "lf",
   "overrides": [
     {
       "files": ["*.json", "*.jsonc", "*.md", "*.yml", "*.yaml"],

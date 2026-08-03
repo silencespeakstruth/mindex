@@ -13,7 +13,7 @@ here.**
 | Tool | Notes |
 | --- | --- |
 | `search(project_guid, query, include?, exclude?)` | Up to **5** ranked chunks. The cap is the context budget and the model cannot raise it. |
-| `symbols(project_guid, name, role?, kind?, anchor_path?)` | Exact-name definitions/references (tree-sitter tags): kinds, enclosing scope, docs. Returns ranked **candidates** + full totals — a name can legitimately live in several places. `anchor_path` ranks your current file first. |
+| `symbols(project_guid, name, kind?, anchor_path?)` | Exact-name **definition** lookup (tree-sitter tags): kinds, enclosing scope, docs. Returns ranked **candidates** + full totals — a name can legitimately live in several places. `anchor_path` ranks your current file first. It does not answer "who uses this name": that is lexical, and `grep` answers it honestly. The `role` parameter was removed with the reference half of the table; sending it is now a `400` rather than a plausible wrong answer. |
 | `index_files(project_guid, files)` | Reindex the files you just touched, bodies **verbatim**. Unchanged content is hash-skipped server-side, so it is cheap to call often. |
 | `delete_files(project_guid, paths)` | Soft-delete after a delete/rename (pass the OLD paths). |
 | `drift(project_guid, root?, include?, exclude?)` | Is the index in sync? Returns `stale` / `missing` / `orphaned` / `indexing`. Needs `mindex-index` on `PATH`. |

@@ -1,0 +1,26 @@
+{
+  // The webview half of the extension. Separate from tsconfig.json because the two
+  // halves target different runtimes: the host is Node16/CommonJS with no DOM, the
+  // webview is a browser with no `require` and no `vscode` module. One config would
+  // have to admit both libs, and then a host file could reach for `document` and a
+  // webview file for `fs` with nothing complaining until runtime.
+  //
+  // `src/shared` is compiled by BOTH projects on purpose: the field table and the
+  // slider maths must be the same code the host imports and `node --test` exercises.
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "outDir": "media/js",
+    "rootDir": "src",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "sourceMap": false,
+    "skipLibCheck": true
+  },
+  "include": ["src/webview", "src/shared"]
+}

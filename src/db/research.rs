@@ -9,13 +9,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::backend::metrics::{
     ClassLabels, Metrics, ModelEffortLabels, ModelKindLabels, ModelLabels, ModelReasonLabels,
 };
 use crate::db::sqlite3::SQLite3Pool;
-use crate::research::{ResearchJournal, RunRecord};
+use crate::research::{RecordedRun, ResearchJournal, RunRecord};
+
+/// Shared with `worker::gc`, which prunes on the same unit.
+const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Everything about a run that the *request* decided rather than the loop.
 ///
@@ -23,24 +26,88 @@ use crate::research::{ResearchJournal, RunRecord};
 /// projects or HTTP: whoever builds the journal already holds these.
 #[derive(Debug, Clone)]
 pub struct RunContext {
+    /// The run's identity, minted at **admission** rather than here.
+    ///
+    /// It used to be created in this function, which meant a run had no name until
+    /// the moment it ended: nothing could list it while it ran, and nothing could
+    /// cancel it by name. The id now comes from `post_research`, which registers it
+    /// in `backend::inflight::ResearchRegistry` and streams it as the `started`
+    /// event — so the id on the wire at second zero is the id in this row.
+    pub id: String,
     pub project_guid: String,
     pub effort: &'static str,
     pub seed: Option<i64>,
     pub temperature: Option<f64>,
+    /// The third sampling axis; NULL = the model's own default, like the two above.
+    pub top_p: Option<f64>,
+    /// The Ollama blob digest of the resolved model, from the model catalog at
+    /// admission; `None` when the catalog had not seen it yet (e.g. within the
+    /// first refresh interval after startup). The name in `model` is mutable —
+    /// a re-pulled tag is a different artifact — so this is what makes two runs
+    /// actually comparable.
+    pub model_digest: Option<String>,
+    /// The catalog's details object for the model (parameter size, quantization,
+    /// family), stored whole as JSON; read by humans and notebooks, never joined.
+    pub model_details_json: Option<String>,
+    /// Which embedding model the run's file baselines were read under
+    /// (`RouterState.model_id`). The staleness join has always bound this from
+    /// state; stamping it keeps stored runs interpretable across an embedder swap.
+    pub embedder_model_id: String,
+    /// `CARGO_PKG_VERSION` of the server that produced the row.
+    pub server_version: &'static str,
+    /// Wall-clock admission time (unix seconds). `created_at` is the INSERT's
+    /// time — the run's end — so without this the corpus never recorded when a
+    /// run began.
+    pub started_at: i64,
+    /// The resolved checkpoint interval for this run (`0` = off) — request
+    /// override over `[research].checkpoint_every_steps`, resolved by the
+    /// handler like the rest of this struct.
+    pub checkpoint_every_steps: usize,
     /// The run's file scope, rendered once by the caller. `None` for an unscoped run —
     /// stored as SQL NULL, so "no scope" and "an empty scope" stay apart.
     pub scope_json: Option<String>,
+    /// The same scope as data (serialized `ToolScope`), for the challenge
+    /// endpoint to re-inhabit. `None` on unscoped runs.
+    pub scope_spec_json: Option<String>,
+    /// `"research"` or `"challenge"` — the row's `kind` column.
+    pub kind: &'static str,
+    /// The run this challenge attacked; `None` on ordinary research runs. No FK
+    /// (see the migration): a dangling id means the subject is gone, nothing more.
+    pub challenged_run_id: Option<String>,
+    /// `[research].retention_days`, threaded rather than read from a global. Stamped
+    /// onto the row as an absolute `expires_at` at insert, so a run's deadline is a
+    /// property of the run and a later config change moves only future runs.
+    pub retention_days: u64,
 }
 
 /// Insert one finished run. Logs and swallows every failure — the caller is on
 /// the "report already delivered" side of the run.
+///
+/// Returns [`RecordedRun`] so the `done` event can name what was stored, or `None`
+/// if nothing was: the best-effort contract is unchanged, and a `None` simply means
+/// the client is not offered a run it cannot later fetch.
+///
+/// **Two tables, one transaction.** The v1.0.0 comment on this table says "one row,
+/// one INSERT", which stopped being literally true when `research_run_files` arrived;
+/// the property it was really claiming — a run has all its rows or none — is what the
+/// single transaction still guarantees. A half-written run would be worse than no run
+/// at all here, since a report stored without its baselines reads as permanently
+/// fresh.
 pub async fn insert_run(
     db_pool: &SQLite3Pool,
     ctx: RunContext,
     record: RunRecord,
     token: CancellationToken,
-) {
-    let id = uuid::Uuid::new_v4().to_string();
+) -> Option<RecordedRun> {
+    let id = ctx.id.clone();
+    // Read out before `ctx`/`record` move into the closure. The verdict is what
+    // gates the replace rule below; the subject id is only for the log line, which
+    // runs after the transaction has already consumed both.
+    let challenge_verdict = record.challenge.as_ref().and_then(|c| c.verdict);
+    let subject_for_log = ctx.challenged_run_id.clone();
+    let retention_secs = (ctx.retention_days as i64).saturating_mul(SECONDS_PER_DAY);
+    let context_run_ids =
+        serde_json::to_string(&record.context_run_ids).unwrap_or_else(|_| "[]".to_string());
     let cited_paths =
         serde_json::to_string(&record.citations.cited_paths).unwrap_or_else(|_| "[]".to_string());
     let unverified_paths = serde_json::to_string(&record.citations.unverified_paths)
@@ -50,9 +117,18 @@ pub async fn insert_run(
 
     let res = db_pool
         .transaction(token, move |tx| {
+            // The per-project ordinal, read inside the same transaction as the insert
+            // that consumes it. GC reaps the oldest rows, so MAX survives a sweep and
+            // the sequence keeps climbing; the UNIQUE index on (project_guid, seq) is
+            // the backstop if two runs ever race here.
+            let seq: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM research_runs WHERE project_guid = ?1",
+                rusqlite::params![ctx.project_guid],
+                |r| r.get(0),
+            )?;
             tx.execute(
                 "INSERT INTO research_runs (
-                     id, project_guid,
+                     id, project_guid, seq, expires_at, context_run_ids_json,
                      question, model, prompt_version, effort, seed, temperature,
                      granted_seconds, granted_tokens, granted_steps, granted_search_top_k,
                      done_reason, steps, turns, elapsed_ms,
@@ -65,9 +141,20 @@ pub async fn insert_run(
                      out_of_scope_refusals, out_of_scope_rows,
                      scoped, scope_json,
                      forced_synthesis, report_window_ms, report_elapsed_ms,
-                     report
+                     title, report,
+                     top_p, model_digest, model_details_json,
+                     granted_context_fraction, granted_report_words,
+                     granted_report_sections, granted_evidence_width,
+                     checkpoint_every_steps, checkpoints_taken,
+                     revalidation_draft_unverified, revalidation_draft_path_only,
+                     revalidation_draft_stale, revalidation_steps,
+                     sufficiency_verdict,
+                     embedder_model_id, server_version, started_at,
+                     scope_spec_json, kind, challenged_run_id,
+                     challenge_verdict, claims_total, claims_confirmed,
+                     claims_disputed, claims_refuted
                  ) VALUES (
-                     ?1, ?2,
+                     ?1, ?2, ?44, unixepoch() + ?45, ?46,
                      ?3, ?4, ?5, ?6, ?7, ?8,
                      ?9, ?10, ?11, ?12,
                      ?13, ?14, ?15, ?16,
@@ -80,7 +167,18 @@ pub async fn insert_run(
                      ?36, ?37,
                      ?38, ?39,
                      ?40, ?41, ?42,
-                     ?43
+                     ?47, ?43,
+                     ?48, ?49, ?50,
+                     ?51, ?52,
+                     ?53, ?54,
+                     ?55, ?56,
+                     ?57, ?58,
+                     ?59, ?60,
+                     ?61,
+                     ?62, ?63, ?64,
+                     ?65, ?66, ?67,
+                     ?68, ?69, ?70,
+                     ?71, ?72
                  )",
                 rusqlite::params![
                     id,
@@ -126,17 +224,175 @@ pub async fn insert_run(
                     record.tools.report_window_ms as i64,
                     record.tools.report_elapsed_ms as i64,
                     record.report,
+                    seq,
+                    retention_secs,
+                    context_run_ids,
+                    record.title,
+                    ctx.top_p,
+                    ctx.model_digest,
+                    ctx.model_details_json,
+                    record.budget.context_fraction,
+                    record.budget.max_report_words as i64,
+                    record.budget.max_report_sections as i64,
+                    record.budget.evidence_width as i64,
+                    ctx.checkpoint_every_steps as i64,
+                    record.tools.checkpoints_taken as i64,
+                    record.revalidation.map(|r| r.draft_unverified as i64),
+                    record.revalidation.map(|r| r.draft_path_only as i64),
+                    record.revalidation.map(|r| r.draft_stale as i64),
+                    record.revalidation.map(|r| r.steps as i64),
+                    record.sufficiency_verdict,
+                    ctx.embedder_model_id,
+                    ctx.server_version,
+                    ctx.started_at,
+                    ctx.scope_spec_json,
+                    ctx.kind,
+                    ctx.challenged_run_id,
+                    challenge_verdict,
+                    record.challenge.as_ref().map(|c| c.claims.len() as i64),
+                    record.challenge.as_ref().map(|c| c.count_of("confirmed")),
+                    record.challenge.as_ref().map(|c| c.count_of("disputed")),
+                    record.challenge.as_ref().map(|c| c.count_of("refuted")),
                 ],
             )?;
-            Ok(())
+
+            // The baselines, in the same transaction. A prepared statement reused
+            // across the loop: a run that read fifty files would otherwise re-parse
+            // the same INSERT fifty times.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_files (run_id, path, sha256) VALUES (?1, ?2, ?3)",
+                )?;
+                for b in &record.file_baselines {
+                    stmt.execute(rusqlite::params![id, b.path, b.sha256])?;
+                }
+            }
+            // The shown spans — what makes the citation check re-runnable against
+            // this row later without a model or a GPU.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_evidence (run_id, path, spans_json) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for e in &record.evidence_spans {
+                    let spans =
+                        serde_json::to_string(&e.spans).unwrap_or_else(|_| "[]".to_string());
+                    stmt.execute(rusqlite::params![id, e.path, spans])?;
+                }
+            }
+            // Every citation occurrence with its own verdict, in report order.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_citations \
+                     (run_id, ord, path, start_line, end_line, verdict, stale) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                for (ord, c) in record.citations.details.iter().enumerate() {
+                    stmt.execute(rusqlite::params![
+                        id,
+                        ord as i64,
+                        c.path,
+                        c.start as i64,
+                        c.end as i64,
+                        c.verdict,
+                        i64::from(c.stale),
+                    ])?;
+                }
+            }
+            // The tool-call trace: calls + arguments + landing spans, no bodies.
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO research_run_steps \
+                     (run_id, n, phase, action, argument, hits, spans_json, \
+                      spans_truncated, at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )?;
+                for s in &record.trace {
+                    let spans =
+                        serde_json::to_string(&s.spans).unwrap_or_else(|_| "[]".to_string());
+                    stmt.execute(rusqlite::params![
+                        id,
+                        s.n as i64,
+                        s.phase,
+                        s.action,
+                        s.argument,
+                        s.hits as i64,
+                        spans,
+                        i64::from(s.spans_truncated),
+                        s.at_ms as i64,
+                    ])?;
+                }
+            }
+            // **One challenge per report, newest verdict wins.** A challenge that
+            // reached a verdict evicts every earlier challenge of the same subject,
+            // so `research_trust_column`'s severity fold has a single row to fold
+            // and a reader is never asked to reconcile a pile of verdicts.
+            //
+            // Four things here are load-bearing:
+            //
+            // * **In this transaction, not after it.** The journal is best-effort by
+            //   contract — a failure logs and returns `None`. A follow-up DELETE
+            //   could therefore destroy the standing verdict on behalf of a run that
+            //   left no trace at all. Here, a failed insert rolls the eviction back
+            //   with it.
+            // * **`challenge_verdict IS NOT NULL` gates it.** An inconclusive run is
+            //   journalled normally and evicts nothing: it produced no finding, and
+            //   letting it erase a `refuted` would spend the mechanism's most
+            //   valuable output on its least informative outcome. The cost is that a
+            //   subject can carry an old verdict plus a new inconclusive row; the
+            //   fold already handles that, and the UI says so.
+            // * **`id <> ?3`.** The new row is already inserted and matches the same
+            //   predicate — without this the challenge deletes itself.
+            // * **The predicate is exactly `kind='challenge'` + this subject + this
+            //   project.** It can never reach a research run, another subject's
+            //   challenge, or another project.
+            //
+            // The four `research_run_*` children are `ON DELETE CASCADE`, and the
+            // pool sets `foreign_keys = ON` on every non-migration connection, so
+            // the evicted run's baselines, evidence, citations and trace go with it.
+            //
+            // Not backed by a unique index on purpose: a partial unique index would
+            // make the *insert* fail rather than evict — the opposite of "newest
+            // wins" — and would refuse to build on a database that already holds two
+            // challenges of one subject.
+            let replaced = match (ctx.kind, ctx.challenged_run_id.as_deref()) {
+                ("challenge", Some(subject)) if challenge_verdict.is_some() => tx.execute(
+                    "DELETE FROM research_runs \
+                     WHERE project_guid = ?1 AND kind = 'challenge' \
+                       AND challenged_run_id = ?2 AND id <> ?3",
+                    rusqlite::params![ctx.project_guid, subject, id],
+                )?
+                    as u64,
+                _ => 0,
+            };
+
+            Ok(RecordedRun { id, seq, replaced })
         })
         .await;
-    if let Err(e) = res {
-        warn!(
-            error = ?e,
-            "Could not journal a finished research run; the report was delivered but \
-             leaves no trace. Check the database is writable."
-        );
+    match res {
+        Ok(recorded) => {
+            // Logged after the commit, never inside the closure: an uncommitted
+            // eviction is not a fact. The counter is the other half — the override
+            // is destructive and otherwise leaves no trace anywhere.
+            if recorded.replaced > 0 {
+                info!(
+                    run_id = %recorded.id,
+                    subject_run_id = ?subject_for_log,
+                    replaced = recorded.replaced,
+                    "This challenge replaced the standing challenge of the same report."
+                );
+            }
+            Some(recorded)
+        }
+        Err(e) => {
+            warn!(
+                error = ?e,
+                "Could not journal a finished research run; the report was delivered but \
+                 leaves no trace, and the client cannot be offered it as context for a \
+                 later run. Check the database is writable."
+            );
+            None
+        }
     }
 }
 
@@ -176,12 +432,21 @@ impl MeteredJournal {
 
 #[async_trait]
 impl ResearchJournal for MeteredJournal {
-    async fn record(&self, record: RunRecord) {
+    async fn record(&self, record: RunRecord) -> Option<RecordedRun> {
         let r = &self.metrics.research;
         let model = record.model.clone();
         let labels = ModelLabels {
             model: model.clone(),
         };
+
+        // Was this run given earlier reports to read, and how many? Counted here
+        // rather than at the injection site for the decorator's usual reason: a seam
+        // cannot miss a caller, and `RunRecord` already carries the list.
+        if !record.context_run_ids.is_empty() {
+            r.runs_with_context.get_or_create(&labels).inc();
+            r.context_runs_used
+                .inc_by(record.context_run_ids.len() as u64);
+        }
 
         // Split from `runs_by_effort` rather than crossed with it: `model` is a
         // client-supplied string, so model x effort x reason is the one product
@@ -241,11 +506,38 @@ impl ResearchJournal for MeteredJournal {
         if record.revalidation.is_some() {
             r.revalidations.inc();
         }
+        // A challenge's verdict is a server-defined closed set; `None` — a
+        // verdict turn that parsed to nothing — is its own label rather than a
+        // dropped event, because "inconclusive" is the value that must not be
+        // mistaken for an acquittal.
+        if let Some(challenge) = &record.challenge {
+            r.challenges
+                .get_or_create(&crate::backend::metrics::OutcomeLabels {
+                    outcome: challenge.verdict.unwrap_or("inconclusive"),
+                })
+                .inc();
+            // The cap is the challenge mechanism's one safety property that leaves
+            // no trace anywhere else: the verdict it overrode is not stored, so a
+            // capped accusation and an honest `disputed` are the same row. This
+            // counter is the only answer to "does it ever fire on this hardware".
+            if challenge.capped {
+                r.challenge_verdict_caps.inc();
+            }
+        }
         if record.tools.forced_synthesis {
             r.forced_syntheses.inc();
         }
 
-        self.inner.record(record).await;
+        // The eviction count comes back from the write, not from `record` — only
+        // the journal knows how many rows the replace rule actually took, and a
+        // run whose insert failed took none.
+        let recorded = self.inner.record(record).await;
+        if let Some(rec) = &recorded
+            && rec.replaced > 0
+        {
+            r.challenges_replaced.inc_by(rec.replaced);
+        }
+        recorded
     }
 }
 
@@ -257,6 +549,8 @@ mod tests {
     fn record() -> RunRecord {
         RunRecord {
             tools: crate::research::RunTools::default(),
+            file_baselines: Vec::new(),
+            context_run_ids: Vec::new(),
             question: "how does GC work?".into(),
             model: "test-model".into(),
             prompt_version: "test.1",
@@ -266,6 +560,9 @@ mod tests {
                 context_fraction: 0.7,
                 max_steps: 20,
                 search_top_k: 5,
+                max_report_words: 900,
+                max_report_sections: 6,
+                evidence_width: 1,
             },
             reason: DoneReason::Finalized,
             steps: 3,
@@ -280,17 +577,53 @@ mod tests {
                 verified: 1,
                 path_only: 0,
                 unverified: 1,
+                path_resolved: 0,
                 stale: 1,
                 unverified_paths: vec!["src/nope.rs".into()],
                 stale_paths: vec!["src/gc.rs".into()],
                 cited_paths: vec!["src/gc.rs".into(), "src/nope.rs".into()],
+                // Not journalled — the excerpt channel's input, not the record's.
+                verified_locations: Vec::new(),
+                details: vec![
+                    crate::research::CitationDetail {
+                        path: "src/gc.rs".into(),
+                        start: 10,
+                        end: 20,
+                        verdict: "verified",
+                        stale: true,
+                    },
+                    crate::research::CitationDetail {
+                        path: "src/nope.rs".into(),
+                        start: 1,
+                        end: 2,
+                        verdict: "unverified",
+                        stale: false,
+                    },
+                ],
             },
             staleness: RunStaleness {
                 changed_files: 1,
                 removed_files: 0,
             },
             revalidation: None,
+            title: Some("Report".into()),
             report: "# Report\n\nIt sweeps.".into(),
+            evidence_spans: vec![crate::research::EvidenceSpans {
+                path: "src/gc.rs".into(),
+                spans: vec![(10, 30)],
+            }],
+            trace: vec![crate::research::StepTrace {
+                n: 1,
+                phase: "main",
+                action: "grep",
+                argument: "sweep".into(),
+                hits: 2,
+                spans: vec!["src/gc.rs:10-30".into()],
+                spans_truncated: false,
+                at_ms: 42,
+            }],
+            sufficiency_verdict: Some("1. ANSWERED".into()),
+            challenge: None,
         }
     }
 
@@ -301,8 +634,9 @@ mod tests {
         struct Inner(std::sync::atomic::AtomicUsize);
         #[async_trait]
         impl ResearchJournal for Inner {
-            async fn record(&self, _: RunRecord) {
+            async fn record(&self, _: RunRecord) -> Option<RecordedRun> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
             }
         }
 
@@ -354,11 +688,23 @@ mod tests {
 
     fn ctx() -> RunContext {
         RunContext {
+            id: uuid::Uuid::new_v4().to_string(),
             scope_json: None,
+            retention_days: 90,
             project_guid: "c2d7e2c1-3165-42f5-9366-0ff1492b4bab".into(),
             effort: "medium",
             seed: Some(7),
             temperature: Some(0.2),
+            top_p: Some(0.9),
+            model_digest: Some("sha256:abc".into()),
+            model_details_json: Some(r#"{"parameter_size":"32B"}"#.into()),
+            embedder_model_id: "BAAI/bge-m3".into(),
+            server_version: "0.0.0-test",
+            started_at: 1_700_000_000,
+            checkpoint_every_steps: 6,
+            scope_spec_json: None,
+            kind: "research",
+            challenged_run_id: None,
         }
     }
 
@@ -366,12 +712,19 @@ mod tests {
     // larger pool would read a different (empty) one back.
     async fn pool() -> SQLite3Pool {
         let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
-        pool.transaction(CancellationToken::new(), |tx| {
-            tx.execute_batch(include_str!("migrations/v1.0.0_schema.sql"))?;
+        // Every migration, through `migration_transaction`, exactly as startup applies
+        // them. Pinning this to v1.0.0 alone was a trap: the schema this module writes
+        // to is the migrated one, so a test against the base file would fail on any
+        // column a later migration added — and would have passed while production
+        // broke, had the columns gone the other way.
+        pool.migration_transaction(CancellationToken::new(), |tx| {
+            for (_, sql) in crate::MIGRATIONS {
+                tx.execute_batch(sql)?;
+            }
             Ok(())
         })
         .await
-        .expect("migration applies");
+        .expect("migrations apply");
         pool
     }
 
@@ -456,6 +809,186 @@ mod tests {
         assert_eq!(got, (None, None));
     }
 
+    /// The stored title is the record's own — nothing derives or defaults it at
+    /// write time, so None must land as NULL, not as an empty string a reader
+    /// would render.
+    #[tokio::test]
+    async fn the_title_is_stored_and_null_when_absent() {
+        let pool = pool().await;
+        insert_run(&pool, ctx(), record(), CancellationToken::new()).await;
+        let mut untitled = record();
+        untitled.title = None;
+        insert_run(&pool, ctx(), untitled, CancellationToken::new()).await;
+
+        let titles: Vec<Option<String>> = pool
+            .transaction(CancellationToken::new(), |tx| {
+                let mut stmt = tx.prepare("SELECT title FROM research_runs ORDER BY seq")?;
+                let rows = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("two rows");
+        assert_eq!(titles, vec![Some("Report".to_string()), None]);
+    }
+
+    /// The three structured children land in the same transaction as the row —
+    /// spans (what re-verification reconstructs `Evidence` from), per-citation
+    /// verdicts, and the tool-call trace.
+    #[tokio::test]
+    async fn the_structured_children_land_with_the_run() {
+        let pool = pool().await;
+        let c = ctx();
+        let run_id = c.id.clone();
+        insert_run(&pool, c, record(), CancellationToken::new()).await;
+
+        type EvidenceRow = (String, String);
+        type CitationRow = (i64, String, String, i64);
+        type StepRow = (String, String, String, i64);
+        let (spans, citation, step): (EvidenceRow, CitationRow, StepRow) = pool
+            .transaction(CancellationToken::new(), move |tx| {
+                let spans = tx.query_row(
+                    "SELECT path, spans_json FROM research_run_evidence WHERE run_id = ?1",
+                    rusqlite::params![run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let citation = tx.query_row(
+                    "SELECT ord, path, verdict, stale FROM research_run_citations \
+                     WHERE run_id = ?1 AND ord = 0",
+                    rusqlite::params![run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                let step = tx.query_row(
+                    "SELECT phase, action, argument, hits FROM research_run_steps \
+                     WHERE run_id = ?1 AND n = 1",
+                    rusqlite::params![run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                Ok((spans, citation, step))
+            })
+            .await
+            .expect("children present");
+        assert_eq!(spans, ("src/gc.rs".to_string(), "[[10,30]]".to_string()));
+        assert_eq!(
+            citation,
+            (0, "src/gc.rs".to_string(), "verified".to_string(), 1)
+        );
+        assert_eq!(
+            step,
+            (
+                "main".to_string(),
+                "grep".to_string(),
+                "sweep".to_string(),
+                2
+            )
+        );
+    }
+
+    /// The metadata that used to be measured and then dropped at the journal's
+    /// door — plus the request-decided fields that never had columns. NULL means
+    /// "not recorded", so the None case must land as NULL, not zero.
+    #[tokio::test]
+    async fn the_new_metadata_lands_on_the_row_and_absent_reads_as_null() {
+        let pool = pool().await;
+        let mut with_reval = record();
+        with_reval.revalidation = Some(crate::research::Revalidation {
+            draft_unverified: 3,
+            draft_path_only: 2,
+            draft_stale: 1,
+            steps: 4,
+        });
+        insert_run(&pool, ctx(), with_reval, CancellationToken::new()).await;
+        let mut bare = record();
+        bare.sufficiency_verdict = None;
+        let mut c2 = ctx();
+        c2.top_p = None;
+        c2.model_digest = None;
+        insert_run(&pool, c2, bare, CancellationToken::new()).await;
+
+        type Row = (
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<f64>,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = pool
+            .transaction(CancellationToken::new(), |tx| {
+                let mut stmt = tx.prepare(
+                    "SELECT revalidation_draft_unverified, revalidation_steps, \
+                     sufficiency_verdict, top_p, model_digest, embedder_model_id, \
+                     server_version, started_at, granted_context_fraction, \
+                     checkpoint_every_steps \
+                     FROM research_runs ORDER BY seq",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("two rows");
+
+        let first = &rows[0];
+        assert_eq!((first.0, first.1), (Some(3), Some(4)));
+        assert_eq!(first.2.as_deref(), Some("1. ANSWERED"));
+        assert_eq!(first.3, Some(0.9));
+        assert_eq!(first.4.as_deref(), Some("sha256:abc"));
+        assert_eq!(first.5.as_deref(), Some("BAAI/bge-m3"));
+        assert_eq!(first.6.as_deref(), Some("0.0.0-test"));
+        assert_eq!(first.7, Some(1_700_000_000));
+        assert_eq!(first.8, Some(0.7));
+        assert_eq!(first.9, Some(6));
+
+        let second = &rows[1];
+        // No repair happened, nothing was said, nothing was configured: NULL.
+        assert_eq!((second.0, second.1), (None, None));
+        assert_eq!(second.2, None);
+        assert_eq!(second.3, None);
+        assert_eq!(second.4, None);
+    }
+
+    /// Every journalled row is an ordinary research run: `kind` takes its
+    /// DEFAULT and the challenge columns stay NULL — the challenge endpoint
+    /// writes its own rows.
+    #[tokio::test]
+    async fn an_ordinary_run_is_stored_as_kind_research() {
+        let pool = pool().await;
+        insert_run(&pool, ctx(), record(), CancellationToken::new()).await;
+
+        let (kind, challenged, verdict): (String, Option<String>, Option<String>) = pool
+            .transaction(CancellationToken::new(), |tx| {
+                Ok(tx.query_row(
+                    "SELECT kind, challenged_run_id, challenge_verdict FROM research_runs",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .expect("one row");
+        assert_eq!(kind, "research");
+        assert_eq!((challenged, verdict), (None, None));
+    }
+
     /// The write is on the "report already delivered" side of the run, so a
     /// missing table (an un-migrated DB) must log and return, never propagate.
     #[tokio::test]
@@ -463,5 +996,188 @@ mod tests {
         let pool = SQLite3Pool::new(std::path::Path::new(":memory:"), 1, 16384, "NORMAL");
         // No migration applied: the table does not exist.
         insert_run(&pool, ctx(), record(), CancellationToken::new()).await;
+    }
+
+    // ── The replace rule: one challenge per report, newest verdict wins ────────
+
+    /// A challenge run aimed at `subject`, with the given overall verdict.
+    fn challenge_of(subject: &str, verdict: Option<&'static str>) -> (RunContext, RunRecord) {
+        let mut c = ctx();
+        c.kind = "challenge";
+        c.challenged_run_id = Some(subject.to_string());
+        let mut r = record();
+        r.challenge = Some(crate::research::ChallengeOutcome {
+            verdict,
+            grounded: true,
+            capped: false,
+            claims: vec![crate::research::ClaimVerdict {
+                claim: "It sweeps.".into(),
+                verdict: verdict.unwrap_or("confirmed"),
+            }],
+        });
+        (c, r)
+    }
+
+    /// Every `kind='challenge'` row aimed at `subject`, oldest first.
+    async fn challenges_of(pool: &SQLite3Pool, subject: &str) -> Vec<(String, Option<String>)> {
+        let subject = subject.to_string();
+        pool.transaction(CancellationToken::new(), move |tx| {
+            let mut stmt = tx.prepare(
+                "SELECT id, challenge_verdict FROM research_runs \
+                 WHERE kind = 'challenge' AND challenged_run_id = ?1 ORDER BY seq",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![subject], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("query")
+    }
+
+    #[tokio::test]
+    async fn a_verdict_bearing_challenge_replaces_the_previous_one() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(first.replaced, 0, "the first challenge evicts nothing");
+
+        let (c2, r2) = challenge_of("subject-1", Some("confirmed"));
+        let second = insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(second.replaced, 1);
+
+        let rows = challenges_of(&pool, "subject-1").await;
+        assert_eq!(rows.len(), 1, "exactly one challenge stands");
+        assert_eq!(rows[0].0, second.id);
+        assert_eq!(rows[0].1.as_deref(), Some("confirmed"));
+    }
+
+    /// The whole point of gating the rule on a verdict: a re-check that parsed to
+    /// nothing must not be able to erase a refutation. If this ever flips, the
+    /// mechanism's most valuable output is spendable by its least informative one.
+    #[tokio::test]
+    async fn an_inconclusive_challenge_does_not_evict_a_refuted_one() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let (c2, r2) = challenge_of("subject-1", None);
+        let second = insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(second.replaced, 0);
+
+        let rows = challenges_of(&pool, "subject-1").await;
+        assert_eq!(rows.len(), 2, "both rows stand: {rows:?}");
+        assert!(rows.iter().any(|(id, _)| *id == first.id));
+    }
+
+    /// The children are `ON DELETE CASCADE`, and `foreign_keys = ON` on every
+    /// non-migration connection is what makes that fire. An orphaned baseline set
+    /// would keep feeding the staleness join for a run nothing can name.
+    #[tokio::test]
+    async fn replacing_a_challenge_takes_its_child_rows() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("disputed"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let (c2, r2) = challenge_of("subject-1", Some("refuted"));
+        insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let dead = first.id.clone();
+        let counts: (i64, i64, i64, i64) = pool
+            .transaction(CancellationToken::new(), move |tx| {
+                let one = |table: &str| -> rusqlite::Result<i64> {
+                    tx.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                        rusqlite::params![dead],
+                        |r| r.get(0),
+                    )
+                };
+                Ok((
+                    one("research_run_files")?,
+                    one("research_run_evidence")?,
+                    one("research_run_citations")?,
+                    one("research_run_steps")?,
+                ))
+            })
+            .await
+            .expect("counts");
+        assert_eq!(counts, (0, 0, 0, 0), "child rows survived the eviction");
+    }
+
+    #[tokio::test]
+    async fn a_challenge_of_another_subject_is_untouched() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+        let (c2, r2) = challenge_of("subject-2", Some("confirmed"));
+        let other = insert_run(&pool, c2, r2, CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(other.replaced, 0);
+
+        assert_eq!(challenges_of(&pool, "subject-1").await.len(), 1);
+        assert_eq!(challenges_of(&pool, "subject-2").await.len(), 1);
+    }
+
+    /// A research run never evicts anything, whatever else is on its context.
+    #[tokio::test]
+    async fn an_ordinary_run_evicts_nothing() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        let plain = insert_run(&pool, ctx(), record(), CancellationToken::new())
+            .await
+            .expect("journalled");
+        assert_eq!(plain.replaced, 0);
+        assert_eq!(challenges_of(&pool, "subject-1").await.len(), 1);
+    }
+
+    /// **This is why the DELETE lives inside `insert_run`'s transaction.** The
+    /// journal is best-effort: a failed write logs and returns `None`. If the
+    /// eviction were a follow-up statement, a run that left no trace at all could
+    /// still have destroyed the standing verdict.
+    #[tokio::test]
+    async fn a_failed_journal_leaves_the_old_challenge_alone() {
+        let pool = pool().await;
+        let (c1, r1) = challenge_of("subject-1", Some("refuted"));
+        let first = insert_run(&pool, c1, r1, CancellationToken::new())
+            .await
+            .expect("journalled");
+
+        // Same id as a row that already exists: the INSERT violates the primary
+        // key and the whole transaction — eviction included — rolls back.
+        let (mut c2, r2) = challenge_of("subject-1", Some("confirmed"));
+        c2.id = first.id.clone();
+        assert!(
+            insert_run(&pool, c2, r2, CancellationToken::new())
+                .await
+                .is_none(),
+            "the duplicate insert must fail"
+        );
+
+        let rows = challenges_of(&pool, "subject-1").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("refuted"),
+            "the verdict survived"
+        );
     }
 }

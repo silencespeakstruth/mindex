@@ -1,67 +1,66 @@
 import * as vscode from "vscode";
+import { humanize } from "./problem";
+import { BRAND } from "./brand";
 
-/** RFC 7807 problem+json body every mindex non-2xx response carries. */
-export interface ProblemDetails {
-    type?: string;
-    title?: string;
-    status?: number;
-    detail?: string;
-    code?: string;
-    field?: string;
-    meta?: Record<string, unknown>;
+export type { ProblemDetails, Humanized } from "./problem";
+export {
+    humanize,
+    isCancellation,
+    MalformedResponseError,
+    ProblemError,
+    TimeoutError,
+    UnreachableError,
+} from "./problem";
+
+let channel: vscode.OutputChannel | undefined;
+
+/**
+ * The raw failure, in full, where a person can go and read it.
+ *
+ * This is what makes "no raw errors reach the user" affordable rather than
+ * destructive. A notification saying "the server hit an internal error" is the
+ * right thing to *show*; it is the wrong thing to be the only surviving record,
+ * because then a bug report contains no error at all. So the sentence goes to
+ * the notification and the stack goes here, one click away.
+ *
+ * Created lazily: a session that never fails never grows an output channel, and
+ * an empty one in the picker reads as something having gone wrong.
+ */
+export function logError(what: string, e: unknown): void {
+    channel ??= vscode.window.createOutputChannel(BRAND);
+    const code = humanize(e).code;
+    const raw = e instanceof Error ? (e.stack ?? e.message) : String(e);
+    channel.appendLine(
+        `[${new Date().toISOString()}] ${what}${code !== undefined ? ` (${code})` : ""}\n${raw}`
+    );
 }
 
-/** A non-2xx mindex response, keyed by the stable machine `code`. */
-export class ProblemError extends Error {
-    constructor(
-        public readonly status: number,
-        public readonly code: string,
-        public readonly detail: string
-    ) {
-        super(`${code} (${status}): ${detail}`);
-        this.name = "ProblemError";
-    }
-}
-
-/** The server could not be reached at all (connection refused, TLS failure, timeout). */
-export class UnreachableError extends Error {
-    constructor(public readonly cause_: Error) {
-        super(`mindex server unreachable: ${cause_.message}`);
-        this.name = "UnreachableError";
-    }
-}
-
-export function isCancellation(e: unknown): boolean {
-    return e instanceof Error && e.name === "AbortError";
+/** Dispose the output channel, if one was ever needed. For `deactivate`. */
+export function disposeErrorLog(): void {
+    channel?.dispose();
+    channel = undefined;
 }
 
 /**
- * Show an operation failure to the user. Infra failures (unreachable, 503) get a Retry
- * button; cancellations are silent. `retry` re-runs the operation when the user asks.
+ * Show an operation failure to the user: one sentence, never the error's own
+ * words. Retryable failures get a Retry button; cancellations are silent.
+ *
+ * `what` is the operation, in the user's terms ("Delete failed"). The rest comes
+ * from `humanize`, so this notification and a panel's inline banner cannot
+ * disagree about what a 404 means.
  */
 export async function reportError(
     what: string,
     e: unknown,
     retry?: () => Promise<void>
 ): Promise<void> {
-    if (isCancellation(e)) {
+    const h = humanize(e);
+    if (h.cancelled) {
         return;
     }
-    let message: string;
-    let retriable = false;
-    if (e instanceof ProblemError) {
-        if (e.code === "request.cancelled") {
-            return;
-        }
-        message = `${what}: ${e.code} — ${e.detail}`;
-        retriable = e.status === 503 || e.status === 500 || e.status === 409;
-    } else if (e instanceof UnreachableError) {
-        message = `${what}: ${e.message}. Is the mindex server running? Check mindex.serverUrl / mindex.noVerify.`;
-        retriable = true;
-    } else {
-        message = `${what}: ${e instanceof Error ? e.message : String(e)}`;
-    }
-    if (retriable && retry) {
+    logError(what, e);
+    const message = `${what}: ${h.text}`;
+    if (h.retryable && retry) {
         const pick = await vscode.window.showErrorMessage(message, "Retry");
         if (pick === "Retry") {
             await retry();

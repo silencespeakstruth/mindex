@@ -24,6 +24,21 @@ pub struct EmbedTuning {
     pub sparse_min_weight: f32,
 }
 
+/// One embed batch's worth of progress, reported after the batch has been both
+/// encoded **and** upserted — `chunks_done` never counts a chunk whose vectors
+/// are not in Qdrant yet. `chunks_done`/`chunks_total` are cumulative over one
+/// `embed_and_upsert` call, which is what a client needs to compute an honest
+/// chunks-per-second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedProgress {
+    /// Chunks in the batch that just completed.
+    pub batch_chunks: usize,
+    /// Chunks completed so far, this batch included.
+    pub chunks_done: usize,
+    /// Chunks this whole call was given.
+    pub chunks_total: usize,
+}
+
 /// Failure modes of [`embed_and_upsert`], kept distinct so callers can map each
 /// to their own control flow (HTTP status + file-status recovery in the handler;
 /// a success flag in the retry worker).
@@ -33,6 +48,8 @@ pub enum EmbedUpsertError {
     Cancelled,
     /// The model server request failed.
     Embed(reqwest::Error),
+    /// The embedder stayed busy until the whole-call budget was spent.
+    Timeout(std::time::Duration),
     /// The embedder's binary response couldn't be decoded (wire-format skew).
     Decode(String),
     /// A vector-store upsert failed.
@@ -44,8 +61,11 @@ pub enum EmbedUpsertError {
 /// sent per `/encode` call — the lever for GPU batch size (the model server further
 /// sub-batches by its own `--batch`); `tuning.upsert_batch` and
 /// `tuning.sparse_min_weight` govern Qdrant upsert sizing and sparse pruning.
-/// Side-effect-free apart from the embed/upsert I/O, so behaviour is identical for
-/// every caller.
+/// Side-effect-free apart from the embed/upsert I/O — and the optional `progress`
+/// callback, the one deliberate departure from that sentence: it exists so a
+/// streaming `/index` (`?stream=yes`) can report per-batch progress, is invoked
+/// only after a batch is fully upserted, and a `None` caller (the retry worker,
+/// every test that doesn't pin it) gets byte-for-byte the old behaviour.
 pub async fn embed_and_upsert(
     embedder: &dyn BGEm3Model,
     store: &dyn VectorStore,
@@ -53,7 +73,10 @@ pub async fn embed_and_upsert(
     chunks: &[(UUIDv4, String)],
     token: &CancellationToken,
     tuning: EmbedTuning,
+    progress: Option<&(dyn Fn(EmbedProgress) + Send + Sync)>,
 ) -> Result<(), EmbedUpsertError> {
+    let chunks_total = chunks.len();
+    let mut chunks_done = 0usize;
     for batch in chunks.chunks(tuning.embed_batch.max(1)) {
         let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
         let guids: Vec<UUIDv4> = batch.iter().map(|(g, _)| *g).collect();
@@ -71,8 +94,29 @@ pub async fn embed_and_upsert(
             Ok(val) => val,
             Err(EncodeError::Cancelled) => return Err(EmbedUpsertError::Cancelled),
             Err(EncodeError::Request(e)) => return Err(EmbedUpsertError::Embed(e)),
+            Err(EncodeError::Timeout(d)) => return Err(EmbedUpsertError::Timeout(d)),
             Err(EncodeError::Decode(e)) => return Err(EmbedUpsertError::Decode(e)),
         };
+
+        // The embedder's contract is one row per text, positionally aligned. Nothing
+        // checked it: the `zip` below silently truncates a short response — those
+        // chunks are never upserted and their file is still marked `indexed`, so the
+        // file is permanently missing vectors with no error anywhere — and a long one
+        // indexes `guids[i]` out of bounds and panics.
+        if dense_vecs.len() != guids.len()
+            || sparse_vecs.len() != guids.len()
+            || colbert_vecs.len() != guids.len()
+        {
+            return Err(EmbedUpsertError::Decode(format!(
+                "embedder returned {} dense / {} sparse / {} colbert rows for {} texts; \
+                 the embedder and this binary disagree about the wire format — redeploy \
+                 them from the same revision",
+                dense_vecs.len(),
+                sparse_vecs.len(),
+                colbert_vecs.len(),
+                guids.len()
+            )));
+        }
 
         let mut vector_batch: Vec<ChunkAsVector> = Vec::with_capacity(guids.len());
         for (i, ((dense, sparse), colbert)) in dense_vecs
@@ -106,6 +150,15 @@ pub async fn embed_and_upsert(
                 .insert_batch(collection, points_batch.to_vec())
                 .await
                 .map_err(EmbedUpsertError::Store)?;
+        }
+
+        chunks_done += batch.len();
+        if let Some(report) = progress {
+            report(EmbedProgress {
+                batch_chunks: batch.len(),
+                chunks_done,
+                chunks_total,
+            });
         }
     }
 
@@ -150,6 +203,43 @@ mod tests {
                 dense_vecs: vec![vec![0.1; 4]; n],
                 sparse_vecs: vec![HashMap::from([(1u32, 0.5f32)]); n],
                 colbert_vecs: vec![vec![vec![0.1; 4]]; n],
+            })
+        }
+        async fn health(&self) -> Result<(), EncodeError> {
+            unreachable!("embed_and_upsert does not call health")
+        }
+    }
+
+    /// An embedder whose reply does not have one row per text — the wire-format
+    /// skew that used to be silent. Each head's row count is `texts.len() + delta`,
+    /// clamped at zero, so one fake covers both the short and the long response.
+    struct MisalignedEmbedder {
+        dense_delta: isize,
+        sparse_delta: isize,
+        colbert_delta: isize,
+    }
+
+    impl MisalignedEmbedder {
+        fn rows(n: usize, delta: isize) -> usize {
+            n.saturating_add_signed(delta)
+        }
+    }
+
+    #[async_trait]
+    impl BGEm3Model for MisalignedEmbedder {
+        async fn encode(
+            &self,
+            req: BGEm3EmbedRequest,
+            _token: CancellationToken,
+        ) -> Result<BGEm3EmbedResponse, EncodeError> {
+            let n = req.texts.len();
+            Ok(BGEm3EmbedResponse {
+                dense_vecs: vec![vec![0.1; 4]; Self::rows(n, self.dense_delta)],
+                sparse_vecs: vec![
+                    HashMap::from([(1u32, 0.5f32)]);
+                    Self::rows(n, self.sparse_delta)
+                ],
+                colbert_vecs: vec![vec![vec![0.1; 4]]; Self::rows(n, self.colbert_delta)],
             })
         }
         async fn health(&self) -> Result<(), EncodeError> {
@@ -232,6 +322,7 @@ mod tests {
             &input,
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await
         .expect("should succeed");
@@ -256,11 +347,62 @@ mod tests {
             &[],
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await
         .expect("empty is a no-op success");
 
         assert!(store.upserted.lock().unwrap().is_empty());
+    }
+
+    /// The progress callback fires once per embed batch, after the batch is
+    /// upserted, with cumulative counts — the contract the streaming `/index`
+    /// mode's `embedded` events (and every client rate display) are built on.
+    #[tokio::test]
+    async fn progress_reports_each_batch_with_cumulative_counts() {
+        let embedder = StubEmbedder { cancel: false };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
+        // 150 chunks at embed_batch 64 → batches of 64, 64, 22.
+        let input = chunks(150);
+        let seen: Mutex<Vec<EmbedProgress>> = Mutex::new(vec![]);
+        let record = |p: EmbedProgress| seen.lock().unwrap().push(p);
+
+        embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &input,
+            &CancellationToken::new(),
+            TEST_TUNING,
+            Some(&record),
+        )
+        .await
+        .expect("should succeed");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![
+                EmbedProgress {
+                    batch_chunks: 64,
+                    chunks_done: 64,
+                    chunks_total: 150,
+                },
+                EmbedProgress {
+                    batch_chunks: 64,
+                    chunks_done: 128,
+                    chunks_total: 150,
+                },
+                EmbedProgress {
+                    batch_chunks: 22,
+                    chunks_done: 150,
+                    chunks_total: 150,
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -278,9 +420,156 @@ mod tests {
             &chunks(1),
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await;
         assert!(matches!(res, Err(EmbedUpsertError::Store(_))));
+    }
+
+    /// A response with fewer rows than texts used to be truncated by `zip`: those
+    /// chunks were never upserted, the file was still marked `indexed`, and nothing
+    /// anywhere said so. The only honest answer is to fail the batch — the retry
+    /// worker then re-attempts it.
+    #[tokio::test]
+    async fn a_short_embedder_response_fails_the_batch_instead_of_losing_chunks() {
+        for (dense, sparse, colbert) in [(-1, 0, 0), (0, -1, 0), (0, 0, -1)] {
+            let embedder = MisalignedEmbedder {
+                dense_delta: dense,
+                sparse_delta: sparse,
+                colbert_delta: colbert,
+            };
+            let store = RecordingStore {
+                upserted: Mutex::new(vec![]),
+                fail_upsert: false,
+            };
+
+            let res = embed_and_upsert(
+                &embedder,
+                &store,
+                "c",
+                &chunks(4),
+                &CancellationToken::new(),
+                TEST_TUNING,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(res, Err(EmbedUpsertError::Decode(_))),
+                "a short {dense}/{sparse}/{colbert} response was accepted: {res:?}"
+            );
+            assert!(
+                store.upserted.lock().unwrap().is_empty(),
+                "a misaligned batch must upsert nothing at all"
+            );
+        }
+    }
+
+    /// The mirror case: more rows than texts indexed `guids[i]` out of bounds and
+    /// panicked — which `SQLite3Pool` would then have reported to the client as a
+    /// disconnect. It must be a decode error, on the wire and in the log.
+    #[tokio::test]
+    async fn a_long_embedder_response_is_an_error_not_a_panic() {
+        for (dense, sparse, colbert) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+            let embedder = MisalignedEmbedder {
+                dense_delta: dense,
+                sparse_delta: sparse,
+                colbert_delta: colbert,
+            };
+            let store = RecordingStore {
+                upserted: Mutex::new(vec![]),
+                fail_upsert: false,
+            };
+
+            let res = embed_and_upsert(
+                &embedder,
+                &store,
+                "c",
+                &chunks(4),
+                &CancellationToken::new(),
+                TEST_TUNING,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(res, Err(EmbedUpsertError::Decode(_))),
+                "a long {dense}/{sparse}/{colbert} response was accepted: {res:?}"
+            );
+        }
+    }
+
+    /// The misalignment check runs per batch, so a reply that is correct for the
+    /// first batch and short for the second must still fail — and must not report
+    /// progress for a batch it did not complete.
+    #[tokio::test]
+    async fn misalignment_is_caught_in_a_later_batch_too() {
+        /// Correct for every batch but the second.
+        struct SecondBatchShort {
+            calls: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl BGEm3Model for SecondBatchShort {
+            async fn encode(
+                &self,
+                req: BGEm3EmbedRequest,
+                _token: CancellationToken,
+            ) -> Result<BGEm3EmbedResponse, EncodeError> {
+                let nth = {
+                    let mut c = self.calls.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                let n = req.texts.len();
+                let dense = if nth == 2 { n - 1 } else { n };
+                Ok(BGEm3EmbedResponse {
+                    dense_vecs: vec![vec![0.1; 4]; dense],
+                    sparse_vecs: vec![HashMap::from([(1u32, 0.5f32)]); n],
+                    colbert_vecs: vec![vec![vec![0.1; 4]]; n],
+                })
+            }
+            async fn health(&self) -> Result<(), EncodeError> {
+                unreachable!()
+            }
+        }
+
+        let embedder = SecondBatchShort {
+            calls: Mutex::new(0),
+        };
+        let store = RecordingStore {
+            upserted: Mutex::new(vec![]),
+            fail_upsert: false,
+        };
+        let seen: Mutex<Vec<EmbedProgress>> = Mutex::new(vec![]);
+        let record = |p: EmbedProgress| seen.lock().unwrap().push(p);
+
+        // 100 chunks at embed_batch 64 → batches of 64 then 36; the second is short.
+        let res = embed_and_upsert(
+            &embedder,
+            &store,
+            "c",
+            &chunks(100),
+            &CancellationToken::new(),
+            TEST_TUNING,
+            Some(&record),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(EmbedUpsertError::Decode(_))),
+            "the second batch's misalignment slipped through: {res:?}"
+        );
+        assert_eq!(
+            store.upserted.lock().unwrap().len(),
+            64,
+            "the first batch is legitimately upserted; the second must not be"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "progress must be reported only for batches that completed"
+        );
     }
 
     #[tokio::test]
@@ -298,6 +587,7 @@ mod tests {
             &chunks(1),
             &CancellationToken::new(),
             TEST_TUNING,
+            None,
         )
         .await;
         assert!(matches!(res, Err(EmbedUpsertError::Cancelled)));

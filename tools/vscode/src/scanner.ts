@@ -6,7 +6,7 @@ import { detectLanguage } from "./languages";
 import { MindexFile } from "./mindexFile";
 
 export interface ScannedFile {
-    /** Forward-slash path relative to the workspace root (stored in mindex as-is). */
+    /** Forward-slash path relative to the workspace root (stored in the index as-is). */
     relPath: string;
     absPath: string;
     language: string;

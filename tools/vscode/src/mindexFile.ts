@@ -8,6 +8,8 @@
 //       - tools/**
 //     include_paths: []
 //     languages: []
+//     git_refs:
+//       - master
 
 import { parse as parseYaml } from "yaml";
 
@@ -18,9 +20,16 @@ export interface MindexFile {
     excludePaths: string[];
     /** Lowercase mindex language ids; empty means all languages. */
     languages: string[];
+    /**
+     * Ref patterns bounding the git-history walk. The extension is not a history
+     * producer — `mindex-index` is the only one, deliberately — so this is parsed
+     * and carried rather than used: without it `deny_unknown_fields`' mirror here
+     * would reject every `.mindex` that names the key.
+     */
+    gitRefs: string[];
 }
 
-const KNOWN_KEYS = ["guid", "include_paths", "exclude_paths", "languages"];
+const KNOWN_KEYS = ["guid", "include_paths", "exclude_paths", "languages", "git_refs"];
 const HYPHENATED = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DASHLESS = /^[0-9a-f]{32}$/;
 
@@ -36,7 +45,7 @@ export function parseMindexFile(text: string): MindexFile {
     if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
         throw new Error(
             ".mindex must be a YAML mapping with a `guid:` key and optional " +
-                "`include_paths:`/`exclude_paths:`/`languages:` lists"
+                "`include_paths:`/`exclude_paths:`/`languages:`/`git_refs:` lists"
         );
     }
     const map = doc as Record<string, unknown>;
@@ -52,9 +61,10 @@ export function parseMindexFile(text: string): MindexFile {
 
     return {
         guid: normalizeGuid(map.guid),
-        includePaths: stringList(map.include_paths, "include_paths"),
-        excludePaths: stringList(map.exclude_paths, "exclude_paths"),
+        includePaths: globList(map.include_paths, "include_paths"),
+        excludePaths: globList(map.exclude_paths, "exclude_paths"),
         languages: stringList(map.languages, "languages"),
+        gitRefs: stringList(map.git_refs, "git_refs"),
     };
 }
 
@@ -95,4 +105,30 @@ function stringList(value: unknown, key: string): string[] {
         );
     }
     return (value as string[]).map((v) => v.trim()).filter((v) => v !== "");
+}
+
+/**
+ * A scope list whose entries are globs, held to the same standard as the Rust side.
+ *
+ * `mindexfile::build_globset` rejects a pattern starting with `/` or containing `\`,
+ * and it is the *only* implementation that did: this parser accepted both, and
+ * picomatch then simply never matched them. So a `.mindex` naming `/target/**` used
+ * to load here, scan a tree the indexer refuses to scan at all, and report the
+ * difference as drift no reindex could clear — while `mindex-index` failed outright
+ * with an error the extension never showed. Rejecting at parse time surfaces it
+ * where the user is looking, and one implementation refusing what another accepts is
+ * the divergence this mirror exists to prevent.
+ */
+function globList(value: unknown, key: string): string[] {
+    const globs = stringList(value, key);
+    for (const glob of globs) {
+        if (glob.startsWith("/") || glob.includes("\\")) {
+            throw new Error(
+                `.mindex \`${key}:\` has an invalid glob \`${glob}\` — patterns are ` +
+                    "relative to the project root and use forward slashes " +
+                    "(write `src/**`, not `/src/**` or `src\\**`)"
+            );
+        }
+    }
+    return globs;
 }

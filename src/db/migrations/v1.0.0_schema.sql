@@ -1,13 +1,16 @@
 -- ============================================================
 -- mindex schema
 -- ============================================================
--- The whole schema, in one migration. Every statement is `IF NOT EXISTS`, so a
--- cold re-run is a no-op — `every_migration_sql_is_idempotent` enforces that and
--- is what forbids `ALTER TABLE ... ADD COLUMN`, which has no `IF NOT EXISTS`
--- form. Until 1.0.0 ships a released schema this file is edited in place; after
--- that, a new field arrives as a new migration file appended to the `MIGRATIONS`
--- slice in `src/main.rs` — and there, `ADD COLUMN` being unavailable, as a 1:1
--- side table with `ON DELETE CASCADE`.
+-- The 1.0.0 schema. Every statement is `IF NOT EXISTS`, so a cold re-run is a
+-- no-op — `every_migration_sql_is_idempotent` enforces that and is what forbids
+-- `ALTER TABLE ... ADD COLUMN`, which has no `IF NOT EXISTS` form.
+--
+-- This file is now FROZEN: 1.0.0's schema is in use, so editing it in place
+-- would not reach a database already stamped at version 1 (the migration filter
+-- is `version > user_version`), and the change would be skipped in silence. A
+-- new table goes in a new migration file appended to the `MIGRATIONS` slice in
+-- `src/main.rs` — v1.1.0_git_history.sql is the first — and a new *field*, with
+-- `ADD COLUMN` unavailable, as a 1:1 side table with `ON DELETE CASCADE`.
 --
 -- Statement order is load-bearing: SQLite needs a table to exist before a
 -- trigger or a foreign key can name it.
@@ -42,10 +45,13 @@ CREATE TABLE IF NOT EXISTS project_files (
     ),
 
     sha256               TEXT    NOT NULL COLLATE NOCASE CHECK (length(sha256) = 64),
+    -- Kept in step with migration 3, which widens this same list on databases
+    -- that were created before it: this file is only ever read by a cold start.
     programming_language TEXT    NOT NULL CHECK (programming_language IN (
         'rust', 'python', 'javascript', 'typescript', 'tsx',
         'go', 'c', 'cpp', 'java', 'csharp', 'ruby', 'php', 'bash',
         'html', 'css', 'json', 'scala', 'haskell', 'ocaml', 'zig', 'sql',
+        'toml', 'yaml',
         'markdown'
     )),
 
@@ -263,10 +269,15 @@ END;
 
 
 -- ============================================================
--- Code symbols (definitions + references)
+-- Code symbols (definitions)
 -- ============================================================
 -- Extracted at indexing time from the language's upstream tree-sitter tags
--- query (one universal extractor, src/slicing/symbols.rs). Unlike chunks,
+-- query (one universal extractor, src/slicing/symbols.rs). DEFINITIONS ONLY:
+-- the query emits references too, and they were stored until they were
+-- measured — 87.5% of the table serving one tool nobody called. See
+-- v1.4.0_symbol_definitions.sql, which narrows an existing database to the
+-- shape this file now creates directly; the two must be kept in step. Unlike
+-- chunks,
 -- symbol rows have no Qdrant counterpart, so they are HARD-deleted inline —
 -- no soft-delete/GC cycle. Invariant: a file's symbol rows always parallel
 -- its chunk set — every transaction that marks a file's chunks 'deleted'
@@ -283,7 +294,6 @@ CREATE TABLE IF NOT EXISTS project_file_symbols (
 
     name         TEXT    NOT NULL CHECK (length(name) > 0),
     kind         TEXT    NOT NULL CHECK (length(kind) > 0),
-    role         TEXT    NOT NULL CHECK (role IN ('definition', 'reference')),
 
     start_line   INTEGER NOT NULL,
     end_line     INTEGER NOT NULL,
@@ -301,18 +311,11 @@ CREATE TABLE IF NOT EXISTS project_file_symbols (
 
 -- Symbol lookup (the /symbols endpoint).
 CREATE INDEX IF NOT EXISTS idx_project_file_symbols_lookup
-ON project_file_symbols (project_guid, model_id, name, role);
+ON project_file_symbols (project_guid, model_id, name);
 
 -- Per-file replacement on reindex / delete.
 CREATE INDEX IF NOT EXISTS idx_project_file_symbols_file
 ON project_file_symbols (project_guid, model_id, file_path);
-
--- The enclosing definition as a *selector*: "what does the definition named X
--- reference" is `WHERE parent_name = ?`, which the `callers` tool asks in the
--- `out` direction. Every other read locates rows by name or by file first, so
--- without this index that one query is a full scan of the symbol table.
-CREATE INDEX IF NOT EXISTS idx_project_file_symbols_parent
-ON project_file_symbols (project_guid, model_id, parent_name, role);
 
 
 

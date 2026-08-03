@@ -65,7 +65,7 @@ EXC_PATHS=()
 # GET /config (`.languages`); refresh_valid_langs replaces this on demand when the
 # server is reachable, so a flag is validated against the live set. This baked-in
 # copy is only used when /config cannot be fetched (server down, no curl/jq).
-VALID_LANGS=(rust python javascript typescript tsx go c cpp java csharp ruby php bash html css json scala haskell ocaml zig sql markdown)
+VALID_LANGS=(rust python javascript typescript tsx go c cpp java csharp ruby php bash html css json scala haskell ocaml zig sql toml yaml markdown)
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -441,6 +441,8 @@ ext_to_lexer() {
         *.ml | *.mli) echo ocaml ;;
         *.zig) echo zig ;;
         *.sql) echo sql ;;
+        *.toml) echo toml ;;
+        *.yaml | *.yml) echo yaml ;;
         *.md | *.markdown) echo markdown ;;
         *) echo "" ;;
     esac

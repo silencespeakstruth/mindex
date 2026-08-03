@@ -1,0 +1,131 @@
+<!--
+  Research History: ONE full-width list, no reading pane.
+
+  The two-pane shape it replaces put a 24rem list beside a rendered report, which
+  on a wide screen was a cramped column of overlapping badges next to acres of
+  prose — and the prose was already available, better, as a Markdown tab. So the
+  list takes the whole panel, and a selected run expands in place to show what the
+  list cannot fit: its provenance, its ancestry, and the actions that act on it.
+  The report itself opens in a tab, which is the one button that survived.
+-->
+<main class="runs-page">
+    <header class="runs-head">
+        <div class="row runs-search-row">
+            <div class="runs-search-field">
+                <span class="codicon codicon-search dim" aria-hidden="true"></span>
+                <input
+                    id="runs-search"
+                    type="search"
+                    class="runs-search"
+                    placeholder="Search titles, questions and reports…"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+            </div>
+            <span class="runs-spinner dim" id="runs-loading" hidden>
+                <span class="codicon codicon-loading codicon-modifier-spin"></span>
+            </span>
+            <button
+                id="runs-refresh"
+                class="ghost"
+                data-busy-key="list"
+                title="Re-run this query and refresh the open report"
+            >
+                <span class="codicon codicon-refresh" data-busy-icon></span>
+            </button>
+        </div>
+        <!--
+            Four selects and nothing else. The "Show" label and the two preset
+            buttons beside them said the same thing three ways: a select whose
+            first option is "Any freshness" needs no word in front of it, and
+            "Outdated" as a button next to "Outdated" as an option is a second,
+            competing way to set one filter.
+        -->
+        <div class="row runs-filters">
+            <select id="runs-freshness" class="runs-select">
+                <option value="all">Any freshness</option>
+                <option value="fresh">Still current</option>
+                <option value="stale">Outdated</option>
+            </select>
+            <select
+                id="runs-validity"
+                class="runs-select"
+                title="A report is valid when its own files are current and every report it built on is still valid"
+            >
+                <option value="all">Any validity</option>
+                <option value="valid">Valid</option>
+                <option value="invalid">Invalid</option>
+            </select>
+            <select
+                id="runs-kind"
+                class="runs-select"
+                title="Research runs answer a question; challenges attack another report's claims"
+            >
+                <option value="all">Any kind</option>
+                <option value="research">Research</option>
+                <option value="challenge">Challenges</option>
+            </select>
+            <select
+                id="runs-completeness"
+                class="runs-select"
+                title="Partial = a budget stopped the run before it finished, so its report rests on partial evidence"
+            >
+                <option value="all">Any completeness</option>
+                <option value="finalized">Finished</option>
+                <option value="partial">Partial</option>
+            </select>
+            <!--
+                The corpus line is a FIXED denominator: no filter above moves it.
+                A count that shrank as the user typed would be a worse rendering of
+                the list length they can already see.
+            -->
+            <span id="runs-counts" class="dim runs-counts"></span>
+            <!-- Same shape as Collect garbage beside it: both act on the whole
+                 corpus rather than on a row, and a bare word next to a proper
+                 button read as a label that happened to be clickable. -->
+            <button
+                id="runs-select-all"
+                class="secondary"
+                data-busy-key="list"
+                title="Select every report matching the filters, not just the loaded page"
+            >
+                <span class="codicon codicon-check-all codicon-sm" data-busy-icon></span>
+                Select all
+            </button>
+            <button id="runs-gc" class="secondary" data-busy-key="gc" disabled>
+                <span class="codicon codicon-trash codicon-sm" data-busy-icon></span>
+                <span id="runs-gc-label">Collect garbage</span>
+            </button>
+        </div>
+    </header>
+
+    <div class="runs-error" id="runs-error" hidden></div>
+
+    <ul class="runs-items" id="runs-items"></ul>
+
+    <!-- The empty state is the panel's whole middle, not a footnote under the list:
+         "there is nothing here" and "your filter matched nothing" are the two things
+         a reader needs told at a glance, and they are different sentences. -->
+    <div class="runs-empty" id="runs-empty" hidden>
+        <p class="runs-empty-title" id="runs-empty-title"></p>
+        <p class="runs-empty-hint dim" id="runs-empty-hint"></p>
+    </div>
+
+    <!-- The garbage-collection review takes the whole panel while it is open: it is a
+         decision about the corpus, not a detail of one row. -->
+    <section class="runs-gc-view" id="runs-gc-view" hidden></section>
+
+    <footer class="runs-foot">
+        <button id="runs-more" class="ghost runs-text-button" data-busy-key="more" hidden>
+            Load more
+        </button>
+        <button id="runs-delete" class="secondary" data-busy-key="delete" disabled>
+            <span class="codicon codicon-trash codicon-sm" data-busy-icon></span>
+            <span id="runs-delete-label">Delete</span>
+        </button>
+        <button id="runs-use" disabled>
+            <span class="codicon codicon-references codicon-sm"></span>
+            <span id="runs-use-label">Use as context</span>
+        </button>
+    </footer>
+</main>

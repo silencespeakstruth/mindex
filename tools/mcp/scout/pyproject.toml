@@ -1,6 +1,6 @@
 [project]
 name = "scout"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server that delegates codebase investigation to a local model and returns a cited report."
 authors = [{ name = "Сергей Боголюбов" }]
 license = "MIT"

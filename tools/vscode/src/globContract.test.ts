@@ -50,12 +50,13 @@ const GUID = "123e4567-e89b-42d3-a456-426614174000";
 
 void test("parses guid, scope lists and comments", () => {
     const f = parseMindexFile(
-        `# a comment\n\nguid: ${GUID}\ninclude_paths:\n  - src/**\nexclude_paths:\n  - target/**\nlanguages:\n  - rust\n`
+        `# a comment\n\nguid: ${GUID}\ninclude_paths:\n  - src/**\nexclude_paths:\n  - target/**\nlanguages:\n  - rust\ngit_refs:\n  - master\n`
     );
     assert.equal(f.guid, GUID);
     assert.deepEqual(f.includePaths, ["src/**"]);
     assert.deepEqual(f.excludePaths, ["target/**"]);
     assert.deepEqual(f.languages, ["rust"]);
+    assert.deepEqual(f.gitRefs, ["master"]);
 });
 
 void test("guid-only file has empty scope", () => {
@@ -63,6 +64,7 @@ void test("guid-only file has empty scope", () => {
     assert.deepEqual(f.includePaths, []);
     assert.deepEqual(f.excludePaths, []);
     assert.deepEqual(f.languages, []);
+    assert.deepEqual(f.gitRefs, []);
 });
 
 void test("a dashless guid is normalized to hyphenated", () => {
@@ -83,4 +85,24 @@ void test("missing, malformed and unknown keys are errors", () => {
         /list of strings/
     );
     assert.throws(() => parseMindexFile("just a string\n"), /YAML mapping/);
+});
+
+void test("globs the Rust parser rejects are rejected here too", () => {
+    // mindexfile::build_globset bails on a leading `/` or any `\`. This parser used
+    // to accept both and picomatch would simply never match them — the extension
+    // scanning a tree mindex-index refuses to scan at all, reported as drift that no
+    // reindex clears.
+    assert.throws(
+        () => parseMindexFile(`guid: ${GUID}\nexclude_paths:\n  - /target/**\n`),
+        /invalid glob `\/target\/\*\*`/
+    );
+    assert.throws(
+        () => parseMindexFile(`guid: ${GUID}\ninclude_paths:\n  - src\\\\**\n`),
+        /invalid glob/
+    );
+    // Only the two glob lists are held to it: a git ref pattern is not a path glob,
+    // and the Rust side never puts one through build_globset.
+    assert.deepEqual(parseMindexFile(`guid: ${GUID}\ngit_refs:\n  - "feat/*"\n`).gitRefs, [
+        "feat/*",
+    ]);
 });

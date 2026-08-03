@@ -1,0 +1,477 @@
+/*
+ * Research History: one full-width list.
+ *
+ * Everything here is expressed in the shared `--mx-*` tokens from common.css, and
+ * the controls are the shared ones (`button`, `button.secondary`, `button.ghost`,
+ * `.notice`, `.badge` shapes) — this panel used to hand-roll its own palette from
+ * raw VS Code variables, which is how it came to look like a different product
+ * from the sidebar it is opened out of.
+ *
+ * The list is not width-capped. A run's title, its provenance badges and its
+ * timestamp all live on one line, and the whole complaint about the old two-pane
+ * layout was that they were fighting for 24rem while a reading pane it did not
+ * need held the rest of a 4K screen.
+ */
+
+.runs-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    box-sizing: border-box;
+}
+
+/* ── head ─────────────────────────────────────────────────────────────────── */
+
+.runs-head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--mx-gap-tight);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--mx-border);
+}
+
+.runs-search-row {
+    gap: var(--mx-gap-tight);
+}
+
+/*
+ * The magnifier sits INSIDE the field rather than beside it: two controls in a row
+ * where one is decoration reads as two, and the icon then competes with the
+ * refresh button at the other end for what a click might do.
+ */
+.runs-search-field {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
+}
+
+.runs-search-field .codicon {
+    position: absolute;
+    top: 50%;
+    left: 8px;
+    transform: translateY(-50%);
+    pointer-events: none;
+}
+
+/* `input[type="search"]` is not in common.css's control selector — it is the only
+ * one of its kind in the extension — so the shared look is restated here rather
+ * than widening a selector every other page would then inherit. */
+.runs-search {
+    flex: 1;
+    min-width: 0;
+    box-sizing: border-box;
+    height: var(--mx-control-h);
+    padding: 0 8px 0 28px;
+    font-family: inherit;
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--mx-border-strong);
+    border-radius: var(--mx-radius);
+}
+
+/* Both rows wrap: four selects plus two buttons do not fit a narrow panel, and
+ * without this the last control is clipped past the edge instead of moving down. */
+.runs-filters {
+    flex-wrap: wrap;
+    gap: var(--mx-gap-tight);
+}
+
+.runs-select {
+    height: 26px;
+    font-size: var(--mx-fs-sm);
+    padding: 0 20px 0 6px;
+}
+
+/* Pushes the corpus line and the two corpus-wide actions to the far edge. */
+.runs-counts {
+    margin-left: auto;
+    font-size: var(--mx-fs-sm);
+    white-space: nowrap;
+}
+
+/* A ghost button carrying a word rather than a glyph: same no-chrome-until-hover
+ * treatment, but it must be as wide as its label. */
+.runs-text-button {
+    width: auto;
+    padding: 0 8px;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-error {
+    padding: 8px 14px;
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-errorBackground, rgba(190, 40, 40, 0.15));
+    border-bottom: 1px solid var(--vscode-inputValidation-errorBorder, var(--mx-bad));
+}
+/* A failure a second press could survive — a timeout, a busy server, a
+ * dependency that is coming back. Red for those says "this will not work",
+ * which is the opposite of what the user should do about them. */
+.runs-error.warn {
+    color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-warningBackground, rgba(190, 140, 0, 0.15));
+    border-bottom-color: var(--vscode-inputValidation-warningBorder, var(--mx-warn));
+}
+
+/* ── the list ─────────────────────────────────────────────────────────────── */
+
+.runs-items {
+    flex: 1;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    list-style: none;
+}
+
+.runs-item {
+    border-bottom: 1px solid color-mix(in srgb, var(--mx-border) 55%, transparent);
+}
+
+.runs-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: var(--mx-gap);
+    align-items: start;
+    padding: 7px 14px;
+    cursor: pointer;
+}
+
+.runs-item:hover .runs-row {
+    background: var(--vscode-list-hoverBackground);
+}
+
+/* The open row, not a selected one: the checkbox is what selects, and the two used
+ * to share a highlight that made a multi-row selection look like five open reports. */
+.runs-item.open .runs-row {
+    background: var(--mx-surface);
+}
+
+.runs-item-body {
+    min-width: 0;
+}
+
+.runs-title {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.runs-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    margin-top: 3px;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-seq {
+    font-family: var(--vscode-editor-font-family, monospace);
+    opacity: 0.75;
+}
+
+/*
+ * Staleness is the one thing in this list that changes what a report is worth, so it
+ * is a badge rather than another dim meta field.
+ */
+.runs-badge {
+    padding: 0 5px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-size: var(--mx-fs-xs);
+    white-space: nowrap;
+}
+
+.runs-badge.stale,
+/* The "partial" badge on a run stopped by a budget rather than finished. */
+.runs-badge.incomplete,
+.runs-badge.expiring {
+    color: var(--mx-warn);
+    border-color: color-mix(in srgb, var(--mx-warn) 45%, transparent);
+}
+
+/*
+ * Invalidity outranks staleness: a stale report is dubious, an invalid one is
+ * refused as context by the server — so it borrows the error palette.
+ */
+.runs-badge.invalid {
+    color: var(--mx-bad);
+    border-color: color-mix(in srgb, var(--mx-bad) 45%, transparent);
+}
+
+/*
+ * The quiet badges: `⤷N` reports this one was built on, `↩N` reports built on it,
+ * and the pinned marker. Context for a decision, not a warning — colouring them
+ * would compete with the two badges that are.
+ */
+.runs-badge.deps,
+.runs-badge.refd,
+.runs-badge.pinned {
+    color: var(--mx-dim);
+    border-color: var(--mx-border);
+}
+
+/*
+ * A link, not a badge: it navigates, and painting it like the verdict badges beside
+ * it would make three passive labels and one action indistinguishable.
+ */
+.runs-subject-link {
+    height: auto;
+    padding: 0;
+    color: var(--vscode-textLink-foreground);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--mx-fs-sm);
+}
+.runs-subject-link:hover:not(:disabled) {
+    background: none;
+    text-decoration: underline;
+}
+
+.runs-actions {
+    display: flex;
+    gap: 2px;
+}
+
+/* The empty state owns the middle of the panel, so the list gives up its `flex: 1`
+ * when it has nothing in it — otherwise the message would sit at the bottom of an
+ * empty box that had already claimed the height. */
+.runs-items:empty {
+    flex: none;
+}
+
+.runs-empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--mx-gap-tight);
+    padding: 32px 14px;
+    text-align: center;
+}
+
+.runs-empty-title {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 600;
+    /* Loud in shape, quiet in colour: it is a fact about the corpus, not a fault. */
+    color: var(--mx-dim);
+}
+
+.runs-empty-hint {
+    margin: 0;
+    max-width: 34rem;
+    font-size: var(--mx-fs-sm);
+    line-height: 1.5;
+}
+
+.runs-foot {
+    display: flex;
+    gap: var(--mx-gap-tight);
+    align-items: center;
+    padding: 8px 14px;
+    border-top: 1px solid var(--mx-border);
+}
+
+.runs-foot #runs-use {
+    margin-left: auto;
+}
+
+/* ── the expanded row ─────────────────────────────────────────────────────── */
+/*
+ * What the one-line row cannot carry: provenance, ancestry, the files that have
+ * moved under it, and the actions. NOT the report — that is what "Open in a tab"
+ * is for, and rendering it here is exactly the reading pane this panel dropped.
+ */
+
+.runs-detail {
+    padding: 4px 14px 14px 42px;
+    background: var(--mx-surface);
+    border-top: 1px solid var(--mx-border);
+}
+
+.runs-detail h4 {
+    margin: 0 0 6px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.runs-detail p {
+    margin: 6px 0 0;
+    font-size: var(--mx-fs-sm);
+    line-height: 1.5;
+}
+
+.runs-detail-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--mx-gap-tight);
+    margin: 8px 0;
+}
+
+.runs-detail-actions button {
+    height: 28px;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-files,
+.runs-deps {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-file,
+.runs-dep {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    padding: 1px 0;
+}
+
+.runs-file button,
+.runs-dep button {
+    height: auto;
+    padding: 0;
+    color: var(--vscode-textLink-foreground);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+}
+.runs-file button:hover,
+.runs-dep button:hover {
+    background: none;
+    text-decoration: underline;
+}
+
+.runs-file .state-changed,
+.runs-file .state-removed,
+.runs-dep .verdict-disputed,
+.runs-dep .verdict-inconclusive {
+    color: var(--mx-warn);
+}
+
+.runs-dep .dep-invalid,
+.runs-dep .dep-deleted,
+.runs-dep .verdict-refuted {
+    color: var(--mx-bad);
+}
+
+.runs-section {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid color-mix(in srgb, var(--mx-border) 55%, transparent);
+}
+
+.runs-verify-line {
+    margin: 4px 0 0;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-verify-warning {
+    margin: 4px 0 0;
+    padding: 4px 6px;
+    border-radius: var(--mx-radius);
+    font-size: var(--mx-fs-sm);
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-errorBackground, rgba(190, 40, 40, 0.15));
+    border: 1px solid var(--vscode-inputValidation-errorBorder, var(--mx-bad));
+}
+
+/* ── the garbage-collection review ───────────────────────────────────────── */
+/*
+ * Full width, in place of the list: a QuickPick cannot show why each row is
+ * proposed or that other reports depend on it, and those are the two things a
+ * reviewer unchecks a row over.
+ */
+
+.runs-gc-view {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+}
+
+.runs-gc-head {
+    padding-bottom: 8px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--mx-border);
+}
+
+.runs-gc-head h3 {
+    margin: 0;
+    font-size: 15px;
+}
+
+.runs-gc-note {
+    margin: 4px 0 0;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-gc-group {
+    margin-top: 16px;
+}
+
+.runs-gc-group-head {
+    display: flex;
+    gap: var(--mx-gap);
+    align-items: baseline;
+}
+
+.runs-gc-group-title {
+    font-weight: 600;
+}
+
+.runs-gc-why {
+    margin: 2px 0 6px;
+    font-size: var(--mx-fs-sm);
+}
+
+.runs-gc-rows {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.runs-gc-row {
+    display: flex;
+    gap: var(--mx-gap-tight);
+    align-items: baseline;
+    min-width: 0;
+    padding: 2px 0;
+}
+
+.runs-gc-row-title {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/*
+ * Dependants are the one thing on this screen that can make a proposed delete the
+ * wrong call, so they get the warning palette rather than one more quiet badge.
+ */
+.runs-gc-dependants {
+    padding: 0 5px;
+    border-radius: 999px;
+    font-size: var(--mx-fs-xs);
+    color: var(--mx-warn);
+    border: 1px solid color-mix(in srgb, var(--mx-warn) 45%, transparent);
+    white-space: nowrap;
+}
+
+.runs-gc-foot {
+    display: flex;
+    gap: var(--mx-gap-tight);
+    align-items: center;
+    padding-top: 12px;
+    margin-top: 16px;
+    border-top: 1px solid var(--mx-border);
+}

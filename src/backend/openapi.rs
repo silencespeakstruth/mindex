@@ -19,6 +19,7 @@ use crate::backend::v0::handlers;
 /// `tag = "…"` on the corresponding `#[utoipa::path]`.
 const INDEXING: &str = "Indexing";
 const SEARCH: &str = "Search";
+const RESEARCH: &str = "Research";
 const PROJECTS: &str = "Projects";
 const GC: &str = "Garbage Collection";
 const OBSERVABILITY: &str = "Observability";
@@ -58,14 +59,23 @@ client localizes against (the `detail`/`title` prose is English and informationa
 Field-specific errors add `field` and a structured `meta` for interpolation. The code \
 catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_path`, \
 `request.body_too_large`, \
-`internal.error`, `embedder.unavailable`, `qdrant.unavailable`, `gc.already_running`, \
+`internal.error`, `embedder.unavailable`, `qdrant.unavailable`, `database.busy`, \
+`gc.already_running`, \
 `project.not_found`, `search.no_match`, `selector.empty`, \
 `validation.path_invalid`, `validation.sha256_invalid`, `validation.top_k_out_of_range`, \
 `validation.query_empty`, `validation.query_too_long`, `validation.code_too_large`, \
 `validation.too_many_files`, `validation.selector_too_large`, \
 `validation.symbol_name_empty`, `validation.symbol_name_too_long`, \
 `validation.symbol_limit_out_of_range`, `validation.research_budget_out_of_range`, \
-`research.busy`, `research.model_missing`.",
+`validation.research_shape_out_of_range`, \
+`validation.too_many_commits`, `validation.commit_message_too_large`, \
+`validation.commit_invalid`, `validation.history_bound_missing`, `research.busy`, \
+`research.model_missing`, `research.model_not_allowed`, \
+`validation.research_context_too_many`, \
+`validation.research_context_invalid`, `validation.research_delete_too_many`, \
+`validation.research_list_limit_out_of_range`, `research.run_not_found`, \
+`research.challenge_subject_invalid`, `research.challenge_subject_is_challenge`, \
+`research.scope_matches_nothing`, `research.model_lacks_tools`.",
     ),
     paths(
         // Indexing
@@ -74,10 +84,21 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::post_cancel,
         handlers::post_retry,
         handlers::post_drift,
+        handlers::post_history,
+        handlers::delete_history,
         // Search
         handlers::post_search,
         handlers::post_symbols,
         handlers::post_research,
+        handlers::post_research_challenge,
+        handlers::get_research_runs,
+        handlers::get_research_run,
+        handlers::get_research_verification,
+        handlers::post_research_pin,
+        handlers::delete_research_run,
+        handlers::delete_research_runs,
+        handlers::get_research_active,
+        handlers::delete_research_active,
         // Projects
         handlers::get_projects,
         handlers::get_project_stats,
@@ -98,15 +119,16 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::Code,
         crate::backend::v0::models::IndexRequest,
         crate::backend::v0::models::IndexResponse,
+        crate::backend::v0::models::StreamChoice,
         crate::backend::v0::models::SearchFilter,
         crate::backend::v0::models::SearchRequest,
         crate::backend::v0::models::SearchResult,
         crate::backend::v0::models::SearchResponse,
-        crate::backend::v0::models::SymbolRoleFilter,
         crate::backend::v0::models::SymbolsRequest,
         crate::backend::v0::models::SymbolInfo,
         crate::backend::v0::models::SymbolsResponse,
         crate::backend::v0::models::ResearchRequest,
+        crate::backend::v0::models::ChallengeRequest,
         crate::backend::v0::models::ResearchBudgetOverride,
         crate::research::Effort,
         crate::backend::v0::models::DeleteFilesRequest,
@@ -120,9 +142,34 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ProjectListResponse,
         crate::backend::v0::models::DriftRequest,
         crate::backend::v0::models::DriftResponse,
+        crate::backend::v0::models::ChangeType,
+        crate::backend::v0::models::CommitPath,
+        crate::backend::v0::models::CommitEntry,
+        crate::backend::v0::models::HistoryRequest,
+        crate::backend::v0::models::HistoryResponse,
+        crate::backend::v0::models::HistoryPruneResponse,
         crate::backend::v0::models::GcResponse,
+        crate::backend::v0::models::ResearchFreshness,
+        crate::backend::v0::models::ResearchKind,
+        crate::backend::v0::models::ResearchCompleteness,
+        crate::backend::v0::models::ResearchCorpusTotals,
+        crate::backend::v0::models::ResearchRunDependency,
+        crate::backend::v0::models::ResearchRunSummary,
+        crate::backend::v0::models::ResearchRunListResponse,
+        crate::backend::v0::models::ResearchRunFile,
+        crate::backend::v0::models::ResearchRunDetail,
+        crate::backend::v0::models::CitationCounts,
+        crate::backend::v0::models::ResearchVerification,
+        crate::backend::v0::models::ResearchPinRequest,
+        crate::backend::v0::models::DeleteResearchRunsRequest,
+        crate::backend::v0::models::DeleteResearchRunsResponse,
+        crate::backend::v0::models::ActiveResearchRun,
+        crate::backend::v0::models::ActiveResearchResponse,
         crate::backend::v0::models::VersionResponse,
+        crate::backend::v0::models::CheckState,
+        crate::backend::v0::models::HealthStatus,
         crate::backend::v0::models::HealthChecks,
+        crate::backend::v0::models::ResearchHealth,
         crate::backend::v0::models::HealthResponse,
         crate::backend::v0::models::FileInfo,
         crate::backend::v0::models::FileListResponse,
@@ -130,14 +177,18 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::RetryResponse,
         crate::backend::v0::models::StatusResponse,
         crate::backend::v0::models::ConfigResponse,
+        crate::backend::v0::models::SearchConfigInfo,
         crate::backend::v0::models::ResearchConfigInfo,
         crate::backend::v0::models::ResearchEffortLadder,
         crate::backend::v0::models::ResearchEffortInfo,
         crate::backend::v0::models::ResearchSamplingInfo,
+        crate::backend::v0::models::ResearchObservedInfo,
+        crate::backend::v0::models::ResearchObservedEffort,
     )),
     tags(
         (name = INDEXING, description = "Index lifecycle: (re)index files, cancel in-flight work, requeue failures, soft-delete files, and detect working-tree drift."),
         (name = SEARCH, description = "Hybrid semantic + lexical code retrieval over a project's active chunks."),
+        (name = RESEARCH, description = "Stored research: browse, search and read past reports, pin the ones worth keeping, and drop the rest. The run that produces a report is POST /v0/{project_guid}/research."),
         (name = PROJECTS, description = "Project inventory, per-project stats, per-file listings, and whole-project hard delete."),
         (name = GC, description = "Reclaim soft-deleted chunks/files and prune the status log (globally serialized)."),
         (name = OBSERVABILITY, description = "Liveness, version, and a live runtime/concurrency snapshot for diagnostics."),
@@ -169,18 +220,26 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (15 routes; two carry two methods each).
+        // Every routed path is documented (20 routes; three carry two methods each).
         for p in [
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",
             "/v0/{project_guid}/symbols",
             "/v0/{project_guid}/research",
+            "/v0/{project_guid}/history",
             "/projects",
             "/projects/{project_guid}",
             "/projects/{project_guid}/files",
             "/projects/{project_guid}/cancel",
             "/projects/{project_guid}/retry",
             "/projects/{project_guid}/drift",
+            "/projects/{project_guid}/research",
+            "/projects/{project_guid}/research/{run_id}",
+            "/projects/{project_guid}/research/{run_id}/pin",
+            "/projects/{project_guid}/research/{run_id}/verification",
+            "/v0/{project_guid}/research/{run_id}/challenge",
+            "/research/active",
+            "/research/active/{run_id}",
             "/gc",
             "/status",
             "/config",
@@ -189,7 +248,7 @@ mod tests {
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 15, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 23, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak
@@ -199,6 +258,15 @@ mod tests {
         assert!(
             !paths.contains_key("/metrics"),
             "/metrics must stay out of the OpenAPI spec — see the handler's doc comment"
+        );
+
+        // `/llms.txt` gets the same treatment for the same reasons: it serves
+        // markdown prose to a language model, not JSON to an API client. Its own
+        // drift guard runs the other way — `llms_doc_mentions_only_routes_that_exist`
+        // checks the document against this spec.
+        assert!(
+            !paths.contains_key("/llms.txt"),
+            "/llms.txt must stay out of the OpenAPI spec — see the handler's doc comment"
         );
 
         // The two dual-method routes expose both verbs.

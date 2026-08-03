@@ -25,15 +25,33 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::models::ollama::OllamaModel;
+use crate::models::ollama::{ModelDescriptor, OllamaModel};
 
 /// The published Ollama model registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelCatalog {
     /// Model names, as Ollama spells them. Empty until the first tick succeeds.
     pub models: Vec<String>,
+    /// The same models with their identity attached (blob digest, details) —
+    /// what `post_research` stamps onto the run journal. Kept beside `models`
+    /// rather than replacing it so `get_config`'s reader stays untouched; the
+    /// two are written together from one `/api/tags` read and cannot diverge.
+    pub descriptors: Vec<ModelDescriptor>,
     /// Unix seconds of the last **successful** refresh; `None` = never succeeded.
     pub refreshed_at: Option<i64>,
+}
+
+impl ModelCatalog {
+    /// The stored identity of one model, or `(None, None)` when the catalog has
+    /// not seen it — which includes the window before the first tick. "Not
+    /// recorded" is the honest answer there, never a fabricated digest.
+    pub fn identity_of(&self, model: &str) -> (Option<String>, Option<String>) {
+        self.descriptors
+            .iter()
+            .find(|d| d.name == model)
+            .map(|d| (d.digest.clone(), d.details_json.clone()))
+            .unwrap_or((None, None))
+    }
 }
 
 /// Shared handle: one writer (this worker), many readers (`get_config`).
@@ -105,10 +123,11 @@ pub(crate) async fn refresh_once(
     ollama: &dyn OllamaModel,
     catalog: &tokio::sync::RwLock<ModelCatalog>,
 ) -> Result<usize, crate::models::ollama::OllamaError> {
-    let models = ollama.list_models().await?;
-    let n = models.len();
+    let descriptors = ollama.list_model_descriptors().await?;
+    let n = descriptors.len();
     *catalog.write().await = ModelCatalog {
-        models,
+        models: descriptors.iter().map(|d| d.name.clone()).collect(),
+        descriptors,
         refreshed_at: Some(crate::unix_now()),
     };
     Ok(n)

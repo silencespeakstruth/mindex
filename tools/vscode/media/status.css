@@ -1,0 +1,308 @@
+/* The Server Status panel. Opened from the status-bar indicator, and looked at only
+ * when that indicator is not green — so it optimises for "what is wrong and what do I
+ * press", not for browsing. */
+
+.page {
+    max-width: 820px;
+    /* Centred: this panel opens as a full editor tab, and a 820px column pinned to
+     * the left edge of a wide screen reads as a page that failed to load. */
+    margin: 0 auto;
+    padding: 0 20px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--mx-gap-loose);
+}
+
+/* ── header ──────────────────────────────────────────────────────────────── */
+
+.head {
+    padding-top: 14px;
+}
+.title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--mx-gap);
+}
+.title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+}
+.state-dot {
+    font-size: 13px;
+}
+.state-ok {
+    color: var(--mx-ok);
+}
+.state-degraded {
+    color: var(--mx-warn);
+}
+/* Both ways of being unusable share the colour: they differ in remedy, not in
+ * what the user can currently do. The card below says which. */
+.state-unhealthy,
+.state-unreachable {
+    color: var(--mx-bad);
+}
+.subtitle {
+    margin-top: 5px;
+    font-size: var(--mx-fs-sm);
+}
+.checked {
+    font-size: var(--mx-fs-sm);
+    white-space: nowrap;
+}
+
+.notice button {
+    margin-top: 9px;
+}
+.unreachable-hint {
+    margin-top: 4px;
+    opacity: 0.85;
+}
+.notice code {
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+/* ── cards ───────────────────────────────────────────────────────────────── */
+
+.card {
+    border: 1px solid var(--mx-border);
+    border-radius: var(--mx-radius-lg);
+    padding: 11px 13px 13px;
+    background: var(--mx-surface);
+}
+.card-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 0 9px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--mx-dim);
+}
+.card-note {
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+}
+/* The failed count only ever renders when it is non-zero — the card is hidden
+ * otherwise — so it can be unconditionally alarming. */
+.failed-count {
+    font-weight: 600;
+    color: var(--mx-bad);
+}
+/* Pushes the card's action button to the far edge of its title row. */
+.card-title button {
+    margin-left: auto;
+    height: 26px;
+    font-size: var(--mx-fs-sm);
+}
+.card .hint {
+    margin: 9px 0 0;
+}
+
+/* ── rows ────────────────────────────────────────────────────────────────── */
+/* One shape for every list in the panel: a fixed-width name, a value, a note that
+ * takes what is left. Four different tables would be four different alignments. */
+
+.line {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 3px 0;
+    line-height: 1.5;
+}
+.line + .line {
+    border-top: 1px solid color-mix(in srgb, var(--mx-border) 55%, transparent);
+}
+.line .name {
+    flex: none;
+    width: 130px;
+    overflow-wrap: anywhere;
+}
+.line .value {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+.line .note {
+    flex: none;
+    color: var(--mx-dim);
+    font-size: var(--mx-fs-sm);
+}
+.line.bad .value {
+    color: var(--mx-bad);
+}
+.line.warn .value {
+    color: var(--mx-warn);
+}
+.line.muted {
+    color: var(--mx-dim);
+}
+.line .codicon {
+    font-size: 13px;
+}
+
+/* A path that opens its file. Styled as a link only on hover: a whole column of
+ * underlined blue reads as a menu. */
+.path {
+    background: none;
+    border: none;
+    padding: 0;
+    height: auto;
+    font: inherit;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.92em;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+    justify-content: flex-start;
+}
+.path:hover {
+    background: none;
+    color: var(--vscode-textLink-foreground);
+    text-decoration: underline;
+}
+/* The failed row's language mark sits inside the path button, so it must not pick up
+ * the underline the path grows on hover. */
+.path .lang-glyph {
+    margin-right: 7px;
+    text-decoration: none;
+}
+
+.line button.retry {
+    height: 24px;
+    padding: 0 8px;
+    font-size: var(--mx-fs-sm);
+}
+
+/* ── health checks ───────────────────────────────────────────────────────── */
+/* Two lines per dependency: the verdict on the first, what the thing is for on the
+ * second. Colour is the severity and the same dot carries it in all three states —
+ * the *word* beside it is what makes the row readable without colour, which is the
+ * job the changing glyph used to do badly. */
+
+/* Two columns, two rows: identity left, verdict right, a caption under each. Both
+ * captions share the second grid row, which is what keeps the halves aligned when
+ * either of them wraps — the thing a pair of stacked flex rows could not do. */
+.check {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+    column-gap: var(--mx-gap-loose);
+    row-gap: 2px;
+    align-items: baseline;
+    padding: 9px 0;
+}
+.check .check-name {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+.check .check-state {
+    text-align: right;
+    font-variant: small-caps;
+    white-space: nowrap;
+}
+/* The two captions: same size, same tone, each under the half it belongs to. */
+.check-purpose,
+.check-impact {
+    font-size: var(--mx-fs-sm);
+    line-height: 1.45;
+    color: var(--mx-dim);
+}
+.check-impact {
+    text-align: right;
+}
+.check-ok .check-name .codicon,
+.check-ok .check-state {
+    color: var(--mx-ok);
+}
+.check-warn .check-name .codicon,
+.check-warn .check-state,
+.check-warn .check-impact {
+    color: var(--mx-warn);
+}
+.check-bad .check-name .codicon,
+.check-bad .check-state,
+.check-bad .check-impact {
+    color: var(--mx-bad);
+}
+
+/* "Optional" is a property of the dependency, not of its current state, so it is a
+ * standing label rather than something that appears when the row goes yellow. */
+.badge {
+    flex: none;
+    padding: 1px 6px;
+    border: 1px solid var(--mx-border);
+    border-radius: 999px;
+    font-size: var(--mx-fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--mx-dim);
+}
+
+/* ── pool meter ──────────────────────────────────────────────────────────── */
+/* One bar, not one cell per connection: at a pool of 64 the old meter was 64 boxes
+ * and a wrapped sentence to say "64/64". */
+
+.meter {
+    flex: none;
+    width: 64px;
+    height: 6px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--mx-border) 70%, transparent);
+}
+.meter .fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+}
+.meter-ok .fill {
+    background: var(--mx-ok);
+}
+.meter-warn .fill {
+    background: var(--mx-warn);
+}
+.meter-bad .fill {
+    background: var(--mx-bad);
+}
+.meter-label {
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── inventory table ─────────────────────────────────────────────────────── */
+
+.inv {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto;
+    gap: 2px 14px;
+    align-items: baseline;
+}
+.inv .h {
+    font-size: var(--mx-fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--mx-dim);
+    padding-bottom: 3px;
+}
+.inv .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.inv .empty {
+    color: var(--mx-dim);
+}
+.inv .lang {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}

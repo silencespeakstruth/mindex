@@ -23,7 +23,7 @@ server_url = "http://localhost:11211" # the BGE-M3 embedder
 health_timeout_ms = 2000             # /health ping timeout
 max_429_retries = 3                  # retries when the embedder returns 429 (busy)
 backoff_base_ms = 200                # first 429 backoff; doubles each retry
-encode_timeout_ms = 600000           # per-attempt /encode request timeout (ms); 10 min
+encode_timeout_ms = 600000           # whole /encode call incl. 429 retries (ms); 10 min
 
 # OPTIONAL second embedder instance serving only the QUERY path (/search, and every
 # search a /research run makes). Commented out = one instance does both, which is
@@ -49,7 +49,24 @@ upsert_batch_points = 256            # points per Qdrant upsert
 dense_prefetch_limit = 200           # dense candidates before RRF fusion
 sparse_prefetch_limit = 200          # sparse candidates before RRF fusion
 fusion_limit = 200                   # candidates after fusion, before ColBERT rerank
-# Invariant: dense/sparse_prefetch_limit >= fusion_limit >= search.default_top_k.
+search_hnsw_ef = 256                 # HNSW beam width for the dense prefetch
+timeout_ms = 30000                   # ceiling on one Qdrant call
+connect_timeout_ms = 5000            # ceiling on establishing the connection
+# Invariant: search_hnsw_ef >= dense_prefetch_limit, and
+# dense/sparse_prefetch_limit >= fusion_limit >= search.max_top_k. Every rung is a
+# silent truncation if it is not held: a beam narrower than the pool it is asked for,
+# or a pool smaller than the top_k a caller may request, comes back short with no
+# error at startup and none at query time.
+# search_hnsw_ef is the recall/latency knob, and it is the only *query*-side Qdrant
+# setting there is — the collection's own index and storage options are structural
+# consts in src/db/qdrant.rs, because changing one is a reindex. Note that on a
+# collection under Qdrant's `indexing_threshold` (10000 points) there is no HNSW
+# index yet and the prefetch is an exact scan, so this changes nothing until a
+# project grows past it. That is exactly when it would otherwise start silently
+# under-recalling.
+# The two timeouts exist because the client's own default is 5s for each and nothing
+# could override it: a project whose candidate set made fusion + ColBERT rerank run
+# past five seconds failed every search with `qdrant.unavailable`, untunably.
 
 [database]
 path = "mindex.db"      # SQLite file (use ":memory:" for ephemeral)
@@ -81,6 +98,13 @@ max_doc_chunk_tokens = 1024
 # this measurably changes nothing — it earns its keep on documents whose headings
 # are sparse or absent, where structure alone can only pack up to the cap.
 doc_semantic_weight = 1.0
+# Node selection alone leaves roughly a third of lines in no chunk at all —
+# consts, type aliases, small helpers, trait signatures and, crucially, the doc
+# comments that have no chunk to attach to. The gap pass packs those into
+# line-aligned windows; measured here it took line coverage from 63% to 99.7%
+# and doc-comment coverage from 40% to 100%. It roughly doubles embedding work,
+# which is the only reason it is a knob rather than a constant.
+fill_gaps = true
 
 [search]
 default_top_k = 5       # results returned when a /search request omits top_k
@@ -95,7 +119,14 @@ max_files_per_request = 10000 # max files in one /index request
 max_drift_files = 200000      # max entries in one /drift path→sha256 map
 max_selector_patterns = 256   # max globs+languages combined in one include/exclude
 max_symbol_name_bytes = 512   # max /symbols name length in bytes
-max_symbol_results = 50       # upper bound a /symbols request may set for limit (per role)
+max_symbol_results = 50       # upper bound a /symbols request may set for limit
+max_history_commits = 20000   # max commits in one /history reconciliation request
+max_commit_message_bytes = 65536 # max subject+body of one commit, in bytes
+# Max ids in one batch DELETE of stored research. An empty list is a 400 rather
+# than a whole-corpus wipe, and over this cap the code is
+# validation.research_delete_too_many. Published on GET /config, because a client
+# pruning a corpus sizes its paging loop from it rather than guessing.
+max_research_delete_ids = 500
 
 # /research — the Ollama-driven iterative research endpoint (SSE). Talks to a
 # local Ollama; each request names its model (or falls back to default_model).
@@ -105,6 +136,14 @@ max_symbol_results = 50       # upper bound a /symbols request may set for limit
 [research]
 ollama_url = "http://127.0.0.1:11434" # local Ollama server
 default_model = ""                    # model when a request omits one; "" = required per request
+allowed_models = []                   # glob whitelist of models /research may run; [] = any.
+                                      # Case-sensitive, matched against the resolved model WITH
+                                      # its tag: "gemma4:*" matches "gemma4:27b" but not bare
+                                      # "gemma4" — list both, or use "gemma4*". A request naming
+                                      # anything else gets 400 research.model_not_allowed, and
+                                      # GET /config's research.models is filtered to the allowed
+                                      # set. A non-empty list must cover default_model (startup
+                                      # refuses otherwise).
 worker_threads = 2                    # threads in the dedicated research runtime
 max_concurrent = 2                    # research jobs beyond this get 429 research.busy
 turn_timeout_ms = 3900000             # DEAD-SOCKET guard only, NOT the run's bound, and it must
@@ -115,6 +154,75 @@ turn_timeout_ms = 3900000             # DEAD-SOCKET guard only, NOT the run's bo
                                       # looping in its thinking channel is exactly what the
                                       # deadline is for, so letting this fire first inverts the
                                       # design. Startup refuses a value that would.
+first_token_timeout_ms = 120000       # abandon ONE turn if Ollama produces NO token at all within
+                                      # this window; 0 disables. The third guard, for what the
+                                      # other two cannot see: a connection that is alive and mute.
+                                      # turn_timeout_ms catches a dead socket and the thinking cap
+                                      # catches a model that will not stop, but an Ollama that is
+                                      # (re)loading a model answers neither — it just holds the
+                                      # request, and before this guard the run's whole budget went
+                                      # into waiting (measured: 300 s of a 300 s budget at
+                                      # steps 0, turns 0, tokens 0). Bounds the SILENT PREFIX
+                                      # only: the first token of any channel spends the guard, so
+                                      # a long prompt evaluation is untouched. Must stay below
+                                      # turn_timeout_ms or it can never fire; startup refuses a
+                                      # value that would, and one small enough to preempt a merely
+                                      # slow first token.
+slow_turn_tokens_per_second = 3       # log ONE turn as contention when it generated slower than
+                                      # this (tokens per second of Ollama's own eval_duration);
+                                      # 0 disables. The third per-turn guard, and the only one that
+                                      # stops nothing — it names a diagnosis. A run inching along at
+                                      # a token a second looks identical whether the model is bad,
+                                      # the prompt is bad or another process is holding the GPU, and
+                                      # on a shared card the last is the usual answer (measured: one
+                                      # run spent 985 s at ~1.5 tok/s with nothing able to say why).
+                                      # SHIPS ARMED at a floor no GPU deployment reaches (measured
+                                      # here: 220 turns, none below 32; the pathologies were 1.5 and
+                                      # 0.77). It used to default to 0 on the argument that a healthy
+                                      # rate is host-specific — true, and the wrong conclusion: this
+                                      # check stops nothing, so a false positive costs a log line
+                                      # while default-off cost two multi-hour investigations of a
+                                      # symptom the code could already name. Raise it once
+                                      # mindex_research_turn_tokens_per_second shows your healthy
+                                      # population; set 0 only for CPU-only inference of a large
+                                      # model, which legitimately runs this slowly.
+                                      # Read it beside mindex_research_turn_load_seconds: a non-zero
+                                      # load after the first turn means Ollama evicted and reloaded
+                                      # the model, i.e. something else wanted the device.
+                                      # IT ANSWERS ONLY HALF THE QUESTION — see the knob below.
+slow_turn_unaccounted_ms = 60000      # log ONE turn as waiting when this much of its wall clock was
+                                      # outside Ollama's own accounting; 0 disables. The other half
+                                      # of contention, and the half the rate above structurally
+                                      # cannot see: Ollama times itself INSIDE its handler, so a
+                                      # request queued in front of a busy GPU is absent from every
+                                      # figure it returns — during exactly the contention being
+                                      # hunted, its numbers look healthy. Measured 2026-08-03: a plan
+                                      # turn took 912 s of wall clock for 702 tokens while every one
+                                      # of the week's 220 turns sat between 32 and 128 tok/s. The
+                                      # rate check would have returned early at ANY threshold; the
+                                      # 890 lost seconds were here, reported nowhere.
+                                      # Unlike the rate this ships a real default, because it is not
+                                      # a fact about a model or a host: unaccounted time is time
+                                      # nobody was computing for this request. HTTP/TLS/NDJSON land
+                                      # here too and are milliseconds, so a minute cannot be them.
+                                      # Watch mindex_research_turn_unaccounted_seconds.
+max_turn_seconds = 300                # ABANDON one turn once it has streamed this long; 0 disables.
+                                      # The only one of the three that stops anything — the two above
+                                      # name a diagnosis and let the turn run. It closes the hole all
+                                      # the other bounds leave: turn_timeout_ms is a dead-socket guard
+                                      # and sits ABOVE every budget by design, first_token_timeout_ms
+                                      # is spent by the first delta and cannot see a turn that starts
+                                      # fine and then dribbles, and max_turn_thinking_chars counts
+                                      # characters a stalled turn does not produce. Measured twice
+                                      # here — 985 s at ~1.5 tok/s, and 912 s for 702 tokens — ONE
+                                      # plan turn ate a whole run's wall clock and the run ended with
+                                      # zero steps. The turn is dropped as an empty reply (the
+                                      # runaway-thinking mechanism, which every phase recovers from)
+                                      # so the run carries on with the budget that is left.
+                                      # 300 s is above report_timeout_ms (the one legitimately long
+                                      # turn) and ~10x a healthy tool turn. Startup refuses a value
+                                      # below report_timeout_ms or at/above turn_timeout_ms.
+                                      # Watch mindex_research_stalled_turns_total.
 max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking channel has streamed
                                       # this many characters; 0 disables. Catches the pathology
                                       # turn_timeout_ms structurally cannot see: a model that
@@ -134,13 +242,31 @@ max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking chann
                                       # degrades to a plan-less run, the tool loop charges a
                                       # bounded parse retry). Startup refuses a small non-zero
                                       # value, which would abandon healthy turns instead.
-report_timeout_ms = 120000            # how long the report phase gets AFTER the investigation
+report_timeout_ms = 300000            # how long the report phase gets AFTER the investigation
                                       # deadline. A window of its own, because the run that most
                                       # needs to synthesise what it found is the one that ran out
                                       # of time. So the longest a caller waits is
                                       # max_seconds + report_timeout_ms. If it expires with a draft
                                       # in hand the draft ships; with nothing, the server writes an
                                       # honest "cut short after N minutes" notice.
+                                      # Raised 120 s -> 300 s when the report stopped being one
+                                      # turn: a plan of 3+ numbered items is now written one
+                                      # section at a time, so this window covers up to six
+                                      # generations plus a per-section repair pass. Anything that
+                                      # reads the worst-case wait (scout's RESEARCH_TOTAL_TIMEOUT)
+                                      # has to move with it.
+checkpoint_every_steps = 6            # investigate this many steps, then spend ONE turn banking the
+                                      # report sections that are already answerable. 0 = off.
+                                      # The insurance policy on a run that does not finish: a
+                                      # deadline / repeated_calls / unparseable stop used to reach
+                                      # the report phase with nothing banked and ship a server-written
+                                      # stub; with this it ships the model's own findings.
+                                      # It COSTS A STEP, deliberately — the operator's step budget is
+                                      # where its cost should show. At 6 against medium's 20 that is
+                                      # ~15% of the run's lookups spent writing, which is a pure loss
+                                      # for a run that would have finished anyway. UNMEASURED: compare
+                                      # coverage on and off at the same seeds before trusting it, and
+                                      # be ready for the answer to be "0, except at low effort".
 health_timeout_ms = 2000              # /health liveness-ping timeout for Ollama (GET /api/tags)
 models_refresh_interval_seconds = 300 # how often the local Ollama model registry is re-read for
                                       # the research.models list GET /config publishes. A catalog
@@ -167,6 +293,38 @@ max_num_ctx_tokens = 131072
 max_request_seconds = 3600
 max_request_tokens = 8000000
 max_request_steps = 200
+# Ceilings on the report-SHAPE axes a request may override. Unlike the three
+# above, two of these carry a floor as well, and two accept 0 meaning "off" —
+# which is why an out-of-range value gets its own code,
+# validation.research_shape_out_of_range. Startup refuses any ceiling below what
+# effort.high already grants.
+max_request_report_sections = 12  # a request may ask for 3..=this many sections
+max_request_report_words = 4000   # 0 (no ceiling announced) or 150..=this
+# Multiplier a request may put on how much evidence one lookup returns
+# (read_chunks / grep / file_history / symbols row limits). Width is resent every
+# turn, so it compounds into max_tokens — hence a small ceiling.
+max_evidence_width = 3            # a request may ask for 1..=this
+
+# Stored research. A finished run is journalled with an `expires_at` of
+# created_at + retention_days, and /gc reaps it once that passes. The deadline is
+# stamped AT INSERT, so changing this affects future runs only — and a PINNED run
+# has no expiry at all (expires_at IS NULL) and is never reaped, which is how a
+# report worth keeping outlives whatever retention you pick here.
+retention_days = 90
+
+# Prior research as context for a new run. A request may name earlier runs in
+# `context_run_ids`; their reports are injected into the transcript before the plan
+# turn. Both caps are real budget knobs rather than politeness: the whole transcript
+# is resent every turn, so an injected block is paid on EVERY turn and multiplies
+# against max_tokens and context_fraction. The last report included is truncated to
+# fit max_context_chars, with a visible marker — never silently. Set
+# max_context_runs = 0 to switch the feature off.
+max_context_runs = 3
+max_context_chars = 24000
+
+# Page size ceiling for GET /projects/{guid}/research, which is keyset-paginated by
+# the per-project `seq` rather than by offset.
+list_page_limit = 50
 
 # Sampling, applied to every research turn. Commented out = each model's OWN
 # Modelfile default is used, which is the right production behaviour and the wrong
@@ -214,12 +372,39 @@ max_request_steps = 200
 # width — so raising it buys transcript (every hit is resent every later turn) and
 # not coverage. It is a knob so a harness can sweep it, not a lever to reach for.
 # Must not exceed [search].max_top_k; startup refuses if it does.
+#
+# max_report_words is the only axis about OUTPUT, and output is where runs were
+# measured to fail. A field report over a real project found the loop locating the
+# right files every time and then failing at the report turn, deterministically by
+# request shape: a broad question with five sub-questions failed; the same question
+# narrowed to one file with a word limit succeeded in minutes. Nothing in the prompt
+# had ever mentioned length, and no turn had ever bounded generation. It is a CEILING
+# announced to the model (the prompt says "at most", not "about"), and it also arms
+# num_predict on the report turn as a runaway backstop.
+#
+# THESE THREE NUMBERS ARE UNMEASURED. They rise with the ladder because a deeper run
+# has more to say, not because 1800 was observed anywhere. 0 = announce no length at
+# all, which is the behaviour before this knob existed and the honest way to disable
+# it while a harness sweeps for where the cliff actually is (it is per-model). A
+# non-zero value under 150 is refused at startup: below that the instruction stops
+# shaping a report and starts forbidding one.
 [research.effort.low]
 max_seconds = 300
 max_tokens = 400000
 context_fraction = 0.5
 max_steps = 8
 search_top_k = 5
+max_report_words = 400
+
+# How many sections a report is written in. At 3 or more plan items the report is
+# written one section at a time, so a section that fails costs that section rather
+# than the whole document; below 3 the run takes the old single-turn path. This is
+# also what the plan prompt asks for ("3-N").
+max_report_sections = 6
+# Multiplier on how much one evidence-returning lookup may return (read_chunks,
+# grep, file_history, symbols). Deliberately does NOT scale outline/list_files
+# (navigation) or search (which has search_top_k). Width is resent every turn.
+evidence_width = 1
 
 [research.effort.medium]
 max_seconds = 900
@@ -227,6 +412,9 @@ max_tokens = 1200000
 context_fraction = 0.7
 max_steps = 20
 search_top_k = 5
+max_report_words = 900
+max_report_sections = 6
+evidence_width = 1
 
 [research.effort.high]
 max_seconds = 3600
@@ -234,6 +422,9 @@ max_tokens = 6000000
 context_fraction = 0.85
 max_steps = 64
 search_top_k = 5
+max_report_words = 1800
+max_report_sections = 6
+evidence_width = 1
 
 [workers]
 gc_interval_seconds = 3600          # how often the GC sweep runs

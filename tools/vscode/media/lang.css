@@ -1,0 +1,147 @@
+/* MINDex — the language marks' colours.
+ *
+ * One rule per language, and each declares *two* colours rather than one. That is not
+ * over-engineering: of the 24 languages' official brand colours, 17 fail a 3:1
+ * contrast check against one of VS Code's two default backgrounds. Rust and Markdown
+ * are black, C is near-white, C# and C++ are dark enough to vanish on a dark theme.
+ * A single hex per language is therefore not a thing that exists — it is only ever
+ * legible on the theme its brand guide assumed.
+ *
+ * So each pair is derived from the official colour by one rule, applied at authoring
+ * time and re-checked by `langIcons.test.ts`: mix toward white (on dark) or black (on
+ * light) in 5% steps until the result clears 3:1 against `#1f1f1f` / `#ffffff`. A
+ * colour that already passes is left exactly as the brand publishes it, which is why
+ * TypeScript, Java, PHP, HTML, CSS, Ruby and Scala carry the same value twice.
+ *
+ * Five base colours are not devicon's, because devicon's is black or grey and says
+ * nothing: rust `#dea584`, bash `#89e051` (both the widely-used linguist colours),
+ * markdown `#755838`, sql `#6a9fb5` and toml `#9c4221` — the last two have no mark at
+ * all and paint a codicon. The test knows this list; adding to it is a decision, not
+ * a typo.
+ */
+
+/* The mark itself. Sized to sit on a text baseline in a list row. */
+.lang-glyph {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    flex: none;
+    vertical-align: text-bottom;
+    color: var(--lang-light, var(--vscode-foreground));
+}
+.lang-glyph svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+/* A fallback codicon has to be pulled down to the same optical size as the SVGs. */
+.lang-glyph.codicon {
+    font-size: 13px;
+}
+
+/* VS Code stamps exactly one of these on <body>, so the dark pair is an override and
+ * the light pair is the default above — a theme class that never arrives still leaves
+ * a legible mark rather than an unset variable. */
+body.vscode-dark .lang-glyph,
+body.vscode-high-contrast .lang-glyph {
+    color: var(--lang-dark, var(--vscode-foreground));
+}
+
+.lang-bash {
+    --lang-light: #609d39;
+    --lang-dark: #89e051;
+}
+.lang-c {
+    --lang-light: #8795a4;
+    --lang-dark: #a9bacd;
+}
+.lang-cpp {
+    --lang-light: #004482;
+    --lang-dark: #4073a1;
+}
+.lang-csharp {
+    --lang-light: #68217a;
+    --lang-dark: #8e599b;
+}
+.lang-css {
+    --lang-light: #3d8fc6;
+    --lang-dark: #3d8fc6;
+}
+.lang-go {
+    --lang-light: #009bc2;
+    --lang-dark: #00acd7;
+}
+.lang-haskell {
+    --lang-light: #5e5185;
+    --lang-dark: #766b97;
+}
+.lang-html {
+    --lang-light: #e54d26;
+    --lang-dark: #e54d26;
+}
+.lang-java {
+    --lang-light: #ea2d2e;
+    --lang-dark: #ea2d2e;
+}
+.lang-javascript {
+    --lang-light: #9c8e33;
+    --lang-dark: #f0db4f;
+}
+.lang-json {
+    --lang-light: #505050;
+    --lang-dark: #6a6a6a;
+}
+.lang-markdown {
+    --lang-light: #755838;
+    --lang-dark: #83694c;
+}
+.lang-ocaml {
+    --lang-light: #d97a03;
+    --lang-dark: #f18803;
+}
+.lang-php {
+    --lang-light: #777bb3;
+    --lang-dark: #777bb3;
+}
+.lang-python {
+    --lang-light: #a68c2d;
+    --lang-dark: #ffd845;
+}
+.lang-ruby {
+    --lang-light: #d91404;
+    --lang-dark: #d91404;
+}
+.lang-rust {
+    --lang-light: #b2846a;
+    --lang-dark: #dea584;
+}
+.lang-scala {
+    --lang-light: #de3423;
+    --lang-dark: #de3423;
+}
+.lang-sql {
+    --lang-light: #6597ac;
+    --lang-dark: #6a9fb5;
+}
+.lang-toml {
+    --lang-light: #9c4221;
+    --lang-dark: #a65537;
+}
+.lang-tsx {
+    --lang-light: #4499b0;
+    --lang-dark: #61dafb;
+}
+.lang-typescript {
+    --lang-light: #007acc;
+    --lang-dark: #007acc;
+}
+.lang-yaml {
+    --lang-light: #cb171e;
+    --lang-dark: #ce2329;
+}
+.lang-zig {
+    --lang-light: #c68317;
+    --lang-dark: #f7a41d;
+}

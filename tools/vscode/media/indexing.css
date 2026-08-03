@@ -1,0 +1,358 @@
+/* The live Indexing panel.
+ *
+ * It optimises for the opposite thing the Server Status panel does: that one is
+ * consulted when something is wrong, this one is watched while something is running.
+ * So the page is two blocks and no more — the run's own header, and the one list of
+ * files it is working through — with the summary appearing under them when there is
+ * one. Nothing here moves unless the run moved.
+ */
+
+.page {
+    max-width: 900px;
+    padding: 0 20px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--mx-gap-loose);
+}
+
+/* ── header ──────────────────────────────────────────────────────────────── */
+
+.head {
+    padding-top: 14px;
+}
+.title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--mx-gap);
+}
+.title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+}
+.state-dot {
+    font-size: 13px;
+}
+.state-running {
+    color: var(--vscode-charts-blue, #3794ff);
+}
+.state-done {
+    color: var(--mx-ok);
+}
+.state-cancelled {
+    color: var(--mx-warn);
+}
+.state-error {
+    color: var(--mx-bad);
+}
+/* The clock is the one thing on the page that keeps moving while the GPU works, so
+ * it is tabular: a width that jitters per second reads as a glitch, not as time. */
+.clock {
+    font-variant-numeric: tabular-nums;
+    font-size: var(--mx-fs-sm);
+    min-width: 46px;
+    text-align: right;
+}
+.subtitle {
+    margin-top: 4px;
+    margin-bottom: 9px;
+    font-size: var(--mx-fs-sm);
+}
+
+.badge {
+    flex: none;
+    align-self: center;
+    padding: 1px 6px;
+    border: 1px solid var(--mx-border);
+    border-radius: 999px;
+    font-size: var(--mx-fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--mx-dim);
+}
+
+/* An advisory that is neither a warning nor an error — `.notice` alone is warning
+ * coloured, and "no run yet" is not a problem. */
+.notice.info {
+    color: var(--vscode-foreground);
+    background: var(--mx-surface);
+    border-color: var(--mx-border);
+}
+.notice code {
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+/* `<progress>` rather than a div whose width is set inline: the value is an
+ * *attribute*, which is the only way to move a bar under a CSP with no
+ * `'unsafe-inline'` in `style-src`. */
+progress {
+    appearance: none;
+    display: block;
+    width: 100%;
+    height: 3px;
+    border: none;
+    border-radius: 999px;
+    background: var(--vscode-progressBar-background, rgba(128, 128, 128, 0.25));
+}
+progress::-webkit-progress-bar {
+    background: rgba(128, 128, 128, 0.25);
+    border-radius: 999px;
+}
+progress::-webkit-progress-value {
+    background: var(--vscode-progressBar-background, #3794ff);
+    border-radius: 999px;
+}
+
+/* The embed pass emits nothing at all until it completes, so there is no position
+ * to draw for ~96% of a small run. An indeterminate bar is motion that claims
+ * nothing — the one honest thing to show for a stretch with no number in it. */
+progress:indeterminate {
+    background: linear-gradient(
+        90deg,
+        rgba(128, 128, 128, 0.2) 0%,
+        var(--vscode-progressBar-background, #3794ff) 50%,
+        rgba(128, 128, 128, 0.2) 100%
+    );
+    background-size: 45% 100%;
+    background-repeat: no-repeat;
+    animation: mx-sweep 1.5s ease-in-out infinite;
+}
+progress:indeterminate::-webkit-progress-bar {
+    background: transparent;
+}
+@keyframes mx-sweep {
+    0% {
+        background-position: -60% 0;
+    }
+    100% {
+        background-position: 160% 0;
+    }
+}
+
+/* ── cards ───────────────────────────────────────────────────────────────── */
+
+.card {
+    border: 1px solid var(--mx-border);
+    border-radius: var(--mx-radius-lg);
+    padding: 11px 13px 13px;
+    background: var(--mx-surface);
+}
+.card-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 0 9px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--mx-dim);
+}
+.card-title button {
+    margin-left: auto;
+    height: 26px;
+    font-size: var(--mx-fs-sm);
+}
+
+/* ── the file list ───────────────────────────────────────────────────────── */
+
+.files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 420px;
+    overflow-y: auto;
+    font-size: var(--mx-fs-sm);
+}
+.file-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 2px 0;
+    white-space: nowrap;
+}
+.file-glyph {
+    flex: none;
+    display: flex;
+    align-items: center;
+}
+.file-path {
+    font-family: var(--vscode-editor-font-family, monospace);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+}
+.file-path:hover {
+    text-decoration: underline;
+}
+.file-note {
+    margin-left: auto;
+    flex: none;
+    padding-left: 10px;
+    color: var(--mx-dim);
+    font-size: var(--mx-fs-xs);
+}
+/* The mark is the whole state machine: it is what changes when a file advances,
+ * and it is why the row is never written twice. */
+.file-mark {
+    flex: none;
+    font-size: 13px;
+    color: var(--mx-dim);
+}
+.file-prepared .file-mark,
+.file-embedding .file-mark {
+    color: var(--vscode-charts-blue, #3794ff);
+}
+.file-indexed .file-mark {
+    color: var(--mx-ok);
+}
+.file-failed .file-mark {
+    color: var(--mx-bad);
+}
+.file-cancelled .file-mark {
+    color: var(--mx-warn);
+}
+.file-indexed,
+.file-skipped,
+.file-cancelled {
+    color: var(--mx-dim);
+}
+.file-empty,
+.files-empty {
+    font-size: var(--mx-fs-sm);
+    padding: 4px 0;
+}
+
+/* ── the summary ─────────────────────────────────────────────────────────── */
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: var(--mx-gap);
+    margin-bottom: 12px;
+}
+.stat {
+    border: 1px solid var(--mx-border);
+    border-radius: var(--mx-radius);
+    padding: 8px 10px;
+}
+.stat-value {
+    font-size: 18px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+.stat-name {
+    font-size: var(--mx-fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--mx-dim);
+    margin-top: 2px;
+}
+.pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 5px;
+}
+.pill {
+    padding: 0 5px;
+    border-radius: 999px;
+    border: 1px solid var(--mx-border);
+    font-size: var(--mx-fs-xs);
+    color: var(--mx-dim);
+}
+
+.rate-row {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    margin-bottom: 10px;
+}
+.rate-aux {
+    flex: none;
+    font-size: var(--mx-fs-sm);
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The sparkline. Drawn by rewriting `points`/`d` attributes — the CSP forbids inline
+ * style, so geometry travels as attributes and colour stays here. */
+.spark {
+    flex: 1;
+    height: 44px;
+    min-width: 120px;
+}
+.spark-line {
+    fill: none;
+    stroke: var(--vscode-charts-blue, #3794ff);
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+}
+.spark-area {
+    fill: var(--vscode-charts-blue, #3794ff);
+    opacity: 0.14;
+    stroke: none;
+}
+.spark-avg {
+    stroke: var(--mx-dim);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+    opacity: 0.5;
+    vector-effect: non-scaling-stroke;
+}
+
+.sum-line {
+    display: flex;
+    gap: var(--mx-gap);
+    font-size: var(--mx-fs-sm);
+    padding: 2px 0;
+}
+.sum-name {
+    flex: none;
+    width: 190px;
+    color: var(--mx-dim);
+}
+.sum-value {
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── language table ──────────────────────────────────────────────────────── */
+
+.lang-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--mx-fs-sm);
+    margin-top: 12px;
+}
+.lang-table th {
+    text-align: left;
+    font-weight: 400;
+    color: var(--mx-dim);
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--mx-border);
+}
+.lang-table td {
+    padding: 3px 0;
+}
+.lang-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    width: 72px;
+}
+.lang-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* The sweep is decoration over an honest static state — it says "position unknown",
+ * which the bar still says standing still. */
+@media (prefers-reduced-motion: reduce) {
+    progress:indeterminate {
+        animation: none;
+    }
+}

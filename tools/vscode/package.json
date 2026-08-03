@@ -1,8 +1,8 @@
 {
   "name": "mindex-vscode",
-  "displayName": "mindex",
-  "description": "Semantic code search, symbol lookup and local-model research over a mindex index, plus drift checks and selective reindexing.",
-  "version": "1.0.0",
+  "displayName": "MINDex",
+  "description": "Ask your codebase: semantic search with live preview, and a local model that investigates and writes a cited report. Plus drift detection and selective reindexing against a MINDex server.",
+  "version": "1.1.0",
   "publisher": "mindex",
   "license": "MIT",
   "author": {
@@ -20,15 +20,18 @@
   "keywords": [
     "code-search",
     "semantic-search",
+    "codebase-search",
     "rag",
     "embeddings",
+    "ollama",
+    "local-llm",
     "mindex"
   ],
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Programming Languages",
+    "AI",
     "Machine Learning",
     "Other"
   ],
@@ -41,7 +44,7 @@
       "activitybar": [
         {
           "id": "mindex",
-          "title": "mindex",
+          "title": "MINDex",
           "icon": "media/mindex-activity.svg"
         }
       ]
@@ -59,12 +62,6 @@
           "id": "mindexDrift",
           "name": "Drift",
           "icon": "$(git-compare)"
-        },
-        {
-          "id": "mindexStatus",
-          "name": "Server Status",
-          "icon": "$(pulse)",
-          "when": "mindex.hasProject"
         }
       ]
     },
@@ -72,108 +69,177 @@
       {
         "view": "mindexDrift",
         "when": "mindex.hasProject",
-        "contents": "No drift data yet.\n[Check Drift](command:mindex.checkDrift)\nCompares the working tree against the index (read-only)."
+        "contents": "Drift is the difference between your working tree and what the MINDex server has indexed — files you edited since the last index, files never indexed, and files the index still holds after you deleted them.\nNothing is checked on its own. Press below and the extension hashes your files and asks the server what it holds; the answer arrives in a few seconds as four groups you can act on.\n[Check Drift](command:mindex.checkDrift)\nRead-only: checking changes nothing on the server."
       },
       {
         "view": "mindexDrift",
         "when": "!mindex.hasProject",
-        "contents": "No usable .mindex project file at the workspace root.\n[Create .mindex File](command:mindex.createProjectFile)\nGenerates a GUID and a commented template — edit the excludes, save, and the extension picks it up."
+        "contents": "No usable .mindex project file at the workspace root.\nThat file is what says this folder is a MINDex project: a GUID identifying it on the server, plus the globs deciding which files belong to the index.\n[Create .mindex File](command:mindex.createProjectFile)\nGenerates a GUID and a commented template — edit the excludes, save, and the extension picks it up."
       }
     ],
     "commands": [
       {
         "command": "mindex.createProjectFile",
         "title": "Create a .mindex Project File",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(new-file)"
       },
       {
         "command": "mindex.ask",
         "title": "Ask: Search or Research",
         "icon": "$(comment-discussion)",
-        "category": "mindex"
+        "category": "MINDex"
       },
       {
         "command": "mindex.search",
         "title": "Search the Index",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(search)"
       },
       {
         "command": "mindex.research",
         "title": "Research a Question",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(beaker)"
       },
       {
         "command": "mindex.checkDrift",
         "title": "Check Drift Against Working Tree",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(git-compare)"
       },
       {
         "command": "mindex.reindexSelected",
         "title": "Reindex Checked Files",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "mindex.syncAll",
+        "title": "Sync All Drift",
+        "category": "MINDex",
+        "icon": "$(sync)"
       },
       {
         "command": "mindex.reindexAllDrift",
         "title": "Reindex All Stale and Missing",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(cloud-upload)"
       },
       {
         "command": "mindex.reindexCurrentFile",
         "title": "Reindex This File",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(save)"
       },
       {
         "command": "mindex.forceReindexCurrentFile",
         "title": "Force Reindex This File",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(debug-rerun)"
       },
       {
         "command": "mindex.forceReindexProject",
         "title": "Force Reindex Whole Project",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(warning)"
       },
       {
         "command": "mindex.deleteOrphanedSelected",
         "title": "Delete Checked Orphans from Index",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(trash)"
       },
       {
         "command": "mindex.cancelIndexing",
         "title": "Cancel In-Flight Indexing",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(stop-circle)"
       },
       {
         "command": "mindex.refreshStatus",
         "title": "Refresh Server Status",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(refresh)"
       },
       {
         "command": "mindex.retryAllFailed",
         "title": "Retry All Failed Files",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(debug-restart)"
       },
       {
         "command": "mindex.retryFile",
         "title": "Retry This File",
-        "category": "mindex",
+        "category": "MINDex",
         "icon": "$(debug-restart)"
+      },
+      {
+        "command": "mindex.openStatus",
+        "title": "Show Server Status",
+        "category": "MINDex",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "mindex.openIndexing",
+        "title": "Show Indexing",
+        "category": "MINDex",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "mindex.openResearchHistory",
+        "title": "Show Research History",
+        "category": "MINDex",
+        "icon": "$(history)"
+      },
+      {
+        "command": "mindex.pickResearchContext",
+        "title": "Pick Research Context",
+        "category": "MINDex",
+        "icon": "$(references)"
+      },
+      {
+        "command": "mindex.openResearchReport",
+        "title": "Open Research Report",
+        "category": "MINDex",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "mindex.challengeResearchRun",
+        "title": "Challenge Research Report",
+        "category": "MINDex",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "mindex.activeResearchRuns",
+        "title": "Active Research Runs",
+        "category": "MINDex",
+        "icon": "$(record)"
+      },
+      {
+        "command": "mindex.openSettings",
+        "title": "Open Settings",
+        "category": "MINDex",
+        "icon": "$(gear)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "mindex.openStatus",
+          "when": "view == mindexAsk",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mindex.openResearchHistory",
+          "when": "view == mindexAsk",
+          "group": "navigation@2"
+        },
+        {
+          "command": "mindex.openSettings",
+          "when": "view == mindexAsk",
+          "group": "navigation@4"
+        },
         {
           "command": "mindex.createProjectFile",
           "when": "view == mindexDrift && !mindex.hasProject",
@@ -195,19 +261,24 @@
           "group": "navigation@3"
         },
         {
-          "command": "mindex.reindexAllDrift",
+          "command": "mindex.syncAll",
           "when": "view == mindexDrift && mindex.hasProject",
           "group": "1_reindex@1"
         },
         {
-          "command": "mindex.reindexCurrentFile",
+          "command": "mindex.reindexAllDrift",
           "when": "view == mindexDrift && mindex.hasProject",
           "group": "1_reindex@2"
         },
         {
-          "command": "mindex.cancelIndexing",
+          "command": "mindex.reindexCurrentFile",
           "when": "view == mindexDrift && mindex.hasProject",
           "group": "1_reindex@3"
+        },
+        {
+          "command": "mindex.cancelIndexing",
+          "when": "view == mindexDrift && mindex.hasProject",
+          "group": "1_reindex@4"
         },
         {
           "command": "mindex.forceReindexCurrentFile",
@@ -220,27 +291,26 @@
           "group": "9_force@2"
         },
         {
-          "command": "mindex.refreshStatus",
-          "when": "view == mindexStatus && mindex.hasProject",
-          "group": "navigation@1"
-        },
-        {
-          "command": "mindex.retryAllFailed",
-          "when": "view == mindexStatus && mindex.hasProject",
-          "group": "navigation@2"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "mindex.retryFile",
-          "when": "view == mindexStatus && viewItem == failedFile",
-          "group": "inline"
+          "command": "mindex.openSettings",
+          "when": "view == mindexDrift",
+          "group": "9_force@9"
         }
       ],
       "commandPalette": [
         {
           "command": "mindex.retryFile",
           "when": "false"
+        },
+        {
+          "command": "mindex.openResearchReport",
+          "when": "false"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "mindex.challengeResearchRun",
+          "when": "resourceScheme == mindex-research",
+          "group": "navigation@1"
         }
       ]
     },
@@ -248,15 +318,23 @@
       {
         "command": "mindex.search",
         "key": "ctrl+alt+/"
+      },
+      {
+        "command": "mindex.research",
+        "key": "ctrl+alt+."
+      },
+      {
+        "command": "mindex.openResearchHistory",
+        "key": "ctrl+alt+,"
       }
     ],
     "configuration": {
-      "title": "mindex",
+      "title": "MINDex",
       "properties": {
         "mindex.serverUrl": {
           "type": "string",
           "default": "https://127.0.0.1:11111",
-          "description": "Base URL of the mindex server."
+          "description": "Base URL of the MINDex server."
         },
         "mindex.noVerify": {
           "type": "boolean",
@@ -271,22 +349,60 @@
         "mindex.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key sent as X-Api-Key on every request. mindex itself has no authentication and ignores this — set it only when a reverse proxy in front of the server requires a key. Leave empty when connecting straight to a local mindex.",
+          "description": "API key sent as X-Api-Key on every request. MINDex itself has no authentication and ignores this — set it only when a reverse proxy in front of the server requires a key. Leave empty when connecting straight to a local MINDex.",
           "scope": "machine-overridable"
+        },
+        "mindex.statusPollSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "How often to re-check server health in the background, in seconds (0 disables it). This is what lets the Ask view stop offering Research when the server's Ollama goes away, and disable itself entirely when a required dependency does. Each poll is a handful of small local requests."
+        },
+        "mindex.requestTimeoutSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 600,
+          "description": "How long to wait for an ordinary request before giving up, in seconds (0 waits forever). Health polls use a shorter deadline of their own. Streaming research and indexing runs are not bounded by this — see mindex.streamIdleTimeoutSeconds.",
+          "scope": "machine-overridable"
+        },
+        "mindex.streamIdleTimeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "How long a streaming research or indexing run may send nothing at all before the connection is treated as dead, in seconds (0 waits forever). This is an idle clock, not a total one: a long run that keeps reporting progress is never cut off. Raise it if a slow model on loaded hardware is being dropped mid-run.",
+          "scope": "machine-overridable"
+        },
+        "mindex.indexingPanel": {
+          "type": "string",
+          "enum": [
+            "beside",
+            "active",
+            "manual"
+          ],
+          "default": "beside",
+          "enumDescriptions": [
+            "Open it in a column beside the editor, without taking focus.",
+            "Open it in the active editor group, without taking focus.",
+            "Never open it on its own — use “MINDex: Show Indexing”."
+          ],
+          "description": "Where the live Indexing panel opens when a reindex starts. It shows what the server streams while it works: the files going through, the embed rate, per-language chunk and symbol counts, and a summary when the run ends."
         },
         "mindex.topK": {
           "type": "number",
           "default": 10,
           "minimum": 1,
           "maximum": 100,
-          "description": "Number of search results to request."
+          "description": "Default number of search results to request. The Ask form's slider starts here; its ceiling comes from the server's own search.max_top_k."
         },
         "mindex.batchSize": {
           "type": "number",
-          "default": 100,
+          "default": 10,
           "minimum": 1,
           "maximum": 10000,
-          "description": "Files per /index request when reindexing."
+          "markdownDescription": "Files per `/index` request when reindexing. Smaller batches report progress more often: the server emits one `embedded` event per completed embed batch, so a whole reindex sent as one request reports its GPU pass exactly once, on completion. Measured on this stack (14 files, 173 chunks): 14 files/request took 18.7 s and produced 1 progress event; 5 took 17.8 s and 3 events; 2 took 17.1 s and 7 events — so splitting cost no throughput at all here. Raise it for bulk runs on a fast GPU, where larger `/encode` batches do pay."
         },
         "mindex.researchModel": {
           "type": "string",
@@ -297,33 +413,37 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p .",
-    "test": "tsc -p . && node --test dist/*.test.js",
-    "watch": "tsc -watch -p .",
+    "typecheck": "tsc -p . --noEmit && tsc -p tsconfig.webview.json --noEmit",
+    "build": "node esbuild.mjs",
+    "compile": "npm run typecheck && npm run build",
+    "watch": "node esbuild.mjs --watch",
+    "test": "tsc -p . && node --test \"out/**/*.test.js\"",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "npm run format:check && npm run lint && npm run test",
-    "package": "npm run compile && vsce package",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test",
+    "vscode:prepublish": "npm run build -- --production",
+    "package": "npm run check && vsce package",
     "icons": "rsvg-convert -w 128 -h 128 media/icon.svg -o media/icon.png"
-  },
-  "dependencies": {
-    "marked": "^16.4.2",
-    "picomatch": "^4.0.2",
-    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "@types/node": "^20.11.0",
     "@types/picomatch": "^3.0.1",
     "@types/vscode": "^1.85.0",
+    "@vscode/codicons": "^0.0.46-24",
     "@vscode/vsce": "3.9.2",
+    "devicon": "^2.17.0",
+    "esbuild": "^0.28.1",
     "eslint": "^9.39.5",
     "eslint-config-prettier": "^10.1.8",
+    "marked": "^16.4.2",
+    "picomatch": "^4.0.2",
     "prettier": "^3.9.5",
     "typescript": "^5.5.0",
-    "typescript-eslint": "^8.64.0"
+    "typescript-eslint": "^8.64.0",
+    "yaml": "^2.9.0"
   },
   "icon": "media/icon.png"
 }

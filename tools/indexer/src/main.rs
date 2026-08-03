@@ -1,5 +1,6 @@
 mod client;
 mod config;
+mod git;
 mod scanner;
 
 use anyhow::{Context, Result, bail};
@@ -15,7 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use sha2::{Digest, Sha256};
 
-use client::{Code, DriftRequest, IndexRequest, IndexResponse, check_drift, upload_batch};
+use client::{
+    Code, DriftRequest, HistoryRequest, IndexRequest, IndexResponse, IndexStreamEvent, check_drift,
+    post_history, upload_batch, upload_batch_streaming,
+};
 use scanner::{FileEntry, Language, ScanResult, scan};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -165,6 +169,50 @@ struct Cli {
     /// too); run without this flag for those.
     #[arg(long)]
     symbols_only: bool,
+
+    /// Also reconcile the project's git history (the second content channel).
+    ///
+    /// Walks the commits reachable from the tracked refs within the configured
+    /// window and posts them; the server inserts what it lacks and drops what
+    /// this run did not name. Since a sha is its own content hash, a force-push
+    /// or a rebase needs no special handling — it is one reconciliation in which
+    /// many shas orphan at once. Costs no GPU and no Qdrant work.
+    #[arg(long, conflicts_with = "no_history")]
+    history: bool,
+
+    /// Skip the git history reconciliation even if the config file enables it.
+    #[arg(long)]
+    no_history: bool,
+
+    /// Reconcile only the git history, leaving the working tree alone.
+    ///
+    /// Restricts the run to the history phase; it does NOT switch the channel on
+    /// — pass --history as well for a one-off against a config that has it off.
+    /// That split is what lets the post-commit hook pass this unconditionally
+    /// without enabling the channel behind the operator's back.
+    ///
+    /// A separate mode rather than a flag on an ordinary run because --include
+    /// narrows the walk too: a run scoped to one commit's files would filter
+    /// every *other* commit's paths down to those and drop nearly the whole
+    /// history as out of scope.
+    #[arg(long, conflicts_with_all = ["no_history", "check", "symbols_only"])]
+    history_only: bool,
+
+    /// Ref pattern bounding the history walk (repeatable), e.g.
+    /// --git-ref master --git-ref 'feat/*'. Overrides the .mindex `git_refs`;
+    /// like --include/--exclude it REPLACES the list rather than extending it.
+    #[arg(long = "git-ref", value_name = "PATTERN")]
+    git_refs: Vec<String>,
+
+    /// Age bound on the history walk, in days. Applied together with
+    /// --history-max-commits; the stricter of the two binds.
+    #[arg(long, value_name = "DAYS")]
+    history_since_days: Option<u64>,
+
+    /// Count bound on the history walk. Applied together with
+    /// --history-since-days; the stricter of the two binds.
+    #[arg(long, value_name = "N")]
+    history_max_commits: Option<usize>,
 }
 
 /// Project identity + file selection for this run.
@@ -174,6 +222,10 @@ struct Scope {
     includes: Vec<String>,
     excludes: Vec<String>,
     languages: Vec<String>,
+    /// Ref patterns whose commits make up the project's history. Empty means the
+    /// indexer config's own fallback — this is a scope key, not a switch; whether
+    /// history is walked at all is `--history`.
+    git_refs: Vec<String>,
 }
 
 /// Resolves identity and scope with the crate's standing precedence,
@@ -216,6 +268,7 @@ fn resolve_scope(cli: &Cli, root: &Path) -> Result<Scope> {
         includes: pick(&cli.includes, file.as_ref().map(|f| &f.include_paths)),
         excludes: pick(&cli.excludes, file.as_ref().map(|f| &f.exclude_paths)),
         languages: pick(&cli.languages, file.as_ref().map(|f| &f.languages)),
+        git_refs: pick(&cli.git_refs, file.as_ref().map(|f| &f.git_refs)),
     })
 }
 
@@ -233,6 +286,10 @@ struct Shared {
     chunks: AtomicU64,
     errors: AtomicU64,
     active: AtomicUsize,
+    /// The most recently touched file (prepared or indexed), for the bar's status
+    /// line. With several workers it is simply the last event to arrive — a live
+    /// "what is it doing right now", not an ordered log.
+    current: std::sync::Mutex<String>,
 }
 
 #[derive(Default)]
@@ -276,6 +333,16 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|v| !v.is_empty())
         }),
+        // Two flags for one setting: the file default is `false`, so `--history`
+        // alone could never express "off" and a config that enabled it would be
+        // unoverridable from the command line.
+        history: match (cli.history, cli.no_history) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
+        history_since_days: cli.history_since_days,
+        history_max_commits: cli.history_max_commits,
     })?;
     let concurrency = cfg.concurrency.unwrap_or_else(default_concurrency).max(1);
 
@@ -311,6 +378,25 @@ async fn main() -> Result<()> {
     row("root", root.display().to_string());
     row("threads", concurrency.to_string());
     eprintln!();
+
+    // ── History-only: reconcile the second channel and exit. Placed before the
+    // scan because skipping the tree entirely is the whole point of the mode —
+    // it is what makes the post-commit hook cheap enough to run every commit.
+    if cli.history_only {
+        if !cfg.history {
+            eprintln!(
+                "history is disabled (indexer config `history = false`); nothing to do. \
+                 Pass --history as well for a one-off."
+            );
+            return Ok(());
+        }
+        let http = build_http_client(&cfg).context("failed to build HTTP client")?;
+        reconcile_history(&http, &cfg, &scope, &root, &cancel).await?;
+        if cancel.is_cancelled() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // ── Scan ────────────────────────────────────────────────────────────────
     let spin = spinner("Scanning…");
@@ -430,11 +516,14 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // ── Drive the bar from the shared counters. Position updates every tick;
-    // the speed line is the cumulative average (total chunks / elapsed) rather
-    // than a windowed rate, so it stays stable instead of collapsing to zero
-    // during the prepare-heavy gaps between embed bursts. ETA uses the same
-    // cumulative file rate. ────────────────────────────────────────────────────
+    // ── Drive the bar from the shared counters. Position updates every tick.
+    // The chunk counter advances per embed batch (SSE `embedded` events), so the
+    // speed line can be an honest **windowed** rate — what the GPU is doing right
+    // now — instead of the old cumulative average that a long run flattened into
+    // meaninglessness. Until the window fills (and against an old JSON-only
+    // server, whose counter still jumps per batch) the oldest retained sample is
+    // t=0, which makes the very same formula the cumulative average — the stable
+    // fallback, not a special case. ETA keeps the cumulative file rate. ────────
     let total_files = total as u64;
     let tick_stop = CancellationToken::new();
     let ticker = {
@@ -442,17 +531,29 @@ async fn main() -> Result<()> {
         let shared = shared.clone();
         let stop = tick_stop.clone();
         tokio::spawn(async move {
+            const RATE_WINDOW_SECS: f64 = 20.0;
+            let mut samples: std::collections::VecDeque<(f64, u64)> =
+                std::collections::VecDeque::from([(0.0, 0u64)]);
             loop {
                 let done = shared.files_done.load(Ordering::Relaxed);
                 let chunks = shared.chunks.load(Ordering::Relaxed);
                 let active = shared.active.load(Ordering::Relaxed);
                 let errs = shared.errors.load(Ordering::Relaxed);
+                let current = shared.current.lock().unwrap().clone();
 
                 bar.set_position(done);
 
                 let elapsed = t0.elapsed().as_secs_f64();
-                let chunks_per_s = if elapsed > 0.0 {
-                    chunks as f64 / elapsed
+                samples.push_back((elapsed, chunks));
+                while samples.len() > 2
+                    && elapsed - samples.front().map(|s| s.0).unwrap_or(0.0) > RATE_WINDOW_SECS
+                {
+                    samples.pop_front();
+                }
+                let (t_old, chunks_old) = *samples.front().unwrap_or(&(0.0, 0));
+                let dt = elapsed - t_old;
+                let chunks_per_s = if dt > 0.0 {
+                    chunks.saturating_sub(chunks_old) as f64 / dt
                 } else {
                     0.0
                 };
@@ -468,12 +569,17 @@ async fn main() -> Result<()> {
                     f64::INFINITY
                 };
                 bar.set_message(format!(
-                    "{chunks_per_s:.0} chunks/s · ETA {} · {chunks} chunks · {active} active{}",
+                    "{chunks_per_s:.0} chunks/s · ETA {} · {chunks} chunks · {active} active{}{}",
                     fmt_eta(eta),
                     if errs > 0 {
                         format!(" · {errs} err")
                     } else {
                         String::new()
+                    },
+                    if current.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", path_tail(&current, 42))
                     },
                 ));
 
@@ -513,10 +619,118 @@ async fn main() -> Result<()> {
         cli.symbols_only,
     );
 
+    // ── Git history: the second content channel, opt-in and best-effort ───────
+    // Runs after the files because it is secondary to them and costs no GPU. A
+    // failure here is a WARN, never a failed run: history is an addition to what
+    // the working tree already says, and refusing to index a repository because
+    // `git` is missing or the root is not a checkout would be the wrong trade —
+    // the same reasoning that makes a failed symbol extraction degrade to "no
+    // symbols" rather than failing the file.
+    if cfg.history
+        && !cancel.is_cancelled()
+        && let Err(e) = reconcile_history(&http, &cfg, &scope, &root, &cancel).await
+    {
+        eprintln!(
+            "{} git history skipped: {e:#}",
+            style("warning:").yellow().bold()
+        );
+    }
+
     if cancel.is_cancelled() || totals.errors > 0 {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// Walk the tracked refs and reconcile the result against the server.
+///
+/// One request, not a diff negotiation: a sha is the hash of its own content, so
+/// re-posting a commit the server already holds is free, and the server's reply
+/// says how many were new. That is also why a force-push needs nothing special —
+/// the walk simply reaches a different set, and the server drops what this run
+/// did not name.
+async fn reconcile_history(
+    http: &reqwest::Client,
+    cfg: &config::IndexerConfig,
+    scope: &Scope,
+    root: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    // `.mindex` first, the config file's list as the fallback — the same
+    // precedence the path scope follows, one level down.
+    let patterns: Vec<String> = if scope.git_refs.is_empty() {
+        cfg.git_refs.clone()
+    } else {
+        scope.git_refs.clone()
+    };
+
+    let refs = git::resolve_refs(root, &patterns)?;
+    if refs.is_empty() {
+        anyhow::bail!(
+            "none of the configured git_refs ({}) matched a local branch",
+            patterns.join(", ")
+        );
+    }
+
+    let (includes, excludes) = mindexfile::build_globsets(&scope.includes, &scope.excludes)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let walk = git::walk(
+        root,
+        &refs,
+        cfg.history_max_age_days,
+        cfg.history_max_commits,
+        cfg.history_min_message_bytes,
+        includes.as_ref(),
+        excludes.as_ref(),
+        now,
+    )?;
+
+    // Every drop is announced. A channel that quietly indexes a third of what it
+    // walked is indistinguishable from a repository that small, and the first
+    // question anyone asks of a thin history is which of the two happened.
+    let dropped =
+        walk.skipped_short_message + walk.skipped_generated_merge + walk.skipped_out_of_scope;
+    if dropped > 0 || walk.truncated_messages > 0 {
+        eprintln!(
+            "history: dropped {dropped} commits ({} too short, {} generated merges, {} out of scope){}",
+            walk.skipped_short_message,
+            walk.skipped_generated_merge,
+            walk.skipped_out_of_scope,
+            if walk.truncated_messages > 0 {
+                format!("; truncated {} oversized messages", walk.truncated_messages)
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    let posted = walk.commits.len();
+    let res = post_history(
+        http,
+        &cfg.server_url,
+        &cfg.protocol,
+        &scope.project,
+        HistoryRequest {
+            since: walk.since,
+            commits: walk.commits,
+        },
+        cancel,
+    )
+    .await?;
+
+    println!(
+        "{} {} refs · {posted} commits · {} new · {} unchanged · {} removed",
+        style("history").cyan().bold(),
+        refs.len(),
+        res.indexed,
+        res.unchanged,
+        res.removed,
+    );
     Ok(())
 }
 
@@ -578,7 +792,49 @@ async fn run_worker(
             continue;
         }
 
-        match upload_batch(
+        // Per-event progress: files advance the bar as the server settles them,
+        // embed batches advance the chunk counter (the honest chunks-per-second
+        // source), and `counted` remembers how many files the events already
+        // moved so the post-request catch-up below never double-counts.
+        let mut counted: u64 = 0;
+        let mut on_event = |ev: IndexStreamEvent| match ev {
+            IndexStreamEvent::Started { .. } => {}
+            IndexStreamEvent::Prepared { path, .. } => {
+                *shared.current.lock().unwrap() = path;
+            }
+            IndexStreamEvent::Skipped { path, reason } => {
+                counted += 1;
+                shared.files_done.fetch_add(1, Ordering::Relaxed);
+                // Unchanged files are the silent common case (they are absent
+                // from the JSON response too); the rarer reasons are worth a line.
+                if verbose && reason != "unchanged" {
+                    bar.println(format!(
+                        "  {} {}  {}",
+                        style("!").yellow(),
+                        path,
+                        style(reason).yellow().dim(),
+                    ));
+                }
+            }
+            IndexStreamEvent::Embedded { batch_chunks, .. } => {
+                shared.chunks.fetch_add(batch_chunks, Ordering::Relaxed);
+            }
+            IndexStreamEvent::Indexed { path, count } => {
+                counted += 1;
+                shared.files_done.fetch_add(1, Ordering::Relaxed);
+                // The embed pass never runs under --symbols-only, so the live
+                // counter advances on the per-file symbol counts instead.
+                if symbols_only {
+                    shared.chunks.fetch_add(count, Ordering::Relaxed);
+                }
+                if verbose {
+                    print_verbose_line(&bar, &path, count);
+                }
+                *shared.current.lock().unwrap() = path;
+            }
+        };
+
+        match upload_batch_streaming(
             &http,
             &server,
             &protocol,
@@ -589,16 +845,22 @@ async fn run_worker(
                 symbols_only,
             },
             &cancel,
+            &mut on_event,
         )
         .await
         {
-            Ok(resp) => {
-                let (chunks, too_short) = tally_response(&resp);
+            Ok(outcome) => {
+                let (chunks, too_short) = tally_response(&outcome.response);
                 stats.new_chunks += chunks;
                 stats.too_short += too_short;
-                shared.chunks.fetch_add(chunks, Ordering::Relaxed);
-                if verbose {
-                    print_verbose(&bar, &resp);
+                if !outcome.streamed {
+                    // Plain-JSON fallback (an older server): the callback saw
+                    // nothing, so the counters and verbose lines come from the
+                    // response, batch-granular — exactly the old behaviour.
+                    shared.chunks.fetch_add(chunks, Ordering::Relaxed);
+                    if verbose {
+                        print_verbose(&bar, &outcome.response);
+                    }
                 }
             }
             Err(e) => {
@@ -615,7 +877,11 @@ async fn run_worker(
             }
         }
 
-        shared.files_done.fetch_add(readable, Ordering::Relaxed);
+        // Catch up the bar for whatever the events did not report per file:
+        // everything in the JSON fallback, and the tail of a failed stream.
+        shared
+            .files_done
+            .fetch_add(readable.saturating_sub(counted), Ordering::Relaxed);
     }
 
     shared.active.fetch_sub(1, Ordering::Relaxed);
@@ -772,6 +1038,20 @@ fn fmt_eta(secs: f64) -> String {
     }
 }
 
+/// The trailing `max_chars` of a path for the bar's one-line status, `…`-prefixed
+/// when truncated — the file name end is the informative half.
+fn path_tail(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    let tail: String = path
+        .chars()
+        .skip(count.saturating_sub(max_chars.saturating_sub(1)))
+        .collect();
+    format!("…{tail}")
+}
+
 /// The one HTTP client every request goes through.
 ///
 /// TLS trusts the OS store (reqwest's `rustls-tls-native-roots`), plus `ca_cert`
@@ -859,25 +1139,31 @@ fn print_verbose(pb: &ProgressBar, resp: &IndexResponse) {
     lines.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (path, count) in lines {
-        if count == 0 {
-            pb.println(format!(
-                "  {} {}  {}",
-                style("⊘").dim(),
-                style(&path).dim(),
-                style("0 chunks (too short)").dim(),
-            ));
-        } else {
-            pb.println(format!(
-                "  {} {}  {}",
-                style("✓").green(),
-                path,
-                style(format!(
-                    "{count} chunk{}",
-                    if count == 1 { "" } else { "s" }
-                ))
-                .green(),
-            ));
-        }
+        print_verbose_line(pb, &path, count);
+    }
+}
+
+/// One file's verbose line — shared by the batch printer above (JSON fallback)
+/// and the per-`indexed`-event streaming path, so both modes read identically.
+fn print_verbose_line(pb: &ProgressBar, path: &str, count: u64) {
+    if count == 0 {
+        pb.println(format!(
+            "  {} {}  {}",
+            style("⊘").dim(),
+            style(path).dim(),
+            style("0 chunks (too short)").dim(),
+        ));
+    } else {
+        pb.println(format!(
+            "  {} {}  {}",
+            style("✓").green(),
+            path,
+            style(format!(
+                "{count} chunk{}",
+                if count == 1 { "" } else { "s" }
+            ))
+            .green(),
+        ));
     }
 }
 

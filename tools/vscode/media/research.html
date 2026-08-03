@@ -1,0 +1,41 @@
+<main class="page">
+    <header class="head">
+        <h3 class="title"><span class="codicon codicon-beaker"></span>Research</h3>
+        <div class="question" id="question"></div>
+        <div class="scope" id="scope" hidden></div>
+        <!-- The reports this run was built on; each opens in its own tab. -->
+        <div class="deps" id="deps" hidden></div>
+    </header>
+
+    <!-- Sticky, so it stays readable while a long report scrolls past. -->
+    <div id="budget" hidden>
+        <div class="axes">
+            <div class="axis" id="axis-time">
+                <div class="label"><span>time</span><span class="val"></span></div>
+                <div class="bar"><div class="fill"></div></div>
+            </div>
+            <div class="axis" id="axis-tokens">
+                <div class="label"><span>tokens</span><span class="val"></span></div>
+                <div class="bar"><div class="fill"></div></div>
+            </div>
+            <div class="axis" id="axis-steps">
+                <div class="label"><span>steps</span><span class="val"></span></div>
+                <div class="bar"><div class="fill"></div></div>
+            </div>
+            <div class="axis" id="axis-context">
+                <div class="label"><span>context</span><span class="val"></span></div>
+                <div class="bar"><div class="fill"></div></div>
+            </div>
+        </div>
+        <div class="cost" id="cost"></div>
+    </div>
+
+    <div id="steps"></div>
+    <div class="status" id="status">starting…</div>
+    <div id="report"></div>
+    <div id="toolbar" hidden>
+        <button id="copy" class="secondary">
+            <span class="codicon codicon-copy codicon-sm"></span>Copy markdown
+        </button>
+    </div>
+</main>

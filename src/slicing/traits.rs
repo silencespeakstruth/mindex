@@ -43,6 +43,39 @@ const ABSORBED_KINDS: &[&str] = &["comment", "attribute", "decorator", "annotati
 /// closing brace, one `use` line — that costs a vector and answers nothing.
 const GAP_MIN_TOKENS: usize = 24;
 
+/// Two tokens for the `[CLS]`/`[SEP]` pair the embedder adds around every text.
+/// They are not in the tokenizer offsets a slicer measures with (which are taken
+/// with `add_special_tokens = false`) but they *are* in the ColBERT output, so a
+/// chunk cut to exactly the ceiling below comes back two rows over it.
+const SPECIAL_TOKENS: usize = 2;
+
+/// Tokens whose ColBERT rows still fit in one Qdrant point: a multivector may
+/// hold at most 1 048 576 elements, ColBERT emits one [`VECTOR_DIM`]-element row
+/// per token, and [`SPECIAL_TOKENS`] of those rows are not the chunk's own.
+///
+/// **Structural, not configurable** — like [`VECTOR_DIM`] itself. A chunk above
+/// it is not a coarse chunk, it is one Qdrant refuses, and the refusal fails the
+/// whole upsert batch rather than the offending file.
+pub(crate) const STORABLE_TOKENS_CEILING: usize =
+    (1_048_576 / crate::db::qdrant::VECTOR_DIM as usize) - SPECIAL_TOKENS;
+
+/// What a slicer may aim for, which is not the ceiling itself.
+///
+/// Both slicers measure spans against *whole-file* token offsets, while the
+/// embedder re-tokenizes each chunk on its own — and tokenization is
+/// context-dependent, so the two disagree by an edge token or two (the same fact
+/// `WINDOW_SLACK` exists for in the window test). Aiming at the ceiling
+/// therefore lands just over it, measured: a cut of 1022 came back 1023.
+const RETOKENIZATION_SLACK: usize = 2;
+
+/// Hard ceiling both slicers clamp their configured window to, rather than
+/// trusting config validation to have caught it: `[slicer].max_doc_chunk_tokens`
+/// defaults to exactly 1024, which is already over
+/// [`STORABLE_TOKENS_CEILING`] — so a validation rule would refuse a
+/// configuration the operator never chose. The code window (512) is far below it
+/// and clamping never reaches it.
+pub(crate) const MAX_STORABLE_TOKENS: usize = STORABLE_TOKENS_CEILING - RETOKENIZATION_SLACK;
+
 /// The single tokenizer capability the slicer needs: the byte-offset span of each
 /// token in `text`. Abstracted behind a trait so the AST-walk/selection logic can
 /// be tested with a cheap deterministic tokenizer instead of downloading the real
@@ -124,7 +157,7 @@ impl<'a> Slicer<'a> {
             parser,
             tokenizer,
             min_tokens,
-            max_tokens,
+            max_tokens: max_tokens.min(MAX_STORABLE_TOKENS),
             fill_gaps,
         })
     }
@@ -363,18 +396,39 @@ impl<'a> Slicer<'a> {
         let mut last_blank: Option<usize> = None;
 
         for line_end in line_starts(code, start, end) {
-            if tokens_between(window_start, line_end) > self.max_tokens && last_fit > window_start {
-                // Prefer the last paragraph break inside the window, so a chunk
-                // does not begin mid-sentence inside a comment — but only if
-                // cutting there still leaves a chunk worth having. A blank line
-                // immediately after `window_start` would otherwise emit a chunk
-                // that is one newline.
-                let cut = last_blank
-                    .filter(|b| tokens_between(window_start, *b) >= GAP_MIN_TOKENS)
-                    .unwrap_or(last_fit);
-                out.push((window_start, cut));
-                window_start = cut;
-                last_blank = None;
+            if tokens_between(window_start, line_end) > self.max_tokens {
+                if last_fit > window_start {
+                    // Prefer the last paragraph break inside the window, so a chunk
+                    // does not begin mid-sentence inside a comment — but only if
+                    // cutting there still leaves a chunk worth having. A blank line
+                    // immediately after `window_start` would otherwise emit a chunk
+                    // that is one newline.
+                    let cut = last_blank
+                        .filter(|b| tokens_between(window_start, *b) >= GAP_MIN_TOKENS)
+                        .unwrap_or(last_fit);
+                    out.push((window_start, cut));
+                    window_start = cut;
+                    last_blank = None;
+                }
+                // What is left is a single line, and a line is not bounded by
+                // anything: a minified file is one line for its whole length,
+                // so cutting only at line boundaries left the window
+                // unenforced exactly where it matters most. Cut on token
+                // boundaries instead. An over-window chunk is not merely
+                // coarse, it is unusable downstream — see
+                // `STORABLE_TOKENS_CEILING`, and note that both the Qdrant
+                // refusal and the embedder's out-of-memory fail the whole batch
+                // the chunk travelled in, not just its own file.
+                while tokens_between(window_start, line_end) > self.max_tokens {
+                    let Some(cut) =
+                        token_boundary(code, offsets, window_start, line_end, self.max_tokens)
+                    else {
+                        break;
+                    };
+                    out.push((window_start, cut));
+                    window_start = cut;
+                    last_blank = None;
+                }
             }
             if code[last_fit..line_end].trim().is_empty() {
                 last_blank = Some(line_end);
@@ -406,6 +460,38 @@ fn next_line_start(code: &str, at: usize) -> usize {
         .find('\n')
         .map_or(code.len(), |i| at + i + 1)
         .min(code.len())
+}
+
+/// Byte offset that closes the `max_tokens`-th token at or after `from`, or
+/// `None` when `from..upto` needs no cut — fewer tokens remain, or the cut would
+/// make no progress.
+///
+/// The last resort of both slicers, for the case a structural boundary cannot
+/// answer: a line (or a documentation block) longer on its own than the window
+/// it must fit. Cutting mid-token would be the same defect one byte smaller, so
+/// the cut lands on a boundary the tokenizer itself reported, ceiled to a `char`
+/// boundary because `code[..cut]` is sliced afterwards and a fake tokenizer in
+/// tests is under no obligation to respect UTF-8.
+pub(crate) fn token_boundary(
+    code: &str,
+    offsets: &[(usize, usize)],
+    from: usize,
+    upto: usize,
+    max_tokens: usize,
+) -> Option<usize> {
+    let first = offsets.partition_point(|&(s, _)| s < from);
+    let last = first + max_tokens.max(1) - 1;
+    let cut = char_boundary(code, offsets.get(last)?.1);
+    (from < cut && cut < upto).then_some(cut)
+}
+
+/// `at`, moved forward to the next `char` boundary of `code`.
+fn char_boundary(code: &str, at: usize) -> usize {
+    let mut at = at.min(code.len());
+    while at < code.len() && !code.is_char_boundary(at) {
+        at += 1;
+    }
+    at
 }
 
 /// The start of every line after the first within `start..end`, then `end`.
@@ -521,6 +607,49 @@ mod tests {
         .unwrap();
         let chunks = slicer.parse(&src, CancellationToken::new()).unwrap();
         assert!(!chunks.is_empty(), "the fn node should have been selected");
+    }
+
+    /// A minified file is one line for its whole length, so the gap pass has no
+    /// line boundary to cut at and used to emit the file as a single chunk of
+    /// any size. Downstream that is not a coarse chunk but an unstorable one:
+    /// Qdrant refuses a multivector point above 1 048 576 elements (1024 ColBERT
+    /// tokens × 1024 dimensions) and the embedder runs out of GPU memory on a
+    /// large one, either of which fails the whole batch, not just this file.
+    #[test]
+    fn one_line_longer_than_the_window_is_still_cut_to_it() {
+        // One token per byte, so the assertion below reads in bytes.
+        let src = format!("const D: &str = \"{}\";\n", "ab,".repeat(1200));
+        let mut s = Slicer::new(
+            Language::new(tree_sitter_rust::LANGUAGE),
+            &OnePerByte,
+            128,
+            512,
+            true,
+        )
+        .unwrap();
+        let chunks = s.parse(&src, CancellationToken::new()).unwrap();
+        assert!(
+            chunks.len() > 5,
+            "one line produced {} chunks",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(
+                c.code.len() <= 512,
+                "chunk at line {} has {} tokens (window is 512)",
+                c.start_line,
+                c.code.len()
+            );
+        }
+        // The cuts tile the line rather than sampling it: consecutive chunks are
+        // contiguous, so nothing between them is silently absent from the index.
+        for pair in chunks.windows(2) {
+            assert_eq!(
+                pair[0].end_byte, pair[1].start_byte,
+                "a gap opened between chunks at bytes {} and {}",
+                pair[0].end_byte, pair[1].start_byte
+            );
+        }
     }
 
     #[test]

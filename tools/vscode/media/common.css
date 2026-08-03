@@ -1,0 +1,293 @@
+/* MINDex — the design tokens and base controls every webview shares.
+ *
+ * Loaded first, before each page's own stylesheet. Everything here is expressed in
+ * VS Code's CSS variables so the pages theme themselves; the literal fallbacks exist
+ * because some themes leave a variable unset, and a control with no border on a
+ * same-coloured background is invisible — which is exactly how the Ask view once read
+ * as "there is no textbox". Fall back through the *nearest* token first, then a
+ * neutral grey, never to nothing.
+ */
+
+:root {
+    --mx-gap: 8px;
+    --mx-gap-tight: 5px;
+    --mx-gap-loose: 14px;
+    --mx-radius: 5px;
+    --mx-radius-lg: 7px;
+
+    /* Hit targets. 30px is VS Code's own input height; 34px is the floor for
+     * anything that is a button first, which is the "big enough to hit" rule. */
+    --mx-control-h: 30px;
+    --mx-button-h: 34px;
+
+    --mx-fs-sm: 11px;
+    --mx-fs-xs: 10px;
+
+    --mx-border: var(
+        --vscode-widget-border,
+        var(--vscode-input-border, rgba(128, 128, 128, 0.35))
+    );
+    --mx-border-strong: var(--vscode-input-border, rgba(128, 128, 128, 0.5));
+    --mx-surface: var(
+        --vscode-editorWidget-background,
+        var(--vscode-input-background, rgba(128, 128, 128, 0.08))
+    );
+    --mx-dim: var(--vscode-descriptionForeground, var(--vscode-foreground));
+
+    --mx-ok: var(--vscode-charts-green, #4caf50);
+    --mx-warn: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow, #cca700));
+    --mx-bad: var(--vscode-errorForeground, var(--vscode-charts-red, #f14c4c));
+}
+
+body {
+    margin: 0;
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+}
+
+/* ── layout primitives ───────────────────────────────────────────────────── */
+
+.stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--mx-gap);
+}
+.row {
+    display: flex;
+    align-items: center;
+    gap: var(--mx-gap-tight);
+}
+.grow {
+    flex: 1;
+    min-width: 0;
+}
+[hidden] {
+    display: none !important;
+}
+
+/* ── text ────────────────────────────────────────────────────────────────── */
+
+.hint {
+    font-size: var(--mx-fs-sm);
+    line-height: 1.5;
+    color: var(--mx-dim);
+}
+.hint code {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--mx-fs-xs);
+    padding: 0 3px;
+    border-radius: 3px;
+    background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+}
+.dim {
+    color: var(--mx-dim);
+}
+kbd {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--mx-fs-xs);
+    padding: 0 4px;
+    border-radius: 3px;
+    border: 1px solid var(--mx-border);
+    background: var(--vscode-keybindingLabel-background, rgba(128, 128, 128, 0.17));
+}
+
+/* ── form controls ───────────────────────────────────────────────────────── */
+
+textarea,
+input[type="text"],
+input[type="number"],
+select {
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: var(--vscode-font-size);
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--mx-border-strong);
+    border-radius: var(--mx-radius);
+    padding: 0 7px;
+    height: var(--mx-control-h);
+}
+textarea {
+    width: 100%;
+    resize: vertical;
+    height: auto;
+    min-height: 70px;
+    line-height: 1.45;
+    padding: 7px;
+}
+select {
+    /* Native arrow + our padding disagree in some themes; the extra right padding
+     * keeps a long model name from running under the arrow. */
+    padding-right: 22px;
+}
+::placeholder {
+    color: var(--vscode-input-placeholderForeground);
+    opacity: 1;
+}
+
+:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+    border-color: var(--vscode-focusBorder);
+}
+
+/* ── buttons ─────────────────────────────────────────────────────────────── */
+
+button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-sizing: border-box;
+    height: var(--mx-button-h);
+    padding: 0 12px;
+    border: 1px solid transparent;
+    border-radius: var(--mx-radius);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    transition:
+        background 90ms ease,
+        opacity 90ms ease;
+}
+button:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground);
+}
+button:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+button.secondary {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border-color: var(--mx-border);
+}
+button.secondary:hover:not(:disabled) {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* A toolbar glyph: no chrome until hovered. */
+button.ghost {
+    height: 26px;
+    width: 26px;
+    padding: 0;
+    background: transparent;
+    color: var(--vscode-foreground);
+    border-color: transparent;
+}
+button.ghost:hover:not(:disabled) {
+    background: var(--vscode-toolbar-hoverBackground);
+}
+
+/* A control whose work is in flight. Deliberately no colour of its own: three
+ * states already need one, and "working" resolves by itself — the spinning glyph
+ * the busy layer swaps in is the whole signal, plus the cursor saying the click
+ * would go nowhere. */
+[aria-busy="true"] {
+    cursor: progress;
+}
+
+/* ── segmented control ───────────────────────────────────────────────────── */
+/* Used for the Search/Research mode switch and for the effort ladder — the same
+ * component twice, because they are the same act: pick one of a short closed set. */
+
+.segmented {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: var(--mx-radius-lg);
+    background: var(--mx-surface);
+    border: 1px solid var(--mx-border);
+}
+.segmented button {
+    flex: 1;
+    height: 30px;
+    padding: 0 6px;
+    border: none;
+    border-radius: var(--mx-radius);
+    background: transparent;
+    color: var(--vscode-foreground);
+    font-size: 12px;
+    font-weight: 400;
+    opacity: 0.72;
+}
+.segmented button:hover:not([aria-selected="true"]) {
+    background: var(--vscode-toolbar-hoverBackground);
+    opacity: 1;
+}
+.segmented button[aria-selected="true"] {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    opacity: 1;
+    font-weight: 600;
+}
+/* The compact variant: three tightly-packed options with no icons. */
+.segmented.compact button {
+    height: 26px;
+    font-size: var(--mx-fs-sm);
+}
+
+/* ── notice ──────────────────────────────────────────────────────────────── */
+/* An advisory, not an error: the surface it sits on still works. */
+
+.notice {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    font-size: var(--mx-fs-sm);
+    line-height: 1.45;
+    padding: 7px 8px;
+    border-radius: var(--mx-radius);
+    color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-warningBackground, rgba(190, 140, 0, 0.15));
+    border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(190, 140, 0, 0.5));
+}
+.notice .codicon {
+    margin-top: 1px;
+}
+/* The error variant: the surface it sits on does *not* still work. Same shape so the
+ * two read as one family, error colours so they are never confused for each other. */
+.notice.bad {
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-errorBackground, rgba(190, 40, 40, 0.15));
+    border-color: var(--vscode-inputValidation-errorBorder, rgba(190, 40, 40, 0.5));
+}
+
+/* ── spinner ─────────────────────────────────────────────────────────────── */
+
+.running {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--mx-fs-sm);
+}
+.spinner {
+    flex: none;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 1.5px solid var(--mx-dim);
+    border-top-color: transparent;
+    animation: mx-spin 0.8s linear infinite;
+}
+@keyframes mx-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* ── codicons ────────────────────────────────────────────────────────────── */
+
+.codicon {
+    flex: none;
+    font-size: 15px;
+    line-height: 1;
+}
+.codicon-sm {
+    font-size: 13px;
+}
