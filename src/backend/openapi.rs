@@ -124,7 +124,6 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::SearchRequest,
         crate::backend::v0::models::SearchResult,
         crate::backend::v0::models::SearchResponse,
-        crate::backend::v0::models::SymbolRoleFilter,
         crate::backend::v0::models::SymbolsRequest,
         crate::backend::v0::models::SymbolInfo,
         crate::backend::v0::models::SymbolsResponse,
@@ -221,7 +220,7 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (21 routes; three carry two methods each).
+        // Every routed path is documented (20 routes; three carry two methods each).
         for p in [
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",

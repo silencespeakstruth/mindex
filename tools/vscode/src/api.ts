@@ -335,7 +335,6 @@ export interface ResearchStep {
         | "grep"
         | "symbols"
         | "outline"
-        | "callers"
         | "list_files"
         | "read_chunks"
         | "file_history"

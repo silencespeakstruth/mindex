@@ -494,40 +494,26 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
 
-/// A `/symbols` role filter (the table's `role` column values).
-#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SymbolRoleFilter {
-    Definition,
-    Reference,
-}
-
-/// Which way to read the approximate call graph.
-#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum CallDirection {
-    /// Who references the name: reference rows carrying it, grouped by the
-    /// definition each one sits inside.
-    In,
-    /// What the definition of that name references: reference rows whose
-    /// enclosing definition is it.
-    Out,
-}
-
-/// `POST /v0/{project_guid}/symbols` body — exact-name symbol lookup over the
-/// definitions/references extracted at indexing time.
+/// `POST /v0/{project_guid}/symbols` body — exact-name lookup over the
+/// definitions extracted at indexing time.
+///
+/// **`deny_unknown_fields`, and the reason is specific to this body.** It used to
+/// carry a `role` filter, dropped when references stopped being extracted. Without
+/// this, a client still sending `role: "reference"` is answered `200` with the
+/// *definitions* — the one wrong answer that costs nothing to detect and looks
+/// exactly like a right one. A stale field is now `request.malformed_body`, which
+/// says what happened.
 #[derive(Deserialize, Serialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolsRequest {
     /// Exact symbol name (case-sensitive), e.g. a function or type identifier.
     pub name: String,
-    /// Restrict to one role; both are returned when omitted.
-    pub role: Option<SymbolRoleFilter>,
-    /// Restrict to one tags.scm kind (`function`, `method`, `class`, `call`, …).
+    /// Restrict to one tags.scm kind (`function`, `method`, `class`, …).
     pub kind: Option<String>,
     /// Ranking anchor: candidates in this file rank first, then its directory,
     /// then the rest. No filtering — only ordering.
     pub anchor_path: Option<UnixPath>,
-    /// Max results *per role*. Defaults to 20 when omitted.
+    /// Max results. Defaults to 20 when omitted.
     #[schema(default = 20, example = 20)]
     pub limit: Option<usize>,
     /// Keep only occurrences in files matching this selector. Same shape and
@@ -535,9 +521,9 @@ pub struct SymbolsRequest {
     /// this one the same way.
     ///
     /// Rows outside the selector are dropped **and counted**
-    /// (`out_of_scope_definitions`/`_references`): a filtered list whose totals
-    /// silently shrink is indistinguishable from a name that simply occurs less
-    /// often, and `/symbols` calls its "no such symbol" answer definitive.
+    /// (`out_of_scope_definitions`): a filtered list whose totals silently shrink is
+    /// indistinguishable from a name that simply occurs less often, and `/symbols`
+    /// calls its "no such symbol" answer definitive.
     pub include: Option<SearchFilter>,
     /// Drop occurrences in files matching this selector (applied after `include`).
     pub exclude: Option<SearchFilter>,
@@ -569,17 +555,12 @@ pub struct SymbolInfo {
 #[derive(Serialize, Debug, ToSchema)]
 pub struct SymbolsResponse {
     pub definitions: Vec<SymbolInfo>,
-    pub references: Vec<SymbolInfo>,
     pub total_definitions: u64,
-    pub total_references: u64,
     /// Definitions the selector excluded. Zero for an unscoped lookup, and reported
     /// rather than absorbed: "not found" and "found, outside what you asked for" are
     /// different answers, and only one of them means the name does not exist.
     #[serde(skip_serializing_if = "is_zero")]
     pub out_of_scope_definitions: u64,
-    /// References the selector excluded.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub out_of_scope_references: u64,
 }
 
 /// Keeps the zero case off the wire, so an unscoped response is byte-identical to
@@ -630,57 +611,6 @@ pub struct OutlineResponse {
     pub symbols: Vec<OutlineSymbol>,
     /// Full count before the limit, so truncation stays visible.
     pub total_definitions: u64,
-}
-
-/// One end of an approximate call edge, grouped per (file, symbol) pair.
-///
-/// *Which* end depends on the lookup's direction: with `In` this is the definition
-/// the reference sits inside (the caller), with `Out` it is the name being
-/// referenced (the callee). `symbol` is `None` only under `In`, for a reference at
-/// file scope with no enclosing definition — a top-level call, an import. Those
-/// rows are kept rather than dropped: they are real references, and omitting them
-/// would make the totals disagree with the list for no visible reason.
-#[derive(Serialize, Debug, ToSchema, PartialEq)]
-pub struct CallSite {
-    pub path: UnixPath,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-    /// The tags.scm syntax type of `symbol`, on the same terms as everywhere else:
-    /// upstream query data, not uniform across languages.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// First occurrence within the file, 1-indexed — where to point `read_chunks`.
-    pub first_line: usize,
-    /// How many reference rows this pair accounts for.
-    pub occurrences: u64,
-}
-
-/// The approximate call graph around one exact name.
-///
-/// **Lexical, not resolved.** A reference row records that a token appeared in a
-/// call position, never which definition it binds to, so these edges are exact up
-/// to name collision: a common name (`new`, `get`, `collect`) mixes unrelated
-/// definitions, and an aliased import breaks the edge entirely. Candidates to
-/// confirm, not a resolved graph.
-///
-/// `defined` separates the two ways `sites` can be empty, the way
-/// [`OutlineResponse::indexed`] does: an identifier the index has never seen from
-/// one that is defined and simply never referenced.
-#[derive(Serialize, Debug, ToSchema, PartialEq)]
-pub struct CallersResponse {
-    pub name: String,
-    pub direction: CallDirection,
-    pub defined: bool,
-    pub sites: Vec<CallSite>,
-    /// Distinct (file, symbol) pairs before the limit, so truncation stays visible.
-    pub total_sites: u64,
-    /// Reference rows behind those pairs, before grouping and the limit.
-    pub total_references: u64,
-    /// Call sites the run's scope excluded. `defined` is deliberately *not* scoped:
-    /// "there is no such name" and "it exists, outside your scope" must read
-    /// differently, and the second is the more useful of the two.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub out_of_scope_sites: u64,
 }
 
 /// One file in a listing.
@@ -871,7 +801,7 @@ pub struct ResearchBudgetOverride {
     /// `[research].checkpoint_every_steps`.
     pub checkpoint_every_steps: Option<usize>,
     /// Multiplier on the per-call evidence widths (`read_chunks`, `grep`,
-    /// `callers`, `file_history`, `symbols`). `1` = the historical widths;
+    /// `file_history`, `symbols`). `1` = the historical widths;
     /// capped by `[research].max_evidence_width`. Width is paid in prompt
     /// tokens on every later turn — it compounds into `max_tokens`.
     pub evidence_width: Option<u64>,

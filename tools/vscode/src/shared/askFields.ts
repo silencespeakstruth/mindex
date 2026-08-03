@@ -232,7 +232,7 @@ export const ASK_FIELDS: readonly AskField[] = [
         label: "evidence",
         title:
             "Multiplier on how many rows each evidence tool returns (read_chunks, grep, " +
-            "callers, history, symbols). Width is resent every turn — it costs tokens.",
+            "history, symbols). Width is resent every turn — it costs tokens.",
         group: "budget",
         modes: ["research"],
         kind: {

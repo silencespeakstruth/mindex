@@ -12,9 +12,6 @@ use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
 use crate::backend::v0::models::ActiveResearchResponse;
 use crate::backend::v0::models::ActiveResearchRun;
-use crate::backend::v0::models::CallDirection;
-use crate::backend::v0::models::CallSite;
-use crate::backend::v0::models::CallersResponse;
 use crate::backend::v0::models::CancelRequest;
 use crate::backend::v0::models::CancelResponse;
 use crate::backend::v0::models::ChallengeRequest;
@@ -77,7 +74,6 @@ use crate::backend::v0::models::SkipReason;
 use crate::backend::v0::models::StatusResponse;
 use crate::backend::v0::models::StreamChoice;
 use crate::backend::v0::models::SymbolInfo;
-use crate::backend::v0::models::SymbolRoleFilter;
 use crate::backend::v0::models::SymbolsRequest;
 use crate::backend::v0::models::SymbolsResponse;
 use crate::backend::v0::models::UUIDv4;
@@ -526,16 +522,15 @@ fn extract_and_insert_symbols(
         tx.execute(
             "INSERT INTO project_file_symbols
                  (project_guid, model_id, file_path, name, kind,
-                  role, start_line, end_line, start_column,
+                  start_line, end_line, start_column,
                   end_column, parent_name, parent_kind, doc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 project_guid,
                 model_id,
                 path,
                 s.name,
                 s.kind,
-                s.role.as_str(),
                 s.start_line as i64,
                 s.end_line as i64,
                 s.start_column as i64,
@@ -2654,16 +2649,14 @@ fn rank_by_score(results: &mut [SearchResult]) -> u64 {
 /// `[limits].max_symbol_results`), not a tuning knob.
 const DEFAULT_SYMBOL_LIMIT: usize = 20;
 
-/// The per-role `/symbols` lookup SQL + binds. Bind ?4 is a placeholder for the
-/// role, rewritten by the caller per executed query (`'definition'`/`'reference'`).
+/// The `/symbols` lookup SQL + binds.
 /// Ranking with an `anchor_path` is purely path-based and deterministic: same file
 /// → 0, same directory (exact — not a deeper subtree) → 1, everything else → 2;
 /// ties break by `path ASC, start_line ASC`. `COUNT(*) OVER ()` carries the full
-/// per-role total past the `LIMIT`.
+/// total past the `LIMIT`.
 /// The selector, when present, is appended as a `file_path IN (…)` subquery whose
-/// binds land **last**. That placement is load-bearing: `symbols_core` rewrites the
-/// role bind by Vec index (`binds[3]`), so inserting anything before it would silently
-/// query the wrong role.
+/// binds land **last**, which is the placement every builder here uses so that a
+/// caller can reason about bind positions without reading the selector's own SQL.
 fn build_symbols_query(
     project_guid: UUIDv4,
     model_id: &str,
@@ -2674,15 +2667,14 @@ fn build_symbols_query(
         "SELECT file_path, kind, start_line, end_line, start_column, end_column,
                 parent_name, parent_kind, doc, COUNT(*) OVER () AS total
          FROM project_file_symbols
-         WHERE project_guid = ?1 AND model_id = ?2 AND name = ?3 AND role = ?4",
+         WHERE project_guid = ?1 AND model_id = ?2 AND name = ?3",
     );
     let mut binds: Vec<Bind> = vec![
         Bind::Guid(project_guid),
         Bind::Path(model_id.to_string()),
         Bind::Path(req.name.clone()),
-        Bind::Path(String::new()), // role placeholder (see doc comment)
     ];
-    let mut next = 5;
+    let mut next = 4;
     if let Some(kind) = &req.kind {
         sql.push_str(&format!(" AND kind = ?{next}"));
         binds.push(Bind::Path(kind.clone()));
@@ -2782,7 +2774,7 @@ pub async fn post_symbols(
 }
 
 /// The `/symbols` core, shared by [`post_symbols`] and the research loop: the
-/// per-role candidate query + assembly. Validation stays with the callers.
+/// candidate query + assembly. Validation stays with the callers.
 pub(crate) async fn symbols_core(
     s: &RouterState,
     project_guid: UUIDv4,
@@ -2792,83 +2784,63 @@ pub(crate) async fn symbols_core(
     let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
     let limit = req.limit.unwrap_or(DEFAULT_SYMBOL_LIMIT);
 
-    let (sql, mut binds) = build_symbols_query(project_guid, model_id, req, limit);
+    let (sql, binds) = build_symbols_query(project_guid, model_id, req, limit);
 
-    let roles: Vec<&'static str> = match req.role {
-        Some(SymbolRoleFilter::Definition) => vec!["definition"],
-        Some(SymbolRoleFilter::Reference) => vec!["reference"],
-        None => vec!["definition", "reference"],
-    };
-
-    // What the selector hid, per role. Only when there *is* a selector, and asked
-    // unscoped on purpose: the point is the difference, and a scoped total cannot
-    // report what it excluded. Without this, a run scoped to `docs/**` looking up a
-    // name defined in `src/` reads exactly like a name that does not exist — and
-    // `/symbols` calls that answer definitive.
+    // What the selector hid. Only when there *is* a selector, and asked unscoped on
+    // purpose: the point is the difference, and a scoped total cannot report what it
+    // excluded. Without this, a run scoped to `docs/**` looking up a name defined in
+    // `src/` reads exactly like a name that does not exist — and `/symbols` calls
+    // that answer definitive.
     let scoped = req.include.is_some() || req.exclude.is_some();
-    let mut unscoped_req = SymbolsRequest {
+    let unscoped_req = SymbolsRequest {
         name: req.name.clone(),
-        role: req.role,
         kind: req.kind.clone(),
-        anchor_path: req.anchor_path.clone(),
+        // Ranking is irrelevant to a count, and an anchor would add two binds.
+        anchor_path: None,
         limit: req.limit,
         include: None,
         exclude: None,
     };
-    unscoped_req.anchor_path = None;
     let count_sql = scoped.then(|| {
-        let (q, b) = build_symbols_query(project_guid, model_id, &unscoped_req, limit);
         // Only the totals matter here, and `COUNT(*) OVER ()` already carries them
         // past the LIMIT — so the same builder answers this with no second SQL to
         // keep in step.
-        (q, b)
+        build_symbols_query(project_guid, model_id, &unscoped_req, limit)
     });
 
-    type SymbolRows = (Vec<SymbolInfo>, u64, u64);
-    let per_role: Vec<(&'static str, SymbolRows)> = s
+    let (definitions, total_definitions, out_of_scope_definitions) = s
         .db_pool
         .transaction(token.child_token(), move |tx| {
-            let mut out = Vec::with_capacity(roles.len());
-            let mut stmt = tx.prepare(&sql)?;
-            let mut count_stmt = match &count_sql {
-                Some((q, _)) => Some(tx.prepare(q)?),
-                None => None,
-            };
-            for role in roles {
-                binds[3] = Bind::Path(role.to_string());
-                let unscoped_total = match (&mut count_stmt, &count_sql) {
-                    (Some(stmt), Some((_, cb))) => {
-                        let mut cb = cb.clone();
-                        cb[3] = Bind::Path(role.to_string());
-                        stmt.query_map(params_from_iter(cb.iter()), |r| {
-                            r.get::<_, i64>(9).map(|n| n as u64)
-                        })?
-                        .next()
-                        .transpose()?
-                        .unwrap_or(0)
-                    }
-                    _ => 0,
-                };
-                let mut total: u64 = 0;
-                let rows = stmt
-                    .query_map(params_from_iter(binds.iter()), |r| {
-                        total = r.get::<_, i64>(9)? as u64;
-                        Ok(SymbolInfo {
-                            path: r.get(0)?,
-                            kind: r.get(1)?,
-                            start_line: r.get::<_, i64>(2)? as usize,
-                            end_line: r.get::<_, i64>(3)? as usize,
-                            start_column: r.get::<_, i64>(4)? as usize,
-                            end_column: r.get::<_, i64>(5)? as usize,
-                            parent_name: r.get(6)?,
-                            parent_kind: r.get(7)?,
-                            doc: r.get(8)?,
-                        })
+            let unscoped_total = match &count_sql {
+                Some((q, cb)) => tx
+                    .prepare(q)?
+                    .query_map(params_from_iter(cb.iter()), |r| {
+                        r.get::<_, i64>(9).map(|n| n as u64)
                     })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                out.push((role, (rows, total, unscoped_total.saturating_sub(total))));
-            }
-            Ok(out)
+                    .next()
+                    .transpose()?
+                    .unwrap_or(0),
+                None => 0,
+            };
+            let mut stmt = tx.prepare(&sql)?;
+            let mut total: u64 = 0;
+            let rows = stmt
+                .query_map(params_from_iter(binds.iter()), |r| {
+                    total = r.get::<_, i64>(9)? as u64;
+                    Ok(SymbolInfo {
+                        path: r.get(0)?,
+                        kind: r.get(1)?,
+                        start_line: r.get::<_, i64>(2)? as usize,
+                        end_line: r.get::<_, i64>(3)? as usize,
+                        start_column: r.get::<_, i64>(4)? as usize,
+                        end_column: r.get::<_, i64>(5)? as usize,
+                        parent_name: r.get(6)?,
+                        parent_kind: r.get(7)?,
+                        doc: r.get(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((rows, total, unscoped_total.saturating_sub(total)))
         })
         .with_cancellation_token(token)
         .await
@@ -2880,30 +2852,11 @@ pub(crate) async fn symbols_core(
             ApiError::from(err)
         })?;
 
-    let mut resp = SymbolsResponse {
-        definitions: Vec::new(),
-        references: Vec::new(),
-        total_definitions: 0,
-        total_references: 0,
-        out_of_scope_definitions: 0,
-        out_of_scope_references: 0,
-    };
-    for (role, (rows, total, hidden)) in per_role {
-        if role == "definition" {
-            (
-                resp.definitions,
-                resp.total_definitions,
-                resp.out_of_scope_definitions,
-            ) = (rows, total, hidden);
-        } else {
-            (
-                resp.references,
-                resp.total_references,
-                resp.out_of_scope_references,
-            ) = (rows, total, hidden);
-        }
-    }
-    Ok(resp)
+    Ok(SymbolsResponse {
+        definitions,
+        total_definitions,
+        out_of_scope_definitions,
+    })
 }
 
 // ─── /research ──────────────────────────────────────────────────────────────
@@ -3026,7 +2979,6 @@ pub(crate) async fn outline_core(
                         COUNT(*) OVER () AS total
                  FROM project_file_symbols
                  WHERE project_guid = ?1 AND model_id = ?2 AND file_path = ?3
-                   AND role = 'definition'
                  ORDER BY start_line ASC, name ASC
                  LIMIT {OUTLINE_LIMIT}"
             ))?;
@@ -3069,172 +3021,6 @@ pub(crate) async fn outline_core(
         in_scope: true,
         symbols: rows.into_iter().map(|(sym, _)| sym).collect(),
         total_definitions,
-    })
-}
-
-/// Call sites per `callers` call, at `evidence_width` 1. Between `outline`'s 300
-/// and `read_chunks`'s 8: the rows are compact metadata and the point is to see
-/// the *shape* of a name's usage, but unlike an outline this is not bounded by
-/// one file — a common name can span the whole repo, and this text is resent
-/// every later turn. Truncation stays visible through `total_sites`.
-const CALLERS_LIMIT: usize = 50;
-
-/// The grouped call-edge SQL for one direction. Binds are `?1` project, `?2`
-/// model, `?3` the name.
-///
-/// Pulled out of `callers_core` to be testable on its own (as `build_search_query`
-/// and `build_symbols_query` are): the risky parts are the direction swap and the
-/// windows over an aggregate, neither of which is visible from the response type.
-///
-/// The two directions differ only in which column *selects* rows and which pair
-/// names the far end of the edge — `In` filters on `name` and reports the
-/// enclosing definition, `Out` filters on `parent_name` and reports what was
-/// referenced. Both column sets are literals chosen here, never caller input, so
-/// the interpolation carries no injection surface.
-/// `scope_clause` is an already-built `AND file_path IN (…)` fragment (empty when the
-/// run is unscoped), so a scoped run cannot read call sites it was not given.
-/// `limit` is [`CALLERS_LIMIT`] scaled by the run's `evidence_width`.
-fn build_callers_query(direction: CallDirection, scope_clause: &str, limit: usize) -> String {
-    let (filter_column, symbol_column, kind_column) = match direction {
-        CallDirection::In => ("name", "parent_name", "parent_kind"),
-        CallDirection::Out => ("parent_name", "name", "kind"),
-    };
-    // `COUNT(*) OVER ()` counts *groups* here — windows are applied after
-    // grouping — so summing the per-group counts is what recovers the row total.
-    format!(
-        "SELECT file_path, {symbol_column}, {kind_column},
-                MIN(start_line) AS first_line, COUNT(*) AS occurrences,
-                COUNT(*) OVER () AS total_sites,
-                SUM(COUNT(*)) OVER () AS total_references
-         FROM project_file_symbols
-         WHERE project_guid = ?1 AND model_id = ?2 AND role = 'reference'
-           AND {filter_column} = ?3{scope_clause}
-         GROUP BY file_path, {symbol_column}, {kind_column}
-         ORDER BY file_path ASC, first_line ASC
-         LIMIT {limit}"
-    )
-}
-
-/// The approximate call graph around one exact name — `parent_name`, read as an
-/// edge.
-///
-/// A reference row already knows the definition it sits inside, so "who calls X"
-/// is one indexed `SELECT` over data the symbol table already holds. The edges
-/// are **lexical**: a reference records that a token appeared in a call position,
-/// never which definition it binds to, so results for a common name mix unrelated
-/// definitions and an aliased import breaks the edge entirely. That imprecision is
-/// deliberate and reported rather than hidden — the alternative is a resolution
-/// layer (LSP/SCIP) that needs each project to build on the indexing host, which
-/// buys accuracy for some users by making quality silently vary between them.
-///
-/// Pure SQL, like `outline_core`/`list_files_core`: no embedder, no Qdrant. `In`
-/// is served by `idx_project_file_symbols_lookup`, `Out` by
-/// `idx_project_file_symbols_parent`.
-pub(crate) async fn callers_core(
-    s: &RouterState,
-    project_guid: UUIDv4,
-    name: &str,
-    direction: CallDirection,
-    scope: &crate::research::ToolScope,
-    limit: usize,
-    token: &CancellationToken,
-) -> Result<CallersResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
-    let owned_name = name.to_string();
-    // The scope's binds go after the query's own three, so the fixed `?1..?3` above
-    // stay put.
-    let (scope_clause, scope_binds) = if scope.is_scoped() {
-        let (sql, binds) = scope_subquery(project_guid, scope, 4);
-        (format!(" AND file_path IN ({sql})"), binds)
-    } else {
-        (String::new(), Vec::new())
-    };
-    let sql = build_callers_query(direction, &scope_clause, limit);
-    // Unscoped, for the difference only — see `symbols_core`.
-    let unscoped_sql = scope
-        .is_scoped()
-        .then(|| build_callers_query(direction, "", limit));
-    let mut binds: Vec<Bind> = vec![
-        Bind::Guid(project_guid),
-        Bind::Path(model_id.clone()),
-        Bind::Path(owned_name.clone()),
-    ];
-    let unscoped_binds = binds.clone();
-    binds.extend(scope_binds);
-
-    let (defined, rows, all_sites): (bool, Vec<(CallSite, u64, u64)>, u64) = s
-        .db_pool
-        .transaction(token.child_token(), move |tx| {
-            // Two reads, as in `outline_core`: an unknown identifier and one that
-            // is defined but never referenced are different answers, and a single
-            // query cannot tell them apart.
-            let defined: bool = tx.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM project_file_symbols
-                     WHERE project_guid = ?1 AND model_id = ?2 AND name = ?3
-                       AND role = 'definition'
-                 )",
-                (&project_guid, &model_id, &owned_name),
-                |r| r.get(0),
-            )?;
-
-            let mut stmt = tx.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params_from_iter(binds.iter()), |r| {
-                    Ok((
-                        CallSite {
-                            path: r.get(0)?,
-                            symbol: r.get(1)?,
-                            kind: r.get(2)?,
-                            first_line: r.get::<_, i64>(3)? as usize,
-                            occurrences: r.get::<_, i64>(4)? as u64,
-                        },
-                        r.get::<_, i64>(5)? as u64,
-                        r.get::<_, i64>(6)? as u64,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let scoped_sites = rows
-                .first()
-                .map_or(0, |(_, t, _): &(CallSite, u64, u64)| *t);
-            let all_sites = match &unscoped_sql {
-                Some(q) => {
-                    let mut stmt = tx.prepare(q)?;
-                    stmt.query_map(params_from_iter(unscoped_binds.iter()), |r| {
-                        r.get::<_, i64>(5).map(|n| n as u64)
-                    })?
-                    .next()
-                    .transpose()?
-                    .unwrap_or(0)
-                }
-                None => scoped_sites,
-            };
-            Ok((defined, rows, all_sites))
-        })
-        .with_cancellation_token(token)
-        .await
-        .from_cancelled()
-        .map_err(|e| {
-            error!(
-                error = %e,
-                project_guid = %project_guid.0,
-                name = %name,
-                "Failed to read the call graph from SQLite."
-            );
-            ApiError::from(e)
-        })?;
-
-    let total_sites = rows.first().map_or(0, |(_, t, _)| *t);
-    let total_references = rows.first().map_or(0, |(_, _, t)| *t);
-    Ok(CallersResponse {
-        name: name.to_string(),
-        direction,
-        defined,
-        out_of_scope_sites: all_sites.saturating_sub(total_sites),
-        sites: rows.into_iter().map(|(site, _, _)| site).collect(),
-        total_sites,
-        total_references,
     })
 }
 
@@ -4463,25 +4249,6 @@ impl crate::research::ResearchTools for StateResearchTools {
         outline_core(&self.state, self.project_guid, &path, scope, token).await
     }
 
-    async fn callers(
-        &self,
-        name: String,
-        direction: CallDirection,
-        scope: &crate::research::ToolScope,
-        token: &CancellationToken,
-    ) -> Result<CallersResponse, ApiError> {
-        callers_core(
-            &self.state,
-            self.project_guid,
-            &name,
-            direction,
-            scope,
-            scaled_width(CALLERS_LIMIT, self.evidence_width),
-            token,
-        )
-        .await
-    }
-
     async fn list_files(
         &self,
         glob: String,
@@ -4757,7 +4524,7 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   (`note`, `revise_plan`) or return paths without usable spans (`list_files`).
 ///   Capped, with `spans_truncated` saying so rather than the cut being silent.
 ///   `action` is
-///   `search`, `grep`, `symbols`, `outline`, `callers`, `list_files`, `read_chunks`,
+///   `search`, `grep`, `symbols`, `outline`, `list_files`, `read_chunks`,
 ///   `note` or `revise_plan`, and the argument key is named for what it is: `query`,
 ///   `pattern`, `name`, `path`, `name`, `glob`, `path`, `text` and `plan`
 ///   respectively — exactly one is present per step. `note` and `revise_plan` write
@@ -5000,13 +4767,14 @@ pub async fn post_research(
     let prior_reports =
         load_prior_reports(&s, &project_guid, &context_run_ids, &load_guard.0).await?;
 
+    let scope = crate::research::ToolScope {
+        include: req.include,
+        exclude: req.exclude,
+    };
     let params = crate::research::ResearchParams {
         question: req.question,
         model,
-        scope: crate::research::ToolScope {
-            include: req.include,
-            exclude: req.exclude,
-        },
+        scope,
         budget: s.research_budget(req.effort, req.budget),
         sampling: s.research_sampling_for(req.seed),
         report_timeout_ms: s.research_report_timeout_ms,
@@ -5017,6 +4785,7 @@ pub async fn post_research(
             .and_then(|b| b.checkpoint_every_steps)
             .unwrap_or(s.research_checkpoint_every_steps),
         max_turn_thinking_chars: s.research_max_turn_thinking_chars,
+        max_turn_seconds: s.research_max_turn_seconds,
         metrics: Some(s.metrics.clone()),
         prior_reports,
         max_context_chars: s.research_max_context_chars,
@@ -5197,6 +4966,7 @@ pub async fn post_research_challenge(
             .and_then(|b| b.checkpoint_every_steps)
             .unwrap_or(s.research_checkpoint_every_steps),
         max_turn_thinking_chars: s.research_max_turn_thinking_chars,
+        max_turn_seconds: s.research_max_turn_seconds,
         metrics: Some(s.metrics.clone()),
         // The subject is injected by the challenge machinery itself, not as a
         // prior report: it is the question, not background.
@@ -5724,7 +5494,7 @@ fn build_file_filter(
 /// `project_file_symbols`. Teaching it to qualify them would touch `DELETE /files`
 /// and `POST /cancel`, the two destructive endpoints, to make a research lookup
 /// tidier. This way the filter stays exactly the expression those endpoints already
-/// rely on, and the same one idea scopes symbols, callers and grep.
+/// rely on, and the same one idea scopes symbols and grep.
 ///
 /// `first_bind` is where this fragment's placeholders start, so the caller can put
 /// its own binds before it.
@@ -5742,9 +5512,7 @@ fn scope_subquery(
 }
 
 /// As [`build_file_filter`], with the first placeholder number given. Split out so a
-/// scope filter can be appended to a query that already has binds of its own — and
-/// numbering from the end is what keeps `symbols_core`'s by-index rewrite of the role
-/// bind valid.
+/// scope filter can be appended to a query that already has binds of its own.
 fn build_file_filter_from(
     project_guid: UUIDv4,
     include: &Option<SearchFilter>,
@@ -9916,7 +9684,7 @@ mod tests {
     /// network call.
     ///
     /// The `*_core` functions — `grep`, `read_chunks`, `outline`, `list_files`,
-    /// `callers`, `symbols` — are pure SQL and are what both the research tool loop
+    /// `symbols` — are pure SQL and are what both the research tool loop
     /// and several public endpoints run. They took a `&RouterState`, which is only
     /// obtainable from a fully wired server, so their real queries were reachable in
     /// tests **only through the research fakes that replace them**: the scope
@@ -9995,6 +9763,7 @@ mod tests {
             research_report_timeout_ms: cfg.research.report_timeout_ms,
             research_checkpoint_every_steps: cfg.research.checkpoint_every_steps,
             research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
+            research_max_turn_seconds: cfg.research.max_turn_seconds,
             research_retention_days: cfg.research.retention_days,
             research_max_context_runs: cfg.research.max_context_runs,
             research_max_context_chars: cfg.research.max_context_chars,
@@ -10395,9 +10164,9 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO project_file_symbols
-                     (project_guid, model_id, file_path, name, kind, role,
+                     (project_guid, model_id, file_path, name, kind,
                       start_line, end_line, start_column, end_column)
-                 VALUES (?1, ?2, ?3, ?4, 'function', 'definition', 1, 1, 0, 1)",
+                 VALUES (?1, ?2, ?3, ?4, 'function', 1, 1, 0, 1)",
                 params![guid(), MODEL, path, name],
             )?;
             Ok(())
@@ -10448,9 +10217,11 @@ mod tests {
             !names.iter().any(|n| n == "stale_symbol"),
             "old symbols must be hard-deleted on reindex"
         );
-        assert!(
-            names.iter().any(|n| n == "fresh") && names.iter().any(|n| n == "helper"),
-            "fresh content's definitions and references must be inserted, got {names:?}"
+        assert_eq!(
+            names,
+            vec!["fresh"],
+            "the new definition must be inserted — and `helper()`, a call, must not: \
+             references are no longer extracted"
         );
     }
 
@@ -10534,15 +10305,13 @@ mod tests {
 
     // ── /symbols lookup: ranking + totals (the exact production SQL) ──────────
 
-    /// Executes `build_symbols_query` for one role, returning (paths, total).
+    /// Executes `build_symbols_query`, returning (paths, total).
     async fn run_symbols_query(
         pool: &SQLite3Pool,
         req: SymbolsRequest,
         limit: usize,
-        role: &'static str,
     ) -> (Vec<String>, u64) {
-        let (sql, mut binds) = build_symbols_query(guid(), MODEL, &req, limit);
-        binds[3] = Bind::Path(role.to_string());
+        let (sql, binds) = build_symbols_query(guid(), MODEL, &req, limit);
         pool.transaction(CancellationToken::new(), move |tx| {
             let mut total = 0u64;
             let paths = tx
@@ -10563,7 +10332,6 @@ mod tests {
             include: None,
             exclude: None,
             name: name.to_string(),
-            role: None,
             kind: None,
             anchor_path: anchor.map(str::to_string),
             limit: None,
@@ -10615,11 +10383,11 @@ mod tests {
         assert_eq!(locate_match(code, "let y", 1), (1, "İ İ let y = 2;".into()));
     }
 
-    /// `symbols_core` rewrites the role bind **by Vec index**, so anything appended to
-    /// the query must land after it. This is the guard on that: a scope filter inserted
-    /// earlier would silently query the wrong role.
+    /// The scope must arrive as a subquery appended after the query's own binds —
+    /// `build_file_filter` emits unqualified column names, so a join would be
+    /// ambiguous, and binds landing anywhere but last would renumber the rest.
     #[test]
-    fn build_symbols_query_scopes_rows_without_disturbing_the_role_bind() {
+    fn build_symbols_query_scopes_rows_with_a_subquery_bound_last() {
         let mut req = symbols_req("collect", Some("src/db/qdrant.rs"));
         req.include = Some(SearchFilter {
             paths: Some(vec![crate::backend::v0::models::GlobPattern(
@@ -10634,9 +10402,13 @@ mod tests {
              column names: {sql}"
         );
         assert_eq!(
-            binds[3],
-            Bind::Path(String::new()),
-            "index 3 must still be the role placeholder: {binds:?}"
+            &binds[..3],
+            &[
+                Bind::Guid(guid()),
+                Bind::Path("m".into()),
+                Bind::Path("collect".into()),
+            ],
+            "the query's own binds must keep positions 1-3: {binds:?}"
         );
     }
 
@@ -10646,7 +10418,7 @@ mod tests {
     fn an_unscoped_symbols_lookup_builds_the_sql_it_always_did() {
         let (sql, binds) = build_symbols_query(guid(), "m", &symbols_req("collect", None), 10);
         assert!(!sql.contains("file_path IN"), "{sql}");
-        assert_eq!(binds.len(), 4, "project, model, name, role — nothing else");
+        assert_eq!(binds.len(), 3, "project, model, name — nothing else");
     }
 
     #[tokio::test]
@@ -10663,13 +10435,8 @@ mod tests {
             insert_symbol(&pool, f, "target").await;
         }
 
-        let (paths, total) = run_symbols_query(
-            &pool,
-            symbols_req("target", Some("src/db/qdrant.rs")),
-            10,
-            "definition",
-        )
-        .await;
+        let (paths, total) =
+            run_symbols_query(&pool, symbols_req("target", Some("src/db/qdrant.rs")), 10).await;
         assert_eq!(total, 5);
         assert_eq!(
             paths,
@@ -10691,13 +10458,7 @@ mod tests {
         for f in files {
             insert_symbol(&pool, f, "target").await;
         }
-        let (paths, _) = run_symbols_query(
-            &pool,
-            symbols_req("target", Some("main.rs")),
-            10,
-            "definition",
-        )
-        .await;
+        let (paths, _) = run_symbols_query(&pool, symbols_req("target", Some("main.rs")), 10).await;
         assert_eq!(paths, vec!["main.rs", "other.rs", "src/lib.rs"]);
     }
 
@@ -10708,193 +10469,9 @@ mod tests {
         for f in files {
             insert_symbol(&pool, f, "popular").await;
         }
-        let (paths, total) =
-            run_symbols_query(&pool, symbols_req("popular", None), 2, "definition").await;
+        let (paths, total) = run_symbols_query(&pool, symbols_req("popular", None), 2).await;
         assert_eq!(paths.len(), 2, "the limit caps the returned rows");
         assert_eq!(total, 5, "the total must report the full candidate count");
-
-        // The other role is independent: no references exist.
-        let (refs, ref_total) =
-            run_symbols_query(&pool, symbols_req("popular", None), 2, "reference").await;
-        assert!(refs.is_empty());
-        assert_eq!(ref_total, 0);
-    }
-
-    // ── callers: the approximate call graph ─────────────────────────────────
-
-    /// One reference row. `parent` is `None` for a reference at file scope — a
-    /// top-level call or an import, which `callers` must report rather than drop.
-    async fn insert_reference(
-        pool: &SQLite3Pool,
-        path: &'static str,
-        name: &'static str,
-        parent: Option<&'static str>,
-        line: i64,
-    ) {
-        pool.transaction(CancellationToken::new(), move |tx| {
-            tx.execute(
-                "INSERT INTO project_file_symbols
-                     (project_guid, model_id, file_path, name, kind, role,
-                      start_line, end_line, start_column, end_column,
-                      parent_name, parent_kind)
-                 VALUES (?1, ?2, ?3, ?4, 'call', 'reference', ?5, ?5, 0, 1, ?6, ?7)",
-                params![
-                    guid(),
-                    MODEL,
-                    path,
-                    name,
-                    line,
-                    parent,
-                    parent.map(|_| "function")
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    }
-
-    /// `(path, symbol, kind, first_line, occurrences)` per group, plus the two totals.
-    #[allow(clippy::type_complexity)]
-    async fn run_callers_query(
-        pool: &SQLite3Pool,
-        name: &'static str,
-        direction: CallDirection,
-    ) -> (
-        Vec<(String, Option<String>, Option<String>, i64, i64)>,
-        i64,
-        i64,
-    ) {
-        let sql = build_callers_query(direction, "", CALLERS_LIMIT);
-        let rows: Vec<(String, Option<String>, Option<String>, i64, i64, i64, i64)> = pool
-            .transaction(CancellationToken::new(), move |tx| {
-                tx.prepare(&sql)?
-                    .query_map(params![guid(), MODEL, name], |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(SQLite3PoolError::from)
-            })
-            .await
-            .unwrap();
-        let total_sites = rows.first().map_or(0, |r| r.5);
-        let total_references = rows.first().map_or(0, |r| r.6);
-        (
-            rows.into_iter()
-                .map(|r| (r.0, r.1, r.2, r.3, r.4))
-                .collect(),
-            total_sites,
-            total_references,
-        )
-    }
-
-    /// `In` is the headline question — "who calls X". The grouping is the load-
-    /// bearing part: one row per (file, enclosing definition) with the first line
-    /// to read and how many times it happens, not one row per occurrence.
-    #[tokio::test]
-    async fn callers_in_groups_occurrences_by_enclosing_definition() {
-        let files: &[&str] = &["a.rs", "b.rs"];
-        let pool = pool_with_prepared_files(files, 0).await;
-        // `caller_one` calls target twice in a.rs, `caller_two` once, and b.rs has
-        // a top-level reference with no enclosing definition.
-        insert_reference(&pool, "a.rs", "target", Some("caller_one"), 30).await;
-        insert_reference(&pool, "a.rs", "target", Some("caller_one"), 10).await;
-        insert_reference(&pool, "a.rs", "target", Some("caller_two"), 50).await;
-        insert_reference(&pool, "b.rs", "target", None, 3).await;
-        // Noise that must not be counted: a different name, in the same files.
-        insert_reference(&pool, "a.rs", "unrelated", Some("caller_one"), 11).await;
-
-        let (sites, total_sites, total_refs) =
-            run_callers_query(&pool, "target", CallDirection::In).await;
-
-        assert_eq!(
-            sites,
-            vec![
-                // MIN(start_line), not the first row inserted.
-                (
-                    "a.rs".to_string(),
-                    Some("caller_one".to_string()),
-                    Some("function".to_string()),
-                    10,
-                    2
-                ),
-                (
-                    "a.rs".to_string(),
-                    Some("caller_two".to_string()),
-                    Some("function".to_string()),
-                    50,
-                    1
-                ),
-                // A top-level reference is kept, with no symbol: dropping it would
-                // make the totals disagree with the list.
-                ("b.rs".to_string(), None, None, 3, 1),
-            ]
-        );
-        assert_eq!(total_sites, 3, "windows count groups, not rows");
-        assert_eq!(
-            total_refs, 4,
-            "summing the per-group counts recovers the row total"
-        );
-    }
-
-    /// `Out` is the same table read the other way: filter on the enclosing
-    /// definition, report what it referenced. Getting the column swap wrong would
-    /// silently answer the `In` question instead.
-    #[tokio::test]
-    async fn callers_out_reports_what_a_definition_references() {
-        let files: &[&str] = &["a.rs"];
-        let pool = pool_with_prepared_files(files, 0).await;
-        insert_reference(&pool, "a.rs", "alpha", Some("outer"), 12).await;
-        insert_reference(&pool, "a.rs", "alpha", Some("outer"), 14).await;
-        insert_reference(&pool, "a.rs", "beta", Some("outer"), 20).await;
-        // A call in a *different* definition must not appear.
-        insert_reference(&pool, "a.rs", "gamma", Some("elsewhere"), 90).await;
-
-        let (sites, total_sites, total_refs) =
-            run_callers_query(&pool, "outer", CallDirection::Out).await;
-
-        let names: Vec<Option<String>> = sites.iter().map(|s| s.1.clone()).collect();
-        assert_eq!(
-            names,
-            vec![Some("alpha".to_string()), Some("beta".to_string())],
-            "only what `outer` references, and `gamma` is not one of them"
-        );
-        assert_eq!(sites[0].4, 2, "alpha is referenced twice");
-        assert_eq!(sites[0].3, 12);
-        assert_eq!((total_sites, total_refs), (2, 3));
-    }
-
-    /// An unknown name and a defined-but-unreferenced one both come back with no
-    /// sites, so the row count alone cannot tell them apart — `defined` is what
-    /// does, and it is the reason `callers_core` reads twice.
-    #[tokio::test]
-    async fn callers_finds_no_sites_for_an_unreferenced_or_unknown_name() {
-        let files: &[&str] = &["a.rs"];
-        let pool = pool_with_prepared_files(files, 0).await;
-        insert_symbol(&pool, "a.rs", "lonely").await;
-
-        for name in ["lonely", "no_such_symbol"] {
-            let (sites, total_sites, total_refs) = run_callers_query(
-                &pool,
-                if name == "lonely" {
-                    "lonely"
-                } else {
-                    "no_such_symbol"
-                },
-                CallDirection::In,
-            )
-            .await;
-            assert!(sites.is_empty(), "{name} must yield no call sites");
-            assert_eq!((total_sites, total_refs), (0, 0));
-        }
     }
 
     // ── git history reconciliation ──────────────────────────────────────
@@ -12019,38 +11596,31 @@ mod tests {
         );
     }
 
-    /// Add symbol rows for `path`. Each is `(name, kind, role, start_line, parent)`.
+    /// Add definition rows for `path`. Each is `(name, kind, start_line, parent)`.
     async fn add_symbols(
         pool: &SQLite3Pool,
         path: &'static str,
-        rows: &[(
-            &'static str,
-            &'static str,
-            &'static str,
-            i64,
-            Option<&'static str>,
-        )],
+        rows: &[(&'static str, &'static str, i64, Option<&'static str>)],
     ) {
         let rows: Vec<_> = rows
             .iter()
-            .map(|(n, k, r, l, p)| {
+            .map(|(n, k, l, p)| {
                 (
                     (*n).to_string(),
                     (*k).to_string(),
-                    (*r).to_string(),
                     *l,
                     p.map(str::to_string),
                 )
             })
             .collect();
         pool.transaction(CancellationToken::new(), move |tx| {
-            for (name, kind, role, line, parent) in &rows {
+            for (name, kind, line, parent) in &rows {
                 tx.execute(
                     "INSERT INTO project_file_symbols
-                         (project_guid, model_id, file_path, name, kind, role,
+                         (project_guid, model_id, file_path, name, kind,
                           start_line, end_line, start_column, end_column, parent_name)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0, 1, ?8)",
-                    params![guid(), MODEL, path, name, kind, role, line, parent],
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, 1, ?7)",
+                    params![guid(), MODEL, path, name, kind, line, parent],
                 )?;
             }
             Ok(())
@@ -12072,12 +11642,7 @@ mod tests {
             ("tests/b.rs", "fn beta() {}"),
         ])
         .await;
-        add_symbols(
-            &pool,
-            "src/a.rs",
-            &[("alpha", "function", "definition", 1, None)],
-        )
-        .await;
+        add_symbols(&pool, "src/a.rs", &[("alpha", "function", 1, None)]).await;
         let s = router_state(pool);
 
         let found = outline_core(
@@ -12129,12 +11694,7 @@ mod tests {
         assert!(!unknown.indexed);
 
         // Refused: indexed, tagged, and deliberately not shown.
-        add_symbols(
-            &s.db_pool,
-            "tests/b.rs",
-            &[("beta", "function", "definition", 1, None)],
-        )
-        .await;
+        add_symbols(&s.db_pool, "tests/b.rs", &[("beta", "function", 1, None)]).await;
         let refused = outline_core(
             &s,
             guid(),
@@ -12149,84 +11709,6 @@ mod tests {
             "a refused path read as an empty outline, i.e. as a file with no definitions"
         );
         assert!(refused.symbols.is_empty());
-    }
-
-    /// `callers` answers two different questions and must not collapse them:
-    /// `defined` is deliberately **unscoped**, so "there is no such name" stays
-    /// distinguishable from "it exists, outside your scope" — the second being the
-    /// more useful of the two, and the one a scoped `defined: false` would hide.
-    #[tokio::test]
-    async fn callers_keeps_existence_unscoped_while_scoping_the_sites() {
-        let pool =
-            pool_with_chunks(&[("src/a.rs", "fn caller() {}"), ("tests/b.rs", "fn t() {}")]).await;
-        add_symbols(
-            &pool,
-            "src/a.rs",
-            &[
-                ("target", "function", "definition", 1, None),
-                ("target", "call", "reference", 5, Some("caller")),
-            ],
-        )
-        .await;
-        add_symbols(
-            &pool,
-            "tests/b.rs",
-            &[("target", "call", "reference", 3, Some("t"))],
-        )
-        .await;
-        let s = router_state(pool);
-
-        let all = callers_core(
-            &s,
-            guid(),
-            "target",
-            CallDirection::In,
-            &unscoped(),
-            8,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("callers runs");
-        assert!(all.defined);
-        assert_eq!(all.total_sites, 2);
-        assert_eq!(all.out_of_scope_sites, 0);
-
-        let scoped = callers_core(
-            &s,
-            guid(),
-            "target",
-            CallDirection::In,
-            &scoped_to(&["src/**"]),
-            8,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("callers runs");
-        assert!(
-            scoped.defined,
-            "the definition is outside the scope, but its *existence* must not be"
-        );
-        assert_eq!(scoped.total_sites, 1);
-        assert_eq!(
-            scoped.out_of_scope_sites, 1,
-            "the run was not told a call site had been hidden from it"
-        );
-
-        // A name nothing ever references, in a project that has symbols: `defined`
-        // is what separates "never referenced" from "no such name".
-        let unknown = callers_core(
-            &s,
-            guid(),
-            "no_such_symbol",
-            CallDirection::In,
-            &unscoped(),
-            8,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("callers runs");
-        assert!(!unknown.defined);
-        assert_eq!(unknown.total_sites, 0);
     }
 
     /// `list_files` is navigation, and its glob is SQLite `GLOB` — where `*` crosses
@@ -12320,7 +11802,7 @@ mod tests {
                     "src/sibling.rs" => "src/sibling.rs",
                     _ => "other/far.rs",
                 },
-                &[("collide", "function", "definition", 1, None)],
+                &[("collide", "function", 1, None)],
             )
             .await;
         }
@@ -12328,7 +11810,6 @@ mod tests {
 
         let req = SymbolsRequest {
             name: "collide".to_string(),
-            role: None,
             kind: None,
             anchor_path: Some("src/anchor.rs".to_string()),
             limit: Some(2),
@@ -12360,17 +11841,11 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_symbol_is_an_empty_answer_not_a_failure() {
         let pool = pool_with_chunks(&[("src/a.rs", "a")]).await;
-        add_symbols(
-            &pool,
-            "src/a.rs",
-            &[("known", "function", "definition", 1, None)],
-        )
-        .await;
+        add_symbols(&pool, "src/a.rs", &[("known", "function", 1, None)]).await;
         let s = router_state(pool);
 
         let req = SymbolsRequest {
             name: "nonexistent".to_string(),
-            role: None,
             kind: None,
             anchor_path: None,
             limit: None,
@@ -12382,7 +11857,6 @@ mod tests {
             .expect("an unknown symbol is not an error");
         assert_eq!(out.total_definitions, 0);
         assert!(out.definitions.is_empty());
-        assert!(out.references.is_empty());
     }
 
     fn filter_of(paths: &[&str], langs: &[ProgrammingLanguage]) -> Option<SearchFilter> {
@@ -12568,18 +12042,8 @@ mod tests {
             ("tests/b.rs", "fn needle() {}"),
         ])
         .await;
-        add_symbols(
-            &pool,
-            "src/a.rs",
-            &[("needle", "function", "definition", 1, None)],
-        )
-        .await;
-        add_symbols(
-            &pool,
-            "tests/b.rs",
-            &[("needle", "call", "reference", 2, Some("t"))],
-        )
-        .await;
+        add_symbols(&pool, "src/a.rs", &[("needle", "function", 1, None)]).await;
+        add_symbols(&pool, "tests/b.rs", &[("needle", "function", 2, None)]).await;
         let s = router_state(pool);
         let sc = scope(filter_of(&["src/**"], &[]), None);
 
@@ -12598,27 +12062,10 @@ mod tests {
         assert_eq!(g.total, 1, "the scope and the pattern binds crossed over");
         assert_eq!(g.matches[0].path, "src/a.rs");
 
-        // callers: the name bind sits before the scope's, and one bind is rewritten
-        // by index afterwards.
-        let c = callers_core(
-            &s,
-            guid(),
-            "needle",
-            CallDirection::In,
-            &sc,
-            8,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("callers runs");
-        assert!(c.defined, "the name bind did not survive the scope append");
-        assert_eq!(c.out_of_scope_sites, 1);
-
-        // symbols: the role bind is rewritten by index per executed query, which is
-        // only valid while the scope's binds are numbered last.
+        // symbols: the name bind sits before the scope's, and the scope's binds are
+        // numbered from the end — so an off-by-one here shows up as the wrong rows.
         let req = SymbolsRequest {
             name: "needle".to_string(),
-            role: None,
             kind: None,
             anchor_path: None,
             limit: None,
@@ -12633,11 +12080,12 @@ mod tests {
             .expect("symbols runs");
         assert_eq!(
             sym.total_definitions, 1,
-            "the role bind and the scope binds crossed over"
+            "the name bind and the scope binds crossed over"
         );
         assert_eq!(
-            sym.total_references, 0,
-            "the reference lives outside the scope"
+            sym.out_of_scope_definitions, 1,
+            "the definition in tests/ is outside the scope and must be counted, \
+             not absorbed"
         );
     }
 

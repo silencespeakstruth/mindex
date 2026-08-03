@@ -21,9 +21,8 @@ use tracing::{debug, info, warn};
 use crate::backend::error::ApiError;
 use crate::backend::v0::handlers::{GREP_MIN_PATTERN_CHARS, research_title};
 use crate::backend::v0::models::{
-    CallDirection, CallersResponse, ChangeType, FileHistoryResponse, GrepResponse,
-    ListFilesResponse, OutlineResponse, ReadChunksResponse, SearchFilter, SearchRequest,
-    SearchResult, SymbolRoleFilter, SymbolsRequest, SymbolsResponse,
+    ChangeType, FileHistoryResponse, GrepResponse, ListFilesResponse, OutlineResponse,
+    ReadChunksResponse, SearchFilter, SearchRequest, SearchResult, SymbolsRequest, SymbolsResponse,
 };
 use crate::models::ollama::{
     ChatDelta, ChatMessage, ChatOutcome, OllamaError, OllamaModel, Sampling, ToolCall, ToolSpec,
@@ -45,7 +44,8 @@ use crate::models::ollama::{
 /// [`REPORT_ROLE`], [`report_system_prompt`], [`section_system_prompt`] or
 /// [`section_request`], either report turn's
 /// user message, the
-/// budget-exhausted nudges, [`format_prior_reports`], or [`tool_specs`] — anything
+/// budget-exhausted nudges, [`format_prior_reports`], or
+/// [`tool_specs`] — anything
 /// that changes what the model is asked or what it may call. The run-state note counts too, but only its
 /// wording ([`format_state_note`]'s labels): its *contents* are the run's own
 /// history and differ every run by design. Not a version of the *code*: refactors
@@ -101,8 +101,23 @@ use crate::models::ollama::{
 /// [`format_citation_complaint`] gained the bucket for a name that fits two shown
 /// files, and [`format_hearsay_complaint`] is new: a run whose tools returned
 /// nothing while it held prior reports is now sent back rather than allowed to pass
-/// their prose off as findings. MINOR: the job is unchanged.
-pub const PROMPT_VERSION: &str = "2.5";
+/// /// their prose off as findings. MINOR: the job is unchanged.
+///
+/// 2.5 → 2.6: the run opened with a **repo map** — the project's ranked
+/// structural vocabulary, pushed before the plan turn. Withdrawn at 2.7; see
+/// below.
+///
+/// 2.6 → 2.7: two withdrawals. The repo-map prelude is gone: measured at equal
+/// efforts it did not carry its 2000-tokens-per-turn, and the runs that had it
+/// searched *more* and navigated less, which is the opposite of what it was for.
+/// And `callers` is gone with the reference half of the symbol table — it was
+/// called twice in twenty-five runs at a fifty-percent miss rate, and the lexical
+/// edges under it are the ones that made the map's ranking indefensible. The
+/// prescribed pipeline in [`system_prompt`] loses the hop. MINOR: the job is
+/// unchanged; the run is told less and offered one tool fewer. **Not a revert to
+/// 2.5** — nine journalled runs carry 2.6, and a reused version would make them
+/// name a prompt that never existed.
+pub const PROMPT_VERSION: &str = "2.7";
 
 /// How many extra results a prefixed `search` fetches before filtering.
 ///
@@ -250,7 +265,7 @@ pub struct Budget {
     /// `[research].max_request_report_sections`.
     pub max_report_sections: usize,
     /// Multiplier on the per-call evidence widths (`read_chunks`, `grep`,
-    /// `callers`, `file_history`, `symbols`). Request-overridable, capped by
+    /// `file_history`, `symbols`). Request-overridable, capped by
     /// `[research].max_evidence_width`. Like `search_top_k`, not a budget axis —
     /// it rides along as per-run tool configuration.
     pub evidence_width: u64,
@@ -652,7 +667,7 @@ pub enum ResearchEvent {
 /// it records for citation provenance.
 ///
 /// `path:start-end` strings, the same grammar citations use, so one parser reads
-/// both. Bounded, because `callers` can return fifty rows and the frame must not
+/// both. Bounded, because a lookup can return many rows and the frame must not
 /// become the response: past [`MAX_STEP_SPANS`] the list is cut and `truncated`
 /// says so rather than the cut being silent.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -698,9 +713,6 @@ pub enum StepCall {
     Outline {
         path: String,
     },
-    Callers {
-        name: String,
-    },
     ListFiles {
         glob: String,
     },
@@ -737,7 +749,6 @@ impl StepCall {
             StepCall::Search { .. } => "search",
             StepCall::Symbols { .. } => "symbols",
             StepCall::Outline { .. } => "outline",
-            StepCall::Callers { .. } => "callers",
             StepCall::ListFiles { .. } => "list_files",
             StepCall::ReadChunks { .. } => "read_chunks",
             StepCall::Grep { .. } => "grep",
@@ -755,7 +766,6 @@ impl StepCall {
             StepCall::Search { query } => ("query", query),
             StepCall::Symbols { name } => ("name", name),
             StepCall::Outline { path } => ("path", path),
-            StepCall::Callers { name } => ("name", name),
             StepCall::ListFiles { glob } => ("glob", glob),
             StepCall::ReadChunks { path } => ("path", path),
             StepCall::Grep { pattern } => ("pattern", pattern),
@@ -956,17 +966,6 @@ pub trait ResearchTools: Send + Sync {
         token: &CancellationToken,
     ) -> Result<OutlineResponse, ApiError>;
 
-    /// The approximate call graph around one exact name, read off `parent_name`.
-    /// Lexical, so the edges are exact only up to name collision. Call sites outside
-    /// the scope are dropped and counted, not silently omitted.
-    async fn callers(
-        &self,
-        name: String,
-        direction: CallDirection,
-        scope: &ToolScope,
-        token: &CancellationToken,
-    ) -> Result<CallersResponse, ApiError>;
-
     /// Indexed paths matching a glob, within the run's scope.
     async fn list_files(
         &self,
@@ -1114,19 +1113,6 @@ impl ResearchTools for MeteredResearchTools {
         r
     }
 
-    async fn callers(
-        &self,
-        name: String,
-        direction: CallDirection,
-        scope: &ToolScope,
-        token: &CancellationToken,
-    ) -> Result<CallersResponse, ApiError> {
-        let t = Instant::now();
-        let r = self.inner.callers(name, direction, scope, token).await;
-        self.record("callers", t, &r);
-        r
-    }
-
     async fn list_files(
         &self,
         glob: String,
@@ -1238,7 +1224,7 @@ pub struct FileVersion {
 /// The set of files a run may see, enforced on **every** model-facing lookup.
 ///
 /// One struct rather than two loose `Option<SearchFilter>` parameters, and that is
-/// the point of it: before it existed, `symbols`, `outline`, `callers` and
+/// the point of it: before it existed, `symbols`, `outline` and
 /// `read_chunks` had nowhere to put a scope, so a run the caller had scoped to
 /// `docs/**` could still read any file in the project by naming it. The scope was
 /// enforced on retrieval (`search`) and enumeration (`list_files`) and nowhere else —
@@ -1359,6 +1345,13 @@ pub struct ResearchParams {
     /// the caller holds no information the server lacks — the number depends on the
     /// model, and the model is already the server's to look up.
     pub max_turn_thinking_chars: usize,
+    /// Abandon one turn once it has streamed this many seconds; `0` disables the
+    /// guard (`[research].max_turn_seconds`).
+    ///
+    /// The only per-turn guard that *stops* something. Not request-overridable, for
+    /// `max_turn_thinking_chars`' reason: nothing good lies on either side of the
+    /// default, and the caller holds no information the server lacks.
+    pub max_turn_seconds: u64,
     /// `Some` makes this run a **challenge**: the subject's report is injected as
     /// the thing under examination, the plan turn asks for its claims, and a
     /// verdict turn closes the report phase. Everything else — budgets, scope
@@ -1454,8 +1447,6 @@ enum Action {
     },
     Symbols {
         name: String,
-        #[serde(default)]
-        role: Option<SymbolRoleFilter>,
         /// Optional: the tags.scm syntax type (`function`, `method`, `class`, …).
         /// A free string, not an enum — the vocabulary is upstream query data and
         /// differs per language, so validating it here would reject labels that
@@ -1467,12 +1458,6 @@ enum Action {
     },
     Outline {
         path: String,
-    },
-    /// The approximate call graph, read off `parent_name` — see `callers_core`.
-    Callers {
-        name: String,
-        #[serde(default)]
-        direction: Option<CallDirection>,
     },
     // `rename_all = "lowercase"` would make this `listfiles`; the prompt (and
     // every model that has seen a JSON tool API) says `list_files`.
@@ -1557,21 +1542,17 @@ fn tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::function(
             "symbols",
-            "Where an EXACT identifier is defined and referenced, with kinds and \
-             enclosing scopes. Use it once you know a name.",
+            "Where an EXACT identifier is DEFINED, with its kind and enclosing scope. \
+             Use it once you know a name. It does not answer who uses the name — for \
+             that, grep the name: those matches are lexical and say so.",
             json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Exact, case-sensitive identifier." },
-                    "role": {
-                        "type": "string",
-                        "enum": ["definition", "reference"],
-                        "description": "Optional: restrict to definitions or references."
-                    },
                     "kind": {
                         "type": "string",
                         "description": "Optional: restrict to one syntax kind, e.g. \"function\", \
-                                        \"method\", \"class\", \"call\". Useful to separate a \
+                                        \"method\", \"class\". Useful to separate a \
                                         function from a type of the same name. The labels come \
                                         from tree-sitter and are NOT uniform across languages (a \
                                         Rust struct and enum both read \"class\"), so use it to \
@@ -1581,30 +1562,6 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "anchor_path": {
                         "type": "string",
                         "description": "Optional: rank candidates in this file first."
-                    }
-                },
-                "required": ["name"]
-            }),
-        ),
-        ToolSpec::function(
-            "callers",
-            "The call graph around an EXACT identifier: which definitions reference it \
-             (direction \"in\", the default), or what the definition of that name \
-             references (direction \"out\"). Answers \"who uses this\" and \"what does \
-             this depend on\" in one call, instead of reading every hit by hand. \
-             IMPORTANT: these edges are LEXICAL — they match the name only and are not \
-             resolved, so a common name like \"new\" or \"get\" mixes unrelated \
-             definitions and a renamed import is missed. Treat the result as candidates \
-             and confirm with read_chunks.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Exact, case-sensitive identifier." },
-                    "direction": {
-                        "type": "string",
-                        "enum": ["in", "out"],
-                        "description": "\"in\" (default): who references this name. \
-                                        \"out\": what the definition of this name references."
                     }
                 },
                 "required": ["name"]
@@ -1923,7 +1880,7 @@ fn system_prompt(budget: Budget, scope: &ToolScope, has_prior_research: bool) ->
 
 READ THIS — it decides whether you succeed. `search` matches *text*, and this project's code is written in identifiers while your questions are in plain English. A plain-English query tends to return the TEST that describes a behaviour, not the code that implements it. The identifier is what finds the implementation, so your first job is to LEARN THE REAL NAMES and only then search for them:
 
-  list_files → outline → (now you have exact names) → symbols / search / callers → read_chunks
+  list_files → outline → (now you have exact names) → symbols / search / grep → read_chunks
 
 That rule governs CODE. The index also contains this project's DOCUMENTATION — `*.md` files: `README.md`, `CLAUDE.md`, the per-tool READMEs — and there the rule inverts, because documentation is written in the same plain English you think in. Ask those questions in plain English, in the words you would use with a colleague. Documentation is where a project states what it does not say in code: why a design was chosen over the alternative, which steps a change must touch, what an invariant is for. When your question is "why", "what are all the places", or "what is the rule for", search the prose FIRST — it is often a single hit against many steps of reading code, and it will hand you the identifiers to search for next. `list_files` with glob `**/*.md` shows you what documentation exists.
 
@@ -1933,9 +1890,9 @@ When you take a claim from a commit, cite the CODE it is about — a `path:start
 
 This project also keeps STORED RESEARCH REPORTS — the reports earlier runs like this one produced. `list_research` shows the still-valid ones (seq, title, question) and `read_research(seq)` opens one. They are HEARSAY, exactly like any report injected below: the fastest way to learn the real names and what was already ruled out, and never citable — a `path:start-end` copied out of one will be reported as invented, so open the location yourself before citing it. Consulting them early can save most of a cold start. Your file scope does not cover them: they are reports, not files.
 
-`outline`, `list_files` and `callers` are metadata lookups — cheap, and they cost the same as any other step, so spending your first step or two on them pays for itself. When `symbols` or `outline` hands you a location, READ IT with `read_chunks` — do not search for its line numbers, that never works. If you know which directory the answer lives in, pass `path_prefix` to `search` rather than re-asking the same query and hoping.
+`outline` and `list_files` are metadata lookups — cheap, and they cost the same as any other step, so spending your first step or two on them pays for itself. When `symbols` or `outline` hands you a location, READ IT with `read_chunks` — do not search for its line numbers, that never works. If you know which directory the answer lives in, pass `path_prefix` to `search` rather than re-asking the same query and hoping.
 
-Once you have an exact name, `callers` answers "who uses this" and "what does this depend on" in ONE call, where searching would cost several and still miss the uses that spell the call differently. Reach for it when the question is about reach, blast radius or dependencies. Its edges are matched by NAME ALONE and are not resolved, so a short or common name will mix in unrelated code — check a site with `read_chunks` before you build an argument on it.
+When the question is about reach — who uses this, what would break — `grep` the exact identifier. Those matches are LEXICAL and nothing resolves them, so a short or common name will pull in unrelated code; read a hit with `read_chunks` before you build an argument on it. The index holds no resolved call graph and will not pretend to.
 
 HOW YOUR MEMORY WORKS, because it is not what you expect: your internal reasoning is NOT carried from one turn to the next. Only the tool results and the text you write alongside your calls come back to you. So write one short line with every call — what the last result established, and what this call tests. That line is the only note-to-self you will still have next turn, and without it you will re-derive the same plan from raw output over and over.
 
@@ -2659,7 +2616,6 @@ struct RunState {
     searches: Vec<String>,
     symbols: Vec<String>,
     outlines: Vec<String>,
-    callers: Vec<String>,
     globs: Vec<String>,
     greps: Vec<String>,
     reads: Vec<String>,
@@ -2883,13 +2839,6 @@ impl RunState {
             }),
             Action::Symbols { name, .. } => self.symbols.push(name.clone()),
             Action::Outline { path } => self.outlines.push(path.clone()),
-            Action::Callers { name, direction } => self.callers.push(format!(
-                "{name} ({})",
-                match direction.unwrap_or(CallDirection::In) {
-                    CallDirection::In => "who references it",
-                    CallDirection::Out => "what it references",
-                }
-            )),
             Action::ListFiles { glob } => self.globs.push(glob.clone()),
             Action::ReadChunks {
                 path,
@@ -2979,7 +2928,7 @@ fn tally_tool_use(tools: &mut RunTools, action: &Action, reply: &str, hits: usiz
         }
         _ => {}
     }
-    if let Action::Symbols { .. } | Action::Callers { .. } | Action::Grep { .. } = action {
+    if let Action::Symbols { .. } | Action::Grep { .. } = action {
         tools.out_of_scope_rows += hidden_row_count(reply);
     }
 }
@@ -3148,12 +3097,6 @@ fn format_state_note(
     );
     state_note_line(
         &mut out,
-        "Call graphs already asked for",
-        &state.callers,
-        STATE_NOTE_MAX_ITEMS,
-    );
-    state_note_line(
-        &mut out,
         "Globs already listed",
         &state.globs,
         STATE_NOTE_MAX_ITEMS,
@@ -3244,8 +3187,8 @@ fn format_search_results(query: &str, results: &[SearchResult]) -> String {
 }
 
 fn format_symbols_response(name: &str, resp: &SymbolsResponse, scope: &ToolScope) -> String {
-    let hidden = resp.out_of_scope_definitions + resp.out_of_scope_references;
-    if resp.total_definitions == 0 && resp.total_references == 0 {
+    let hidden = resp.out_of_scope_definitions;
+    if resp.total_definitions == 0 {
         // "Not here" and "not anywhere" are different answers, and `/symbols` calls
         // the second one definitive — so a scope that hid every occurrence must say
         // so, or the model concludes the name does not exist.
@@ -3261,9 +3204,8 @@ fn format_symbols_response(name: &str, resp: &SymbolsResponse, scope: &ToolScope
         };
     }
     let mut out = format!(
-        "Symbol \"{name}\": {} definition(s), {} reference(s).{}\n",
+        "Symbol \"{name}\": {} definition(s).{}\n",
         resp.total_definitions,
-        resp.total_references,
         if hidden > 0 {
             format!(" ({hidden} more are outside this run's scope.)")
         } else {
@@ -3278,18 +3220,6 @@ fn format_symbols_response(name: &str, resp: &SymbolsResponse, scope: &ToolScope
             d.start_line,
             d.end_line,
             d.parent_name
-                .as_deref()
-                .map(|p| format!(" (in {p})"))
-                .unwrap_or_default()
-        ));
-    }
-    for r in &resp.references {
-        out.push_str(&format!(
-            "ref  {} {}:{}{}\n",
-            r.kind,
-            r.path,
-            r.start_line,
-            r.parent_name
                 .as_deref()
                 .map(|p| format!(" (in {p})"))
                 .unwrap_or_default()
@@ -4785,92 +4715,6 @@ fn format_outline(resp: &OutlineResponse, scope: &ToolScope) -> String {
     out
 }
 
-/// Render a call-graph lookup, keeping the two ways it can come back empty apart.
-///
-/// "Nothing calls this" and "no such identifier" are different findings and the
-/// model acts differently on them — the first invites reading the definition, the
-/// second means the name was guessed wrong. Collapsing them into one empty list
-/// tells the model its name was right, which is the failure `outline`'s `indexed`
-/// flag already guards against.
-///
-/// The lexical caveat is repeated here, not only in the tool description: by the
-/// time this text is read the description is thousands of tokens back, and a list
-/// of file:line pairs reads as resolved unless it says otherwise.
-fn format_callers(resp: &CallersResponse, scope: &ToolScope) -> String {
-    let (subject, relation) = match resp.direction {
-        CallDirection::In => ("references to", "referenced in"),
-        CallDirection::Out => ("references made by", "referenced by"),
-    };
-    if resp.sites.is_empty() {
-        if resp.out_of_scope_sites > 0 {
-            return format!(
-                "No {subject} \"{}\" within this run's scope ({}), though {} site(s) \
-                 exist outside it. The scope is fixed by whoever started this run and \
-                 cannot be widened.",
-                resp.name,
-                scope.describe(),
-                resp.out_of_scope_sites
-            );
-        }
-        return if resp.defined {
-            format!(
-                "\"{}\" is defined in this project, but there are no {subject} it \
-                 anywhere in the index. Read its definition (symbols, then \
-                 read_chunks) rather than looking for callers.",
-                resp.name
-            )
-        } else {
-            format!(
-                "No symbol named \"{}\" is defined or referenced anywhere in the \
-                 index — the name is probably wrong. Use outline on a likely file, \
-                 or search, to find the real one.",
-                resp.name
-            )
-        };
-    }
-    let mut out = format!(
-        "{} {} \u{2014} {} occurrence(s) across {} site(s){}. These edges are \
-         LEXICAL: they match the name only, so a common name mixes unrelated \
-         definitions and an aliased import is missed entirely. Confirm with \
-         read_chunks before relying on one.\n",
-        resp.total_references,
-        subject,
-        resp.total_references,
-        resp.total_sites,
-        if resp.sites.len() as u64 == resp.total_sites {
-            String::new()
-        } else {
-            format!(", showing the first {}", resp.sites.len())
-        }
-    );
-    if resp.out_of_scope_sites > 0 {
-        out.push_str(&format!(
-            "A further {} site(s) are outside this run's scope and are not listed.\n",
-            resp.out_of_scope_sites
-        ));
-    }
-    for site in &resp.sites {
-        out.push_str(&format!(
-            "{} :{}{}{}\n",
-            site.path,
-            site.first_line,
-            match (&site.symbol, &site.kind) {
-                // A reference with no enclosing definition: file scope, an import,
-                // a top-level call. Named as such rather than dropped.
-                (None, _) => format!(" ({relation} at top level)"),
-                (Some(sym), None) => format!(" ({relation} {sym})"),
-                (Some(sym), Some(kind)) => format!(" ({relation} {kind} {sym})"),
-            },
-            if site.occurrences > 1 {
-                format!(" \u{d7}{}", site.occurrences)
-            } else {
-                String::new()
-            }
-        ));
-    }
-    out
-}
-
 /// Render a chunk read, naming the lines that have **no** chunk.
 ///
 /// The gap report is the point. Chunk coverage is sparse by construction, so a
@@ -5038,7 +4882,7 @@ fn context_ceiling(tally: &TokenTally, fraction: f64) -> Option<u64> {
 /// erring low means shedding a little early and erring high means not shedding when
 /// it was needed. Log the estimate against the turn's real `prompt_tokens` before
 /// trusting it; do not tune it from intuition, which has already lost twice here.
-const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+pub(crate) const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Size an assembled transcript without asking Ollama.
 ///
@@ -5249,13 +5093,11 @@ async fn execute(
         }
         Action::Symbols {
             name,
-            role,
             kind,
             anchor_path,
         } => {
             let req = SymbolsRequest {
                 name: name.clone(),
-                role: *role,
                 kind: kind.clone(),
                 anchor_path: anchor_path.clone(),
                 limit: Some(
@@ -5268,13 +5110,11 @@ async fn execute(
                 .symbols(req, token)
                 .await
                 .map_err(ResearchAbort::from)?;
-            let hits = (resp.total_definitions + resp.total_references) as usize;
+            let hits = resp.total_definitions as usize;
             let text = format_symbols_response(name, &resp, &params.scope);
-            // Both roles: a reference is as much "shown to you" as a definition.
             let shown = resp
                 .definitions
                 .iter()
-                .chain(resp.references.iter())
                 .map(|s| {
                     (
                         s.path.clone(),
@@ -5316,38 +5156,6 @@ async fn execute(
             }
             Ok(Executed {
                 call: StepCall::Outline { path: path.clone() },
-                hits,
-                text,
-                shown,
-            })
-        }
-        Action::Callers { name, direction } => {
-            let direction = direction.unwrap_or(CallDirection::In);
-            let resp = tools
-                .callers(name.clone(), direction, &params.scope, token)
-                .await
-                .map_err(ResearchAbort::from)?;
-            let hits = resp.sites.len();
-            let text = format_callers(&resp, &params.scope);
-            // Each site is a real location the model was shown, so a citation to
-            // it must verify. The span is a point: grouping collapses a pair's
-            // occurrences to the first line, and claiming a range would assert
-            // extent the query never measured.
-            let shown = resp
-                .sites
-                .iter()
-                .map(|s| {
-                    (
-                        s.path.clone(),
-                        Some(Span {
-                            start: s.first_line,
-                            end: s.first_line,
-                        }),
-                    )
-                })
-                .collect();
-            Ok(Executed {
-                call: StepCall::Callers { name: name.clone() },
                 hits,
                 text,
                 shown,
@@ -6293,7 +6101,7 @@ async fn research_inner(
                         &mut messages,
                         format!(
                             "No such tool, or wrong arguments: \"{asked}\". Available: search, \
-                         grep, symbols, outline, callers, list_files, read_chunks, \
+                         grep, symbols, outline, list_files, read_chunks, \
                          file_history, list_research, read_research, note, \
                          revise_plan, finalize."
                         ),
@@ -6326,16 +6134,12 @@ async fn research_inner(
                     }
                     Action::Symbols {
                         name,
-                        role,
                         kind,
                         anchor_path,
                     } => {
-                        format!("symbols\u{0}{name}\u{0}{role:?}\u{0}{kind:?}\u{0}{anchor_path:?}")
+                        format!("symbols\u{0}{name}\u{0}{kind:?}\u{0}{anchor_path:?}")
                     }
                     Action::Outline { path } => format!("outline\u{0}{}", path.trim()),
-                    Action::Callers { name, direction } => {
-                        format!("callers\u{0}{}\u{0}{direction:?}", name.trim())
-                    }
                     Action::ListFiles { glob } => format!("list_files\u{0}{}", glob.trim()),
                     Action::FileHistory { path } => {
                         format!("file_history\u{0}{}", path.trim())
@@ -8554,6 +8358,25 @@ async fn chat_turn(
     let thinking_limit = params.max_turn_thinking_chars;
     let mut thinking_chars = 0usize;
     let mut runaway = false;
+    // **The stall guard.** One turn must not be able to spend a whole run.
+    //
+    // Every other bound here misses the shape that actually happens: `turn_timeout_ms`
+    // is a dead-socket guard and is deliberately set *above* every budget;
+    // `first_token_timeout_ms` is spent by the first delta and cannot see a turn that
+    // starts fine and then dribbles; the runaway-thinking guard counts characters, and
+    // a stalled turn produces few. Measured on this host twice — 985 s at ~1.5 tok/s,
+    // and 912 s producing 702 tokens — a single plan turn consumed the entire
+    // wall-clock budget and the run ended with **zero steps**. Nothing stopped it,
+    // because nothing was watching this clock.
+    //
+    // Checked in the delta callback rather than on a timer: a turn that is stalling
+    // still emits deltas (702 tokens over 900 s is one every 1.3 s), and a turn
+    // emitting nothing at all is `first_token_timeout_ms`'s job. Abandonment is the
+    // runaway guard's mechanism exactly — cancel this turn's own token, convert to an
+    // empty `ChatOutcome`, let the loop carry on with the budget that is left.
+    let stall_limit = params.max_turn_seconds;
+    let turn_started = std::time::Instant::now();
+    let mut stalled = false;
     // Content-gate state for the report turn. A reply whose first non-whitespace
     // character is `{` is almost certainly one more tool call, so it is buffered
     // instead of streamed: nothing reaches the client until the shape is known,
@@ -8568,6 +8391,13 @@ async fn chat_turn(
             tools,
             opts.sampling,
             &mut |delta| {
+                // Before the per-channel handling, because a stall is about the turn
+                // rather than about what the turn is saying — and because the cheapest
+                // place to notice it is the moment a delta arrives.
+                if stall_limit > 0 && !stalled && turn_started.elapsed().as_secs() >= stall_limit {
+                    stalled = true;
+                    turn_token.cancel();
+                }
                 let event = match delta {
                     ChatDelta::Thinking(text) => {
                         // Counted before it is forwarded: the client sees every delta
@@ -8623,6 +8453,33 @@ async fn chat_turn(
         // Our own cancellation, not the caller's — the parent token decides which,
         // and it is tested first because a deadline or a disconnect cancels the whole
         // tree and must keep meaning what it means.
+        // Tested before the runaway arm only because both can be true and this is the
+        // more specific diagnosis; either way the recovery is identical.
+        Err(_) if stalled && !token.is_cancelled() => {
+            warn!(
+                elapsed_s = turn_started.elapsed().as_secs(),
+                limit_s = stall_limit,
+                model = %params.model,
+                "Abandoning a turn that would have spent the whole run: it passed the \
+                 per-turn ceiling while still streaming. This is what a shared device \
+                 looks like from in here — the model is generating, just far too slowly \
+                 to finish anything. The run continues with the budget that is left, \
+                 rather than ending with zero steps. Sysadmin: check what else is using \
+                 the GPU; see mindex_research_turn_unaccounted_seconds. Hint: if this \
+                 fires on healthy turns, raise [research].max_turn_seconds."
+            );
+            if let Some(m) = &params.metrics {
+                m.research.stalled_turns.inc();
+            }
+            ChatOutcome {
+                content: String::new(),
+                tool_calls: Vec::new(),
+                prompt_tokens: None,
+                eval_tokens: None,
+                num_ctx: 0,
+                ..Default::default()
+            }
+        }
         Err(_) if runaway && !token.is_cancelled() => {
             warn!(
                 thinking_chars,
@@ -10028,37 +9885,8 @@ mod tests {
                     parent_kind: None,
                     doc: None,
                 }],
-                references: vec![],
                 total_definitions: 1,
-                total_references: 0,
                 out_of_scope_definitions: 0,
-                out_of_scope_references: 0,
-            })
-        }
-
-        async fn callers(
-            &self,
-            name: String,
-            direction: CallDirection,
-            _scope: &ToolScope,
-            _token: &CancellationToken,
-        ) -> Result<CallersResponse, ApiError> {
-            // A path `stable_versions` knows, so a citation to it can verify and
-            // the freshness probe has something to say about it.
-            Ok(CallersResponse {
-                name,
-                direction,
-                defined: true,
-                sites: vec![crate::backend::v0::models::CallSite {
-                    path: "src/worker/gc.rs".into(),
-                    symbol: Some("sweep".into()),
-                    kind: Some("function".into()),
-                    first_line: 12,
-                    occurrences: 2,
-                }],
-                total_sites: 1,
-                total_references: 2,
-                out_of_scope_sites: 0,
             })
         }
 
@@ -10318,6 +10146,9 @@ mod tests {
             // delta every turn, and a guard armed by default would be a tripwire on
             // every one of these runs rather than a thing under test.
             max_turn_thinking_chars: 0,
+            // Off unless a test is about the stall guard: the fakes answer instantly,
+            // so a wall-clock ceiling could only ever be a tripwire here.
+            max_turn_seconds: 0,
             prior_reports: Vec::new(),
             max_context_chars: 24_000,
             metrics: None,
@@ -10657,7 +10488,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "callers",
                 "file_history",
                 "finalize",
                 "grep",
@@ -10677,7 +10507,6 @@ mod tests {
                 "search" => json!({"query": "x"}),
                 "symbols" => json!({"name": "x"}),
                 "outline" => json!({"path": "x"}),
-                "callers" => json!({"name": "x"}),
                 "list_files" => json!({"glob": "x"}),
                 "read_chunks" => json!({"path": "x", "start_line": 1, "end_line": 2}),
                 "grep" => json!({"pattern": "xyz"}),
@@ -11403,6 +11232,116 @@ mod tests {
         async fn list_models(&self) -> Result<Vec<String>, OllamaError> {
             unreachable!("the research loop does not list models")
         }
+    }
+
+    /// A model that generates, just far too slowly to finish — the shape a shared
+    /// GPU produces, and the one every other per-turn bound misses. It emits real
+    /// deltas with real time between them, so only a wall clock can see it.
+    struct StallingModel {
+        calls: Mutex<usize>,
+        deltas: usize,
+        gap_ms: u64,
+        reply: &'static str,
+    }
+
+    #[async_trait]
+    impl OllamaModel for StallingModel {
+        async fn chat_stream(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolSpec],
+            _sampling: Sampling,
+            on_delta: &mut (dyn FnMut(ChatDelta) + Send),
+            token: &CancellationToken,
+        ) -> Result<ChatOutcome, OllamaError> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if n == 1 {
+                for _ in 0..self.deltas {
+                    // Content, not thinking: the runaway-thinking guard must not be
+                    // what catches this, or the test proves the wrong mechanism.
+                    on_delta(ChatDelta::Content("tok ".to_string()));
+                    if token.is_cancelled() {
+                        return Err(OllamaError::Cancelled);
+                    }
+                    tokio::time::sleep(Duration::from_millis(self.gap_ms)).await;
+                }
+            }
+            on_delta(ChatDelta::Content(self.reply.to_string()));
+            Ok(ChatOutcome {
+                content: self.reply.to_string(),
+                tool_calls: Vec::new(),
+                prompt_tokens: Some(10),
+                eval_tokens: Some(2),
+                num_ctx: 8192,
+                ..Default::default()
+            })
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, OllamaError> {
+            unreachable!("the research loop does not list models")
+        }
+    }
+
+    /// **The guard that stops a run being eaten by one turn.**
+    ///
+    /// Measured twice on this host: a single plan turn spent the whole wall-clock
+    /// budget (985 s at ~1.5 tok/s; then 912 s for 702 tokens) and the run ended with
+    /// **zero steps**. Nothing caught it — `turn_timeout_ms` sits above every budget
+    /// by design, `first_token_timeout_ms` was spent by the first delta, and the
+    /// thinking guard counts characters a stalled turn does not produce. Real
+    /// `Instant`s in small increments, because `tokio::test(start_paused)` does not
+    /// move them — the same reason the budget tests use them.
+    #[tokio::test]
+    async fn a_turn_that_streams_past_the_ceiling_is_abandoned_and_the_run_survives() {
+        let ollama = Arc::new(StallingModel {
+            calls: Mutex::new(0),
+            deltas: 40,
+            gap_ms: 120,
+            reply: "# Report\n\nDone.",
+        });
+        let mut p = params(8);
+        p.max_turn_seconds = 1;
+        let started = std::time::Instant::now();
+        let events = run_model(ollama, p).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the turn ran to the fake's own end ({:?}) instead of being abandoned at \
+             the ceiling; a stalled turn can still spend a whole run",
+            started.elapsed()
+        );
+        assert_eq!(
+            done_reason(&events),
+            Some(DoneReason::Finalized),
+            "abandoning the turn must cost the turn, not the run: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ResearchEvent::Summary { .. })),
+            "and the run must still report: {events:?}"
+        );
+    }
+
+    /// `0` is the explicit off switch, and off must mean the turn is left alone —
+    /// the escape hatch for a deployment whose turns really are that long.
+    #[tokio::test]
+    async fn a_zero_turn_ceiling_leaves_the_turn_alone() {
+        let ollama = Arc::new(StallingModel {
+            calls: Mutex::new(0),
+            deltas: 6,
+            gap_ms: 60,
+            reply: "# Report\n\nDone.",
+        });
+        let mut p = params(8);
+        p.max_turn_seconds = 0;
+        let events = run_model(ollama, p).await;
+        assert_eq!(done_reason(&events), Some(DoneReason::Finalized));
     }
 
     fn thinking_chars(events: &[ResearchEvent]) -> usize {
@@ -12964,11 +12903,8 @@ mod tests {
             "collect",
             &SymbolsResponse {
                 definitions: vec![],
-                references: vec![],
                 total_definitions: 0,
-                total_references: 0,
-                out_of_scope_definitions: 1,
-                out_of_scope_references: 3,
+                out_of_scope_definitions: 4,
             },
             &scope,
         );
@@ -13309,7 +13245,6 @@ mod tests {
             (StepCall::Search { query: "x".into() }, "query"),
             (StepCall::Symbols { name: "x".into() }, "name"),
             (StepCall::Outline { path: "x".into() }, "path"),
-            (StepCall::Callers { name: "x".into() }, "name"),
             (StepCall::ListFiles { glob: "x".into() }, "glob"),
             (StepCall::ReadChunks { path: "x".into() }, "path"),
             (StepCall::ListResearch { query: "x".into() }, "query"),
@@ -13329,64 +13264,6 @@ mod tests {
                 "{action} must carry its argument as {key}: {d}"
             );
         }
-    }
-
-    /// An empty `callers` result has two meanings and the model acts differently
-    /// on each: "defined, nobody calls it" invites reading the definition, "no such
-    /// name" means the identifier was guessed wrong. One shared empty list would
-    /// tell the model its name was right — the failure `outline`'s `indexed` flag
-    /// exists to prevent.
-    #[test]
-    fn an_empty_call_graph_says_which_kind_of_empty_it_is() {
-        let empty = |defined| CallersResponse {
-            name: "collect".into(),
-            direction: CallDirection::In,
-            defined,
-            sites: vec![],
-            total_sites: 0,
-            total_references: 0,
-            out_of_scope_sites: 0,
-        };
-
-        let unreferenced = format_callers(&empty(true), &ToolScope::default());
-        assert!(
-            unreferenced.contains("is defined in this project"),
-            "a defined but unreferenced name must say so: {unreferenced}"
-        );
-
-        let unknown = format_callers(&empty(false), &ToolScope::default());
-        assert!(
-            unknown.contains("probably wrong"),
-            "an unknown name must be called out as a wrong guess: {unknown}"
-        );
-    }
-
-    /// The lexical caveat rides on the *result*, not only on the tool description:
-    /// by the time this is read the description is thousands of tokens back, and a
-    /// list of file:line pairs reads as resolved unless it says otherwise.
-    #[test]
-    fn a_call_graph_result_repeats_that_its_edges_are_lexical() {
-        let text = format_callers(
-            &CallersResponse {
-                name: "collect".into(),
-                direction: CallDirection::In,
-                defined: true,
-                sites: vec![crate::backend::v0::models::CallSite {
-                    path: "src/worker/gc.rs".into(),
-                    symbol: Some("sweep".into()),
-                    kind: Some("function".into()),
-                    first_line: 12,
-                    occurrences: 2,
-                }],
-                total_sites: 1,
-                total_references: 2,
-                out_of_scope_sites: 0,
-            },
-            &ToolScope::default(),
-        );
-        assert!(text.contains("LEXICAL"), "{text}");
-        assert!(text.contains("src/worker/gc.rs :12"), "{text}");
-        assert!(text.contains("sweep"), "{text}");
     }
 
     // ── near-duplicate rejection ────────────────────────────────────────────
@@ -14374,7 +14251,7 @@ mod tests {
         assert_eq!(d["spans_truncated"], json!(false));
     }
 
-    /// `callers` can return fifty rows; the frame must not become the response. A
+    /// A lookup can return many rows; the frame must not become the response. A
     /// cut is fine, a *silent* cut is not.
     #[test]
     fn a_step_that_shows_too_much_says_it_was_cut() {
@@ -14391,7 +14268,7 @@ mod tests {
             .collect();
         let d = ResearchEvent::Step {
             n: 1,
-            call: StepCall::Callers { name: "x".into() },
+            call: StepCall::Symbols { name: "x".into() },
             hits: shown.len(),
             shown: StepShown::new(&shown),
         }

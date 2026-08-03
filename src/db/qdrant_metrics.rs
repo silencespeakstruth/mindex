@@ -114,6 +114,13 @@ impl VectorStore for MeteredVectorStore {
         r
     }
 
+    async fn list_collections(&self) -> Result<Option<Vec<String>>, VectorStoreError> {
+        let t = Instant::now();
+        let r = self.inner.list_collections().await;
+        self.record("list_collections", t, &r);
+        r
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors the trait method, whose inputs are the irreducible parts \
@@ -237,6 +244,9 @@ mod tests {
         async fn count_points(&self, _: &str) -> Result<Option<u64>, VectorStoreError> {
             Ok(Some(7))
         }
+        async fn list_collections(&self) -> Result<Option<Vec<String>>, VectorStoreError> {
+            Ok(Some(vec!["a_v1".into(), "a_v2".into()]))
+        }
         async fn search(
             &self,
             _: &str,
@@ -251,13 +261,15 @@ mod tests {
         }
     }
 
-    /// `count_points` is the one trait method with a **provided default**, and the
-    /// default declines (`Ok(None)`) so the seven test fakes need no change. That
-    /// makes forgetting the override here uniquely dangerous: production always
-    /// wraps the real store in this decorator, so a missing forward would answer
-    /// `None` for every project, `probe_vector_counts` would publish nothing, and
-    /// the only detector for a lost Qdrant volume would be silently switched off —
-    /// no error, no empty family to notice, just a panel that never has data.
+    /// `count_points` and `list_collections` are the trait's two methods with a
+    /// **provided default**, and both defaults decline (`Ok(None)`) so the test fakes
+    /// need no change. That makes forgetting an override here uniquely dangerous:
+    /// production always wraps the real store in this decorator, so a missing forward
+    /// would answer `None` for every project — `probe_vector_counts` would publish
+    /// nothing and `warn_stale` would report that it cannot enumerate collections, so
+    /// the only two detectors for a lost Qdrant volume or a stale
+    /// `COLLECTION_SCHEMA_VERSION` would be silently switched off. No error, no empty
+    /// family to notice, just a panel that never has data.
     #[tokio::test]
     async fn the_decorator_forwards_the_count_rather_than_taking_the_declining_default() {
         let metrics = Arc::new(Metrics::new());
@@ -269,17 +281,29 @@ mod tests {
             "the decorator swallowed the count and answered the trait's declining \
              default; the vector-count probe is dead in every real deployment"
         );
+        assert_eq!(
+            store
+                .list_collections()
+                .await
+                .expect("the fake answers")
+                .as_deref(),
+            Some(&["a_v1".to_string(), "a_v2".to_string()][..]),
+            "the decorator swallowed the listing and answered the trait's declining \
+             default; the stale-collection check is blind in every real deployment"
+        );
+        let text = metrics.render().expect("renders");
         assert!(
-            metrics
-                .render()
-                .expect("renders")
-                .contains(r#"mindex_qdrant_ops_total{op="count_points",outcome="ok"} 1"#),
+            text.contains(r#"mindex_qdrant_ops_total{op="count_points",outcome="ok"} 1"#),
+            "the forwarded call was not measured"
+        );
+        assert!(
+            text.contains(r#"mindex_qdrant_ops_total{op="list_collections",outcome="ok"} 1"#),
             "the forwarded call was not measured"
         );
     }
 
     /// The decorator exists so no caller can be missed, which only holds while every
-    /// method is wrapped. This walks all seven and checks each left its own `op`
+    /// method is wrapped. This walks all eight and checks each left its own `op`
     /// label — a method added to the trait and forwarded without instrumentation
     /// makes that op invisible to the dashboard while looking perfectly healthy.
     #[tokio::test]
@@ -293,6 +317,7 @@ mod tests {
         store.delete_collection("c").await.expect("ok");
         store.health().await.expect("ok");
         store.count_points("c").await.expect("ok");
+        store.list_collections().await.expect("ok");
         store
             .search("c", vec![], vec![], vec![], vec![], vec![], 5)
             .await
@@ -306,6 +331,7 @@ mod tests {
             "delete_collection",
             "health",
             "count_points",
+            "list_collections",
             "search",
         ] {
             assert!(

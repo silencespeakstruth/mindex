@@ -21,7 +21,7 @@ use crate::backend::v0::models::ProgrammingLanguage;
 /// [`CHUNKS_DERIVATION_VERSION`](crate::slicing::traits::CHUNKS_DERIVATION_VERSION).
 ///
 /// Not configurable: it describes what the code *is*, not how it is tuned.
-pub const SYMBOLS_DERIVATION_VERSION: &str = "1.0";
+pub const SYMBOLS_DERIVATION_VERSION: &str = "1.1";
 
 /// Upstream tags/locals queries for a language, or `None` when the grammar crate
 /// ships none. The per-language part is *data* maintained upstream (like the
@@ -77,7 +77,7 @@ fn queries_for(pl: ProgrammingLanguage) -> Option<(String, String)> {
         // No upstream tags.scm in these grammar crates: no symbols for now. The
         // three data formats (json, toml, yaml) ship only a highlights query, and
         // whether a key is a "definition" at all is a separate decision from
-        // vendoring one — `outline` and `callers` mean something specific.
+        // vendoring one — `outline` and `/symbols` mean something specific.
         ProgrammingLanguage::Bash
         | ProgrammingLanguage::Html
         | ProgrammingLanguage::Css
@@ -99,32 +99,27 @@ pub enum SymbolError {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolRole {
-    Definition,
-    Reference,
-}
-
-impl SymbolRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SymbolRole::Definition => "definition",
-            SymbolRole::Reference => "reference",
-        }
-    }
-}
-
-/// One tagged occurrence of a name: a definition (function/class/…) or a
-/// reference (call site, implemented interface, …). Spans cover the whole tagged
-/// node (a definition's span is its entire body), 1-indexed lines and byte
-/// columns with an exclusive end — the same coordinate conventions as
-/// `SlicedChunk`.
+/// One **definition** of a name (function/class/…). Spans cover the whole tagged
+/// node — a definition's span is its entire body — with 1-indexed lines and byte
+/// columns and an exclusive end, the same coordinate conventions as `SlicedChunk`.
+///
+/// **References are deliberately not extracted.** The tags query emits them, and
+/// they were stored until they were measured: 23 810 reference rows against 3 397
+/// definitions, 87.5% of the table, serving one tool (`callers`) that ran twice in
+/// twenty-five recorded runs at a 50% miss rate. The edges are lexical — a
+/// reference row records a token in call position, not which definition it binds
+/// to — so on this repo the top referenced names were `assert_eq` (1084), `clone`,
+/// `Ok`, `unwrap`, `map`, several of which have exactly one definition in the tree.
+/// Nothing aggregates usefully over that, which is why the repo map ranked by it
+/// and was withdrawn. Separating a real core abstraction from a name shared with a
+/// language builtin needs resolution, i.e. the LSP/SCIP wall this project has
+/// declined to climb; `grep` answers "who uses this name" honestly and lexically in
+/// the meantime.
 #[derive(Debug)]
 pub struct ExtractedSymbol {
     pub name: String,
     /// The tags.scm syntax type: `function`, `method`, `class`, `call`, ….
     pub kind: String,
-    pub role: SymbolRole,
     pub start_line: usize,
     pub end_line: usize,
     pub start_column: usize,
@@ -176,7 +171,6 @@ impl SymbolExtractor {
             end_byte: usize,
             name: String,
             kind: String,
-            role: SymbolRole,
             doc: Option<String>,
         }
 
@@ -186,6 +180,13 @@ impl SymbolExtractor {
                 return Err(SymbolError::Cancelled);
             }
             let tag = tag?;
+            // Definitions only — see `ExtractedSymbol`. Dropped here rather than
+            // after the parent sweep so references never enter the containment
+            // stack: a nested definition's parent must be the definition around it,
+            // never a call that happens to span it.
+            if !tag.is_definition {
+                continue;
+            }
             // A name that isn't valid UTF-8 can't be stored or queried; skip the tag.
             let Ok(name) = std::str::from_utf8(&source[tag.name_range.clone()]) else {
                 continue;
@@ -198,11 +199,6 @@ impl SymbolExtractor {
                 end_byte: tag.range.end,
                 name: name.to_string(),
                 kind: self.config.syntax_type_name(tag.syntax_type_id).to_string(),
-                role: if tag.is_definition {
-                    SymbolRole::Definition
-                } else {
-                    SymbolRole::Reference
-                },
                 doc: tag.docs,
             });
         }
@@ -228,9 +224,7 @@ impl SymbolExtractor {
                 open_defs.pop();
             }
             parents[i] = open_defs.last().copied();
-            if raw[i].role == SymbolRole::Definition {
-                open_defs.push(i);
-            }
+            open_defs.push(i);
         }
 
         // ── byte offsets → 1-indexed lines + in-line byte columns ──
@@ -255,7 +249,6 @@ impl SymbolExtractor {
                 ExtractedSymbol {
                     name: t.name.clone(),
                     kind: t.kind.clone(),
-                    role: t.role,
                     start_line,
                     end_line,
                     start_column,
@@ -270,13 +263,6 @@ impl SymbolExtractor {
         Ok(out)
     }
 }
-
-/// Cross-language guard for the parent-assignment property `callers` depends on.
-/// Own file because its table grows with the language set, and `tests` below is
-/// already long.
-#[cfg(test)]
-#[path = "symbols_cross_language_tests.rs"]
-mod cross_language_tests;
 
 #[cfg(test)]
 mod tests {
@@ -295,25 +281,19 @@ mod tests {
             .unwrap()
     }
 
-    fn has(symbols: &[ExtractedSymbol], name: &str, kind: &str, role: SymbolRole) -> bool {
-        symbols
-            .iter()
-            .any(|s| s.name == name && s.kind == kind && s.role == role)
+    fn has(symbols: &[ExtractedSymbol], name: &str, kind: &str) -> bool {
+        symbols.iter().any(|s| s.name == name && s.kind == kind)
     }
 
-    pub(super) fn find<'a>(
-        symbols: &'a [ExtractedSymbol],
-        name: &str,
-        role: SymbolRole,
-    ) -> &'a ExtractedSymbol {
+    fn find<'a>(symbols: &'a [ExtractedSymbol], name: &str) -> &'a ExtractedSymbol {
         symbols
             .iter()
-            .find(|s| s.name == name && s.role == role)
-            .unwrap_or_else(|| panic!("symbol {name} ({role:?}) not found"))
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("definition {name} not found"))
     }
 
     #[test]
-    fn rust_defs_refs_and_parent() {
+    fn rust_defs_and_parent() {
         let code = "pub fn greet() {\n    helper();\n}\n\
                     pub struct Config;\n\
                     impl Config {\n    pub fn load() { greet(); }\n}\n";
@@ -322,25 +302,22 @@ mod tests {
             Language::new(tree_sitter_rust::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "greet", "function", SymbolRole::Definition));
-        assert!(has(&symbols, "Config", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "load", "method", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
-        assert!(has(&symbols, "greet", "call", SymbolRole::Reference));
+        assert!(has(&symbols, "greet", "function"));
+        assert!(has(&symbols, "Config", "class"));
+        assert!(has(&symbols, "load", "method"));
 
-        let greet = find(&symbols, "greet", SymbolRole::Definition);
+        let greet = find(&symbols, "greet");
         assert_eq!(greet.start_line, 1);
         assert_eq!(greet.end_line, 3);
 
-        // The call to helper() is nested inside fn greet.
-        let helper = find(&symbols, "helper", SymbolRole::Reference);
-        assert_eq!(helper.parent_name.as_deref(), Some("greet"));
-        assert_eq!(helper.parent_kind.as_deref(), Some("function"));
-
-        // The impl block is tagged as a *reference* (reference.implementation), so
-        // it is not a parent candidate; the call inside fn load nests under load.
-        let call = find(&symbols, "greet", SymbolRole::Reference);
-        assert_eq!(call.parent_name.as_deref(), Some("load"));
+        // Rust's `impl` block is tagged as a *reference* (reference.implementation),
+        // so it is not extracted and cannot be a parent — and `pub struct Config;`
+        // spans only its own line, so it does not contain `load` either. A Rust
+        // method therefore has NO enclosing definition here. That was already true
+        // before references were dropped (a reference was never a parent candidate),
+        // so this is a property of the upstream tags query, not of the trim.
+        let load = find(&symbols, "load");
+        assert_eq!(load.parent_name, None);
     }
 
     #[test]
@@ -351,10 +328,9 @@ mod tests {
             Language::new(tree_sitter_python::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "greet", "function", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
-        let greet = find(&symbols, "greet", SymbolRole::Definition);
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(has(&symbols, "greet", "function"));
+        let greet = find(&symbols, "greet");
         assert_eq!(greet.parent_name.as_deref(), Some("Greeter"));
     }
 
@@ -366,10 +342,9 @@ mod tests {
             Language::new(tree_sitter_javascript::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "greet", "method", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "function", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(has(&symbols, "greet", "method"));
+        assert!(has(&symbols, "helper", "function"));
     }
 
     #[test]
@@ -381,8 +356,8 @@ mod tests {
             Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
             code,
         );
-        assert!(has(&symbols, "Shape", "interface", SymbolRole::Definition));
-        assert!(has(&symbols, "compute", "function", SymbolRole::Definition));
+        assert!(has(&symbols, "Shape", "interface"));
+        assert!(has(&symbols, "compute", "function"));
     }
 
     #[test]
@@ -393,7 +368,7 @@ mod tests {
             Language::new(tree_sitter_typescript::LANGUAGE_TSX),
             code,
         );
-        assert!(has(&symbols, "Widget", "function", SymbolRole::Definition));
+        assert!(has(&symbols, "Widget", "function"));
     }
 
     #[test]
@@ -404,11 +379,10 @@ mod tests {
             Language::new(tree_sitter_go::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "greet", "function", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
+        assert!(has(&symbols, "greet", "function"));
         // Go's upstream query captures the preceding comment as @doc (rust's has
         // no @doc captures, so the doc assertion lives here).
-        let greet = find(&symbols, "greet", SymbolRole::Definition);
+        let greet = find(&symbols, "greet");
         assert_eq!(greet.doc.as_deref(), Some("greet says hello."));
     }
 
@@ -420,8 +394,8 @@ mod tests {
             Language::new(tree_sitter_c::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "greet", "function", SymbolRole::Definition));
-        assert!(has(&symbols, "config", "class", SymbolRole::Definition));
+        assert!(has(&symbols, "greet", "function"));
+        assert!(has(&symbols, "config", "class"));
     }
 
     #[test]
@@ -432,12 +406,8 @@ mod tests {
             Language::new(tree_sitter_cpp::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.name == "greet" && s.role == SymbolRole::Definition)
-        );
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(symbols.iter().any(|s| s.name == "greet"));
     }
 
     #[test]
@@ -448,15 +418,8 @@ mod tests {
             Language::new(tree_sitter_java::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "greet", "method", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
-        assert!(has(
-            &symbols,
-            "Speaker",
-            "implementation",
-            SymbolRole::Reference
-        ));
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(has(&symbols, "greet", "method"));
     }
 
     #[test]
@@ -467,8 +430,8 @@ mod tests {
             Language::new(tree_sitter_c_sharp::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "Greet", "method", SymbolRole::Definition));
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(has(&symbols, "Greet", "method"));
     }
 
     #[test]
@@ -479,9 +442,8 @@ mod tests {
             Language::new(tree_sitter_ruby::LANGUAGE),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "greet", "method", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(has(&symbols, "greet", "method"));
     }
 
     #[test]
@@ -494,9 +456,8 @@ mod tests {
             Language::new(tree_sitter_php::LANGUAGE_PHP),
             code,
         );
-        assert!(has(&symbols, "Greeter", "class", SymbolRole::Definition));
-        assert!(has(&symbols, "greet", "function", SymbolRole::Definition));
-        assert!(has(&symbols, "helper", "call", SymbolRole::Reference));
+        assert!(has(&symbols, "Greeter", "class"));
+        assert!(has(&symbols, "greet", "function"));
     }
 
     #[test]
@@ -507,11 +468,7 @@ mod tests {
             Language::new(tree_sitter_ocaml::LANGUAGE_OCAML),
             code,
         );
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.name == "greet" && s.role == SymbolRole::Definition)
-        );
+        assert!(symbols.iter().any(|s| s.name == "greet"));
     }
 
     #[test]
@@ -522,12 +479,8 @@ mod tests {
             Language::new(tree_sitter_scala::LANGUAGE),
             code,
         );
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.name == "Greeter" && s.role == SymbolRole::Definition)
-        );
-        assert!(has(&symbols, "greet", "function", SymbolRole::Definition));
+        assert!(symbols.iter().any(|s| s.name == "Greeter"));
+        assert!(has(&symbols, "greet", "function"));
     }
 
     #[test]
@@ -591,13 +544,15 @@ mod tests {
             Language::new(tree_sitter_rust::LANGUAGE),
             code,
         );
-        let middle = find(&symbols, "middle", SymbolRole::Definition);
-        assert_eq!(middle.parent_name.as_deref(), Some("outer"));
-        let inner = find(&symbols, "inner", SymbolRole::Reference);
+        let middle = find(&symbols, "middle");
         assert_eq!(
-            inner.parent_name.as_deref(),
-            Some("middle"),
+            middle.parent_name.as_deref(),
+            Some("outer"),
             "nearest enclosing definition wins, not the outermost"
+        );
+        assert!(
+            !symbols.iter().any(|s| s.name == "inner"),
+            "`inner()` is a call, and calls are no longer extracted"
         );
     }
 
@@ -609,12 +564,14 @@ mod tests {
             Language::new(tree_sitter_rust::LANGUAGE),
             code,
         );
-        let alpha = find(&symbols, "alpha", SymbolRole::Definition);
+        let alpha = find(&symbols, "alpha");
         assert_eq!((alpha.start_line, alpha.start_column), (1, 0));
         assert_eq!(alpha.end_line, 1);
-        let call = find(&symbols, "alpha", SymbolRole::Reference);
-        assert_eq!(call.start_line, 3);
-        assert_eq!(call.start_column, 4);
+        assert_eq!(
+            symbols.iter().filter(|s| s.name == "alpha").count(),
+            1,
+            "the call to alpha() on line 3 must not appear as a second row"
+        );
     }
 
     #[test]
@@ -627,14 +584,15 @@ mod tests {
             &src,
         );
         assert!(
-            symbols
-                .iter()
-                .any(|s| s.name == "collection_for" && s.role == SymbolRole::Definition),
+            symbols.iter().any(|s| s.name == "collection_for"),
             "collection_for must be tagged as a definition in qdrant.rs"
         );
+        // The regression this file exists to prevent from coming back. `qdrant.rs`
+        // calls `collection_for` many times over; before the trim each call was a
+        // stored row, and those rows were 87.5% of the table.
         assert!(
-            !symbols.is_empty() && symbols.iter().any(|s| s.role == SymbolRole::Reference),
-            "a real source file must yield references too"
+            symbols.iter().all(|s| s.kind != "call"),
+            "call sites must not be extracted — see `ExtractedSymbol`"
         );
     }
 }

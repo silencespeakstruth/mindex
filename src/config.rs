@@ -44,6 +44,22 @@ const DEFAULT_UPSERT_BATCH_POINTS: usize = 256;
 const DEFAULT_DENSE_PREFETCH_LIMIT: u32 = 200;
 const DEFAULT_SPARSE_PREFETCH_LIMIT: u32 = 200;
 const DEFAULT_FUSION_LIMIT: u32 = 200;
+/// HNSW `ef` for the **dense** prefetch — how wide Qdrant's graph search keeps its
+/// candidate beam.
+///
+/// A genuine tuning knob (recall against latency), unlike the collection's own HNSW
+/// settings, which are structural consts beside the code that writes them: `ef` is a
+/// *query* parameter and changing it needs no reindex.
+///
+/// 256 rather than the client's implicit default of 128, because the beam must not be
+/// narrower than the pool the query asks for: `dense_prefetch_limit` is 200, and an
+/// `ef` under that returns fewer good candidates than were requested with no error.
+///
+/// Honest caveat: on a collection under `optimizers_config.indexing_threshold`
+/// (10 000 points by Qdrant's default) no HNSW index exists yet, the prefetch is an
+/// exact scan and this value changes nothing. It is set now so that a project growing
+/// past that threshold does not walk off a silent recall cliff on the day it does.
+const DEFAULT_SEARCH_HNSW_EF: u64 = 256;
 /// Whole-request ceiling for one Qdrant call. The client's own default is **5 s**,
 /// which nothing in this repo set or could override: a project whose candidate set is
 /// large enough that fusion + ColBERT rerank exceeds it failed *every* search with
@@ -157,7 +173,7 @@ const DEFAULT_RESEARCH_MAX_EVIDENCE_WIDTH: u64 = 3;
 /// prompt is templated from the resolved value, so raising this genuinely asks
 /// the model for a longer plan rather than silently truncating one.
 const DEFAULT_RESEARCH_MAX_REPORT_SECTIONS: usize = 6;
-/// Multiplier on the per-call evidence widths (`read_chunks`, `grep`, `callers`,
+/// Multiplier on the per-call evidence widths (`read_chunks`, `grep`,
 /// `file_history`, `symbols`), at every effort level. One — the historical
 /// widths — because width compounds into the token budget (every widened result
 /// is resent on every later turn); this exists for a caller who knows the
@@ -310,6 +326,23 @@ const MIN_RESEARCH_MAX_TURN_THINKING_CHARS: usize = 4096;
 /// service targets generates a thousand tokens a second, so a threshold at or above
 /// it fires on every turn — and a warning that always fires is one nobody reads.
 const MAX_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND: f64 = 1000.0;
+/// Default floor for `slow_turn_tokens_per_second`. See the field: a diagnostic that
+/// stops nothing has no business shipping disabled, and 3 tok/s is an order of
+/// magnitude under any GPU-resident local model.
+const DEFAULT_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND: f64 = 3.0;
+/// Default for `slow_turn_unaccounted_ms`: a full minute of a turn spent outside the
+/// inference server's own clock. Chosen to be unmistakable rather than sensitive —
+/// HTTP, TLS and NDJSON parsing also land in `unaccounted_ms`, and they are
+/// milliseconds, so a minute cannot be them. The event this exists for measured 890
+/// seconds, an order of magnitude past this.
+const DEFAULT_RESEARCH_SLOW_TURN_UNACCOUNTED_MS: u64 = 60_000;
+/// Floor for a non-zero `slow_turn_unaccounted_ms`. Under a second the field is
+/// dominated by transport overhead, so the warning would fire on healthy turns and
+/// stop being read. `0` is how it is switched off.
+const MIN_RESEARCH_SLOW_TURN_UNACCOUNTED_MS: u64 = 1000;
+/// Default for `max_turn_seconds`: above `report_timeout_ms` and an order of
+/// magnitude above a healthy tool turn.
+const DEFAULT_RESEARCH_MAX_TURN_SECONDS: u64 = 300;
 /// Floor on `report_timeout_ms`: below this the report turn cannot finish and every
 /// truncated run would ship the server-written notice instead of a real report.
 const MIN_RESEARCH_REPORT_TIMEOUT_MS: u64 = 5000;
@@ -391,6 +424,8 @@ pub struct QdrantConfig {
     pub dense_prefetch_limit: u32,
     pub sparse_prefetch_limit: u32,
     pub fusion_limit: u32,
+    /// HNSW `ef` for the dense prefetch stage.
+    pub search_hnsw_ef: u64,
     /// Whole-request timeout for one Qdrant call.
     pub timeout_ms: u64,
     /// Connection-establishment timeout for one Qdrant call.
@@ -553,12 +588,69 @@ pub struct ResearchConfig {
     /// answer is usually none of those — one measured run spent 985 s at ~1.5 tok/s
     /// with nothing anywhere able to say why.
     ///
-    /// **Defaults to `0`, and that is the honest default.** A healthy rate is a fact
-    /// about one model on one host — 15 tok/s is fine for a 30B and alarming for a
-    /// 7B — so shipping a number would be guessing on the operator's behalf, exactly
-    /// as `temperature` declines to. Read `mindex_research_turn_tokens_per_second`
-    /// for a few runs, then set this under the low end of the healthy population.
+    /// **Ships ON, at a floor no healthy GPU deployment reaches.** It used to default
+    /// to `0` on the argument that a healthy rate is a fact about one model on one
+    /// host, which is true and was the wrong conclusion: this check *stops nothing*,
+    /// so a false positive costs one log line, while the default-off cost the
+    /// operator two multi-hour investigations of a symptom the code could already
+    /// name. A guard that ships disabled is not a guard.
+    ///
+    /// 3 tok/s is an order of magnitude under any GPU-resident local model (measured
+    /// here: 220 turns, none below 32) and under the pathologies it exists for (1.5
+    /// and 0.77). **CPU-only deployments of a large model legitimately run this
+    /// slowly** — that is the one case to set it to `0`, or to raise it once
+    /// `mindex_research_turn_tokens_per_second` shows the healthy population.
+    ///
+    /// **It answers only half the question**, which is why the knob below exists.
+    /// This rate is over Ollama's *own* generation clock, so a turn that was slow
+    /// because it waited scores perfectly well here — see
+    /// [`Self::slow_turn_unaccounted_ms`].
     pub slow_turn_tokens_per_second: f64,
+    /// Warn when a turn spent more than this many milliseconds **outside Ollama's own
+    /// accounting**; `0` disables it.
+    ///
+    /// The other half of the contention question, and the half that catches the
+    /// failure the rate check above was written for and cannot see.
+    /// `unaccounted_ms` is wall clock minus Ollama's `total_duration`. Ollama times
+    /// itself inside its own handler, so a request queued behind another client on
+    /// the same GPU is *not* in that figure — during exactly the contention being
+    /// hunted, every number Ollama reports looks healthy and the waiting is invisible.
+    ///
+    /// Measured on this host, 2026-08-03: a plan turn took **912 seconds** of wall
+    /// clock to produce 702 tokens, and `mindex_research_turn_tokens_per_second` put
+    /// all 220 turns of the preceding week between 32 and 128 tok/s — none below 32.
+    /// The rate check would have returned early at any threshold. The 890 lost
+    /// seconds were in `unaccounted_ms`, which until now was reported nowhere: it
+    /// appeared only as a *field on the warning the rate check emits*, i.e. only once
+    /// the rate check had already fired, which is precisely when it is not needed.
+    ///
+    /// **Unlike the rate, this has a defensible default**, because it is not a fact
+    /// about a model or a host: unaccounted time is time nobody was computing for
+    /// this request. HTTP, TLS and NDJSON parsing live here too, so small values are
+    /// noise — but a full minute of a turn spent outside the inference server's own
+    /// clock means waiting on every host there is.
+    pub slow_turn_unaccounted_ms: u64,
+    /// Abandon one turn once it has streamed for this many seconds; `0` disables it.
+    ///
+    /// **The only one of the three that stops anything.** The two above name a
+    /// diagnosis and let the turn run; this ends it, as an empty `ChatOutcome` —
+    /// the runaway-thinking guard's mechanism, which every phase already recovers
+    /// from — so the run continues with the budget that is left instead of ending
+    /// with nothing.
+    ///
+    /// It closes a hole every other bound leaves open. `turn_timeout_ms` is a
+    /// dead-socket guard and is deliberately set *above* every budget;
+    /// `first_token_timeout_ms` is spent by the first delta and cannot see a turn that
+    /// starts fine and then dribbles; `max_turn_thinking_chars` counts characters, and
+    /// a stalled turn produces few. Measured twice on this host — 985 s at ~1.5 tok/s,
+    /// and 912 s producing 702 tokens — one plan turn consumed a whole run's wall
+    /// clock and the run finished with **zero steps**.
+    ///
+    /// 300 s is above `report_timeout_ms` (120 s, the longest legitimately long turn)
+    /// and an order of magnitude above a healthy tool turn (10-30 s measured here).
+    /// Startup refuses a value that would cut the report window short, or one at or
+    /// above `turn_timeout_ms`, where it could never fire.
+    pub max_turn_seconds: u64,
     /// How long the report phase gets after the investigation ends, in milliseconds.
     ///
     /// A window of its own rather than a slice of `max_seconds`, because a run
@@ -816,7 +908,7 @@ pub struct EffortBudget {
     /// sections is not more report, past the window it is more stubs.
     pub max_report_sections: usize,
     /// Multiplier on the per-call evidence widths: `read_chunks`, `grep`,
-    /// `callers`, `file_history`, `symbols`. `1` = the historical widths.
+    /// `file_history`, `symbols`. `1` = the historical widths.
     ///
     /// Overridable per request (`budget.evidence_width`), capped by
     /// `[research].max_evidence_width`. Deliberately **not** applied to the
@@ -926,6 +1018,7 @@ impl Default for QdrantConfig {
             dense_prefetch_limit: DEFAULT_DENSE_PREFETCH_LIMIT,
             sparse_prefetch_limit: DEFAULT_SPARSE_PREFETCH_LIMIT,
             fusion_limit: DEFAULT_FUSION_LIMIT,
+            search_hnsw_ef: DEFAULT_SEARCH_HNSW_EF,
             timeout_ms: DEFAULT_QDRANT_TIMEOUT_MS,
             connect_timeout_ms: DEFAULT_QDRANT_CONNECT_TIMEOUT_MS,
         }
@@ -1013,7 +1106,9 @@ impl Default for ResearchConfig {
             turn_timeout_ms: DEFAULT_RESEARCH_TURN_TIMEOUT_MS,
             first_token_timeout_ms: DEFAULT_RESEARCH_FIRST_TOKEN_TIMEOUT_MS,
             max_turn_thinking_chars: DEFAULT_RESEARCH_MAX_TURN_THINKING_CHARS,
-            slow_turn_tokens_per_second: 0.0,
+            slow_turn_tokens_per_second: DEFAULT_RESEARCH_SLOW_TURN_TOKENS_PER_SECOND,
+            slow_turn_unaccounted_ms: DEFAULT_RESEARCH_SLOW_TURN_UNACCOUNTED_MS,
+            max_turn_seconds: DEFAULT_RESEARCH_MAX_TURN_SECONDS,
             report_timeout_ms: DEFAULT_RESEARCH_REPORT_TIMEOUT_MS,
             checkpoint_every_steps: DEFAULT_RESEARCH_CHECKPOINT_EVERY_STEPS,
             health_timeout_ms: DEFAULT_RESEARCH_HEALTH_TIMEOUT_MS,
@@ -1483,6 +1578,19 @@ impl Config {
                 "[qdrant].sparse_prefetch_limit = {} is below fusion_limit = {}; fusion starves. \
                  Fix: set sparse_prefetch_limit >= fusion_limit.",
                 self.qdrant.sparse_prefetch_limit, self.qdrant.fusion_limit
+            ));
+        }
+        // Checked against the pool the prefetch is *asked* for, not against
+        // `dense_prefetch_limit` alone: a beam narrower than the requested pool returns
+        // fewer candidates than were asked for, silently, and the shortfall then
+        // propagates through fusion into a short result set that looks like a genuinely
+        // thin index.
+        if self.qdrant.search_hnsw_ef < self.qdrant.dense_prefetch_limit as u64 {
+            e.push(format!(
+                "[qdrant].search_hnsw_ef = {} is below dense_prefetch_limit = {}; the graph \
+                 search would return fewer candidates than the prefetch asks for, with no \
+                 error. Fix: set search_hnsw_ef >= dense_prefetch_limit.",
+                self.qdrant.search_hnsw_ef, self.qdrant.dense_prefetch_limit
             ));
         }
 
@@ -1982,6 +2090,47 @@ impl Config {
                  disable the check (the default)."
             ));
         }
+        // `0` is how this one is switched off, so any other too-small value is a
+        // mistake: under a second the field is transport overhead, and a warning that
+        // fires on healthy turns is a warning nobody reads — the same failure the
+        // ceiling above guards against, from the other end.
+        let unacc = self.research.slow_turn_unaccounted_ms;
+        if unacc > 0 && unacc < MIN_RESEARCH_SLOW_TURN_UNACCOUNTED_MS {
+            e.push(format!(
+                "[research].slow_turn_unaccounted_ms = {unacc} is below the transport \
+                 overhead every healthy turn carries, so it would report contention on \
+                 all of them. Fix: use at least {MIN_RESEARCH_SLOW_TURN_UNACCOUNTED_MS} \
+                 (default {DEFAULT_RESEARCH_SLOW_TURN_UNACCOUNTED_MS}), or 0 to disable \
+                 the check."
+            ));
+        }
+        // Both ends, and both are silent failures rather than loud ones. Under the
+        // report window the guard cuts short the one turn that is legitimately long,
+        // so every run would ship a truncated report and nothing would say why. At or
+        // above `turn_timeout_ms` the socket guard always wins and this can never
+        // fire — a protection that is present, configured, and dead.
+        let turn_cap = self.research.max_turn_seconds;
+        if turn_cap > 0 && turn_cap * 1000 < self.research.report_timeout_ms {
+            e.push(format!(
+                "[research].max_turn_seconds = {turn_cap} is below report_timeout_ms = {} \
+                 (i.e. {} s), so the guard would abandon the report turn — the one turn \
+                 that is legitimately long — and every run would ship a cut-short report. \
+                 Fix: set max_turn_seconds >= report_timeout_ms / 1000 (default \
+                 {DEFAULT_RESEARCH_MAX_TURN_SECONDS}), or 0 to disable the guard.",
+                self.research.report_timeout_ms,
+                self.research.report_timeout_ms / 1000
+            ));
+        }
+        if turn_cap > 0 && turn_cap * 1000 >= self.research.turn_timeout_ms {
+            e.push(format!(
+                "[research].max_turn_seconds = {turn_cap} is at or above turn_timeout_ms = \
+                 {} (i.e. {} s), so the socket timeout always fires first and this guard \
+                 can never do anything. Fix: set max_turn_seconds well under \
+                 turn_timeout_ms / 1000 (default {DEFAULT_RESEARCH_MAX_TURN_SECONDS}).",
+                self.research.turn_timeout_ms,
+                self.research.turn_timeout_ms / 1000
+            ));
+        }
         if self.research.report_timeout_ms < MIN_RESEARCH_REPORT_TIMEOUT_MS {
             e.push(format!(
                 "[research].report_timeout_ms = {} leaves no time to write the report, so \
@@ -2256,14 +2405,68 @@ mod tests {
                 "{spelling}: {err:?}"
             );
         }
-        // Zero is the off switch and the shipped default — a healthy rate is a fact
-        // about one model on one host, so guessing one here would be worse than
-        // measuring it.
+        // Zero is still the off switch — for the CPU-only deployment that genuinely
+        // runs this slowly — but it is no longer the default. See below.
         let off = parse("[research]\nslow_turn_tokens_per_second = 0\n").expect("parses");
         off.validate().expect("0 disables the check");
         assert_eq!(off.research.slow_turn_tokens_per_second, 0.0);
         let set = parse("[research]\nslow_turn_tokens_per_second = 8.5\n").expect("parses");
         set.validate().expect("a plausible rate is accepted");
+    }
+
+    /// **Every contention guard ships armed.**
+    ///
+    /// This is a policy assertion, not a value assertion: a guard that defaults to
+    /// off is one nobody turns on, and this repository has now paid for that twice —
+    /// two multi-hour investigations of a stalled run whose symptom the code could
+    /// already name and whose remedy it already contained. Changing any of these back
+    /// to `0` should have to argue with this test.
+    #[test]
+    fn the_contention_guards_are_armed_out_of_the_box() {
+        let d = Config::default().research;
+        assert!(
+            d.slow_turn_tokens_per_second > 0.0,
+            "the generation-rate diagnostic ships disabled"
+        );
+        assert!(
+            d.slow_turn_unaccounted_ms > 0,
+            "the queueing diagnostic ships disabled — and it is the only one that can \
+             see a turn that waited rather than crawled"
+        );
+        assert!(
+            d.max_turn_seconds > 0,
+            "the one guard that STOPS a stalled turn ships disabled; a run can again \
+             spend its whole budget on a single turn and finish with zero steps"
+        );
+        Config::default()
+            .validate()
+            .expect("the shipped defaults must be self-consistent");
+    }
+
+    /// Both walls of the stall guard, and both are silent failures. Under the report
+    /// window it truncates the one turn that is legitimately long; at or above the
+    /// socket timeout it can never fire, which reads as protection and is not.
+    #[test]
+    fn a_stall_ceiling_that_could_not_work_is_refused_at_startup() {
+        // report_timeout_ms defaults to 120000, so 60 s cuts the report turn short.
+        let cfg = parse("[research]\nmax_turn_seconds = 60\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_turn_seconds") && m.contains("report_timeout_ms")),
+            "the error must name both keys: {err:?}"
+        );
+
+        let cfg = parse("[research]\nmax_turn_seconds = 100000\n").expect("parses");
+        let err = cfg.validate().expect_err("must be rejected");
+        assert!(
+            err.iter()
+                .any(|m| m.contains("max_turn_seconds") && m.contains("turn_timeout_ms")),
+            "a ceiling above the socket timeout is dead, and must not read as armed: {err:?}"
+        );
+
+        let off = parse("[research]\nmax_turn_seconds = 0\n").expect("parses");
+        off.validate().expect("0 remains an explicit off switch");
     }
 
     /// The silence guard has to sit strictly between "long prompt evaluation" and
@@ -2330,9 +2533,14 @@ mod tests {
             "{err:?}"
         );
 
-        // Raising both together is the correct fix, and must be accepted.
-        let cfg = parse("[search]\nmax_top_k = 500\n\n[qdrant]\nfusion_limit = 500\ndense_prefetch_limit = 500\nsparse_prefetch_limit = 500\n")
-            .expect("parses");
+        // Raising the whole chain together is the correct fix, and must be accepted.
+        // `search_hnsw_ef` is part of that chain: a beam narrower than the prefetch
+        // pool truncates it just as silently as a fusion limit below `max_top_k`.
+        let cfg = parse(
+            "[search]\nmax_top_k = 500\n\n[qdrant]\nfusion_limit = 500\n\
+             dense_prefetch_limit = 500\nsparse_prefetch_limit = 500\nsearch_hnsw_ef = 500\n",
+        )
+        .expect("parses");
         cfg.validate().expect("a consistently raised set is valid");
     }
 

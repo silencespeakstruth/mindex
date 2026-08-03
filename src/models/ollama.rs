@@ -29,6 +29,10 @@ pub struct OllamaTuning {
     /// is logged as contention. `0` disables it, and is the default — the healthy
     /// rate is a fact about a model on a host, not about this code.
     pub slow_turn_tokens_per_second: f64,
+    /// Above this many milliseconds of wall clock left unaccounted for by Ollama, a
+    /// turn is logged as waiting. `0` disables it. The companion to the rate above,
+    /// and the one that sees queueing — see `[research].slow_turn_unaccounted_ms`.
+    pub slow_turn_unaccounted_ms: u64,
 }
 
 /// Per-turn generation options, from `[research]` config plus the request's
@@ -824,42 +828,85 @@ impl OllamaHttpClient {
     /// On this host the answer is usually the fourth: one GPU, shared with whatever
     /// else the user is running.
     fn warn_if_slow_turn(&self, model: &str, outcome: &ChatOutcome) {
-        let Some(rate) = outcome.tokens_per_second() else {
-            return;
+        let labels = || crate::backend::metrics::ModelLabels {
+            model: model.to_string(),
         };
+        let rate = outcome.tokens_per_second();
+        let unaccounted = outcome.unaccounted_ms();
+
         if let Some(m) = &self.metrics {
-            m.research
-                .turn_tokens_per_second
-                .get_or_create(&crate::backend::metrics::ModelLabels {
-                    model: model.to_string(),
-                })
-                .observe(rate);
+            if let Some(rate) = rate {
+                m.research
+                    .turn_tokens_per_second
+                    .get_or_create(&labels())
+                    .observe(rate);
+            }
             if let Some(load) = outcome.load_nanos {
                 m.research
                     .turn_load_seconds
-                    .get_or_create(&crate::backend::metrics::ModelLabels {
-                        model: model.to_string(),
-                    })
+                    .get_or_create(&labels())
                     .observe(load as f64 / 1e9);
             }
+            if let Some(ms) = unaccounted {
+                m.research
+                    .turn_unaccounted_seconds
+                    .get_or_create(&labels())
+                    .observe(ms as f64 / 1000.0);
+            }
         }
+
+        // **Two independent checks, and neither may gate the other.** They were one,
+        // with the rate tested first and an early `return` under it, which made the
+        // second unreachable in the only case it exists for: a turn slowed by
+        // *queueing* generates at full speed while it holds the device, so the rate
+        // is healthy, the early return fires, and the wait is never reported. Measured
+        // on this host — a 912-second turn whose week of neighbours all sat between 32
+        // and 128 tok/s — the rate check would have returned early at any threshold
+        // anyone would set.
         let floor = self.tuning.slow_turn_tokens_per_second;
-        if floor <= 0.0 || rate >= floor {
-            return;
+        if let Some(rate) = rate
+            && floor > 0.0
+            && rate < floor
+        {
+            warn!(
+                %model,
+                tokens_per_second = format!("{rate:.1}"),
+                eval_tokens = outcome.eval_tokens.unwrap_or(0),
+                load_ms = outcome.load_nanos.unwrap_or(0) / 1_000_000,
+                unaccounted_ms = unaccounted.unwrap_or(0),
+                threshold = format!("{floor:.1}"),
+                "Ollama generated this turn far below the configured healthy rate for \
+                 this host — it was slow while it held the device. Sysadmin: check \
+                 load_ms (a reload means something else wanted the GPU) and the \
+                 model's own quantization; this is not a bad prompt."
+            );
         }
-        warn!(
-            %model,
-            tokens_per_second = format!("{rate:.1}"),
-            eval_tokens = outcome.eval_tokens.unwrap_or(0),
-            load_ms = outcome.load_nanos.unwrap_or(0) / 1_000_000,
-            unaccounted_ms = outcome.unaccounted_ms().unwrap_or(0),
-            threshold = format!("{floor:.1}"),
-            "Ollama generated this turn far below the configured healthy rate for \
-             this host. An anomalously low rate is contention — another process \
-             holding the GPU, or Ollama evicting and reloading this model (see \
-             load_ms) — not a broken model or a bad prompt. The run will be slow \
-             and may spend its whole wall-clock budget waiting."
-        );
+
+        // The half that catches waiting. `unaccounted_ms` is wall clock minus
+        // Ollama's `total_duration`, and Ollama times itself inside its own handler,
+        // so this is the only number in the system that can see a request sitting in
+        // front of a busy device.
+        let ceiling = self.tuning.slow_turn_unaccounted_ms;
+        if let Some(ms) = unaccounted
+            && ceiling > 0
+            && ms > ceiling
+        {
+            warn!(
+                %model,
+                unaccounted_ms = ms,
+                wall_ms = outcome.wall_ms,
+                tokens_per_second = rate.map(|r| format!("{r:.1}")),
+                eval_tokens = outcome.eval_tokens.unwrap_or(0),
+                threshold_ms = ceiling,
+                "This turn spent most of its wall clock outside Ollama's own \
+                 accounting: it was waiting, not generating. Every timing Ollama \
+                 reports for it will look healthy, because Ollama's clock starts when \
+                 the request reaches its handler. Sysadmin: something else is using \
+                 the device — check `ollama ps` for a second resident model, and any \
+                 other client asking this GPU for work. A run in this state will spend \
+                 its whole budget and may finish with no steps at all."
+            );
+        }
     }
 }
 
@@ -1084,6 +1131,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         )
@@ -1151,6 +1199,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -1215,6 +1264,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -1321,6 +1371,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         )
@@ -1460,6 +1511,48 @@ mod tests {
         assert_eq!(outcome.unaccounted_ms(), None);
     }
 
+    /// **The regression guard for a turn that waited rather than crawled.**
+    ///
+    /// The two contention signals used to be one check, with the generation rate
+    /// tested first and an early `return` under it — so a turn that reported no token
+    /// counts recorded *nothing at all*, and a turn slowed by queueing recorded a
+    /// healthy rate and no wait. That is not a corner case, it is the common one on a
+    /// shared device: Ollama times itself inside its own handler, so a request sitting
+    /// in front of a busy GPU is absent from every figure it returns, and the whole
+    /// wait lands in `unaccounted_ms`. Measured on this host — a 912-second turn while
+    /// the preceding week's 220 turns all sat between 32 and 128 tok/s — the rate
+    /// check would have returned early at any threshold anyone would set, and the one
+    /// number that could have named the failure reached no log and no metric.
+    ///
+    /// Driven through the no-token-counts case because that is the shape the early
+    /// return silenced completely, and because it is assertable without a slow stub.
+    #[tokio::test]
+    async fn a_turn_that_reports_no_rate_still_records_the_time_ollama_did_not_account_for() {
+        let metrics = Arc::new(Metrics::new());
+        // `total_duration` present, no `eval_count`/`eval_duration`: `tokens_per_second()`
+        // is `None`, which is exactly what used to end the function on its first line.
+        let client =
+            stub_ollama(&[r#"{"message":{"content":"x"},"done":true,"total_duration":1000000}"#])
+                .await
+                .with_metrics(Arc::clone(&metrics));
+
+        let outcome = run(&client).await.0.unwrap();
+        assert_eq!(
+            outcome.tokens_per_second(),
+            None,
+            "the fixture must exercise the branch that used to return early"
+        );
+        assert!(outcome.unaccounted_ms().is_some());
+
+        let text = metrics.render().expect("renders");
+        assert!(
+            text.contains("mindex_research_turn_unaccounted_seconds_count"),
+            "a turn's unaccounted wall clock was not measured, so queueing — the one \
+             contention shape Ollama's own timings cannot show — is invisible again: \
+             {text}"
+        );
+    }
+
     /// The threshold defaults to off, because a healthy rate is a fact about one
     /// model on one host rather than about this code. Off must mean silent — not
     /// "warn on everything below zero", which is how a float default goes wrong.
@@ -1510,6 +1603,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1538,6 +1632,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1557,6 +1652,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         )
@@ -1594,6 +1690,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -1643,6 +1740,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1705,6 +1803,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1735,6 +1834,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 500,
             },
         );
@@ -1767,6 +1867,7 @@ mod tests {
                 turn_timeout_ms: 5000,
                 first_token_timeout_ms: 0,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1828,6 +1929,7 @@ mod tests {
                 turn_timeout_ms: 30_000,
                 first_token_timeout_ms: 200,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );
@@ -1886,6 +1988,7 @@ mod tests {
                 turn_timeout_ms: 30_000,
                 first_token_timeout_ms: 200,
                 slow_turn_tokens_per_second: 0.0,
+                slow_turn_unaccounted_ms: 0,
                 health_timeout_ms: 2000,
             },
         );

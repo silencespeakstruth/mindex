@@ -28,9 +28,9 @@ from mcp.server.fastmcp import FastMCP
 # the model cannot raise it. Keeps many cheap queries from flooding the context.
 TOP_K = 5
 
-# Hard cap on `symbols` rows per role (definitions / references). Same philosophy
-# as TOP_K, but symbol rows are one-line pointers, not code chunks, so the cap is
-# higher; the server reports full totals so truncation stays visible.
+# Hard cap on `symbols` rows. Same philosophy as TOP_K, but symbol rows are
+# one-line pointers, not code chunks, so the cap is higher; the server reports the
+# full total so truncation stays visible.
 SYMBOL_LIMIT = 10
 
 SERVER = os.environ.get("MINDEX_SERVER", "https://127.0.0.1:11111").rstrip("/")
@@ -134,9 +134,10 @@ files you touched this turn; to (re)index a whole tree, or to apply path exclude
 run the `tools/indexer` CLI instead — it walks the tree and hash-skips server-side
 without sending file bodies through the model.
 
-Between these two: `symbols` is the exact-name lookup (definitions + references
-with kinds and enclosing scopes) — use it when you have the identifier and want
-its precise location, e.g. to open the definition a report cited. Expect
+Between these two: `symbols` is the exact-name lookup (DEFINITIONS, with kinds
+and enclosing scopes) — use it when you have the identifier and want its precise
+location, e.g. to open the definition a report cited. It does not answer who uses
+a name; nothing here resolves references, so for that, grep. Expect
 candidate lists, not a single answer: an exact name can be defined in several
 places; disambiguate by the returned paths/kinds/parents (`anchor_path` ranks
 the file you are working in first). `search` is for when you have no name, only
@@ -218,49 +219,52 @@ def search(
 def symbols(
     project_guid: str,
     name: str,
-    role: str | None = None,
     kind: str | None = None,
     anchor_path: str | None = None,
     include: dict[str, Any] | None = None,
     exclude: dict[str, Any] | None = None,
 ) -> dict:
-    """Exact-name symbol lookup: where is `name` defined, and who references it.
+    """Exact-name lookup: where is `name` DEFINED.
 
     Use it when you already have the identifier and want its precise location —
     e.g. to open a definition a `scout` `research` report cited. It reads the
-    definitions/references extracted at indexing time (tree-sitter tags), so it
-    is exact on the name and far cheaper than semantic ``search`` or grepping.
-    It answers *where*, not *how* or *why*: those are research questions and
-    belong to `scout`'s `research`, not to a chain of lookups here.
+    definitions extracted at indexing time (tree-sitter tags), so it is exact on
+    the name and far cheaper than semantic ``search`` or grepping. It answers
+    *where*, not *how* or *why*: those are research questions and belong to
+    `scout`'s `research`, not to a chain of lookups here.
 
-    It is purely syntactic: expect
-    *candidate lists*, never a single guaranteed answer — the same name can be
-    defined in several modules. Disambiguate via the returned ``kind`` (function,
-    method, class, call, ...), ``parent_name``/``parent_kind`` (the enclosing
-    definition), ``doc``, and paths; pass ``anchor_path`` to rank candidates in
-    the file you are working in (then its directory) first.
+    It does NOT answer who uses the name. References were extracted once and are
+    not any more: nothing resolves them, so they only ever said "this token
+    appeared in call position", which put ``assert_eq`` and ``clone`` at the top
+    of every ranking built on them. For usages, grep — those matches are lexical
+    and read as such.
 
-    Up to 10 rows per role are returned; ``total_definitions``/``total_references``
-    always carry the full counts, so a truncated list is visible — narrow with
-    ``role``/``kind``/``anchor_path`` if you need the long tail. Empty lists are a
-    definitive "this project has no such symbol" (languages without an upstream
-    tags query contribute no symbols). Follow up with ``search`` scoped to the
-    returned path when you need the surrounding code itself.
+    It is purely syntactic: expect *candidate lists*, never a single guaranteed
+    answer — the same name can be defined in several modules. Disambiguate via
+    the returned ``kind`` (function, method, class, ...),
+    ``parent_name``/``parent_kind`` (the enclosing definition), ``doc``, and
+    paths; pass ``anchor_path`` to rank candidates in the file you are working in
+    (then its directory) first.
+
+    Up to 10 rows are returned; ``total_definitions`` always carries the full
+    count, so a truncated list is visible — narrow with ``kind``/``anchor_path``
+    if you need the long tail. An empty list is a definitive "this project has no
+    such symbol" (languages without an upstream tags query contribute none).
+    Follow up with ``search`` scoped to the returned path when you need the
+    surrounding code itself.
 
     Args:
         project_guid: The project's mindex GUID (from the repo-root .mindex file).
         name: Exact symbol name, case-sensitive (e.g. ``collection_for``).
-        role: Optional ``"definition"`` or ``"reference"`` to fetch one side only.
-        kind: Optional tags kind filter (``function``, ``method``, ``class``,
-            ``call``, ...).
+        kind: Optional tags kind filter (``function``, ``method``, ``class``, ...).
         anchor_path: Optional repo-root-relative path used ONLY for ranking
             (same file first, then same directory), never for filtering.
         include: Optional selector that FILTERS (unlike ``anchor_path``), as
             ``{"paths": [...], "programming_languages": [...]}`` — same shape as
             ``search``'s. Use it when a common name collides across subtrees.
-            Occurrences it drops are still counted, as
-            ``out_of_scope_definitions``/``out_of_scope_references``, so a filtered
-            empty list stays distinguishable from "no such symbol".
+            Definitions it drops are still counted, as
+            ``out_of_scope_definitions``, so a filtered empty list stays
+            distinguishable from "no such symbol".
         exclude: Optional selector to drop, same shape.
     """
     body: dict[str, Any] = {
@@ -268,8 +272,6 @@ def symbols(
         "limit": SYMBOL_LIMIT,
         **_filters(include, exclude),
     }
-    if role:
-        body["role"] = role
     if kind:
         body["kind"] = kind
     if anchor_path:

@@ -35,8 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::backend::metrics::{
-    DependencyLabels, Metrics, ProjectLabels, ProjectLangLabels, ProjectRoleLabels,
-    ProjectStatusLabels,
+    DependencyLabels, Metrics, ProjectLabels, ProjectLangLabels, ProjectStatusLabels,
 };
 use crate::backend::v0::models::ProgrammingLanguage;
 use crate::db::qdrant::{VectorStore, collection_name};
@@ -84,7 +83,7 @@ struct Snapshot {
     files_by_language: Counted<&'static str>,
     chunks_active: Counted<&'static str>,
     chunks_deleted: Vec<(String, i64)>,
-    symbols_by_role: Counted<String>,
+    symbols: Vec<(String, i64)>,
     last_indexed: Vec<(String, i64)>,
     permanently_failed: Vec<(String, i64)>,
     projects: i64,
@@ -231,9 +230,9 @@ fn read_snapshot(
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
 
-    s.symbols_by_role = tx
-        .prepare("SELECT project_guid, role, COUNT(*) FROM project_file_symbols GROUP BY 1, 2")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    s.symbols = tx
+        .prepare("SELECT project_guid, COUNT(*) FROM project_file_symbols GROUP BY 1")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
 
     // A Unix-epoch gauge; Grafana renders `time() - x` as age.
@@ -356,11 +355,10 @@ fn apply(metrics: &Metrics, snapshot: &Snapshot) {
     }
 
     s.project_symbols.clear();
-    for (project_guid, role, n) in &snapshot.symbols_by_role {
+    for (project_guid, n) in &snapshot.symbols {
         s.project_symbols
-            .get_or_create(&ProjectRoleLabels {
+            .get_or_create(&ProjectLabels {
                 project_guid: project_guid.clone(),
-                role: role.clone(),
             })
             .set(*n);
     }

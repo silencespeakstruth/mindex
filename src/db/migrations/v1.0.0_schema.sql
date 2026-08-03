@@ -269,10 +269,15 @@ END;
 
 
 -- ============================================================
--- Code symbols (definitions + references)
+-- Code symbols (definitions)
 -- ============================================================
 -- Extracted at indexing time from the language's upstream tree-sitter tags
--- query (one universal extractor, src/slicing/symbols.rs). Unlike chunks,
+-- query (one universal extractor, src/slicing/symbols.rs). DEFINITIONS ONLY:
+-- the query emits references too, and they were stored until they were
+-- measured — 87.5% of the table serving one tool nobody called. See
+-- v1.4.0_symbol_definitions.sql, which narrows an existing database to the
+-- shape this file now creates directly; the two must be kept in step. Unlike
+-- chunks,
 -- symbol rows have no Qdrant counterpart, so they are HARD-deleted inline —
 -- no soft-delete/GC cycle. Invariant: a file's symbol rows always parallel
 -- its chunk set — every transaction that marks a file's chunks 'deleted'
@@ -289,7 +294,6 @@ CREATE TABLE IF NOT EXISTS project_file_symbols (
 
     name         TEXT    NOT NULL CHECK (length(name) > 0),
     kind         TEXT    NOT NULL CHECK (length(kind) > 0),
-    role         TEXT    NOT NULL CHECK (role IN ('definition', 'reference')),
 
     start_line   INTEGER NOT NULL,
     end_line     INTEGER NOT NULL,
@@ -307,18 +311,11 @@ CREATE TABLE IF NOT EXISTS project_file_symbols (
 
 -- Symbol lookup (the /symbols endpoint).
 CREATE INDEX IF NOT EXISTS idx_project_file_symbols_lookup
-ON project_file_symbols (project_guid, model_id, name, role);
+ON project_file_symbols (project_guid, model_id, name);
 
 -- Per-file replacement on reindex / delete.
 CREATE INDEX IF NOT EXISTS idx_project_file_symbols_file
 ON project_file_symbols (project_guid, model_id, file_path);
-
--- The enclosing definition as a *selector*: "what does the definition named X
--- reference" is `WHERE parent_name = ?`, which the `callers` tool asks in the
--- `out` direction. Every other read locates rows by name or by file first, so
--- without this index that one query is a full scan of the symbol table.
-CREATE INDEX IF NOT EXISTS idx_project_file_symbols_parent
-ON project_file_symbols (project_guid, model_id, parent_name, role);
 
 
 

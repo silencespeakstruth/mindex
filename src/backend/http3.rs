@@ -155,6 +155,9 @@ pub struct RouterState {
     /// (`[research].max_turn_thinking_chars`, `0` = off). Not published by
     /// `GET /config`: it changes nothing a caller renders, waits for or may set.
     pub research_max_turn_thinking_chars: usize,
+    /// Abandon one turn once it has streamed this many seconds; `0` = off
+    /// (`[research].max_turn_seconds`). The one per-turn guard that stops something.
+    pub research_max_turn_seconds: u64,
     /// How long a finished run is kept before `/gc` reaps it
     /// (`[research].retention_days`). Stamped onto the row at insert as an absolute
     /// `expires_at`, so this governs new runs only.

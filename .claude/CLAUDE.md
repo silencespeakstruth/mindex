@@ -4,7 +4,8 @@ Only what is **not obvious from reading the code**: invariants, non-trivial
 "why", gotchas, regression guards. No flag tables (`--help`), no per-test lists,
 no language table (the `ProgrammingLanguage` enum + `Cargo.toml`), no struct/SQL
 dumps. Accepted limitations are stated next to the invariant they qualify.
-Detail companions live in `docs/claude/` (research, git history, VS Code) —
+Detail companions live in `docs/claude/` (research, git history, VS Code,
+Qdrant) —
 this file keeps the invariants; read the matching companion before modifying
 that area.
 
@@ -80,7 +81,7 @@ container means mounting a `config.toml`.
   attention kernel**, which returns NaN for padded fp16 rows and still answers
   200 — `attention_backend()` in `__main__.py`; removing it silently corrupts
   every batch of more than one text.
-- Migrations in `src/db/migrations/`. **Five**: `v1.0.0_schema.sql` (version 1,
+- Migrations in `src/db/migrations/`. **Six**: `v1.0.0_schema.sql` (version 1,
   the whole 1.0.0 schema), `v1.1.0_git_history.sql` (2, adds `project_commits`
   + `project_commit_paths`), `v1.1.0_toml_yaml_languages.sql` (3, rebuilds
   `project_files` to widen its `programming_language` CHECK),
@@ -121,10 +122,23 @@ scale; a very large collection would want a stored `project_guid` payload field
 `active`, new vectors upserted; old vectors orphan until GC (decouples indexing
 latency from Qdrant delete latency).
 
-**Symbols parallel chunks, but hard-delete.** `project_file_symbols` (defs/refs
-from the language's upstream tree-sitter tags query — one universal extractor,
-`slicing/symbols.rs`, zero per-language code; vendored queries in
-`slicing/queries/` where the crate exports none) has no Qdrant counterpart, so
+**Symbols parallel chunks, but hard-delete — and they are definitions only.**
+`project_file_symbols` holds the **definition** tags of the language's upstream
+tree-sitter tags query — one universal extractor, `slicing/symbols.rs`, zero
+per-language code; vendored queries in `slicing/queries/` where the crate
+exports none. The query emits references too and they were stored until they
+were measured: 23 810 reference rows against 3 397 definitions, **87.5% of the
+table**, serving one model-facing tool (`callers`) called **twice** across
+twenty-five recorded research runs at a 50% miss rate. The edges are lexical — a
+reference row records a token in call position, not which definition it binds to
+— so the most-referenced names here were `assert_eq` (1084), `clone`, `Ok`,
+`unwrap`, `map`, several with exactly one definition in the tree. Nothing
+aggregates usefully over that, which is why the repo map that ranked by it was
+withdrawn along with them. `grep` answers "who uses this name" lexically **and
+says so**, which is the honest version of what `callers` implied.
+`parent_name`/`parent_kind` survive: for a definition the enclosing definition is
+what makes `Gc::collect` readable, and both `outline` and `/symbols` return it.
+The table has no Qdrant counterpart, so
 its lifecycle is the opposite of chunks: hard `DELETE`, no soft-delete/GC.
 Invariant: every tx that marks a file's chunks `deleted` (reindex-prepare,
 `DELETE /files`, `/cancel`, `drop_cancelled`) deletes its symbols in the same
@@ -215,16 +229,34 @@ current consts; both nullable, and NULL never matches. `post_search` returns
 **Internal versions are all one notation: `MAJOR.MINOR`, as a string.** MINOR =
 the *way* something is produced changed; MAJOR = its *shape* did. All compared
 by plain equality, never ordered — both halves trigger the identical rebuild.
-The set: `CHUNKS_DERIVATION_VERSION`, `SYMBOLS_DERIVATION_VERSION` (both
-`"1.0"`), `PROMPT_VERSION` (`"2.5"`). Deliberately outside it:
-`COLLECTION_SCHEMA_VERSION` (`"v1"`, a collection-*name* component) and the
+The set: `CHUNKS_DERIVATION_VERSION` (`"1.0"`),
+`SYMBOLS_DERIVATION_VERSION` (`"1.1"` — bumped when references stopped being
+extracted, which is what removes the 23 810 stored ones), `PROMPT_VERSION`
+(`"2.7"` — 2.6 was the repo-map prelude and is **not** reverted to 2.5: nine
+journalled runs carry it, and a reused version would make them name a prompt
+that never existed). Deliberately outside it:
+`COLLECTION_SCHEMA_VERSION` (`"v2"`, a collection-*name* component) and the
 migration `i32` in `PRAGMA user_version`.
 
-`COLLECTION_SCHEMA_VERSION` is the one version with **no mismatch detection and
-no self-healing**: bump it and the new name names no collection —
-`ensure_collection` makes an empty one, SQLite still reports every file
-`indexed`, search returns nothing, no error anywhere. A bump means reindexing
-every project by hand.
+`COLLECTION_SCHEMA_VERSION` **is still not self-healing** — bump it and the new
+name names no collection, `ensure_project` makes an empty one, SQLite still
+reports every file `indexed`, and search returns nothing. A bump means
+reindexing every project by hand (`mindex-index --force`) and dropping the
+collections left behind at the old version. What it is no longer is *silent*:
+`worker::stale` runs at startup and hourly and answers two separate questions —
+**stale** (a project holds active chunks but its current-version collection is
+missing or empty; its search is broken now) and **orphaned** (a collection
+exists at a previous version, unreachable by anything, still holding the whole
+pre-bump index — SQLite records no layout, so this listing is the only thing
+that can see it). Both are gauges (`mindex_stale_collections`,
+`mindex_orphaned_collections`) seeded at **-1**, never 0, and a pass that could
+not complete publishes nothing: `0` is the healthy reading, so an unreachable
+Qdrant must not be able to spell it. Foreign collection names are classified and
+then never mentioned — Qdrant may be shared, and telling an operator to delete
+another service's data is worse than the problem being reported. Dropping the
+old collections is deliberately **not** automated: it is what makes a rollback
+impossible. `v1 → v2` (fp16 ColBERT, no ColBERT HNSW graph) is the first bump
+this covers; the runbook is in `docs/claude/qdrant.md`.
 
 **Derivation versions** (two nullable columns on `project_files`), stamped by
 the same prepare-tx upsert that moves the file to `indexing` — the tx that
@@ -454,8 +486,8 @@ is the `research_runs` table.) The hard invariants:
   observed shape is one restated-question line and then the fake call, and half
   a sentence under a server-supplied heading reads as an answer while saying
   nothing.
-- **Native tool calling only; no text fallback.** Twelve tools
-  (search/grep/symbols/outline/callers/list_files/read_chunks/file_history/
+- **Native tool calling only; no text fallback.** Eleven tools
+  (search/grep/symbols/outline/list_files/read_chunks/file_history/
   list_research/read_research/note/revise_plan, plus `finalize`) as `tools`
   JSON Schemas (`tool_specs`), back in `message.tool_calls`; a call becomes an
   `Action` (`#[serde(tag = "action")]`) — one deserializer. A prose call is
@@ -898,7 +930,50 @@ is the `research_runs` table.) The hard invariants:
     model name, the metrics handle and the timings at once. The default is `0`
     because a healthy rate is a fact about one model on one host (15 tok/s is
     fine for a 30B, alarming for a 7B), the `temperature = None` argument;
-    read the histogram, then set it.
+    read the histogram, then set it. **It answers only half the question, and not
+    the half it was built for.** The rate is over Ollama's *own* generation clock,
+    which is taken inside Ollama's handler — so a turn slowed by *queueing*
+    generates at full speed while it holds the device and scores healthy. Measured
+    2026-08-03: a plan turn took **912 s** of wall clock for 702 tokens while every
+    one of the preceding week's 220 turns sat between 32 and 128 tok/s; the check
+    would have returned early at any threshold. The 890 lost seconds were in
+    `unaccounted_ms`, which reached nobody — it appeared in the code exactly once
+    outside its definition, as a *field on the warning the rate check emits*, i.e.
+    only after the rate check had already fired. So the companion knob
+    **`[research].slow_turn_unaccounted_ms`** (60 000, `0` = off) warns when a turn
+    spent that much wall clock outside Ollama's accounting, and
+    `research_turn_unaccounted_seconds` measures it unconditionally. The two checks
+    are **independent, and neither may gate the other** — they were one, with the
+    rate tested first under an early `return`, which made the second unreachable in
+    the only case it exists for (`a_turn_that_reports_no_rate_still_records_the_time_ollama_did_not_account_for`).
+    Unlike the rate, this one ships a non-zero default on purpose: unaccounted time
+    is not a fact about a model or a host, it is time nobody was computing for this
+    request.
+  - **`[research].max_turn_seconds`** (300, `0` = off) is the only one of the three
+    that *stops* anything, and the reason the other two were not enough. Every other
+    per-turn bound misses the observed shape: `turn_timeout_ms` is a dead-socket
+    guard and sits **above** every budget by design, `first_token_timeout_ms` is
+    spent by the first delta and cannot see a turn that starts fine and then
+    dribbles, and `max_turn_thinking_chars` counts characters a stalled turn does not
+    produce. Measured twice on this host — 985 s at ~1.5 tok/s, and 912 s for 702
+    tokens — **one plan turn consumed a whole run's wall clock and the run ended with
+    zero steps**. The turn is abandoned as an empty `ChatOutcome` (the
+    runaway-thinking mechanism, which every phase already recovers from), so the run
+    continues with the budget that is left rather than returning nothing. Checked in
+    the delta callback, not on a timer: a stalling turn still emits deltas, and one
+    emitting none is `first_token_timeout_ms`'s job. Startup refuses a value below
+    `report_timeout_ms` (it would truncate the one legitimately long turn) or at/above
+    `turn_timeout_ms` (it could never fire) — both are protections that read as armed
+    and are not. Counted by `research_stalled_turns_total`, which unlike its
+    neighbours is **not** expected to stay at zero on a shared GPU.
+
+  **All three ship armed** (`the_contention_guards_are_armed_out_of_the_box`). The
+  rate one used to default to `0` on the argument that a healthy rate is
+  host-specific — true, and the wrong conclusion, since it stops nothing and a false
+  positive costs one log line while default-off cost two multi-hour investigations of
+  a symptom the code could already name. A guard that ships disabled is not a guard;
+  `0` remains the escape hatch (CPU-only inference of a large model legitimately runs
+  under 3 tok/s).
   - **`max_tokens`** (400k/1.2M/6M) is the cost axis (`prompt_eval + eval`;
     transcript resent every turn → super-linear in turns).
   - **`context_fraction`** (0.5/0.7/0.85): a guard against Ollama's silent
@@ -950,7 +1025,7 @@ is the `research_runs` table.) The hard invariants:
   inherits this.
 - **`outline`/`list_files`**: pure SQL (`outline_core`/`list_files_core`,
   `idx_project_file_symbols_file`); intended path `list_files → outline →
-  symbols/search/callers → read_chunks` (the prompt says so — half the
+  symbols/search/grep → read_chunks` (the prompt says so — half the
   feature). `outline` reports `indexed` separately from an empty symbol list.
   `list_files`' glob is SQLite `GLOB` (`*` crosses `/`, unlike `.mindex`).
   Post-stream errors are `error` events; `NoMatch` is a tool result.
@@ -959,7 +1034,7 @@ is the `research_runs` table.) The hard invariants:
   the next exception). Evaluated in SQLite by `build_file_filter`, appended
   as a `file_path IN (SELECT …)` subquery, not a join. Path-keyed tools
   (`outline`, `read_chunks`): explicit refusal (`in_scope` flag);
-  name/text-keyed (`symbols`, `callers`, `grep`): rows dropped **and
+  name/text-keyed (`symbols`, `grep`): rows dropped **and
   counted** against one unscoped `COUNT(*)`. All gated on `is_scoped()` —
   unscoped runs build byte-for-byte the old SQL (public `/symbols` provably
   unaffected). `SymbolsRequest.include/exclude` binds append **last**.
@@ -984,14 +1059,24 @@ is the `research_runs` table.) The hard invariants:
   at the start of a run, while this is read at the moment the mistake costs
   something — `\.bwp` → 0 and `.bwp` → 7 is a false negative the reader is
   handed as proof of absence.
-- **`callers` is deliberately approximate** (no target column;
-  `parent_name` by byte-span containment; `direction: "out"` via
-  `idx_project_file_symbols_parent`); the collision/alias caveat is repeated
-  **on every result**; empty answers distinguish "never referenced" from "no
-  such name" (two reads); parent-less references reported, not dropped.
-  LSP/SCIP was rejected; `symbols_cross_language_tests.rs` pins the
-  span-containment property across five languages, and its allow-list forces
-  a decision per new tagged language.
+- **An LSP client in mindex is refused, and this is where that is recorded.**
+  The obvious cure for lexical edges is name resolution, and the obvious source
+  of it is a language server — optional like Ollama, consulted when the project
+  is reachable and the indexed file is current. It is refused on rule 10, not on
+  effort: **the server never walks a tree**, it believes what a client posts,
+  and an LSP server is the opposite — it reads the live worktree itself, one
+  process per project *and* per language, with a startup index measured in
+  minutes and gigabytes. Wiring one in makes mindex the first component owning
+  its own working-tree view, which is the divergence class that surfaces as
+  phantom drift rather than as an error. The currency check that makes the idea
+  sound cheap is exactly where it bites: comparing the indexed sha256 against an
+  editor buffer means mindex reading the file. And the consumer it would serve
+  is already served — an agent harness exposes LSP to the frontier model
+  directly; the only consumer that cannot reach one is the local research model,
+  and serving *that* is precisely the frame break. If exact resolution is ever
+  wanted here the rung is **SCIP/LSIF artifacts posted by a client**
+  (single-producer, the git-history pattern), never a language server the index
+  talks to.
 - **The loop terminates on counters, not a clock** (regression guard): every
   iteration breaks or increments exactly one of `steps`, `parse_retries`
   (≤ `MAX_PARSE_RETRIES`), `duplicate_calls` (≤ `MAX_DUPLICATE_CALLS`); one
@@ -1150,6 +1235,33 @@ descending** before responding (don't rely on Qdrant's order). Sparse weights
 `/encode` (default 256, the GPU-load lever), 256 points per Qdrant
 upsert/delete (`embed.rs`). Embed-response vectors are positionally aligned
 with the chunk list.
+
+**ColBERT is the collection; everything else is rounding error.** Measured on
+this repo's own index: `vector_storage-colbert` 838 MB per segment against
+2.6 MB dense and 0.5 MB sparse — **99.6% of the bytes**, ~1.85 MB per chunk
+(one 1024-wide row *per token*, ~450 of them), 322× dense. So the collection
+carries exactly three non-default options and all three are on that vector,
+as `const`s in `db/qdrant.rs` rather than config keys — each is part of the
+schema, and a TOML key would invite an operator to trigger a full reindex by
+accident. `datatype: Float16` halves the store and is not a quality trade the
+way quantization would be (fp16 carries ~3 decimal digits, and this vector only
+*orders* a pool dense and sparse already agreed on). `on_disk: true` is already
+true via mmap and is stated so a future Qdrant default cannot put gigabytes per
+project back in the heap. **`hnsw_config.m = 0` builds no graph at all**, which
+is correct only because ColBERT is always the *outer* query over a prefetch
+pool, never an entry point — Qdrant rescores an explicit candidate list and
+never traverses. The trap that sets: a query using `.using("colbert")` *without*
+a prefetch would not fail, it would silently brute-force the whole collection.
+The one **query**-side knob is `[qdrant].search_hnsw_ef` (256), applied to the
+dense prefetch alone (sparse is an inverted index, ColBERT has no graph);
+startup refuses it below `dense_prefetch_limit`, since a beam narrower than the
+pool it is asked for truncates it with no error anywhere. It changes nothing
+below Qdrant's `indexing_threshold`, where the prefetch is an exact scan — it is
+set so that crossing that threshold is not the day recall quietly drops.
+Measurement record, the rungs not climbed (binary quantization, token pooling,
+and whether ColBERT earns its place at all — none takeable without the
+retrieval-quality harness this repo does not have) and the `v1→v2` runbook:
+**`docs/claude/qdrant.md`**.
 
 **The query path may run on a second embedder instance.**
 `[model].query_server_url` (absent = one instance does both; `RouterState`
@@ -1614,12 +1726,15 @@ cannot be alerted on — a worker that panics on its first tick is *absent*, not
 zero), joins the task, and on a `JoinError` emits an `error!` naming the worker
 plus `worker_exits_total{worker,outcome="panic"}`. It deliberately does **not**
 restart: a worker that panicked once panics again, and the loop would bury the
-backtrace under its own noise. Before this, all six were bare `tokio::spawn`
+backtrace under its own noise. Before this, they were all bare `tokio::spawn`
 with the `JoinHandle` dropped, so a panic stopped GC or the retry sweep
 permanently and in silence — from outside indistinguishable from a healthy idle
 system. `SupervisorMetrics` is its own group precisely because `StateMetrics` is
 cleared and repopulated whole by the metrics worker, whose own liveness gauge
-would then be erased by the tick that proves it alive.
+would then be erased by the tick that proves it alive. `CollectionMetrics`
+(`worker::stale`, hourly) is a third group for the same reason from the other
+side: written on its own cadence, it would be wiped by a tick of a worker that
+knows nothing about it — and its cleared value, `0`, is its all-clear.
 
 **What is deliberately not measured.** Per-project code bytes as a gauge
 (`SUM(LENGTH(code))` full-scans the biggest column every tick and evicts the
@@ -1773,9 +1888,10 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   `GET /config` at runtime; baked-in `VALID_LANGS` is only the offline
   fallback. 404 = no match, not an error.
 - MCP `mindex` (`tools/mcp/mindex/`): the **primary agent interface** —
-  `search` (top-5 cap fixed in the adapter), `symbols` (exact-name lookup,
-  10-per-role cap), `index_files`/`delete_files`, `drift`, `cancel_indexing`,
-  read-only introspection. `index_files` is **only** for the few just-touched
+  `search` (top-5 cap fixed in the adapter), `symbols` (exact-name **definition**
+  lookup, 10-row cap — it does not answer who uses a name; grep does, lexically),
+  `index_files`/`delete_files`, `drift`,
+  `cancel_indexing`, read-only introspection. `index_files` is **only** for the few just-touched
   files, bodies passed **verbatim** (unchanged files are hash-skipped
   server-side); bulk jobs go through `mindex-index`. `search` takes optional
   `include`/`exclude` (`{paths, programming_languages}`) passed straight to

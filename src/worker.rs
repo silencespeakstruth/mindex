@@ -4,3 +4,4 @@ pub mod ollama_catalog;
 pub mod research_stats;
 pub mod research_watchdog;
 pub mod retry;
+pub mod stale;

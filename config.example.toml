@@ -49,9 +49,21 @@ upsert_batch_points = 256            # points per Qdrant upsert
 dense_prefetch_limit = 200           # dense candidates before RRF fusion
 sparse_prefetch_limit = 200          # sparse candidates before RRF fusion
 fusion_limit = 200                   # candidates after fusion, before ColBERT rerank
+search_hnsw_ef = 256                 # HNSW beam width for the dense prefetch
 timeout_ms = 30000                   # ceiling on one Qdrant call
 connect_timeout_ms = 5000            # ceiling on establishing the connection
-# Invariant: dense/sparse_prefetch_limit >= fusion_limit >= search.max_top_k.
+# Invariant: search_hnsw_ef >= dense_prefetch_limit, and
+# dense/sparse_prefetch_limit >= fusion_limit >= search.max_top_k. Every rung is a
+# silent truncation if it is not held: a beam narrower than the pool it is asked for,
+# or a pool smaller than the top_k a caller may request, comes back short with no
+# error at startup and none at query time.
+# search_hnsw_ef is the recall/latency knob, and it is the only *query*-side Qdrant
+# setting there is — the collection's own index and storage options are structural
+# consts in src/db/qdrant.rs, because changing one is a reindex. Note that on a
+# collection under Qdrant's `indexing_threshold` (10000 points) there is no HNSW
+# index yet and the prefetch is an exact scan, so this changes nothing until a
+# project grows past it. That is exactly when it would otherwise start silently
+# under-recalling.
 # The two timeouts exist because the client's own default is 5s for each and nothing
 # could override it: a project whose candidate set made fusion + ColBERT rerank run
 # past five seconds failed every search with `qdrant.unavailable`, untunably.
@@ -144,7 +156,7 @@ first_token_timeout_ms = 120000       # abandon ONE turn if Ollama produces NO t
                                       # turn_timeout_ms or it can never fire; startup refuses a
                                       # value that would, and one small enough to preempt a merely
                                       # slow first token.
-slow_turn_tokens_per_second = 0       # log ONE turn as contention when it generated slower than
+slow_turn_tokens_per_second = 3       # log ONE turn as contention when it generated slower than
                                       # this (tokens per second of Ollama's own eval_duration);
                                       # 0 disables. The third per-turn guard, and the only one that
                                       # stops nothing — it names a diagnosis. A run inching along at
@@ -152,13 +164,53 @@ slow_turn_tokens_per_second = 0       # log ONE turn as contention when it gener
                                       # the prompt is bad or another process is holding the GPU, and
                                       # on a shared card the last is the usual answer (measured: one
                                       # run spent 985 s at ~1.5 tok/s with nothing able to say why).
-                                      # DEFAULT 0 ON PURPOSE: a healthy rate is a fact about one
-                                      # model on one host — 15 tok/s is fine for a 30B and alarming
-                                      # for a 7B — so watch mindex_research_turn_tokens_per_second
-                                      # for a few runs and set this under the healthy low end.
+                                      # SHIPS ARMED at a floor no GPU deployment reaches (measured
+                                      # here: 220 turns, none below 32; the pathologies were 1.5 and
+                                      # 0.77). It used to default to 0 on the argument that a healthy
+                                      # rate is host-specific — true, and the wrong conclusion: this
+                                      # check stops nothing, so a false positive costs a log line
+                                      # while default-off cost two multi-hour investigations of a
+                                      # symptom the code could already name. Raise it once
+                                      # mindex_research_turn_tokens_per_second shows your healthy
+                                      # population; set 0 only for CPU-only inference of a large
+                                      # model, which legitimately runs this slowly.
                                       # Read it beside mindex_research_turn_load_seconds: a non-zero
                                       # load after the first turn means Ollama evicted and reloaded
                                       # the model, i.e. something else wanted the device.
+                                      # IT ANSWERS ONLY HALF THE QUESTION — see the knob below.
+slow_turn_unaccounted_ms = 60000      # log ONE turn as waiting when this much of its wall clock was
+                                      # outside Ollama's own accounting; 0 disables. The other half
+                                      # of contention, and the half the rate above structurally
+                                      # cannot see: Ollama times itself INSIDE its handler, so a
+                                      # request queued in front of a busy GPU is absent from every
+                                      # figure it returns — during exactly the contention being
+                                      # hunted, its numbers look healthy. Measured 2026-08-03: a plan
+                                      # turn took 912 s of wall clock for 702 tokens while every one
+                                      # of the week's 220 turns sat between 32 and 128 tok/s. The
+                                      # rate check would have returned early at ANY threshold; the
+                                      # 890 lost seconds were here, reported nowhere.
+                                      # Unlike the rate this ships a real default, because it is not
+                                      # a fact about a model or a host: unaccounted time is time
+                                      # nobody was computing for this request. HTTP/TLS/NDJSON land
+                                      # here too and are milliseconds, so a minute cannot be them.
+                                      # Watch mindex_research_turn_unaccounted_seconds.
+max_turn_seconds = 300                # ABANDON one turn once it has streamed this long; 0 disables.
+                                      # The only one of the three that stops anything — the two above
+                                      # name a diagnosis and let the turn run. It closes the hole all
+                                      # the other bounds leave: turn_timeout_ms is a dead-socket guard
+                                      # and sits ABOVE every budget by design, first_token_timeout_ms
+                                      # is spent by the first delta and cannot see a turn that starts
+                                      # fine and then dribbles, and max_turn_thinking_chars counts
+                                      # characters a stalled turn does not produce. Measured twice
+                                      # here — 985 s at ~1.5 tok/s, and 912 s for 702 tokens — ONE
+                                      # plan turn ate a whole run's wall clock and the run ended with
+                                      # zero steps. The turn is dropped as an empty reply (the
+                                      # runaway-thinking mechanism, which every phase recovers from)
+                                      # so the run carries on with the budget that is left.
+                                      # 300 s is above report_timeout_ms (the one legitimately long
+                                      # turn) and ~10x a healthy tool turn. Startup refuses a value
+                                      # below report_timeout_ms or at/above turn_timeout_ms.
+                                      # Watch mindex_research_stalled_turns_total.
 max_turn_thinking_chars = 8192        # abandon ONE turn once its thinking channel has streamed
                                       # this many characters; 0 disables. Catches the pathology
                                       # turn_timeout_ms structurally cannot see: a model that

@@ -538,7 +538,7 @@ async def research(
             (0 = announce no length, else min 150), ``checkpoint_every_steps``
             (0 = no draft-banking turns this run, else min 2 — each costs a step),
             and ``evidence_width`` (min 1 — multiplies how many rows read_chunks/
-            grep/callers/file_history/symbols return; width is resent on every
+            grep/file_history/symbols return; width is resent on every
             later turn, so it is paid for in the token budget, not once). An older
             server rejects the new keys with a 400 rather than ignoring them.
         context_run_ids: Optional ``run_id`` values of earlier runs on this project

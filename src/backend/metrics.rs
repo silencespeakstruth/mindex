@@ -194,12 +194,6 @@ pub struct ProjectStatusLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct ProjectRoleLabels {
-    pub project_guid: String,
-    pub role: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModelLabels {
     pub model: String,
 }
@@ -385,6 +379,19 @@ pub struct ResearchMetrics {
     pub turn_tokens_per_second: HistFamily<ModelLabels>,
     /// Seconds Ollama spent loading the model into the device for one turn.
     pub turn_load_seconds: HistFamily<ModelLabels>,
+    /// Seconds of one turn's wall clock that Ollama did not account for.
+    ///
+    /// The third of the set, and the one that closes it. The two above are read from
+    /// Ollama's own timings, which are taken *inside* its handler — so a request
+    /// queued in front of a busy GPU is absent from both, and during exactly the
+    /// contention they were built to find they report a healthy model. Measured on
+    /// this host: a 912-second turn while every one of the preceding week's 220
+    /// turns sat between 32 and 128 tok/s. This is where those 890 seconds were, and
+    /// until it existed they were in no metric at all.
+    ///
+    /// Small values are transport (HTTP, TLS, NDJSON) and mean nothing. A large one
+    /// means the request waited.
+    pub turn_unaccounted_seconds: HistFamily<ModelLabels>,
     pub tokens: Family<ModelKindLabels, Counter>,
     pub context_used: HistFamily<ModelLabels>,
     pub tool_calls: Family<ToolOutcomeLabels, Counter>,
@@ -434,6 +441,14 @@ pub struct ResearchMetrics {
     /// shape every caller already recovers from — so nothing downstream can tell it
     /// apart from a model that simply said nothing.
     pub runaway_thinking_turns: Counter,
+    /// Turns abandoned for passing `[research].max_turn_seconds` while still
+    /// streaming — i.e. generating far too slowly to finish anything.
+    ///
+    /// Unlike its neighbours this is **not** expected to stay at zero on a host whose
+    /// GPU is shared: it counts the event that twice cost a whole run here. A rise
+    /// means contention, not a code defect; read it against
+    /// `research_turn_unaccounted_seconds`.
+    pub stalled_turns: Counter,
     /// Runs that were given at least one earlier report as context, by model.
     ///
     /// The question this answers is "does prior-research context get used, and with
@@ -531,6 +546,30 @@ pub struct SupervisorMetrics {
     pub exits: Family<WorkerOutcomeLabels, Counter>,
 }
 
+/// The collection-layout check ([`crate::worker::stale`]).
+///
+/// Not part of [`StateMetrics`] for the same reason as [`SupervisorMetrics`]: that set
+/// is cleared and repopulated whole by the metrics worker, and these are written by a
+/// different worker on a different cadence — a tick of one would erase the other's
+/// findings and read as "all clear".
+///
+/// Both are `-1` until the first successful check, never `0`. Zero is the healthy
+/// value here, so a check that could not run must not be able to spell it: an
+/// unreachable Qdrant would otherwise publish the all-clear.
+#[derive(Clone)]
+pub struct CollectionMetrics {
+    /// Projects holding active chunks whose current-version collection is missing or
+    /// empty — i.e. projects whose search silently answers nothing. The alarm for a
+    /// `COLLECTION_SCHEMA_VERSION` bump that was never followed by a reindex, and for
+    /// a lost Qdrant volume.
+    pub stale: Gauge,
+    /// Collections present under a *previous* schema version. Not an error — they are
+    /// the pre-bump store, still holding every byte of it — but nothing else can see
+    /// them: SQLite records no layout, so this is the only number that says how much
+    /// disk is waiting to be reclaimed by hand.
+    pub orphaned: Gauge,
+}
+
 #[derive(Clone)]
 pub struct RetryMetrics {
     pub sweeps: Counter,
@@ -566,7 +605,7 @@ pub struct StateMetrics {
     /// The GC backlog. Language is cut deliberately — nobody dashboards a
     /// backlog by language, and it halves the family.
     pub project_chunks_deleted: Family<ProjectLabels, Gauge>,
-    pub project_symbols: Family<ProjectRoleLabels, Gauge>,
+    pub project_symbols: Family<ProjectLabels, Gauge>,
     pub project_last_indexed: Family<ProjectLabels, Gauge>,
     pub project_files_permanently_failed: Family<ProjectLabels, Gauge>,
     pub projects: Gauge,
@@ -628,6 +667,7 @@ pub struct Metrics {
     pub research: ResearchMetrics,
     pub gc: GcMetrics,
     pub supervisor: SupervisorMetrics,
+    pub collections: CollectionMetrics,
     pub retry: RetryMetrics,
     pub db: DbMetrics,
     pub state: StateMetrics,
@@ -852,6 +892,7 @@ impl Metrics {
             // buckets are where contention shows, and they are the point.
             turn_tokens_per_second: hist_family(count_hist),
             turn_load_seconds: hist_family(request_hist),
+            turn_unaccounted_seconds: hist_family(long_hist),
             tokens: Family::default(),
             context_used: hist_family(ratio_hist),
             tool_calls: Family::default(),
@@ -865,6 +906,7 @@ impl Metrics {
             parse_retries: Counter::default(),
             truncations: Counter::default(),
             runaway_thinking_turns: Counter::default(),
+            stalled_turns: Counter::default(),
             runs_with_context: Family::default(),
             context_runs_used: Counter::default(),
             context_truncations: Counter::default(),
@@ -921,6 +963,11 @@ impl Metrics {
             "research_turn_load_seconds",
             "Time Ollama spent loading the model for one turn",
             research.turn_load_seconds.clone(),
+        );
+        registry.register(
+            "research_turn_unaccounted_seconds",
+            "Wall clock of one model turn that Ollama did not account for (queueing)",
+            research.turn_unaccounted_seconds.clone(),
         );
         registry.register(
             "research_context_used_ratio",
@@ -983,6 +1030,11 @@ impl Metrics {
             "research_runaway_thinking_turns",
             "Turns abandoned after the model streamed past the thinking-volume guard",
             research.runaway_thinking_turns.clone(),
+        );
+        registry.register(
+            "research_stalled_turns",
+            "Turns abandoned for passing the per-turn ceiling while still streaming",
+            research.stalled_turns.clone(),
         );
         registry.register(
             "research_runs_with_context",
@@ -1087,6 +1139,29 @@ impl Metrics {
             supervisor.exits.clone(),
         );
 
+        // ── Collection layout ──
+        //
+        // Seeded at -1, the "not checked yet" value: 0 is the healthy reading and must
+        // never be published by a check that could not run.
+        let collections = CollectionMetrics {
+            stale: Gauge::default(),
+            orphaned: Gauge::default(),
+        };
+        collections.stale.set(-1);
+        collections.orphaned.set(-1);
+        registry.register(
+            "stale_collections",
+            "Projects with active chunks whose current-schema-version Qdrant collection \
+             is missing or empty (-1 = not yet checked)",
+            collections.stale.clone(),
+        );
+        registry.register(
+            "orphaned_collections",
+            "Qdrant collections left behind at a previous schema version (-1 = not yet \
+             checked)",
+            collections.orphaned.clone(),
+        );
+
         // ── Retry worker ──
         let retry = RetryMetrics {
             sweeps: Counter::default(),
@@ -1185,7 +1260,7 @@ impl Metrics {
         );
         registry.register(
             "project_symbols",
-            "Symbol rows in a project, by role",
+            "Definition rows in a project",
             state.project_symbols.clone(),
         );
         registry.register(
@@ -1289,6 +1364,7 @@ impl Metrics {
             research,
             gc,
             supervisor,
+            collections,
             retry,
             db,
             state,
@@ -1462,6 +1538,10 @@ mod tests {
             .get_or_create(&model)
             .observe(0.5);
         m.research
+            .turn_unaccounted_seconds
+            .get_or_create(&model)
+            .observe(0.05);
+        m.research
             .tokens
             .get_or_create(&ModelKindLabels {
                 model: "glm".into(),
@@ -1507,6 +1587,7 @@ mod tests {
         }
         m.research.truncations.inc();
         m.research.runaway_thinking_turns.inc();
+        m.research.stalled_turns.inc();
         m.research
             .runs_with_context
             .get_or_create(&ModelLabels { model: "m".into() })
@@ -1587,9 +1668,8 @@ mod tests {
             })
             .set(0);
         s.project_symbols
-            .get_or_create(&ProjectRoleLabels {
+            .get_or_create(&ProjectLabels {
                 project_guid: "p".into(),
-                role: "definition".into(),
             })
             .set(1);
         s.project_last_indexed
@@ -1701,6 +1781,8 @@ mod tests {
             ("mindex_index_phase_duration_seconds", "histogram"),
             ("mindex_index_symbols_total", "counter"),
             ("mindex_indexing_claims", "gauge"),
+            ("mindex_orphaned_collections", "gauge"),
+            ("mindex_stale_collections", "gauge"),
             ("mindex_project_chunks_active", "gauge"),
             ("mindex_project_chunks_deleted", "gauge"),
             ("mindex_project_files", "gauge"),
@@ -1728,12 +1810,14 @@ mod tests {
             ("mindex_research_runs_total", "counter"),
             ("mindex_research_steps", "histogram"),
             ("mindex_research_turn_load_seconds", "histogram"),
+            ("mindex_research_turn_unaccounted_seconds", "histogram"),
             ("mindex_research_turn_tokens_per_second", "histogram"),
             ("mindex_research_tokens_total", "counter"),
             ("mindex_research_tool_call_parse_retries_total", "counter"),
             ("mindex_research_tool_calls_total", "counter"),
             ("mindex_research_tool_duration_seconds", "histogram"),
             ("mindex_research_runaway_thinking_turns_total", "counter"),
+            ("mindex_research_stalled_turns_total", "counter"),
             ("mindex_research_runs_with_context_total", "counter"),
             ("mindex_research_context_runs_used_total", "counter"),
             ("mindex_research_context_truncations_total", "counter"),
@@ -1883,6 +1967,10 @@ mod tests {
             "mindex_http_requests_in_flight",
             "mindex_index_file_chunks",
             "mindex_indexing_claims",
+            // Both are counts of collections, and both use -1 for "not yet checked" —
+            // a unit suffix on either would promise a measurement they do not make.
+            "mindex_orphaned_collections",
+            "mindex_stale_collections",
             "mindex_project_chunks_active",
             "mindex_project_chunks_deleted",
             "mindex_project_files",

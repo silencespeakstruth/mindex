@@ -5,11 +5,13 @@ use qdrant_client::QdrantError;
 use qdrant_client::qdrant::Condition;
 use qdrant_client::qdrant::CountPointsBuilder;
 use qdrant_client::qdrant::CreateCollectionBuilder;
+use qdrant_client::qdrant::Datatype;
 use qdrant_client::qdrant::DeletePointsBuilder;
 use qdrant_client::qdrant::Distance;
 use qdrant_client::qdrant::Filter;
 use qdrant_client::qdrant::Fusion;
 use qdrant_client::qdrant::HasIdCondition;
+use qdrant_client::qdrant::HnswConfigDiffBuilder;
 use qdrant_client::qdrant::MultiVectorComparator;
 use qdrant_client::qdrant::MultiVectorConfigBuilder;
 use qdrant_client::qdrant::NamedVectors;
@@ -18,6 +20,7 @@ use qdrant_client::qdrant::PointStruct;
 use qdrant_client::qdrant::PrefetchQueryBuilder;
 use qdrant_client::qdrant::Query;
 use qdrant_client::qdrant::QueryPointsBuilder;
+use qdrant_client::qdrant::SearchParamsBuilder;
 use qdrant_client::qdrant::SparseVectorParamsBuilder;
 use qdrant_client::qdrant::SparseVectorsConfigBuilder;
 use qdrant_client::qdrant::UpsertPointsBuilder;
@@ -37,17 +40,55 @@ use crate::backend::v0::models::UUIDv4;
 /// this is a name component, never a compared value, and a dot in a collection
 /// name buys nothing.
 ///
-/// **This is the one version with no mismatch detection, and a bump is not
-/// self-healing.** The new name simply names no collection, `ensure_collection`
-/// creates an empty one, and SQLite goes on reporting every file `indexed` — the
-/// prepare-phase skip does not look at the collection layout. Search then returns
-/// nothing, with no error anywhere. Bumping it means reindexing every project.
-const COLLECTION_SCHEMA_VERSION: &str = "v1";
+/// **A bump is not self-healing.** The new name simply names no collection,
+/// [`VectorStore::ensure_project`] creates an empty one, and SQLite goes on reporting
+/// every file `indexed` — the prepare-phase skip does not look at the collection
+/// layout. Search then returns nothing. Bumping it means reindexing every project
+/// (`mindex-index --force`) and dropping the collections left at the old version.
+///
+/// What a bump is *not* any more is silent: [`crate::worker::stale::check_and_publish`] runs
+/// at startup and hourly, names every project whose current-version collection is
+/// missing or empty, names every collection left behind at another version, and
+/// publishes both as gauges. That check exists because this was for a long time the
+/// one version with no mismatch detection at all, and its failure mode — a healthy
+/// service answering "no match" for ever, with no error anywhere — is the worst
+/// shape a failure can take.
+const COLLECTION_SCHEMA_VERSION: &str = "v2";
 
 /// Dense / ColBERT vector width. **Structural, not configurable**: it is dictated by
 /// the BGE-M3 model and baked into every collection's schema — changing it without a
 /// matching model + collection rebuild silently breaks search.
 pub(crate) const VECTOR_DIM: u64 = 1024;
+
+/// Element type of the stored ColBERT multivector.
+///
+/// **Structural, not a tuning knob**: it is part of the collection's schema, so it
+/// cannot change without a [`COLLECTION_SCHEMA_VERSION`] bump and a full reindex —
+/// exactly what a config key would invite an operator to do by accident.
+///
+/// ColBERT is why this matters at all. It emits one 1024-wide row *per token*, so a
+/// chunk costs hundreds of rows where dense costs one: measured on this repo's own
+/// index, `vector_storage-colbert` was 838 MB per segment against 2.6 MB for dense
+/// and 0.5 MB for sparse — **99.6% of the bytes**, ~1.85 MB per chunk. Halving the
+/// element halves the whole store, and it is not a quality trade in the way
+/// quantization would be: fp16 carries ~3 decimal digits, and this vector is only
+/// ever used to *order* a pool of `fusion_limit` candidates that dense and sparse
+/// already agreed were relevant.
+const COLBERT_DATATYPE: Datatype = Datatype::Float16;
+
+/// HNSW graph degree for the ColBERT vector — `0`, meaning **build no graph**.
+///
+/// Structural for the same reason as [`COLBERT_DATATYPE`]. Correct only because of an
+/// invariant of [`VectorStore::search`]: the ColBERT stage is always the *outer*
+/// query over a prefetch pool, never an entry point, so Qdrant rescores an explicit
+/// candidate list and never traverses a graph. Building one was pure indexing cost
+/// on the most expensive vector in the collection.
+///
+/// **The trap this sets:** a future query that used `.using("colbert")` *without* a
+/// prefetch would not fail — it would silently brute-force the entire collection.
+/// If ColBERT ever needs to be searched directly, this must go back to a real degree
+/// and the schema version must be bumped with it.
+const COLBERT_HNSW_M: u64 = 0;
 
 /// Production [`VectorStore`] backed by a Qdrant client plus the retrieval prefetch
 /// limits from `[qdrant]` config. Wrapping the external `Qdrant` (rather than impl'ing
@@ -58,6 +99,7 @@ pub struct QdrantStore {
     dense_prefetch_limit: u32,
     sparse_prefetch_limit: u32,
     fusion_limit: u32,
+    search_hnsw_ef: u64,
 }
 
 impl QdrantStore {
@@ -66,18 +108,57 @@ impl QdrantStore {
         dense_prefetch_limit: u32,
         sparse_prefetch_limit: u32,
         fusion_limit: u32,
+        search_hnsw_ef: u64,
     ) -> Self {
         Self {
             client,
             dense_prefetch_limit,
             sparse_prefetch_limit,
             fusion_limit,
+            search_hnsw_ef,
         }
     }
 }
 
 pub fn collection_name(project_guid_simple: &str) -> String {
     format!("{}_{}", project_guid_simple, COLLECTION_SCHEMA_VERSION)
+}
+
+/// What a collection name found in the store is, relative to this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionAge {
+    /// A mindex collection at [`COLLECTION_SCHEMA_VERSION`].
+    Current,
+    /// A mindex collection at some *other* version — the store left behind by a bump,
+    /// still holding every byte of the pre-bump index and reachable by nothing.
+    Previous,
+    /// Not a mindex collection name. Qdrant may be shared, so these are counted by
+    /// nothing and named by nothing: a check that told an operator to drop somebody
+    /// else's data would be worse than the problem it reports.
+    Foreign,
+}
+
+/// Classify a collection name as [`CollectionAge`].
+///
+/// The name grammar is the one [`collection_name`] writes: a project GUID in simple
+/// form (32 lowercase hex) then `_` then the schema version. Both halves are checked,
+/// so a collection merely *ending* in `_v2` is still `Foreign`.
+pub fn classify_collection(name: &str) -> CollectionAge {
+    let Some((guid, version)) = name.rsplit_once('_') else {
+        return CollectionAge::Foreign;
+    };
+    if guid.len() != 32
+        || !guid
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return CollectionAge::Foreign;
+    }
+    if version == COLLECTION_SCHEMA_VERSION {
+        CollectionAge::Current
+    } else {
+        CollectionAge::Previous
+    }
 }
 
 /// Qdrant collection name for a project GUID (its dashless simple form + schema
@@ -177,6 +258,22 @@ pub trait VectorStore: Send + Sync {
         Ok(None)
     }
 
+    /// Every collection this store holds, or `None` when it cannot enumerate them.
+    ///
+    /// Read by [`crate::worker::stale::check_and_publish`] for the half of its check that
+    /// [`count_points`](VectorStore::count_points) cannot answer: naming the
+    /// collections left behind at a *previous* [`COLLECTION_SCHEMA_VERSION`], which
+    /// are invisible from SQLite (nothing there records the layout a project's
+    /// vectors were written under) and which go on holding the whole pre-bump store
+    /// until an operator drops them.
+    ///
+    /// Provided, and `None` rather than an empty list, for the same reason as
+    /// `count_points`: a fake that cannot enumerate must say so, because "no
+    /// collections" is itself an alarming answer and must never be manufactured.
+    async fn list_collections(&self) -> Result<Option<Vec<String>>, VectorStoreError> {
+        Ok(None)
+    }
+
     /// Hybrid search: dense + sparse prefetch → RRF fusion → ColBERT MaxSim rerank,
     /// restricted to `chunk_ids` via a `has_id` filter, returning the top `top_k`.
     #[allow(clippy::too_many_arguments)] // irreducible inputs of one hybrid query
@@ -206,10 +303,21 @@ impl VectorStore for QdrantStore {
             VectorParamsBuilder::new(VECTOR_DIM, Distance::Cosine),
         );
 
+        // The three non-default options all belong to ColBERT, which is 99.6% of the
+        // bytes in a collection; `dense` is 2.6 MB per segment and is the vector the
+        // prefetch actually searches, so it stays at Qdrant's defaults deliberately.
+        // See each const for why it is structural rather than configurable.
         vectors_config.add_named_vector_params(
             "colbert",
             VectorParamsBuilder::new(VECTOR_DIM, Distance::Cosine)
-                .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim)),
+                .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim))
+                .datatype(COLBERT_DATATYPE)
+                // Never held in RAM. It is read for `fusion_limit` candidates per
+                // query and nothing else, so page cache is the right place for it —
+                // and the explicit flag stops a future Qdrant default from putting
+                // multiple gigabytes per project back into the heap.
+                .on_disk(true)
+                .hnsw_config(HnswConfigDiffBuilder::default().m(COLBERT_HNSW_M)),
         );
 
         let mut sparse_config = SparseVectorsConfigBuilder::default();
@@ -331,6 +439,11 @@ impl VectorStore for QdrantStore {
         Ok(resp.result.map(|r| r.count))
     }
 
+    async fn list_collections(&self) -> Result<Option<Vec<String>>, VectorStoreError> {
+        let resp = self.client.list_collections().await?;
+        Ok(Some(resp.collections.into_iter().map(|c| c.name).collect()))
+    }
+
     async fn search(
         &self,
         collection: &str,
@@ -370,6 +483,10 @@ impl VectorStore for QdrantStore {
                     .using("dense")
                     .limit(self.dense_prefetch_limit)
                     .filter(filter.clone())
+                    // The only stage `hnsw_ef` reaches: sparse is served by an
+                    // inverted index and the ColBERT stage builds no graph at all
+                    // (`COLBERT_HNSW_M`), so both would ignore it.
+                    .params(SearchParamsBuilder::default().hnsw_ef(self.search_hnsw_ef))
                     .build(),
                 PrefetchQueryBuilder::default()
                     .query(Query::from(sparse_query))
@@ -446,6 +563,59 @@ mod tests {
              old collection instead of naming a new one"
         );
         assert_eq!(name.len(), 32 + 1 + COLLECTION_SCHEMA_VERSION.len());
+    }
+
+    /// Pins the version itself, not just its presence in the name.
+    ///
+    /// A bump breaks every existing project's search until it is reindexed, and does
+    /// it without failing anything, so it must never be a side effect of an edit to
+    /// the vector params above it. `v2` carries the fp16 ColBERT with no HNSW graph;
+    /// changing either of those without changing this leaves the two disagreeing,
+    /// with old-layout collections silently answering new-layout queries.
+    #[test]
+    fn the_collection_schema_version_is_pinned() {
+        assert_eq!(
+            COLLECTION_SCHEMA_VERSION, "v2",
+            "the collection layout changed. Every project must be reindexed \
+             (mindex-index --force) and the previous version's collections dropped; \
+             see docs/claude/qdrant.md"
+        );
+    }
+
+    /// The stale-collection check acts on this classification: `Current` is left
+    /// alone, `Previous` is named in a message telling an operator to delete it, and
+    /// `Foreign` is never named at all. Qdrant may be shared, so a name mistaken for
+    /// `Previous` is a message telling somebody to delete another service's data.
+    #[test]
+    fn only_a_mindex_collection_name_is_classified() {
+        let guid = "a".repeat(32);
+        assert_eq!(
+            classify_collection(&collection_name(&guid)),
+            CollectionAge::Current
+        );
+        assert_eq!(
+            classify_collection(&format!("{guid}_v1")),
+            CollectionAge::Previous
+        );
+
+        for foreign in [
+            // The right shape, wrong alphabet.
+            &format!("{}_v1", "z".repeat(32)),
+            // Uppercase hex: `collection_name` never writes it, so a collection
+            // spelled this way was created by something else.
+            &format!("{}_v1", "A".repeat(32)),
+            // The right suffix, no guid.
+            "someone_elses_v1".to_string().as_str(),
+            // A guid, no version.
+            &guid,
+            "",
+        ] {
+            assert_eq!(
+                classify_collection(foreign),
+                CollectionAge::Foreign,
+                "{foreign} was claimed as a mindex collection"
+            );
+        }
     }
 
     /// Distinct projects, distinct collections — including two guids differing in

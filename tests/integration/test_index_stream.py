@@ -9,7 +9,7 @@ import httpx
 
 MINDEX_URL = __import__("conftest").MINDEX_URL
 
-from test_e2e import RUST_V1, RUST_V2, FILE_PATH, index, search  # noqa: E402
+from test_e2e import FILE_PATH, RUST_V1, RUST_V2, index, search
 
 
 def index_stream(

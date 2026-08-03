@@ -107,6 +107,10 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
         5,
         include_str!("db/migrations/v1.3.0_research_verification.sql"),
     ),
+    (
+        6,
+        include_str!("db/migrations/v1.4.0_symbol_definitions.sql"),
+    ),
 ];
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
@@ -337,6 +341,7 @@ async fn main() -> Result<(), BoxError> {
             cfg.qdrant.dense_prefetch_limit,
             cfg.qdrant.sparse_prefetch_limit,
             cfg.qdrant.fusion_limit,
+            cfg.qdrant.search_hnsw_ef,
         )),
         metrics.clone(),
     ));
@@ -418,6 +423,7 @@ async fn main() -> Result<(), BoxError> {
                 turn_timeout_ms: cfg.research.turn_timeout_ms,
                 first_token_timeout_ms: cfg.research.first_token_timeout_ms,
                 slow_turn_tokens_per_second: cfg.research.slow_turn_tokens_per_second,
+                slow_turn_unaccounted_ms: cfg.research.slow_turn_unaccounted_ms,
                 health_timeout_ms: cfg.research.health_timeout_ms,
             },
         )
@@ -443,8 +449,32 @@ async fn main() -> Result<(), BoxError> {
         tokio::sync::RwLock::new(worker::ollama_catalog::ModelCatalog::default()),
     );
 
+    // Say at once whether any project's vectors are missing from the collection layout
+    // this build looks in. Run here rather than only on the worker's tick because the
+    // condition it reports is worst immediately after a deploy — a
+    // COLLECTION_SCHEMA_VERSION bump breaks every search the moment the new binary
+    // starts, and does it without failing anything.
+    worker::stale::check_and_publish(
+        &db_pool,
+        &qdrant_client,
+        &metrics,
+        &sigterm_token.child_token(),
+    )
+    .await;
+
     let gc_token = sigterm_token.child_token();
     let retry_token = sigterm_token.child_token();
+
+    supervise(
+        "collection_check",
+        &metrics,
+        worker::stale::run(
+            db_pool.clone(),
+            qdrant_client.clone(),
+            metrics.clone(),
+            sigterm_token.child_token(),
+        ),
+    );
 
     supervise(
         "gc",
@@ -627,6 +657,7 @@ async fn main() -> Result<(), BoxError> {
             research_report_timeout_ms: cfg.research.report_timeout_ms,
             research_checkpoint_every_steps: cfg.research.checkpoint_every_steps,
             research_max_turn_thinking_chars: cfg.research.max_turn_thinking_chars,
+            research_max_turn_seconds: cfg.research.max_turn_seconds,
             research_retention_days: cfg.research.retention_days,
             research_max_context_runs: cfg.research.max_context_runs,
             research_max_context_chars: cfg.research.max_context_chars,
