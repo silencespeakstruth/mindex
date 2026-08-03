@@ -50,7 +50,11 @@ index cannot honestly claim to have.
 → [`tools/mcp/mindex`](tools/mcp/mindex/README.md) (search, symbols, live reindex) and
 [`tools/mcp/scout`](tools/mcp/scout/README.md) (research, challenge). A running server
 also serves **`/llms.txt`** — the whole workflow as one document, so pointing an agent
-at that URL is enough to get it started. A terminal frontend and a
+at that URL is enough to get it started — and **`/.well-known/mindex.json`**, the same
+thing as data: identity, endpoint inventory and the live `/config` snapshot in one JSON
+document. Two channels rather than one because some agent harnesses classify a fetched
+document that addresses the model as a prompt injection and refuse to read it; JSON has
+no register to object to, so discovery still works where the prose does not. A terminal frontend and a
 [VS Code extension](tools/vscode/README.md) drive the same API for humans; the extension
 ships as a `.vsix` on the
 [releases page](https://github.com/silencespeakstruth/mindex/releases), so
@@ -206,7 +210,12 @@ intersected — because a sync only drops what your refs no longer reach.
   on first start, which no store can vouch for. Where both are set, the skip wins:
   in VS Code `mindex.noVerify` overrides `mindex.caCert`, and a `caCert` naming a
   file this machine does not have is a warning naming the path, not a dead
-  extension.
+  extension. One consequence worth planning for: those settings exist only in *our*
+  clients. A third-party agent driving the HTTP API has no `--ca-cert` and no
+  `noVerify`, so a locally-issued certificate makes the server simply unreachable to
+  it. Reaching mindex from a machine whose trust store you do not control wants a
+  publicly-trusted certificate; where the listener has no inbound `80`, ACME **DNS-01**
+  is the challenge that still works.
 - **Everything is a knob, documented once.** `mindex --help` and each tool's `--help`;
   the full HTTP API with schemas is live at **`/swagger-ui`** (OpenAPI at
   `/api-docs/openapi.json`). Errors are RFC 7807 `problem+json` with stable machine

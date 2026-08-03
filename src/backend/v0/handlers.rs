@@ -79,6 +79,9 @@ use crate::backend::v0::models::SymbolsResponse;
 use crate::backend::v0::models::UUIDv4;
 use crate::backend::v0::models::VersionResponse;
 use crate::backend::v0::models::{DeleteResearchRunsRequest, DeleteResearchRunsResponse};
+use crate::backend::v0::models::{
+    DescriptorDocuments, DescriptorEndpoint, DescriptorTransport, MindexDescriptor,
+};
 use crate::backend::v0::models::{GrepMatch, GrepResponse};
 use crate::backend::v0::models::{HistoryPruneQuery, HistoryPruneResponse, HistoryRequest};
 use crate::backend::v0::models::{
@@ -6245,6 +6248,172 @@ fn llms_document(c: &ConfigResponse) -> String {
     )
 }
 
+/// Shape version of `/.well-known/mindex.json`. Bumped when a field changes
+/// meaning, not when the server is upgraded — the two move independently, which
+/// is why the document reports both.
+pub const DESCRIPTOR_VERSION: u32 = 1;
+
+/// `GET /.well-known/mindex.json` — what this server is, as data.
+///
+/// The machine twin of [`get_llms_txt`], and the floor under it. The narrative
+/// is fetched over the network by a model whose client may classify a document
+/// addressed to it as a prompt injection — observed in the field — and a caller
+/// that loses it is left with nothing, because it was the only entry point.
+/// JSON has no register to object to, so an agent that can reach the origin can
+/// always discover the service, its endpoints and its current limits.
+///
+/// **Documented in OpenAPI, unlike `/llms.txt` and `/metrics`.** Same question,
+/// opposite answer, and the difference is the audience: those two serve prose to
+/// a reader and exposition to a scraper, this serves JSON to an API client —
+/// which is what the spec exists to describe.
+///
+/// **Concurrency:** safe — a memoized endpoint inventory plus the same two
+/// uncontended snapshot reads `GET /config` makes; no I/O.
+#[utoipa::path(
+    get,
+    path = "/.well-known/mindex.json",
+    tag = "Config",
+    responses((
+        status = 200,
+        description = "Service identity, endpoint inventory and the live configuration snapshot.",
+        body = MindexDescriptor,
+    )),
+)]
+#[debug_handler]
+pub async fn get_mindex_descriptor(State(s): State<RouterState>) -> Json<MindexDescriptor> {
+    let schema_version = s.db_schema_version;
+    Json(descriptor_document(
+        config_snapshot(&s).await,
+        schema_version,
+    ))
+}
+
+/// The whole descriptor. Pure over the snapshot so tests can build it without a
+/// `RouterState`, exactly as [`llms_document`] is.
+fn descriptor_document(config: ConfigResponse, db_schema_version: i32) -> MindexDescriptor {
+    MindexDescriptor {
+        service: "mindex",
+        summary: "Semantic code index over indexed source trees, with a local research agent \
+                  that investigates them and returns cited reports.",
+        version: env!("CARGO_PKG_VERSION"),
+        db_schema_version,
+        descriptor_version: DESCRIPTOR_VERSION,
+        documents: DescriptorDocuments {
+            openapi: "/api-docs/openapi.json",
+            openapi_ui: "/swagger-ui",
+            narrative: "/llms.txt",
+        },
+        authentication: None,
+        transport: DescriptorTransport {
+            tls: true,
+            alpn: vec!["h2", "http/1.1"],
+        },
+        endpoints: descriptor_endpoints().clone(),
+        projects_url: "/projects",
+        health_url: "/health",
+        config_url: "/config",
+        config,
+    }
+}
+
+/// The endpoint inventory, built once from the OpenAPI spec.
+///
+/// Derived rather than written: the route table already exists in the router,
+/// the spec, the narrative and the MCP tool sets, and a hand-maintained fifth
+/// copy would be the one with nothing checking it. Built from the *serialized*
+/// spec rather than utoipa's types for the reason the tests in this file do the
+/// same — the JSON is the contract, and it cannot be invalidated by a utoipa
+/// upgrade rearranging its internals.
+fn descriptor_endpoints() -> &'static Vec<DescriptorEndpoint> {
+    static ENDPOINTS: std::sync::LazyLock<Vec<DescriptorEndpoint>> =
+        std::sync::LazyLock::new(build_descriptor_endpoints);
+    &ENDPOINTS
+}
+
+fn build_descriptor_endpoints() -> Vec<DescriptorEndpoint> {
+    let spec = serde_json::to_value(crate::backend::openapi::api_doc())
+        .expect("the OpenAPI spec serializes — `openapi_spec_is_complete_and_versioned` pins it");
+
+    let mut out: Vec<DescriptorEndpoint> = Vec::new();
+
+    if let Some(paths) = spec["paths"].as_object() {
+        for (path, item) in paths {
+            let Some(ops) = item.as_object() else {
+                continue;
+            };
+            for (method, op) in ops {
+                // A path item also carries non-operation keys (`parameters`,
+                // `summary`); only the verbs describe an endpoint.
+                let method_upper = method.to_ascii_uppercase();
+                if !matches!(
+                    method_upper.as_str(),
+                    "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
+                ) {
+                    continue;
+                }
+                out.push(DescriptorEndpoint {
+                    summary: operation_summary(op),
+                    tag: op["tags"][0].as_str().map(str::to_string),
+                    streaming: streaming_encoding(&method_upper, path),
+                    method: method_upper,
+                    path: path.clone(),
+                    documented: true,
+                });
+            }
+        }
+    }
+
+    // Real routes with no JSON contract to document. Reported so a caller sees
+    // the whole surface, flagged so it knows the spec will not describe them.
+    for (path, summary) in crate::backend::http3::UNDOCUMENTED_ROUTES {
+        if crate::backend::http3::DESCRIPTOR_HIDDEN_ROUTES.contains(path) {
+            continue;
+        }
+        out.push(DescriptorEndpoint {
+            method: "GET".to_string(),
+            path: (*path).to_string(),
+            summary: (*summary).to_string(),
+            tag: None,
+            streaming: None,
+            documented: false,
+        });
+    }
+
+    // Deterministic, so the document diffs cleanly and a test can pin it. Sorted
+    // rather than left in spec order: `serde_json::Value` preserves key order
+    // only under a cargo feature, so relying on it would be a silent dependency.
+    out.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+    out
+}
+
+/// One line describing what an operation returns.
+///
+/// utoipa fills `summary` from the first line of a handler's doc comment only
+/// when a blank line follows it, and folds everything into `description`
+/// otherwise — so both shapes have to be handled or half the inventory would
+/// report an empty string.
+fn operation_summary(op: &serde_json::Value) -> String {
+    if let Some(s) = op["summary"].as_str()
+        && !s.trim().is_empty()
+    {
+        return s.trim().to_string();
+    }
+    op["description"]
+        .as_str()
+        .and_then(|d| d.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// How this endpoint's response arrives, for the few that arrive in frames.
+fn streaming_encoding(method: &str, path: &str) -> Option<&'static str> {
+    crate::backend::http3::STREAMING_ENDPOINTS
+        .iter()
+        .find(|(m, p, _)| *m == method && *p == path)
+        .map(|(_, _, enc)| *enc)
+}
+
 /// The "Live configuration" markdown appended to the narrative: the numbers a
 /// caller needs before its first request — models, ladder, measured costs,
 /// ceilings — restated from [`ConfigResponse`] rather than written, so they are
@@ -6270,7 +6439,9 @@ fn render_llms_live_section(c: &ConfigResponse) -> String {
             let _ = writeln!(
                 out,
                 "The model catalog has not been refreshed yet — what Ollama has is \
-                 unknown right now. Re-check `GET /config` shortly.\n"
+                 unknown right now. It is refreshed on a \
+                 `[research].models_refresh_interval_seconds` tick, and \
+                 `GET /config` carries the same list once it has been.\n"
             );
         } else {
             let _ = writeln!(
@@ -11107,13 +11278,14 @@ mod tests {
     fn llms_doc_mentions_only_routes_that_exist() {
         // Deliberately outside the spec, each asserted so there by
         // `openapi_spec_is_complete_and_versioned` or served by the Swagger
-        // merge rather than a documented handler.
-        const OUTSIDE_SPEC: &[&str] = &[
-            "/llms.txt",
-            "/metrics",
-            "/swagger-ui",
-            "/api-docs/openapi.json",
-        ];
+        // merge rather than a documented handler. Read from the one list the
+        // service descriptor also reads, rather than a second copy of the same
+        // four strings — which is what this was, and what would have had to be
+        // edited twice.
+        let outside_spec: Vec<&str> = crate::backend::http3::UNDOCUMENTED_ROUTES
+            .iter()
+            .map(|(path, _)| *path)
+            .collect();
 
         let doc = llms_document(&llms_test_config(vec![], None, vec![]));
         let spec =
@@ -11127,7 +11299,7 @@ mod tests {
         );
         for m in &mentions {
             assert!(
-                paths.contains_key(m.as_str()) || OUTSIDE_SPEC.contains(&m.as_str()),
+                paths.contains_key(m.as_str()) || outside_spec.contains(&m.as_str()),
                 "llms_doc.md names a route the OpenAPI spec does not know: {m}"
             );
         }
@@ -11164,6 +11336,271 @@ mod tests {
         ));
         assert!(populated.contains("- `glm-4:9b`"));
         assert!(populated.contains("| glm-4:9b | medium | 12 | 180 | 420 |"));
+    }
+
+    /// `/llms.txt` is fetched over the network by a model whose client may
+    /// classify what it fetched as a prompt injection — GitHub Copilot did
+    /// exactly that to an earlier draft of this document, on a corporate
+    /// machine, and the endpoint was simply unusable there. The trigger is
+    /// register, not content: a document that commands its reader, or that
+    /// instructs the reader about how to treat its own instructions, is
+    /// indistinguishable from an attack on the wire.
+    ///
+    /// So the document argues instead of ordering — every recommendation
+    /// carries its reason, and the reader is "a caller", not "you". That much
+    /// is a matter of writing and cannot be asserted. What *can* be pinned is
+    /// the short list of constructions that most reliably trip a classifier,
+    /// none of which has any business in an API reference. A regression here is
+    /// silent: the document still renders, still passes every other test, and
+    /// simply stops being readable by the clients it exists for.
+    ///
+    /// The whole rendered body is scanned, live section included — that section
+    /// is generated, so nothing but a test keeps an imperative out of it.
+    #[test]
+    fn llms_doc_avoids_the_injection_signature() {
+        const SIGNATURES: &[&str] = &[
+            "ignore ",
+            "disregard",
+            "regardless of any",
+            "you have been handed",
+            "instructions above",
+            "previous instructions",
+            "system prompt",
+        ];
+
+        let doc = llms_document(&llms_test_config(
+            vec!["glm-4:9b".into()],
+            Some(1_700_000_000),
+            vec![],
+        ))
+        .to_lowercase();
+
+        for s in SIGNATURES {
+            assert!(
+                !doc.contains(s),
+                "llms_doc.md contains {s:?} — a phrase that reads as an instruction \
+                 to the model rather than a description of this API, and is what \
+                 gets the document refused"
+            );
+        }
+    }
+
+    // ── the service descriptor ───────────────────────────────────────────────
+
+    fn test_descriptor() -> MindexDescriptor {
+        descriptor_document(llms_test_config(vec![], None, vec![]), 6)
+    }
+
+    /// The sync guard, and the reason the inventory is derived rather than
+    /// written: it must be exactly the spec's set of operations, both ways. A
+    /// documented endpoint the descriptor omits is a capability an agent cannot
+    /// discover; an entry with no operation behind it is a 404 the descriptor
+    /// promised. Neither is visible without this test, because both halves
+    /// serialize perfectly well.
+    #[test]
+    fn descriptor_lists_every_route_the_spec_knows() {
+        let spec = serde_json::to_value(crate::backend::openapi::api_doc()).expect("serializes");
+        let paths = spec["paths"].as_object().expect("paths object");
+
+        let mut from_spec: Vec<(String, String)> = Vec::new();
+        for (path, item) in paths {
+            for method in item.as_object().expect("path item").keys() {
+                from_spec.push((method.to_ascii_uppercase(), path.clone()));
+            }
+        }
+        from_spec.sort();
+
+        let mut from_descriptor: Vec<(String, String)> = test_descriptor()
+            .endpoints
+            .into_iter()
+            .filter(|e| e.documented)
+            .map(|e| (e.method, e.path))
+            .collect();
+        from_descriptor.sort();
+
+        assert_eq!(
+            from_descriptor, from_spec,
+            "the descriptor's documented inventory and the OpenAPI spec disagree"
+        );
+    }
+
+    /// The undocumented half is exactly the routes that are deliberately absent
+    /// from the spec, minus the ones the descriptor hides. Without this, adding
+    /// a `#[utoipa::path]` to `/llms.txt` would leave it listed twice — once as
+    /// documented and once as not.
+    #[test]
+    fn descriptor_undocumented_routes_are_the_ones_outside_the_spec() {
+        let spec = serde_json::to_value(crate::backend::openapi::api_doc()).expect("serializes");
+        let paths = spec["paths"].as_object().expect("paths object");
+
+        for (path, _) in crate::backend::http3::UNDOCUMENTED_ROUTES {
+            assert!(
+                !paths.contains_key(*path),
+                "{path} is in UNDOCUMENTED_ROUTES but the spec documents it"
+            );
+        }
+
+        let mut listed: Vec<String> = test_descriptor()
+            .endpoints
+            .into_iter()
+            .filter(|e| !e.documented)
+            .map(|e| e.path)
+            .collect();
+        listed.sort();
+
+        let mut expected: Vec<String> = crate::backend::http3::UNDOCUMENTED_ROUTES
+            .iter()
+            .map(|(p, _)| *p)
+            .filter(|p| !crate::backend::http3::DESCRIPTOR_HIDDEN_ROUTES.contains(p))
+            .map(str::to_string)
+            .collect();
+        expected.sort();
+
+        assert_eq!(listed, expected);
+        assert!(
+            !listed.iter().any(|p| p == "/metrics"),
+            "/metrics is routed only when [metrics].enabled, so advertising it \
+             would promise a 404 on every deployment that has it off"
+        );
+    }
+
+    /// The drift guard against the router itself. Neither axum nor utoipa can
+    /// enumerate registered routes at runtime, so this reads the source text of
+    /// `http3.rs` and pins every `.route("…")` literal against the union the
+    /// descriptor reports plus the routes it deliberately hides. It is a
+    /// source-text test on purpose: the alternative is nothing, and "nothing" is
+    /// what let the route table and its four descriptions drift in the first
+    /// place.
+    #[test]
+    fn the_route_table_holds_no_path_the_descriptor_omits() {
+        // Only the production half: `http3.rs`'s own test module stands up
+        // throwaway routers (`/slow` and friends) whose routes are not part of
+        // the API and must not be discoverable.
+        let src = include_str!("../http3.rs");
+        let src = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(head, _)| head);
+
+        // `.route(` and its path literal are frequently separated by a newline
+        // and indentation — rustfmt breaks the long ones — so the whitespace has
+        // to be skipped or two thirds of the table goes unchecked.
+        let mut routed: Vec<&str> = src
+            .match_indices(".route(")
+            .filter_map(|(i, m)| {
+                let rest = src[i + m.len()..].trim_start();
+                let body = rest.strip_prefix('"')?;
+                body.find('"').map(|end| &body[..end])
+            })
+            .collect();
+        routed.sort_unstable();
+        routed.dedup();
+        assert!(
+            routed.len() > 20,
+            "the extractor found {} routes — it is broken, not the router",
+            routed.len()
+        );
+
+        let descriptor = test_descriptor();
+        let mut known: std::collections::HashSet<&str> = descriptor
+            .endpoints
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        known.extend(
+            crate::backend::http3::DESCRIPTOR_HIDDEN_ROUTES
+                .iter()
+                .copied(),
+        );
+
+        for path in routed {
+            assert!(
+                known.contains(path),
+                "{path} is registered in http3.rs but no discovery document reports it"
+            );
+        }
+    }
+
+    /// A summary is what a caller reads to choose an endpoint; an empty one
+    /// makes the entry noise. Also pins that the derivation actually found
+    /// utoipa's text rather than silently falling back to `""` — which is what a
+    /// change in how utoipa splits `summary` from `description` would look like.
+    #[test]
+    fn descriptor_summaries_are_present_and_descriptive() {
+        for e in test_descriptor().endpoints {
+            assert!(
+                e.summary.len() > 10,
+                "{} {} has no usable summary: {:?}",
+                e.method,
+                e.path,
+                e.summary
+            );
+        }
+    }
+
+    /// The inlined snapshot must be the `/config` body itself, not a trimmed or
+    /// re-derived copy — that is what makes one request enough to bootstrap, and
+    /// what stops the two endpoints answering differently about the same server.
+    #[test]
+    fn descriptor_config_is_the_config_endpoints_own_snapshot() {
+        let snapshot = llms_test_config(vec!["glm-4:9b".into()], Some(1_700_000_000), vec![]);
+        let expected = serde_json::to_value(&snapshot).expect("serializes");
+        let descriptor = descriptor_document(snapshot, 6);
+        assert_eq!(
+            serde_json::to_value(&descriptor.config).expect("serializes"),
+            expected
+        );
+    }
+
+    /// One document, one version. `version` and `config.version` come from
+    /// different structs and could be wired to different sources; a caller that
+    /// finds them disagreeing has no way to tell which describes the running
+    /// build. Driven through a real `RouterState` rather than the fixture
+    /// config, which carries a deliberately fake version and so would agree with
+    /// the bug.
+    #[tokio::test]
+    async fn descriptor_versions_agree() {
+        let pool = pool_with_chunks(&[]).await;
+        let s = router_state(pool);
+        let d = descriptor_document(config_snapshot(&s).await, s.db_schema_version);
+
+        assert_eq!(d.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(d.config.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(d.service, "mindex");
+        // Explicitly null, never absent: a caller must be able to tell "this
+        // server authenticates nothing" from "this server is too old to say".
+        let json = serde_json::to_value(&d).expect("serializes");
+        assert!(json.get("authentication").is_some());
+        assert!(json["authentication"].is_null());
+    }
+
+    /// The streaming flag is the one hand-maintained fact in the inventory, so
+    /// it is the one that can silently stop being true. Both research streams
+    /// are SSE and `/index` is ndjson; everything else is a single body.
+    #[test]
+    fn descriptor_names_the_streaming_endpoints() {
+        let streaming: std::collections::HashMap<String, &'static str> = test_descriptor()
+            .endpoints
+            .into_iter()
+            .filter_map(|e| e.streaming.map(|s| (format!("{} {}", e.method, e.path), s)))
+            .collect();
+
+        assert_eq!(
+            streaming.get("POST /v0/{project_guid}/research"),
+            Some(&"sse")
+        );
+        assert_eq!(
+            streaming.get("POST /v0/{project_guid}/research/{run_id}/challenge"),
+            Some(&"sse")
+        );
+        assert_eq!(
+            streaming.get("POST /v0/{project_guid}/index"),
+            Some(&"ndjson")
+        );
+        assert_eq!(
+            streaming.len(),
+            crate::backend::http3::STREAMING_ENDPOINTS.len()
+        );
+        assert_eq!(streaming.get("POST /v0/{project_guid}/search"), None);
     }
 
     // ── the SQL-only cores ───────────────────────────────────────────────────

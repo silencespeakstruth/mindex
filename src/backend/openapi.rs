@@ -112,6 +112,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::get_version,
         // Config
         handlers::get_config,
+        handlers::get_mindex_descriptor,
     ),
     components(schemas(
         crate::backend::error::ProblemDetails,
@@ -184,6 +185,10 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ResearchSamplingInfo,
         crate::backend::v0::models::ResearchObservedInfo,
         crate::backend::v0::models::ResearchObservedEffort,
+        crate::backend::v0::models::MindexDescriptor,
+        crate::backend::v0::models::DescriptorDocuments,
+        crate::backend::v0::models::DescriptorTransport,
+        crate::backend::v0::models::DescriptorEndpoint,
     )),
     tags(
         (name = INDEXING, description = "Index lifecycle: (re)index files, cancel in-flight work, requeue failures, soft-delete files, and detect working-tree drift."),
@@ -220,8 +225,9 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (20 routes; three carry two methods each).
+        // Every routed path is documented (21 routes; three carry two methods each).
         for p in [
+            "/.well-known/mindex.json",
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",
             "/v0/{project_guid}/symbols",
@@ -248,7 +254,7 @@ mod tests {
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 23, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 24, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak
@@ -267,6 +273,16 @@ mod tests {
         assert!(
             !paths.contains_key("/llms.txt"),
             "/llms.txt must stay out of the OpenAPI spec — see the handler's doc comment"
+        );
+
+        // `/.well-known/mindex.json` takes the opposite decision to both of the
+        // above, and the contrast is the point rather than an inconsistency: it
+        // is the machine twin of `/llms.txt`, serving JSON to an API client
+        // instead of prose to a reader — which is exactly what this spec is for.
+        // Asserted here beside them so the three decisions are read together.
+        assert!(
+            paths.contains_key("/.well-known/mindex.json"),
+            "the service descriptor is JSON for a client and belongs in the spec"
         );
 
         // The two dual-method routes expose both verbs.

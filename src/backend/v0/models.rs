@@ -2020,6 +2020,135 @@ impl ResearchEffortInfo {
     }
 }
 
+// ─── The machine-readable service descriptor (`/.well-known/mindex.json`) ─────
+
+/// What this server is, as **data** rather than prose — the machine twin of
+/// `/llms.txt`, served at `/.well-known/mindex.json`.
+///
+/// It exists because the prose document is not always readable. `/llms.txt` is
+/// fetched over the network by a model whose client may classify a document
+/// addressed to it as a prompt injection, and at least one frontier assistant
+/// does exactly that; a caller that loses the narrative then has nothing left,
+/// because the narrative was the only entry point. JSON carries no register for
+/// a classifier to object to, so this is the floor: an agent that can reach the
+/// origin can always learn what the service is, which endpoints exist and what
+/// the current limits are, without reading a single imperative sentence.
+///
+/// [RFC 8615](https://www.rfc-editor.org/rfc/rfc8615) is why it lives under
+/// `/.well-known/`: an agent that knows only an origin can ask the host what it
+/// is without having been told a path first. The `mindex` suffix is **not**
+/// IANA-registered — stated plainly rather than glossed over; unregistered
+/// vendor suffixes are common practice, and the alternative (`/descriptor.json`)
+/// costs the zero-knowledge probe that is the whole point.
+///
+/// Unlike `/llms.txt`, this **is** in the OpenAPI spec, and the contrast is
+/// deliberate: `/llms.txt` serves prose to a reader, this serves JSON to a
+/// client, and JSON to a client is precisely what the spec is for.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct MindexDescriptor {
+    /// Always `"mindex"`. The identity check a caller makes before trusting the
+    /// rest of the document.
+    pub service: &'static str,
+    /// One sentence on what the service does, for a caller deciding whether to
+    /// read further.
+    pub summary: &'static str,
+    /// Running mindex version — the same value `GET /version` and
+    /// `GET /config` report, from the same source, so one document cannot
+    /// disagree with itself.
+    pub version: &'static str,
+    /// Applied `PRAGMA user_version`, as on `GET /version`.
+    pub db_schema_version: i32,
+    /// The shape version of *this* document, bumped when a field changes
+    /// meaning. Distinct from `version`: the server can be upgraded many times
+    /// without the descriptor's shape moving.
+    pub descriptor_version: u32,
+    pub documents: DescriptorDocuments,
+    /// Always `null`. An explicit statement rather than an omission: mindex
+    /// authenticates nothing at all, and a caller that finds the field missing
+    /// cannot tell that from a server too old to report it. Where a deployment
+    /// requires a key, the check lives in a reverse proxy in front of this
+    /// server, which never sees the header.
+    pub authentication: Option<()>,
+    pub transport: DescriptorTransport,
+    /// Every endpoint this build serves, derived from the OpenAPI spec rather
+    /// than written by hand — see [`DescriptorEndpoint`].
+    pub endpoints: Vec<DescriptorEndpoint>,
+    /// Where the project inventory lives. A pointer, not the list: reading it
+    /// costs a SQLite round trip, and this handler is deliberately I/O-free so
+    /// that discovery still answers when the database is busy — the one moment
+    /// a caller most needs to be told what the server is.
+    pub projects_url: &'static str,
+    pub health_url: &'static str,
+    /// Where [`MindexDescriptor::config`] came from. Kept beside the inlined
+    /// copy because two of its fields (`research.models`, `research.observed`)
+    /// are worker-refreshed, so a long-lived client must re-read rather than
+    /// cache this document once.
+    pub config_url: &'static str,
+    /// The live snapshot `GET /config` serves, inlined so that bootstrapping
+    /// costs one request. Built from the same `config_snapshot` call, so it
+    /// cannot drift from the endpoint it mirrors.
+    pub config: ConfigResponse,
+}
+
+/// Where the human- and machine-readable descriptions of this API live.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DescriptorDocuments {
+    /// Full request/response schemas for every documented endpoint.
+    pub openapi: &'static str,
+    /// The same spec, rendered interactively.
+    pub openapi_ui: &'static str,
+    /// The prose companion to this document: the workflow, the reasoning behind
+    /// it, and the semantics no schema can carry.
+    pub narrative: &'static str,
+}
+
+/// How to talk to this server.
+///
+/// HTTP/3 is deliberately absent. It is an optional second listener whose
+/// availability the server announces per response in the `alt-svc` header, and a
+/// deployment is commonly reached through a proxy that forwards TCP only — so a
+/// descriptor field claiming h3 would be advertising a port that, from the
+/// caller's position, may forward nothing.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DescriptorTransport {
+    /// Always `true`: TLS is the only transport this server has.
+    pub tls: bool,
+    /// ALPN protocols the TCP listener offers, in the order it offers them.
+    pub alpn: Vec<&'static str>,
+}
+
+/// One endpoint, as the descriptor reports it.
+///
+/// The list is **derived from the OpenAPI spec at first use**, never written out:
+/// the route table already has four copies in this repo (the router, the spec,
+/// the narrative document and the MCP tool sets), and a hand-written fifth would
+/// be the one nothing checks. What a maintainer edits is the handler's
+/// `#[utoipa::path]`; this follows.
+#[derive(Serialize, Debug, Clone, ToSchema)]
+pub struct DescriptorEndpoint {
+    /// Uppercase HTTP method.
+    pub method: String,
+    /// Path template, with `{project_guid}`-style parameters left in place.
+    pub path: String,
+    /// What the endpoint returns, one line, from the handler's own
+    /// documentation.
+    pub summary: String,
+    /// OpenAPI tag group, absent for routes outside the spec.
+    pub tag: Option<String>,
+    /// How the response arrives when it is not a single JSON body: `"sse"` for
+    /// the research streams, `"ndjson"` for `/index` under `?stream=yes`.
+    /// `null` for everything else.
+    ///
+    /// The one fact here a maintainer must keep by hand — the spec records the
+    /// response body, not that it arrives in frames — so a new streaming
+    /// endpoint needs an entry in `STREAMING_ENDPOINTS` beside its route.
+    pub streaming: Option<&'static str>,
+    /// Whether this route appears in the OpenAPI spec. `false` marks the
+    /// deliberately undocumented ones (the narrative, the spec itself, the UI),
+    /// which are real routes with no JSON contract to describe.
+    pub documented: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

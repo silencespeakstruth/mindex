@@ -9,6 +9,35 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
+## [Unreleased]
+
+Makes the server discoverable by an agent that was handed nothing but a URL, including
+the ones whose harness will not read prose off the network.
+
+### Added
+
+- **`GET /.well-known/mindex.json`** — the machine twin of `/llms.txt`: service
+  identity, the full endpoint inventory (method, path, one-line summary, which ones
+  stream and in what encoding) and the live `GET /config` snapshot inlined, so
+  bootstrapping costs one request. The endpoint inventory is derived from the OpenAPI
+  spec rather than hand-written, and three tests pin it against the spec and against
+  the router's own `.route(...)` table. Documented in OpenAPI, unlike `/llms.txt` and
+  `/metrics` — it is JSON for a client, which is what the spec is for.
+
+### Changed
+
+- **`/llms.txt` is rewritten to argue rather than order.** The document addressed the
+  model in the second person and told it what to do — which is the prompt-injection
+  signature, and GitHub Copilot refused to read it on a corporate machine, leaving that
+  agent with no entry point at all. Every recommendation now carries its reason and the
+  reader is "a caller"; nothing operational was dropped, and the document leads with the
+  problem the service solves rather than with a list of endpoints. Pinned by
+  `llms_doc_avoids_the_injection_signature`. A refusal is now survivable in any case,
+  since the JSON descriptor above carries the same discovery data.
+- `UNDOCUMENTED_ROUTES` in `http3.rs` is the single list of routes deliberately outside
+  the spec; the `/llms.txt` route guard and the descriptor read it instead of holding a
+  copy each.
+
 ## [1.1.0] — 2026-08-03
 
 Gives research reports an **opponent** and an **offline re-verification**, writes them

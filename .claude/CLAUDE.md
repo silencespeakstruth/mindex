@@ -407,6 +407,34 @@ let GC clean up.
   search frontend); `/files?status=failed` is the dead-letter view. `/config`
   is static **except `research.models` and `research.observed`** — both worker
   -refreshed on a tick; don't cache it once.
+- **Two discovery documents, and the second exists because the first is
+  refusable.** `/llms.txt` is prose for a model; `/.well-known/mindex.json` is
+  the same service as data (identity, endpoint inventory, the inlined `/config`
+  snapshot). The split is not tidiness: a network-fetched document written *at*
+  a model is a prompt-injection signature, GitHub Copilot refused the original
+  `llms_doc.md` on those grounds, and losing it left an agent with nothing —
+  it was the only entry point. So the prose now **argues instead of ordering**
+  (every recommendation carries its reason, the reader is "a caller", never
+  "you"), guarded by `llms_doc_avoids_the_injection_signature`; and JSON, which
+  has no register to object to, is the floor under it. The descriptor **is** in
+  the OpenAPI spec — the opposite call from `/llms.txt` and `/metrics`, because
+  it is JSON for a client rather than prose for a reader or exposition for a
+  scraper, and all three assertions sit together in
+  `openapi_spec_is_complete_and_versioned` so the contrast reads as a decision.
+  Its `endpoints[]` is **derived from the spec at first use**, never written:
+  the route table already had four copies, and a hand-kept fifth is the one
+  nothing checks. Three things are hand-kept and each has a guard —
+  `UNDOCUMENTED_ROUTES` (the routes deliberately outside the spec; read by the
+  descriptor *and* by `llms_doc_mentions_only_routes_that_exist`, one list
+  because it was two), `DESCRIPTOR_HIDDEN_ROUTES` (`/metrics` alone: routed only
+  under `[metrics].enabled`, so advertising it promises a 404), and
+  `STREAMING_ENDPOINTS` (OpenAPI records a response's shape, not that it arrives
+  in frames). `the_route_table_holds_no_path_the_descriptor_omits` scans
+  `http3.rs`'s **production half** for `.route(` literals — neither axum nor
+  utoipa enumerates routes at runtime, so a source-text test is what exists;
+  it must skip the `#[cfg(test)]` module, whose throwaway routers are not API.
+  `authentication` is serialized as an explicit `null`: "authenticates nothing"
+  and "too old to say" must not look the same on the wire.
 - **`GET /health` is tri-state, and the server owns the verdict**
   (`HealthChecks::verdict`, next to the data so nothing computes it twice):
   `ok`; `degraded` = only the **optional** Ollama is failing, which is exactly

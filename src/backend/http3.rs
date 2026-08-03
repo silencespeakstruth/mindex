@@ -30,9 +30,9 @@ use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
     delete_files, delete_history, delete_project, delete_research_active, delete_research_run,
     delete_research_runs, get_config, get_files, get_health, get_llms_txt, get_metrics,
-    get_project_stats, get_projects, get_research_active, get_research_run, get_research_runs,
-    get_research_verification, get_status, get_version, post_cancel, post_drift, post_gc,
-    post_history, post_index, post_research, post_research_challenge, post_research_pin,
+    get_mindex_descriptor, get_project_stats, get_projects, get_research_active, get_research_run,
+    get_research_runs, get_research_verification, get_status, get_version, post_cancel, post_drift,
+    post_gc, post_history, post_index, post_research, post_research_challenge, post_research_pin,
     post_retry, post_search, post_symbols,
 };
 use crate::db::qdrant::VectorStore;
@@ -442,6 +442,61 @@ fn build_quic_endpoint(
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
+/// Routes this server serves that are **not** in the OpenAPI spec, each with the
+/// one-line summary the service descriptor reports for it.
+///
+/// Every one is a deliberate omission rather than an oversight, and
+/// `openapi_spec_is_complete_and_versioned` asserts the absence of the two that
+/// have handlers so that nobody "fixes" it. They are here because two different
+/// readers need the same list for opposite purposes: the descriptor
+/// (`/.well-known/mindex.json`) reports them as real endpoints with
+/// `documented: false`, and `llms_doc_mentions_only_routes_that_exist` allows
+/// the narrative to name them. Keeping one list is what stops those two drifting
+/// apart — they held separate copies of the same four strings before this.
+///
+/// `/metrics` is in the list but the descriptor filters it out: it is an
+/// operator surface, routed only when `[metrics].enabled`, and a discovery
+/// document that advertises a route which 404s on half of all deployments is
+/// worse than one that stays quiet about it.
+pub const UNDOCUMENTED_ROUTES: &[(&str, &str)] = &[
+    (
+        "/llms.txt",
+        "Prose companion to the service descriptor: the workflow this API is built around.",
+    ),
+    (
+        "/metrics",
+        "Prometheus/OpenMetrics exposition, when [metrics].enabled.",
+    ),
+    ("/swagger-ui", "The OpenAPI spec, rendered interactively."),
+    (
+        "/api-docs/openapi.json",
+        "Full request/response schemas for every documented endpoint.",
+    ),
+];
+
+/// Paths in [`UNDOCUMENTED_ROUTES`] the descriptor must not advertise.
+///
+/// One entry, and the reason is in that constant's own doc comment.
+pub const DESCRIPTOR_HIDDEN_ROUTES: &[&str] = &["/metrics"];
+
+/// Which endpoints answer in frames rather than one body, and in what encoding.
+///
+/// The only fact in the descriptor's endpoint inventory that is written by hand:
+/// OpenAPI records the shape of a response, not that it arrives incrementally,
+/// so this cannot be derived from the spec. A new streaming endpoint needs a row
+/// here, next to its `.route(...)` line — a caller that buffers an SSE stream to
+/// completion is exactly the failure this field exists to prevent, and it fails
+/// as a seventy-minute silence rather than as an error.
+pub const STREAMING_ENDPOINTS: &[(&str, &str, &str)] = &[
+    ("POST", "/v0/{project_guid}/index", "ndjson"),
+    ("POST", "/v0/{project_guid}/research", "sse"),
+    (
+        "POST",
+        "/v0/{project_guid}/research/{run_id}/challenge",
+        "sse",
+    ),
+];
+
 fn build_router(
     state: RouterState,
     body_limit_bytes: usize,
@@ -517,6 +572,10 @@ fn build_router(
         // unlike `/metrics`: there is no config gate whose absence it should
         // mirror, and a 404 here would read as "this server has no such doc".
         .route("/llms.txt", get(get_llms_txt))
+        // The machine twin of `/llms.txt`, and the floor under it: a client
+        // whose harness refuses the prose can still learn what this server is
+        // from JSON. Unconditional for the same reason.
+        .route("/.well-known/mindex.json", get(get_mindex_descriptor))
         .route("/health", get(get_health))
         .route("/version", get(get_version));
 
