@@ -157,6 +157,12 @@
         "icon": "$(stop-circle)"
       },
       {
+        "command": "mindex.cancelResearch",
+        "title": "Cancel the Research Run",
+        "category": "MINDex",
+        "icon": "$(stop-circle)"
+      },
+      {
         "command": "mindex.refreshStatus",
         "title": "Refresh Server Status",
         "category": "MINDex",
@@ -309,7 +315,7 @@
         },
         {
           "command": "mindex.openSettings",
-          "when": "view == mindexDrift",
+          "when": "view == mindexDrift && mindex.hasProject",
           "group": "9_force@9"
         }
       ],
@@ -321,6 +327,10 @@
         {
           "command": "mindex.openResearchReport",
           "when": "false"
+        },
+        {
+          "command": "mindex.cancelResearch",
+          "when": "mindex.researchRunning"
         }
       ],
       "editor/title": [
@@ -334,15 +344,18 @@
     "keybindings": [
       {
         "command": "mindex.search",
-        "key": "ctrl+alt+/"
+        "key": "ctrl+alt+/",
+        "when": "mindex.hasProject"
       },
       {
         "command": "mindex.research",
-        "key": "ctrl+alt+."
+        "key": "ctrl+alt+.",
+        "when": "mindex.hasProject"
       },
       {
         "command": "mindex.openResearchHistory",
-        "key": "ctrl+alt+,"
+        "key": "ctrl+alt+,",
+        "when": "mindex.hasProject"
       }
     ],
     "configuration": {

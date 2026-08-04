@@ -4,6 +4,7 @@ import { BRAND } from "./brand";
 
 export type { ProblemDetails, Humanized } from "./problem";
 export {
+    ConfigurationError,
     humanize,
     isCancellation,
     MalformedResponseError,
@@ -48,6 +49,11 @@ export function disposeErrorLog(): void {
  * `what` is the operation, in the user's terms ("Delete failed"). The rest comes
  * from `humanize`, so this notification and a panel's inline banner cannot
  * disagree about what a 404 means.
+ *
+ * Two buttons are possible and they are mutually exclusive by construction: Retry
+ * for a retryable failure the caller gave a `retry` for, and `h.action` for the
+ * credential refusals, which are never retryable. A message that says what is
+ * wrong and offers nothing to press is the shape this exists to avoid.
  */
 export async function reportError(
     what: string,
@@ -65,7 +71,14 @@ export async function reportError(
         if (pick === "Retry") {
             await retry();
         }
-    } else {
-        await vscode.window.showErrorMessage(message);
+        return;
     }
+    if (h.action !== undefined) {
+        const pick = await vscode.window.showErrorMessage(message, h.action.title);
+        if (pick === h.action.title) {
+            await vscode.commands.executeCommand(h.action.command);
+        }
+        return;
+    }
+    await vscode.window.showErrorMessage(message);
 }

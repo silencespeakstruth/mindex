@@ -135,6 +135,36 @@ const emptyTitle = el("runs-empty-title");
 const emptyHint = el("runs-empty-hint");
 const errorBox = el("runs-error");
 
+/**
+ * The banner is a message *and*, when the failure is retryable and the host kept
+ * something to retry, one button. Built here rather than in markup so the two can
+ * never disagree about whether there is anything to press.
+ */
+function showError(message: string, retryable: boolean, canRetry: boolean): void {
+    errorBox.textContent = "";
+    if (message === "") {
+        clearError();
+        return;
+    }
+    const text = document.createElement("span");
+    text.textContent = message;
+    errorBox.appendChild(text);
+    if (canRetry) {
+        const again = document.createElement("button");
+        again.className = "ghost runs-text-button";
+        again.textContent = "Retry";
+        again.addEventListener("click", () => {
+            clearError();
+            api.postMessage({ type: "retryFailed" });
+        });
+        errorBox.appendChild(again);
+    }
+    // Yellow when pressing the same thing again could work, red when it could not:
+    // `retryable` is the only thing that tells the user which of those this is.
+    errorBox.className = retryable ? "runs-error warn" : "runs-error";
+    errorBox.hidden = false;
+}
+
 function clearError(): void {
     errorBox.textContent = "";
     errorBox.className = "runs-error";
@@ -656,7 +686,7 @@ function renderDetail(run: RunDetail): void {
     reAsk.title =
         "Put this question back in the form with its scope and settings, and this " +
         "report as context — the usual way to follow one up.";
-    reAsk.dataset.busyKey = "preview";
+    reAsk.dataset.busyKey = "action";
     reAsk.addEventListener("click", (e) => {
         e.stopPropagation();
         api.postMessage({ type: "reAsk", id: run.id });
@@ -861,7 +891,7 @@ function challengeButton(
     const guard = challengeGuard(run, state);
     const b = document.createElement("button");
     b.className = "secondary";
-    b.dataset.busyKey = "preview";
+    b.dataset.busyKey = "action";
     if (!guard.ok) {
         b.append(icon("shield", true), document.createTextNode(" Challenge"));
         b.disabled = true;
@@ -1269,12 +1299,11 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             }
             break;
         case "error":
-            errorBox.textContent = typeof msg.message === "string" ? msg.message : "";
-            // Yellow when pressing the same thing again could work, red when it
-            // could not: `retryable` is the only thing that tells the user which
-            // of those they are looking at.
-            errorBox.className = msg.retryable === true ? "runs-error warn" : "runs-error";
-            errorBox.hidden = errorBox.textContent === "";
+            showError(
+                typeof msg.message === "string" ? msg.message : "",
+                msg.retryable === true,
+                msg.canRetry === true
+            );
             break;
     }
 });

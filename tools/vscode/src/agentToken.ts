@@ -103,10 +103,16 @@ async function pickActions(projectLabel: string): Promise<string[] | undefined> 
         return undefined;
     }
     if (picked.length === 0) {
-        void vscode.window.showWarningMessage(
-            say("no actions were selected, so there is no token worth issuing.")
+        // Back to the list, not out of the chain. An empty grant is still refused —
+        // the server would issue it happily and the holder would discover it one
+        // 403 at a time — but making that refusal cost four dialogs punished a
+        // mis-click by restarting everything the user had already answered.
+        const AGAIN = "Choose actions";
+        const retry = await vscode.window.showWarningMessage(
+            say("no actions were selected, so there is no token worth issuing."),
+            AGAIN
         );
-        return undefined;
+        return retry === AGAIN ? pickActions(projectLabel) : undefined;
     }
     return picked.map((p) => p.action);
 }
@@ -177,13 +183,21 @@ export async function mintAgentToken(
         return;
     }
 
-    const issued = await api.mintToken({
-        sub: `agent:${holder.trim()}`,
-        projects: [projectGuid],
-        actions,
-        audiences: [AGENT_AUDIENCE],
-        days: lifetime.days,
-    });
+    // The one round trip in an otherwise local chain, and the only step that can
+    // take visible time. Without this the last input box closes and nothing at all
+    // happens until the toast — and from the palette, where no button is greyed,
+    // there is no other sign the request is even in flight.
+    const issued = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: say("issuing a token…") },
+        () =>
+            api.mintToken({
+                sub: `agent:${holder.trim()}`,
+                projects: [projectGuid],
+                actions,
+                audiences: [AGENT_AUDIENCE],
+                days: lifetime.days,
+            })
+    );
 
     await vscode.env.clipboard.writeText(issued.token);
     const until =

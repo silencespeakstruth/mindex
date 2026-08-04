@@ -1,6 +1,7 @@
 import * as https from "node:https";
 import * as http from "node:http";
 import {
+    ConfigurationError,
     MalformedResponseError,
     ProblemDetails,
     ProblemError,
@@ -902,6 +903,33 @@ export function parseSseFrame(frame: string): { event: string; data: unknown } |
     }
 }
 
+/**
+ * Build the request URL, refusing a base the client cannot use.
+ *
+ * Both callers used to do a bare `new URL(this.base + path)` and hand the result to
+ * `https.request`. Neither failure mode was survivable as written: a malformed base
+ * throws here, and a non-`https:` one throws `ERR_INVALID_PROTOCOL` *inside* the
+ * Promise executor — synchronously, before any `try` that would wrap it — so both
+ * escaped the `UnreachableError` mapping and reached the user as
+ * "Something went wrong." The setting is the only thing that can fix either, so the
+ * error names it.
+ */
+function requestUrl(base: string, path: string): URL {
+    let url: URL;
+    try {
+        url = new URL(base + path);
+    } catch {
+        throw new ConfigurationError("mindex.serverUrl", `"${base}" is not a valid URL.`);
+    }
+    if (url.protocol !== "https:") {
+        throw new ConfigurationError(
+            "mindex.serverUrl",
+            `MINDex is served over HTTPS only, and this address is "${url.protocol}//".`
+        );
+    }
+    return url;
+}
+
 /** Parse one SSE frame (`event:` + `data:` lines) and route it to the callbacks. */
 function dispatchSseFrame(frame: string, cb: ResearchCallbacks): void {
     const parsed = parseSseFrame(frame);
@@ -1317,10 +1345,54 @@ export class MindexApi {
         cb: ResearchCallbacks,
         signal: AbortSignal
     ): Promise<void> {
-        return this.streamRequest(`/${this.protocol}/${guid}/research`, req, signal, {
-            onFrame: (frame) => dispatchSseFrame(frame, cb),
+        return this.streamResearch(`/${this.protocol}/${guid}/research`, req, cb, signal);
+    }
+
+    /**
+     * Both research streams, with one guarantee added: the caller sees exactly one
+     * terminal event, or an `error` saying it did not.
+     *
+     * The server already promises this on its side — `SseEventStream` synthesises an
+     * `error` when its channel closes without `done`, so a panicking job does not
+     * read as a completed run. Nothing made the same promise about the *transport*.
+     * A 200 that is not an event stream at all (a proxy's interstitial, a server that
+     * answered the request some other way) parses to no frames, ends cleanly and
+     * resolves — and the panel then sits at "thinking…" for as long as it is left
+     * open, with no report, no error, and nothing in the log.
+     *
+     * A user cancel is exempt: `abortResolves` is deliberate and there is no terminal
+     * to expect after it.
+     */
+    private streamResearch(
+        path: string,
+        req: ResearchRequest | ChallengeRequest,
+        cb: ResearchCallbacks,
+        signal: AbortSignal
+    ): Promise<void> {
+        let terminated = false;
+        const guarded: ResearchCallbacks = {
+            ...cb,
+            onDone: (d) => {
+                terminated = true;
+                cb.onDone(d);
+            },
+            onError: (code, detail) => {
+                terminated = true;
+                cb.onError(code, detail);
+            },
+        };
+        return this.streamRequest(path, req, signal, {
+            onFrame: (frame) => dispatchSseFrame(frame, guarded),
             // An abort is the user's cancel, not a failure.
             abortResolves: true,
+        }).then(() => {
+            if (!terminated && !signal.aborted) {
+                cb.onError(
+                    "internal.error",
+                    "The server closed the connection without finishing the run. " +
+                        "Nothing was stored."
+                );
+            }
         });
     }
 
@@ -1337,14 +1409,11 @@ export class MindexApi {
         cb: ResearchCallbacks,
         signal: AbortSignal
     ): Promise<void> {
-        return this.streamRequest(
+        return this.streamResearch(
             `/${this.protocol}/${guid}/research/${encodeURIComponent(runId)}/challenge`,
             req,
-            signal,
-            {
-                onFrame: (frame) => dispatchSseFrame(frame, cb),
-                abortResolves: true,
-            }
+            cb,
+            signal
         );
     }
 
@@ -1493,7 +1562,7 @@ export class MindexApi {
             abortResolves: boolean;
         }
     ): Promise<void> {
-        const url = new URL(this.base + path);
+        const url = requestUrl(this.base, path);
         const payload = Buffer.from(JSON.stringify(body), "utf8");
         const firstFrameMs = this.timeoutMs;
         const idleMs = this.streamIdleMs;
@@ -1651,7 +1720,7 @@ export class MindexApi {
         body?: unknown,
         signal?: AbortSignal
     ): Promise<unknown> {
-        const url = new URL(this.base + path);
+        const url = requestUrl(this.base, path);
         const payload =
             body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
 

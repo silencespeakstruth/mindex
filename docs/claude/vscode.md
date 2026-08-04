@@ -332,6 +332,24 @@ modifying `tools/vscode`.
   failure, not a cancellation (which would read as the user's own Stop).
   None of this is observable without `[mindex.statusPollSeconds]` (default
   30, `0` = off): every other refresh is event-driven.
+  **The form is destroyed whenever it is hidden, so the host replays what it
+  cannot recover.** The Ask view is registered without
+  `retainContextWhenHidden`: collapsing the sidebar tears the page down and
+  re-showing it builds a fresh one from the default HTML. Availability, the
+  server config and the context chips were already replayed; `running` and the
+  held `submit` key were not, and their absence was the sharpest dead end in
+  the extension — a rebuilt page drew Submit enabled and **Stop hidden**, so
+  pressing Submit earned "cancel it first" while the only control that could
+  cancel was the one missing. `AskFormState` (`src/askState.ts`, `vscode`-free,
+  `askState.test.ts`) now holds the pending mode, the run flag and the held
+  keys, and `replay()` emits only what differs from a default page. The
+  argument against replaying the busy key — "a webview rebuilt cannot be
+  mid-press" — was true of the *page* and beside the point: the press is held
+  by the host, which outlives it. `mindex.cancelResearch` is the second half,
+  gated by a `mindex.researchRunning` context key so the palette offers it
+  exactly while there is a run: the replay fixes a *hidden* sidebar, and a
+  closed one still leaves a run the form cannot draw a button for. Stop remains
+  the primary control; this is the way out, not the way.
   **Language marks are vendored, two-toned and tested.** `esbuild.mjs`
   generates `src/shared/langGlyphs.ts` from devicon's *monochrome* SVGs
   (fills stripped so CSS `color` drives them), committed; `sql` alone falls
@@ -419,11 +437,27 @@ modifying `tools/vscode`.
   touch): `#runs-delete` is disabled because nothing is selected, and an
   unrelated key clearing must not enable it. `{type:"loading"}` is retired —
   the runs spinner rides the same `list` key as the buttons, so the two can
-  no longer disagree. Keys in use: `list`/`more`/`gc`/`delete`/`preview`/
+  no longer disagree. Keys in use: `list`/`more`/`gc`/`delete`/`action`/
   `verify`/`row:<id>` (history), `refresh`/`retry`/`row:<path>` (status),
   `submit` (Ask — shared by the form and the `mindex.search` palette
   command, so five fast clicks are one search rather than five quick picks
-  racing to open). The status panel's `refresh` key is fed by
+  racing to open).
+  **One key, one authority** — the corollary of "the greyed state is an echo".
+  `list` had two: `load` posted it by hand while `BusyKeys` held it for
+  Select-all, so a keystroke completing a `load` mid-pass lit the button back
+  up while the host was still refusing it, and the press vanished (a refusal
+  posts nothing, by design). Select-all now supersedes through the same
+  `Supersedable` handle `load` uses and takes no key of its own. The same rule
+  retired the *shared* `preview` key: opening a row, re-asking, re-checking and
+  launching a challenge were one key, so clicking a row during a challenge was
+  refused — and the row, which carries no key, had already drawn itself open
+  and stayed open and empty forever. Row detail now **supersedes**
+  (`previewWanted`, newest click wins) and the three launches share `action`.
+  **`Supersedable`** (`src/supersede.ts`, `vscode`-free, `supersede.test.ts`) is
+  the read-side counterpart to `BusyKeys`, and it exists because the ownership
+  check that makes superseding safe — release only if you are still the owner —
+  was written in one of the panel's three writers of that handle and forgotten
+  in the other two. The status panel's `refresh` key is fed by
   `StatusMonitor.onDidChangeRefreshing`, not by the press, so a *background*
   poll greys it too — otherwise the panel visibly re-renders while the
   button that supposedly caused it sits idle and clickable.
@@ -494,6 +528,40 @@ modifying `tools/vscode`.
   that had since loaded. `noteIfLegacy` had to stop reading the rendered
   message and became a shape test (`ProblemError`, 400, `detail` matching):
   matching English for a version check breaks the day the wording improves.
+  **A message with nothing to press is the other half of the rule**, and three
+  classes had exactly that. `Humanized` therefore carries an optional
+  `action` — a command id and a button label, strings, so `problem.ts` stays
+  `vscode`-free — which `reportError` renders instead of Retry (they are
+  mutually exclusive: none of these is retryable). **401** and **403** used to
+  fall through to the generic `<500` branch, so an expired credential surfaced
+  only as requests that quietly stopped working — the precise state the token
+  indicator exists to prevent, and one it *cannot* detect for an opaque
+  (non-JWT) token, where a 401 is the only signal that will ever arrive. The
+  two are worded apart on purpose: 401 offers `mindex.setToken`, while 403
+  leads with the server's own detail naming the missing action and offers
+  `mindex.mintAgentToken` — telling someone to replace a valid token is the
+  wrong advice, and it is why the mint command's own catch stopped prefixing a
+  cause of its own (`what` is an operation, not a sentence; the two composed
+  into "cannot issue a token: …`mint`: The server refused the request.").
+  **`ConfigurationError`** is the third: a `mindex.serverUrl` with the wrong
+  scheme makes `https.request` throw `ERR_INVALID_PROTOCOL` *synchronously
+  inside the Promise executor*, so it never reached the `UnreachableError` wrap
+  and landed on "Something went wrong." — the one failure whose remedy the
+  client knows exactly was the one it could not name. `requestUrl` refuses it
+  before the request is built. The history banner's `retryable` now also ships
+  a **Retry button** (the host keeps the thunk; the webview has no name for
+  what to re-run), and the research panel's error block stopped concatenating
+  `code` into `detail` — `ResearchPanel.error` had taken them as separate
+  arguments all along, and that one call site made the panel the last place in
+  the extension showing a user `ollama.unavailable: …`.
+  **A stream that ends without a terminal event is a failure, client-side
+  too.** The server synthesises an `error` when its own channel closes without
+  `done`; nothing made the same promise about the transport, so a 200 that is
+  not an event stream parsed to no frames, ended cleanly and resolved — leaving
+  the panel at "thinking…" indefinitely with no report, no error and no log
+  line. `streamResearch` wraps both research streams and synthesises the
+  terminal itself. A user cancel is exempt: `abortResolves` is deliberate and
+  there is no terminal to expect after it.
   **Requests have deadlines, and the stream's is idle-only.**
   `mindex.requestTimeoutSeconds` (15, `0` = off) arms **two** clocks per
   request — `req.setTimeout` for socket inactivity, plus a total deadline at
@@ -517,7 +585,15 @@ modifying `tools/vscode`.
   single-flight guard, a 20 s backstop deadline and an abort on `dispose` —
   the bug being that `reschedule` re-arms in a `.finally()`, so one
   never-settling poll ended health polling for the life of the window and
-  froze the indicator at whatever colour it had.
+  froze the indicator at whatever colour it had. That single-flight is a
+  **refusal**, which is right for a tick and wrong for the callers that await
+  it *after a write* — a retry, a delete, a reindex got an instant return
+  carrying a snapshot taken before their own change, so the panel could
+  re-render still listing the file they had just requeued (shortening
+  `statusPollSeconds` makes the collision routine rather than rare). Those
+  callers now use **`refreshNow`**, which waits the in-flight read out and then
+  takes its turn: at most one extra pass per write, and a tick still refuses,
+  so the request-storm the guard exists to prevent stays prevented.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, one tool —
 - VS Code (`tools/vscode`): `npm run check` = prettier + eslint + `tsc` + the
   `node --test` suite (`src/*.test.ts`, compiled to `dist/`).

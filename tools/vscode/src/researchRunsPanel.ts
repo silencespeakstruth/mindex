@@ -10,6 +10,7 @@ import type {
 } from "./api";
 import { asString, mediaRoots, readMedia, renderPage } from "./webview";
 import { BusyKeys } from "./busy";
+import { Supersedable } from "./supersede";
 import { humanize, logError, ProblemError } from "./errors";
 import { debounce, type Debounced } from "./shared/debounce";
 import {
@@ -102,8 +103,13 @@ export class ResearchRunsPanel {
 
     private readonly panel: vscode.WebviewPanel;
     private readonly disposables: vscode.Disposable[] = [];
-    /** Supersedes the in-flight list request. */
-    private inFlight?: AbortController;
+    /** The in-flight list request. Newest wins; see `supersede.ts`. */
+    private readonly listRead = new Supersedable();
+    /**
+     * The row whose detail was asked for last, so a slower earlier answer cannot
+     * land on top of it. `getResearchRun` takes no signal, so this is the supersede.
+     */
+    private previewWanted?: string;
     /**
      * Single-flight per button, and the wire that greys them.
      *
@@ -135,6 +141,12 @@ export class ResearchRunsPanel {
     private kind: "all" | "research" | "challenge" = "all";
     private completeness: "all" | "finalized" | "partial" = "all";
     private totals?: ResearchCorpusTotals;
+    /**
+     * What to run if the user presses Retry on the error banner. Set by `fail` and
+     * spent by the press, so a banner cleared by a successful render cannot leave a
+     * stale action armed behind it.
+     */
+    private retryFailed?: () => void;
     /** The challenge state of the previewed run, for the Re-check fork. */
     private challengeState?: { runId: string; state: ChallengeState };
     /**
@@ -225,8 +237,15 @@ export class ResearchRunsPanel {
                         // arrived.
                         this.search(this.query, true);
                         break;
+                    // Not wrapped in `BusyKeys`, unlike its neighbours. It is a read,
+                    // and it already owns the `list` key the way `load` does — an
+                    // `Supersedable` handle of its own, released only by its owner. Two
+                    // authorities over one key is what this used to be: a search
+                    // landing mid-pass posted `list: false` from `load`, the button
+                    // lit up, and `BusyKeys` — which posts nothing when it refuses —
+                    // then swallowed the press in silence.
                     case "selectAllMatching":
-                        void this.busy.run("list", () => this.selectAllMatching());
+                        void this.selectAllMatching();
                         break;
                     case "gcPropose":
                         void this.busy.run("gc", () => this.proposeGarbage());
@@ -240,7 +259,7 @@ export class ResearchRunsPanel {
                         );
                         break;
                     case "recheck":
-                        void this.busy.run("preview", () =>
+                        void this.busy.run("action", () =>
                             this.recheck(asString(msg.id), actions)
                         );
                         break;
@@ -273,15 +292,23 @@ export class ResearchRunsPanel {
                     case "challenge": {
                         const run = this.summaries.get(asString(msg.id));
                         if (run !== undefined) {
-                            void this.busy.run("preview", () =>
+                            void this.busy.run("action", () =>
                                 this.confirmAndChallenge(run, actions)
                             );
                         }
                         break;
                     }
+                    // No key: `preview` supersedes rather than refusing, and the
+                    // row it opens has no key to echo a refusal with.
                     case "select":
-                        void this.busy.run("preview", () => this.preview(asString(msg.id)));
+                        void this.preview(asString(msg.id));
                         break;
+                    case "retryFailed": {
+                        const again = this.retryFailed;
+                        this.retryFailed = undefined;
+                        again?.();
+                        break;
+                    }
                     case "toggle":
                         this.toggle(asString(msg.id), msg.checked === true);
                         break;
@@ -318,7 +345,7 @@ export class ResearchRunsPanel {
                         break;
                     }
                     case "reAsk":
-                        void this.busy.run("preview", () =>
+                        void this.busy.run("action", () =>
                             this.reAsk(asString(msg.id), actions)
                         );
                         break;
@@ -349,7 +376,7 @@ export class ResearchRunsPanel {
             // fires into a disposed webview and surfaces as an error the user can do
             // nothing about.
             this.search.cancel();
-            this.inFlight?.abort();
+            this.listRead.abort();
             this.busy.reset();
             for (const d of this.disposables) {
                 d.dispose();
@@ -471,10 +498,18 @@ export class ResearchRunsPanel {
         return false;
     }
 
-    /** Hand the list spinner and key back, but only if this request still owns them. */
+    /**
+     * Hand the list spinner and key back, but only if this request still owns them.
+     *
+     * Every writer releases through here — `load`, `selectAllMatching` and
+     * `proposeGarbage`. The latter two used to clear the handle unconditionally in a
+     * `finally`, so a keystroke landing mid-pass installed `load`'s controller and
+     * was then disowned by the pass it had just superseded: the spinner went out
+     * while a fetch was still running, and the *next* keystroke aborted nothing,
+     * which is how a stale page could render over a newer one.
+     */
     private releaseList(controller: AbortController): void {
-        if (this.inFlight === controller) {
-            this.inFlight = undefined;
+        if (this.listRead.end(controller)) {
             this.post({ type: "busy", key: "list", busy: false });
         }
     }
@@ -488,7 +523,7 @@ export class ResearchRunsPanel {
      * sentence goes to the banner and the raw error to the output channel, and
      * `where` is what makes the log line worth having.
      */
-    private fail(where: string, e: unknown): void {
+    private fail(where: string, e: unknown, retry?: () => void): void {
         if (isAbort(e)) {
             return;
         }
@@ -497,10 +532,16 @@ export class ResearchRunsPanel {
             return;
         }
         logError(`Research History: ${where}`, e);
+        // A retryable failure with nothing to press is the shape this panel had:
+        // the banner turned yellow to say "this could work if you tried again" and
+        // then offered no way to. The thunk is kept here rather than sent, because
+        // what is retried is a host call and the webview has no name for it.
+        this.retryFailed = humanized.retryable ? retry : undefined;
         this.post({
             type: "error",
             message: humanized.text,
             retryable: humanized.retryable,
+            canRetry: this.retryFailed !== undefined,
         });
     }
 
@@ -510,9 +551,7 @@ export class ResearchRunsPanel {
             this.post({ type: "runs", runs: [], nextBeforeSeq: null, reset: true });
             return;
         }
-        this.inFlight?.abort();
-        const controller = new AbortController();
-        this.inFlight = controller;
+        const controller = this.listRead.begin();
         const reset = beforeSeq === undefined;
         this.post({ type: "busy", key: "list", busy: true });
 
@@ -537,12 +576,12 @@ export class ResearchRunsPanel {
                 await this.load(q, beforeSeq);
                 return;
             }
-            this.fail("loading the list", e);
+            this.fail("loading the list", e, () => void this.load(q, beforeSeq));
             return;
         } finally {
             // Only the current owner clears the spinner and the key. A superseded
             // request turning them off while its successor is still running is how
-            // the panel came to look idle mid-fetch — and clearing `inFlight` from a
+            // the panel came to look idle mid-fetch — and clearing the handle from a
             // stale controller would leave the next keystroke aborting nothing.
             this.releaseList(controller);
         }
@@ -631,9 +670,7 @@ export class ResearchRunsPanel {
         if (guid === undefined) {
             return;
         }
-        this.inFlight?.abort();
-        const controller = new AbortController();
-        this.inFlight = controller;
+        const controller = this.listRead.begin();
         this.post({ type: "busy", key: "list", busy: true });
         try {
             const { rows, truncated } = await this.pageAll(
@@ -655,10 +692,13 @@ export class ResearchRunsPanel {
                 cap: this.maxDelete(),
             });
         } catch (e) {
-            this.fail("selecting everything that matches", e);
+            this.fail(
+                "selecting everything that matches",
+                e,
+                () => void this.selectAllMatching()
+            );
         } finally {
-            this.inFlight = undefined;
-            this.post({ type: "busy", key: "list", busy: false });
+            this.releaseList(controller);
         }
     }
 
@@ -677,9 +717,7 @@ export class ResearchRunsPanel {
         if (guid === undefined) {
             return;
         }
-        this.inFlight?.abort();
-        const controller = new AbortController();
-        this.inFlight = controller;
+        const controller = this.listRead.begin();
         this.post({ type: "busy", key: "list", busy: true });
         try {
             const { rows } = await this.pageAll(
@@ -706,25 +744,39 @@ export class ResearchRunsPanel {
                 expected: this.totals?.gc_candidates ?? null,
             });
         } catch (e) {
-            this.fail("proposing garbage", e);
+            this.fail("proposing garbage", e, () => void this.proposeGarbage());
         } finally {
-            this.inFlight = undefined;
-            this.post({ type: "busy", key: "list", busy: false });
+            this.releaseList(controller);
         }
     }
 
+    /**
+     * Fetch and post one row's detail.
+     *
+     * Superseded, never refused — the list's rule, for the same reason. The webview
+     * marks a row open the moment it is clicked, before the host has answered, so a
+     * *refused* select left that row expanded with no body, no spinner and no error,
+     * permanently: `BusyKeys` posts nothing when it refuses, by design, and the row
+     * carries no key that could have echoed one. Clicking a second row while the
+     * first is still loading is an ordinary thing to do, and the answer the user
+     * wants is the newest one.
+     */
     private async preview(id: string): Promise<void> {
         const guid = this.guid();
         if (guid === undefined) {
             return;
         }
+        this.previewWanted = id;
         let detail: ResearchRunDetail;
         try {
             detail = await this.api().getResearchRun(guid, id);
         } catch (e) {
             // `fail` drops aborts itself — one place, not eight.
-            this.fail("opening the report", e);
+            this.fail("opening the report", e, () => void this.preview(id));
             return;
+        }
+        if (this.previewWanted !== id) {
+            return; // another row was clicked while this was in flight
         }
         this.summaries.set(detail.id, detail);
         this.challengeState = undefined;
@@ -777,7 +829,15 @@ export class ResearchRunsPanel {
                 // rather than guessing — the trust badge still carries the verdict.
                 return;
             }
-            return;
+            if (isAbort(e) || humanize(e).cancelled) {
+                return;
+            }
+            // Not silent. This is best-effort in that it must never cost the
+            // preview — but returning with no state at all rendered as "never
+            // challenged", which is the one wrong answer available here, and left
+            // nothing in the log to explain the missing line either.
+            logError("Research History: reading the challenge history", e);
+            state = { state: "unknown" };
         }
         this.challengeState = { runId: run.id, state };
         this.post({ type: "challengeState", runId: run.id, state });

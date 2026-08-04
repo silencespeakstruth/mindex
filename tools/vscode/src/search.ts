@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "node:path";
 import { MindexApi, SearchResult } from "./api";
-import { ProblemError, isCancellation, reportError } from "./errors";
+import { ProblemError, isCancellation } from "./errors";
 import { BRAND, say } from "./brand";
 import { describeScope, isScoped, Scope } from "./scope";
 
@@ -19,20 +19,45 @@ export interface RunRegistry {
     delete(run: AbortController): void;
 }
 
-/** What a search run is given. `query` preset = no prompt (the Ask form typed it). */
+/** What a search run is given. */
 export interface SearchOptions extends Scope {
     topK: number;
-    query?: string;
+    query: string;
     /** Registered for the duration of the request; see [`RunRegistry`]. */
     registry?: RunRegistry;
 }
 
 /**
- * Prompt for a query, POST /search, and show every result in a QuickPick in
- * server rank order (score descending): each item carries `#rank score path`,
- * the line span, and a one-line code snippet. Moving through the list live
- * previews the location in the editor; Enter opens it, Esc restores the
- * editor state from before the search.
+ * Ask for a query. The palette has nothing to type into; the Ask form does, and
+ * calls `runSearch` with what the user typed.
+ *
+ * Separate from `runSearch` so the *caller* always knows the query. That matters
+ * for exactly one thing: a failed search is reported by the caller, after it has
+ * released the single-flight key, and its Retry has to re-run the same query rather
+ * than open this box again.
+ */
+export async function promptForQuery(): Promise<string | undefined> {
+    const query = await vscode.window.showInputBox({
+        title: `${BRAND} search`,
+        prompt: "Semantic code search query",
+        placeHolder: "e.g. where are Qdrant collection names derived?",
+        ignoreFocusOut: true,
+    });
+    return query === undefined || query.trim() === "" ? undefined : query;
+}
+
+/**
+ * POST /search and show every result in a QuickPick in server rank order (score
+ * descending): each item carries `#rank score path`, the line span, and a one-line
+ * code snippet. Moving through the list live previews the location in the editor;
+ * Enter opens it, Esc restores the editor state from before the search.
+ *
+ * A cancellation and an empty result are handled here — neither is a failure worth
+ * a notification. Anything else is **thrown**, for the caller to report once it has
+ * let go of the `submit` key: an error notification stays on screen until it is
+ * dismissed, so awaiting one here held the form's Submit greyed and spinning for as
+ * long as the toast sat there. `startResearch` hoists its report out for the same
+ * reason; this path had not been given the same treatment.
  */
 export async function runSearch(
     api: MindexApi,
@@ -40,20 +65,7 @@ export async function runSearch(
     workspaceRoot: string,
     opts: SearchOptions
 ): Promise<void> {
-    const { topK, query: presetQuery, registry, ...scope } = opts;
-    // Invoked from the Ask view the query is already typed; from the command palette
-    // there is nothing to type into, so prompt.
-    const query =
-        presetQuery ??
-        (await vscode.window.showInputBox({
-            title: `${BRAND} search`,
-            prompt: "Semantic code search query",
-            placeHolder: "e.g. where are Qdrant collection names derived?",
-            ignoreFocusOut: true,
-        }));
-    if (query === undefined || query.trim() === "") {
-        return;
-    }
+    const { topK, query, registry, ...scope } = opts;
 
     let results: SearchResult[];
     try {
@@ -97,10 +109,7 @@ export async function runSearch(
             void vscode.window.showInformationMessage(say("no matches."));
             return;
         }
-        await reportError("Search failed", e, () =>
-            runSearch(api, guid, workspaceRoot, { ...opts, query })
-        );
-        return;
+        throw e;
     }
 
     if (results.length === 0) {
@@ -214,11 +223,20 @@ async function openResult(
         });
     } catch {
         if (!opts.quiet) {
-            void vscode.window.showWarningMessage(
-                say(
-                    `${r.path} not found in the working tree (index may be stale — run Check Drift).`
+            // The remedy is a command, so it is offered as a button rather than
+            // named in prose: a message that tells the user which command to go and
+            // find is a message that has done half its job.
+            const CHECK = "Check Drift";
+            void vscode.window
+                .showWarningMessage(
+                    say(`${r.path} is not in the working tree — the index may be stale.`),
+                    CHECK
                 )
-            );
+                .then((pick) => {
+                    if (pick === CHECK) {
+                        void vscode.commands.executeCommand("mindex.checkDrift");
+                    }
+                });
         }
     }
 }

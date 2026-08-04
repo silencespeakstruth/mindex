@@ -96,8 +96,9 @@
         <h4 class="card-title">
             <span class="codicon codicon-flame codicon-sm"></span>Failed files
             <span class="card-note dim" id="failed-total"></span>
-            <button id="retry-all" class="secondary" hidden>
-                <span class="codicon codicon-debug-restart codicon-sm"></span>Retry all
+            <button id="retry-all" class="secondary" data-busy-key="retry" hidden>
+                <span class="codicon codicon-debug-restart codicon-sm" data-busy-icon></span>
+                Retry all
             </button>
         </h4>
         <div id="failed"></div>

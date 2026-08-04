@@ -6,6 +6,7 @@ import {
     ResearchRunSummary,
     SearchFilter,
 } from "./api";
+import { AskFormState } from "./askState";
 import { say } from "./brand";
 import { ALL_LANGUAGES } from "./languages";
 import { AskMode } from "./shared/askFields";
@@ -65,8 +66,13 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewId = "mindexAsk";
 
     private view?: vscode.WebviewView;
-    /** A mode requested before the view existed; applied once it resolves. */
-    private pendingMode?: AskMode;
+    /**
+     * The state a rebuilt page cannot recover by itself: the pending mode, whether a
+     * run is in flight, and which keys the host is refusing. See `askState.ts` — the
+     * sidebar is destroyed whenever it is collapsed, and a page that comes back
+     * claiming nothing is running hides the only control that could stop it.
+     */
+    private readonly live = new AskFormState();
     /**
      * What the server can currently be asked for; replayed into a new view.
      *
@@ -146,9 +152,8 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
 
         // A view resolved after the last health refresh (reopened sidebar, window
         // reload) starts from the default HTML, so the known state is replayed.
-        if (this.pendingMode !== undefined) {
-            void view.webview.postMessage({ type: "mode", mode: this.pendingMode });
-            this.pendingMode = undefined;
+        for (const message of this.live.replay()) {
+            void view.webview.postMessage(message);
         }
         if (!this.availability.ask || !this.availability.research) {
             this.postAvailability();
@@ -278,18 +283,30 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
         // The first `mindex.research` of a session may run before the view has ever
         // been resolved, so remember the mode instead of posting into the void.
         if (mode !== undefined) {
-            this.pendingMode = mode;
+            this.live.requestMode(mode);
         }
         void vscode.commands.executeCommand(`${AskViewProvider.viewId}.focus`);
         if (mode !== undefined && this.view !== undefined) {
+            this.live.takePendingMode();
             void this.view.webview.postMessage({ type: "mode", mode });
-            this.pendingMode = undefined;
         }
     }
 
-    /** Research only: disables submit and enables Stop while a run is in flight. */
+    /**
+     * Research only: disables submit and enables Stop while a run is in flight.
+     *
+     * Recorded as well as posted. The sidebar is destroyed when it is collapsed, and
+     * a rebuilt page that has not heard of the run shows Stop hidden while the host
+     * still refuses a second run — a dead end with no control left to leave it by.
+     */
     setRunning(running: boolean): void {
+        this.live.setRunning(running);
         void this.view?.webview.postMessage({ type: "running", running });
+    }
+
+    /** Whether the host believes a research run is in flight. */
+    get isRunning(): boolean {
+        return this.live.running;
     }
 
     /**
@@ -310,11 +327,15 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
      * A keyed round trip started or finished. Currently one key, `submit`, which
      * is Search's in-flight state — Research has `setRunning`, which does more.
      *
-     * Not replayed on resolve, unlike availability and the config: a webview that
-     * was torn down and rebuilt cannot be mid-press, and the host's own
-     * single-flight is what actually refuses a second search.
+     * Replayed on resolve, like availability and the config. The argument for not
+     * replaying it was that a webview which was torn down and rebuilt cannot be
+     * mid-press — true of the *page*, and beside the point: the press is held by the
+     * host, which outlives it. A rebuilt page therefore drew Submit enabled over a
+     * search the host was still refusing, and the refusal posts nothing by design,
+     * so the button did nothing and said nothing.
      */
     setBusy(key: string, busy: boolean): void {
+        this.live.setBusy(key, busy);
         void this.view?.webview.postMessage({ type: "busy", key, busy });
     }
 
