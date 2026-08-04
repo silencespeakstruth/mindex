@@ -315,19 +315,30 @@ mindex cannot tell a loopback scraper from a gated one, so **the local scrape
 breaks unless it sends a token**.
 
 ```sh
-mindex mint-token --sub victoriametrics --project '*' --can admin --days 365 \
-  > ~/.config/mindex/metrics-token && chmod 600 ~/.config/mindex/metrics-token
+mindex mint-token --sub victoriametrics@$(hostname) --project '*' --can admin \
+  --days 0 --key-id metrics-scraper --new-key > /tmp/vm.jwt
+sudo install -m 0640 -o root -g victoriametrics /tmp/vm.jwt \
+  /etc/victoriametrics/mindex-token && shred -u /tmp/vm.jwt
 ```
 
 ```yaml
 # deploy/victoriametrics/mindex.scrape.yml
-  bearer_token_file: /home/<user>/.config/mindex/metrics-token
+  bearer_token_file: /etc/victoriametrics/mindex-token
 ```
 
-A year is deliberate here and wrong everywhere else: it is a machine-local
-credential in a 0600 file that never enters a context, and an expiry that
-silently blanks every dashboard is worse than the exposure it prevents. Put a
-calendar reminder on it, or mint it under its own `kid`.
+**Not under `$HOME`.** The VictoriaMetrics unit runs `ProtectHome=true`, so a
+path there reads as absent — and the symptom is a scrape that simply stops,
+never a message about permissions. `/etc/victoriametrics/` is the natural home;
+0640 owned by the unit's user (`DynamicUser=true` still allocates a stable uid
+for a named `User=`).
+
+**`--days 0` is right here and almost nowhere else**, and its own `--key-id` is
+what makes it right. This is a machine-local credential in a 0640 file that no
+context ever sees, and an expiry would blank every dashboard at an hour nobody is
+watching; the separate key id means withdrawing it is one table deleted from the
+key file rather than a rotation that logs out every other client. The earlier
+advice here — a year plus a calendar reminder — was strictly worse: it kept the
+outage, just on a schedule.
 
 ### A read-only extension, and the new-project trap
 
