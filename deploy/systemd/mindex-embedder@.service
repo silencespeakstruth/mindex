@@ -1,0 +1,159 @@
+# BGE-M3 embedding server for mindex (%i).
+#
+# WHY THIS IS A SYSTEM UNIT (2026-08-04)
+#
+# Same two reasons as qdrant.service: a system unit cannot order itself after a
+# user manager's units, and the BPF-backed network directives are inert in a user
+# unit on this host. Moving mindex without moving this one would have left
+# Before=mindex.service pointing at a unit in another manager — silently doing
+# nothing, which is how the ordering guarantee would have read as present and not
+# been.
+#
+# WHAT THE NETWORK CONFINEMENT IS FOR HERE, SPECIFICALLY
+#
+# This server binds 0.0.0.0:11211 and authenticates nothing. That was correct
+# when mindex ran in a container and reached it over the bridge; mindex now runs
+# on the host and talks to 127.0.0.1, so the wildcard bind is pure exposure —
+# anything on the LAN could drive the GPU. The ExecStart flag is left alone and
+# the kernel is made to disagree with it instead: RestrictNetworkInterfaces=lo
+# plus IPAddressAllow=localhost mean the socket still binds 0.0.0.0 and no packet
+# from anywhere but loopback can reach it. Changing the flag would have been the
+# other way to fix it; this one also survives someone changing the flag back.
+
+[Unit]
+Description=BGE-M3 embedding server for mindex (%i)
+Documentation=https://github.com/silencespeakstruth/mindex/blob/master/embedder/README.md
+After=network-online.target
+Wants=network-online.target
+# mindex degrades gracefully when the embedder is down (files go `failed`, the
+# retry worker re-attempts), so this is not a hard dependency — but starting it
+# first avoids a burst of failures on boot. Now that both are system units this
+# ordering is actually enforced.
+Before=mindex.service
+
+# Exactly one instance may run: both bind port 11211 and both want the whole
+# model resident. Conflicts= does the excluding (starting one enqueues a stop of
+# the other in the same transaction); After= orders that stop *before* this
+# start, so the port is free by the time we bind. systemd drops the
+# self-reference on each line, so one symmetric list serves both instances —
+# verify with `systemctl show mindex-embedder@igpu.service -p Conflicts`.
+# There is no cycle: the reverse ordering constrains jobs that are never in the
+# same transaction, since Conflicts= forbids starting both at once.
+Conflicts=mindex-embedder@egpu.service mindex-embedder@igpu.service
+After=mindex-embedder@egpu.service mindex-embedder@igpu.service
+
+[Service]
+Type=exec
+User=silencespeakstruth
+Group=silencespeakstruth
+Environment=HOME=/home/silencespeakstruth
+WorkingDirectory=/data/silencespeakstruth/Projects/mindex/embedder
+# EnvironmentFile is read by the manager before the namespace exists, so this
+# path needs no bind below.
+EnvironmentFile=/home/silencespeakstruth/.config/mindex/embedder-%i.env
+# What differs between instances is exactly two things: which torch build runs
+# (ROCm vs XPU — a whole separate venv, selected by %i) and which device string
+# it is handed. The venv has to travel in the path because the first token of
+# ExecStart= must be a literal absolute path; everything else can be a variable.
+#
+# --idle-timeout 86400 (was the 600 s default): keeping BGE-M3 resident beats
+# paying a cold load on the first search of every research run. --maxlen is a
+# variable rather than a literal because it is a per-instance memory decision
+# (attention is O(L^2) on the iGPU's MATH backend), and because leaving it to the
+# 8192 default is what made one over-long text a 503.
+ExecStart=/data/silencespeakstruth/Projects/mindex/embedder/.venv-%i/bin/python -m bge_m3_api \
+    --port 11211 --device ${EMBEDDER_DEVICE} --batch ${EMBEDDER_BATCH} \
+    --maxlen ${EMBEDDER_MAXLEN} --idle-timeout 86400
+Restart=on-failure
+RestartSec=5
+# Model load is slow on a cold page cache; don't let systemd call it a failure.
+TimeoutStartSec=300
+
+# ── network ── see the header for why the wildcard bind is left in place ──────
+IPAddressDeny=any
+IPAddressAllow=localhost
+SocketBindDeny=any
+SocketBindAllow=tcp:11211
+RestrictNetworkInterfaces=lo
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# CONSEQUENCE, and it must be spelled to the library or it hangs instead of
+# failing. IPAddressDeny= DROPS packets rather than refusing them, so a client
+# that still tries huggingface.co waits out a TCP connect timeout and then
+# retries. Measured 2026-08-04 on the first boot of this unit: the model load
+# sat at "Loading model …" for four minutes at 2% CPU with every thread in
+# futex_wait, and /health cheerfully answered `{"status":"ok",
+# "model_loaded":false}` throughout — the previous user unit loaded in 3.3s
+# purely because the directive was inert there and the hub call went through.
+#
+# The offline flags turn that into what it should be: the cache below is the
+# whole truth, a miss is an immediate error naming the missing file, and no
+# request leaves the machine.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+
+# ── GPU ──────────────────────────────────────────────────────────────────────
+#
+# PrivateDevices=true IS WRONG HERE, and it fails quietly — which is the only
+# reason it gets a paragraph. It replaces /dev with a minimal private instance,
+# and DeviceAllow= does not populate that: it grants cgroup permission for a node
+# that is then not present. Measured 2026-08-04 on the attempt to enable it:
+# /dev/dri did not exist inside the namespace, torch logged "XPU device count is
+# zero!" as a UserWarning, and the server started, answered /health "ok" and
+# would have run the whole index on CPU. Nothing failed; it just got ~17x slower
+# and no line anywhere said why.
+#
+# So /dev stays real and the restriction is done by the cgroup device policy
+# instead. DevicePolicy=closed denies everything but the standard pseudo-devices,
+# and the list below names what the GPU stacks need. Both cards are listed for
+# both instances (@igpu picks one via ONEAPI_DEVICE_SELECTOR), and /dev/kfd is
+# AMD's compute node, which the ROCm libraries open even in the XPU venv — an
+# unused device costs nothing, a missing one is an import-time crash inside torch.
+#
+# The check that this is still armed is not /health, which cannot tell: it is
+# `journalctl -u mindex-embedder@igpu | grep 'Model loaded'` naming
+# target_devices=['xpu'], and the absence of "device count is zero".
+DevicePolicy=closed
+DeviceAllow=/dev/dri/renderD128 rw
+DeviceAllow=/dev/dri/renderD129 rw
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri/card1 rw
+DeviceAllow=/dev/dri/card2 rw
+SupplementaryGroups=render video
+
+# ── filesystem ───────────────────────────────────────────────────────────────
+#
+# Deliberately NOT the empty-tmpfs treatment mindex and qdrant get. This process
+# is a torch stack with two vendor runtimes underneath it; ProtectSystem=strict
+# already denies every write outside the four paths below, and replacing the home
+# with a tmpfs buys confidentiality against a service that is now unreachable
+# from anywhere but loopback. The cost — a driver cache or a oneAPI path found by
+# a rule nobody wrote down — lands as a GPU that silently falls back to CPU.
+#
+# Writable holes in the read-only tree. Listed for both instances even though
+# each uses only its own: an unused ReadWritePath costs nothing, a missing one
+# fails silently (a JIT cache that cannot be written is recompiled every start).
+#   huggingface        — the weights (~48 G, already populated)
+#   miopen             — ROCm kernel perf DB
+#   neo_compiler_cache — intel-compute-runtime's compiled-kernel cache
+ProtectSystem=strict
+ReadWritePaths=/home/silencespeakstruth/.cache/huggingface
+ReadWritePaths=/home/silencespeakstruth/.config/miopen
+ReadWritePaths=/home/silencespeakstruth/.cache/neo_compiler_cache
+PrivateTmp=true
+
+NoNewPrivileges=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

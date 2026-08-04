@@ -1,0 +1,162 @@
+# mindex — semantic code index/search server.
+#
+# WHY THIS IS A SYSTEM UNIT AND NOT A USER UNIT
+#
+# It ran as a --user unit until 2026-08-04 and the filesystem sandbox worked
+# there, because mount namespaces need no privilege. The network confinement
+# does: IPAddressDeny=, SocketBindDeny= and RestrictNetworkInterfaces= are
+# enforced by BPF programs the *manager* loads, and the user manager holds no
+# bpf cgroup delegation (DelegateControllers=cpu memory pids) while this host
+# sets kernel.unprivileged_bpf_disabled=2.
+#
+# systemd does not fail a unit over that. It starts, the directives are silently
+# inert, and `systemd-analyze security` scores the unit as confined. Measured
+# before moving: a throwaway user unit carrying `IPAddressDeny=any
+# IPAddressAllow=localhost` fetched https://example.com and got HTTP 200. A
+# protection that reads as armed and is not is worse than none, so the unit
+# moved to where the root manager can load the BPF rather than keeping lines
+# that describe a fiction.
+#
+# The service still runs as the same unprivileged user and out of the same home;
+# only the manager changed. Rollback is `systemctl disable --now mindex` here and
+# `systemctl --user enable --now mindex` there — the user unit and its
+# 10-sandbox.conf drop-in are left in place, disabled, for exactly that.
+#
+# ORDERING
+#
+# Qdrant and the BGE-M3 embedder moved to system units in the same change, and
+# that is what makes the ordering real rather than lucky. While they were user
+# units this could only say After=user@1000.service, which waits for the manager
+# and not for what it starts: all three happened to come up in the same second
+# because lingering is on, and Restart=on-failure covered the times they did not.
+# Both now declare Before=mindex.service themselves, so the chain is enforced by
+# the same manager that starts it.
+#
+# Ollama stays a plain After=: research degrades to unavailable without it, and
+# GET /health reports that rather than the unit refusing to start.
+
+[Unit]
+Description=mindex semantic code index/search server
+Documentation=file:///data/silencespeakstruth/Projects/mindex/README.md
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=silencespeakstruth
+Group=silencespeakstruth
+
+# mindex finds config.toml by XDG canon, which starts at $HOME. A system unit
+# inherits no session environment, so this is not cosmetic — without it the
+# server silently starts on compiled-in defaults, with no TLS certificate, no
+# database path and [auth] off.
+Environment=HOME=/home/silencespeakstruth
+
+# THE TOKENIZER IS A DEPENDENCY, NOT A CACHE, AND NOW LIVES LIKE ONE.
+#
+# The slicer counts tokens with BGE-M3's tokenizer, loaded by
+# Tokenizer::from_pretrained("BAAI/bge-m3") — which reads $HF_HOME and falls back
+# to huggingface.co on a miss. That fallback is refused by IPAddressDeny= below,
+# so the miss would be a start failure; and the default location was the shared
+# ~/.cache/huggingface, which is a *cache*: 48 GB that a disk cleanup or
+# `huggingface-cli delete-cache` is entitled to evict, taking the server with it.
+#
+# So mindex owns its copy — 22 MB, five files, inside its own data directory,
+# beside the database it already treats as durable. Nothing else writes there and
+# nothing sweeps it.
+#
+# Refreshing it (only needed if the upstream tokenizer ever changes, which would
+# be a CHUNKS_DERIVATION_VERSION event of its own):
+#   SRC=~/.cache/huggingface/hub/models--BAAI--bge-m3; SHA=$(cat $SRC/refs/main)
+#   DST=~/.local/share/mindex/hf/hub/models--BAAI--bge-m3
+#   mkdir -p $DST/snapshots/$SHA $DST/refs
+#   cp -L $SRC/snapshots/$SHA/{tokenizer.json,tokenizer_config.json,\
+#         special_tokens_map.json,config.json,sentencepiece.bpe.model} \
+#         $DST/snapshots/$SHA/
+#   printf %s "$SHA" > $DST/refs/main
+Environment=HF_HOME=/home/silencespeakstruth/.local/share/mindex/hf
+
+ExecStart=/home/silencespeakstruth/.cargo/bin/mindex
+WorkingDirectory=/home/silencespeakstruth/.local/share/mindex
+Restart=on-failure
+RestartSec=5
+
+# ── network ──────────────────────────────────────────────────────────────────
+#
+# Everything mindex speaks to is on loopback: the embedder (11211), Qdrant
+# (6334) and Ollama (11434). So the whole of its legitimate traffic fits inside
+# `localhost`, and a compromised process gets no route off this machine — which
+# is the point, since the service is reachable from the internet through the
+# gate.
+#
+# The one fetch this refuses is the tokenizer fallback to huggingface.co, which
+# is why HF_HOME above points at a copy mindex owns rather than at a cache.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# It listens on exactly one socket. mindex links quinn and h3 and can serve
+# HTTP/3, but `server.http3` defaults to false and is reachable only through the
+# --http3 flag (which additionally demands explicit --cert-path/--key-path), and
+# this ExecStart passes none — verified 2026-08-04 against the running process,
+# which holds no UDP socket. Switching it on needs `SocketBindAllow=udp:11111`
+# added here; it is deliberately not pre-allowed, so that change fails loudly
+# instead of half-working.
+SocketBindDeny=any
+SocketBindAllow=tcp:11111
+
+RestrictNetworkInterfaces=lo
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── filesystem ───────────────────────────────────────────────────────────────
+#
+# ProtectSystem=strict already stopped mindex WRITING outside its database. It
+# could still READ everything this user can: every repository under /data, every
+# key under ~/.ssh, every token under ~/.config. For an internet-facing daemon
+# that is the half that matters — the interesting outcome of a compromise is
+# exfiltration, not defacement. So both homes become empty tmpfs and exactly
+# four paths are bound back.
+#
+# The two spellings are not redundant. This home is split across two
+# filesystems: /home is the btrfs @home subvolume, and .cargo/.cache/.local are
+# symlinks into /data. mindex opens its database through the /home spelling
+# (config.toml stores absolute paths), so each bind names the real source on
+# /data and the destination the process actually asks for. Binding only the
+# source would leave a dangling symlink inside the sandbox.
+ProtectSystem=strict
+ProtectHome=tmpfs
+TemporaryFileSystem=/data:ro
+
+BindReadOnlyPaths=/data/silencespeakstruth/.cargo/bin/mindex:/home/silencespeakstruth/.cargo/bin/mindex
+BindReadOnlyPaths=/home/silencespeakstruth/.config/mindex
+# The database, the token signing keys, and the owned tokenizer under hf/. The
+# only writable path, and the reason the shared 48 GB HF cache is bound nowhere
+# at all any more.
+BindPaths=/data/silencespeakstruth/.local/share/mindex:/home/silencespeakstruth/.local/share/mindex
+
+PrivateTmp=true
+
+# ── kernel and process surface ───────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+PrivateIPC=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

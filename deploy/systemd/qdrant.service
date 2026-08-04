@@ -1,0 +1,104 @@
+# Qdrant — vector store for mindex.
+#
+# WHY THIS IS A SYSTEM UNIT (2026-08-04)
+#
+# It ran as a --user unit, which cost two things. Ordering: mindex moved to a
+# system unit for its BPF network confinement, and a system unit cannot order
+# itself after another manager's units — After=user@1000.service waits for the
+# manager, not for what it starts, so "Qdrant is up before mindex" was a race
+# that lingering happened to win. Confinement: IPAddressDeny= and SocketBindDeny=
+# are loaded by the manager as BPF programs, and the user manager holds no bpf
+# delegation on this host (DelegateControllers=cpu memory pids, and
+# kernel.unprivileged_bpf_disabled=2). Both units had to move for either to be
+# real.
+#
+# Nothing else changed: same unprivileged user, same storage, same config.
+
+[Unit]
+Description=Qdrant vector database
+Documentation=https://qdrant.tech/documentation/
+After=network-online.target
+Wants=network-online.target
+# The consumer. Declared here rather than in mindex.service so that the whole
+# chain reads in one direction, and so mindex needs no knowledge of the store's
+# unit name to be ordered correctly.
+Before=mindex.service
+
+[Service]
+Type=exec
+User=silencespeakstruth
+Group=silencespeakstruth
+# The config path below is absolute, but Qdrant resolves nothing else relative
+# to $HOME; this is set for parity with the other two units and so a future
+# XDG-aware flag cannot silently read root's home.
+Environment=HOME=/home/silencespeakstruth
+ExecStart=/usr/bin/qdrant --config-path /home/silencespeakstruth/.config/qdrant/config.yaml
+WorkingDirectory=/home/silencespeakstruth/.local/share/qdrant
+Restart=on-failure
+RestartSec=2
+
+# ── network ──────────────────────────────────────────────────────────────────
+#
+# Qdrant holds every vector of every indexed project and authenticates nothing:
+# its API key is unset and its dashboard on 6333 is open to whoever reaches it.
+# config.yaml already binds 127.0.0.1, but that is the application's promise, and
+# this is the kernel's — one edited line in a YAML file can no longer put the
+# whole index on the LAN.
+IPAddressDeny=any
+IPAddressAllow=localhost
+SocketBindDeny=any
+SocketBindAllow=tcp:6333
+SocketBindAllow=tcp:6334
+RestrictNetworkInterfaces=lo
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── filesystem ───────────────────────────────────────────────────────────────
+#
+# Both homes become empty tmpfs; the two paths Qdrant needs are bound back. The
+# storage path is spelled through /home because config.yaml stores it that way,
+# while the directory itself lives on /data behind a symlink — so the bind names
+# the real source and the destination Qdrant will actually open.
+ProtectSystem=strict
+ProtectHome=tmpfs
+TemporaryFileSystem=/data:ro
+BindReadOnlyPaths=/home/silencespeakstruth/.config/qdrant
+BindPaths=/data/silencespeakstruth/.local/share/qdrant:/home/silencespeakstruth/.local/share/qdrant
+PrivateTmp=true
+
+NoNewPrivileges=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+PrivateIPC=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# @resources IS NOT DENIED HERE, and the reason is worth keeping: it killed this
+# service on 2026-08-04, and not at startup. Qdrant's HNSW builder lowers its own
+# thread priority with sched_setscheduler(2) — syscall 144, inside @resources —
+# and a denied syscall under SystemCallFilter= is SIGSYS, not EPERM. So the unit
+# started clean, answered /health "ok" for nine minutes, recovered every
+# collection, and then core-dumped (1.1 GB, thread "hnsw-build-0") the first time
+# a write reached the index builder. A syscall filter can pass every smoke test
+# and still be a time bomb aimed at the one code path that does the real work;
+# the only honest test of one is to exercise the service, not to start it.
+#
+# RestrictRealtime=true above still refuses SCHED_FIFO/SCHED_RR, which is the
+# part actually worth denying — Qdrant asks for SCHED_IDLE/SCHED_BATCH, the
+# opposite direction.
+SystemCallFilter=~@privileged @obsolete
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
