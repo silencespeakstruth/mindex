@@ -103,7 +103,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.research_context_invalid`, `validation.research_delete_too_many`, \
 `validation.research_list_limit_out_of_range`, `research.run_not_found`, \
 `research.challenge_subject_invalid`, `research.challenge_subject_is_challenge`, \
-`research.scope_matches_nothing`, `research.model_lacks_tools`.",
+`research.scope_matches_nothing`, `research.model_lacks_tools`, \
+`ollama.unavailable`, `ollama.error`, `research.no_report`.",
     ),
     paths(
         // Indexing
@@ -158,6 +159,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::SymbolInfo,
         crate::backend::v0::models::SymbolsResponse,
         crate::backend::v0::models::ResearchRequest,
+        crate::backend::v0::models::ResearchResponse,
         crate::backend::v0::models::ChallengeRequest,
         crate::backend::v0::models::ResearchBudgetOverride,
         crate::research::Effort,

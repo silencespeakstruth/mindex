@@ -1338,6 +1338,12 @@ export class MindexApi {
      * non-2xx response. Aborting `signal` closes the connection, which IS the
      * cancellation interface: the server cancels the job on disconnect. No
      * reconnects, by contract.
+     *
+     * `?stream=yes` is not optional here. The server answers one JSON body by
+     * default, because a caller that does not read a stream to `done` cancels the
+     * run it asked for — but this panel exists to show the run arriving, and it is
+     * reading every frame. Without the query the body would parse as zero SSE
+     * frames and `streamResearch` below would report a run that never terminated.
      */
     research(
         guid: string,
@@ -1345,7 +1351,12 @@ export class MindexApi {
         cb: ResearchCallbacks,
         signal: AbortSignal
     ): Promise<void> {
-        return this.streamResearch(`/${this.protocol}/${guid}/research`, req, cb, signal);
+        return this.streamResearch(
+            `/${this.protocol}/${guid}/research?stream=yes`,
+            req,
+            cb,
+            signal
+        );
     }
 
     /**
@@ -1410,7 +1421,7 @@ export class MindexApi {
         signal: AbortSignal
     ): Promise<void> {
         return this.streamResearch(
-            `/${this.protocol}/${guid}/research/${encodeURIComponent(runId)}/challenge`,
+            `/${this.protocol}/${guid}/research/${encodeURIComponent(runId)}/challenge?stream=yes`,
             req,
             cb,
             signal

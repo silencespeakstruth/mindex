@@ -503,6 +503,11 @@ pub const DESCRIPTOR_HIDDEN_ROUTES: &[&str] = &["/metrics"];
 /// here, next to its `.route(...)` line — a caller that buffers an SSE stream to
 /// completion is exactly the failure this field exists to prevent, and it fails
 /// as a seventy-minute silence rather than as an error.
+///
+/// All three rows describe what the endpoint answers **under `?stream=yes`**; each
+/// answers one JSON body without it. The field says an endpoint *can* stream, not
+/// that it always does — which is the reading `/index` has always needed, and now
+/// research does too.
 pub const STREAMING_ENDPOINTS: &[(&str, &str, &str)] = &[
     ("POST", "/v0/{project_guid}/index", "ndjson"),
     ("POST", "/v0/{project_guid}/research", "sse"),

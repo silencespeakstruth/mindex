@@ -63,7 +63,9 @@ use crate::backend::v0::models::ResearchListQuery;
 use crate::backend::v0::models::ResearchObservedEffort;
 use crate::backend::v0::models::ResearchObservedInfo;
 use crate::backend::v0::models::ResearchPinRequest;
+use crate::backend::v0::models::ResearchQuery;
 use crate::backend::v0::models::ResearchRequest;
+use crate::backend::v0::models::ResearchResponse;
 use crate::backend::v0::models::ResearchRunDependency;
 use crate::backend::v0::models::ResearchRunDetail;
 use crate::backend::v0::models::ResearchRunFile;
@@ -4517,9 +4519,27 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
     }
 }
 
-/// Iterative code research driven by a local Ollama model, streamed as SSE.
+/// Iterative code research driven by a local Ollama model.
 ///
-/// A long-lived, one-way stream: the server runs a research loop in which the
+/// **The answer is one JSON body ([`ResearchResponse`]) unless the caller asks for
+/// frames with `?stream=yes`.** The run itself is identical either way — same
+/// loop, same budgets, same journal row; the query decides only who assembles the
+/// terminal. That is `/index`'s shape, and research adopted it late for a reason
+/// worth stating: while frames were compulsory, *reading the response to the end*
+/// was compulsory too, since a disconnect cancels the run. A caller that issued
+/// the request and did not stay to read it spent the whole budget, received
+/// nothing, and raised no error anywhere. Streaming is worth asking for when the
+/// run is being watched; it is a trap when it is not, so it is now asked for.
+///
+/// The non-streaming body carries the report, the citation report, the excerpts,
+/// a challenge's verdict and the `done` payload — every one of them the frame of
+/// the same name, rendered by the same code. What it omits is `thinking`, `step`
+/// and `progress`, which exist to be watched. Failures differ in one way, and only
+/// because they can: with no stream open there is no "after the status was 200",
+/// so what would have been an `error` frame is a problem+json status
+/// (`ollama.unavailable`, `ollama.error`, `research.no_report`).
+///
+/// Under `?stream=yes` it is a long-lived, one-way stream: the server runs a research loop in which the
 /// configured (or request-named) Ollama model asks the index one question per
 /// turn — internal lookups against the index cores, **every one of them scoped by
 /// the request's `include`/`exclude`** — then must write a final report. The scope is
@@ -4668,8 +4688,12 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 ///   streamed is **not** a report and must be discarded, not shown.
 ///
 /// SSE comments are sent as keep-alive every 15 s. **Closing the connection
-/// cancels the research job** — that is still the primary cancellation interface.
-/// It is not the only one: `DELETE /research/active/{run_id}` cancels the same
+/// cancels the research job in either mode** — that is still the primary
+/// cancellation interface, and the JSON mode does not weaken it: the handler
+/// waits on the run for its whole length, so a disconnect drops that wait and
+/// cancels the same token a dropped stream would. What the JSON mode removes is
+/// only the *obligation to keep reading*.
+/// It is not the only interface: `DELETE /research/active/{run_id}` cancels the same
 /// token, for the case the disconnect rule cannot cover — a caller that has
 /// abandoned the run while its socket is still open (an MCP client holds its
 /// connection for as long as its own read timeout allows). Jobs run on a small
@@ -4687,16 +4711,33 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 /// expires with nothing written, the server ships an honest account of the run in its
 /// place rather than closing the stream without a `summary`.
 ///
+/// Without `?stream=yes` that whole window is one silent request: nothing is sent
+/// until the run ends. Any intermediary between caller and server must therefore
+/// tolerate `worst_case_seconds` (published per effort level by `GET /config`) of
+/// quiet — which is the same tolerance an SSE run between two slow turns already
+/// needed, but continuously.
+///
 /// **Concurrency:** read-only against the index; never blocks indexing/GC. The
 /// loop's lookups share the SQLite pool and the embedder with regular traffic.
 #[utoipa::path(
     post,
     path = "/v0/{project_guid}/research",
     tag = "Search",
-    params(("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form.")),
+    params(
+        ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
+        ResearchQuery,
+    ),
     request_body = ResearchRequest,
     responses(
-        (status = 200, description = "SSE stream of research events \
+        (status = 200, description = "Without `?stream=yes`: one JSON body when the run ends — \
+`run_id`, the resolved `model`/`effort` and their grants, the Markdown `report`, and the \
+`citations`, `excerpts`, `verdict` and `done` objects, each byte-for-byte the SSE frame of the \
+same name (the fields below describe both). `thinking`, `step` and `progress` are omitted: they \
+exist to be watched, and a caller that wanted to watch asks for the stream. Nothing is sent \
+until the run ends, so the connection is silent for up to the level's `worst_case_seconds`. A \
+failure that would have been an `error` frame is instead the response status \
+(`ollama.unavailable`, `ollama.error`, `research.no_report`), since with no stream open there \
+is no point at which the status has already been sent. With `?stream=yes`: an SSE stream of research events \
 (started/thinking/step/progress/summary/citations/excerpts/done/error). `started` is always the \
 first frame and carries `run_id` — the name this run answers to for its whole life, in \
 `GET /research/active` and in `DELETE /research/active/{run_id}` — plus `worst_case_ms`, the \
@@ -4748,14 +4789,17 @@ so. Every file lookup the model makes is scoped by the request's `include`/`excl
 out-of-scope path is refused by name rather than answered empty; the stored-report browse \
 tools (`list_research`/`read_research`) are the one unscoped exception, offer only valid \
 runs, and their content is hearsay that cannot be cited. A run whose `context_run_ids` name \
-an invalid run is refused up front with 400 `validation.research_context_invalid`.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, an include/exclude scope matching no indexed file — `research.scope_matches_nothing`, a model Ollama reports cannot call tools — `research.model_lacks_tools`, or `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`).", body = ProblemDetails),
+an invalid run is refused up front with 400 `validation.research_context_invalid`.", body = ResearchResponse),
+        (status = 400, description = "Validation failed (empty/oversized question, oversized selector, no model, a model outside `[research].allowed_models` — `research.model_not_allowed`, out-of-range budget, an include/exclude scope matching no indexed file — `research.scope_matches_nothing`, a model Ollama reports cannot call tools — `research.model_lacks_tools`, `context_run_ids` naming an invalid run — `validation.research_context_invalid`, with each offender and its reason in `meta.runs`, or a `?stream=` value other than `yes`/`no` — `request.malformed_body`).", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
+        (status = 500, description = "Non-streaming mode only: the run reached its report turn and produced nothing usable (`research.no_report`). Under `?stream=yes` the same failure is an `error` event on an already-200 stream.", body = ProblemDetails),
+        (status = 503, description = "Non-streaming mode only: Ollama was unreachable or mute (`ollama.unavailable`), or answered with an error — nearly always a model that is not pulled (`ollama.error`). Under `?stream=yes` these are `error` events.", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_research(
     ResearchScope(project_guid, _auth): ResearchScope,
+    ApiQuery(q): ApiQuery<ResearchQuery>,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ResearchRequest>,
 ) -> Result<Response, ApiError> {
@@ -4817,7 +4861,16 @@ pub async fn post_research(
         max_context_chars: s.research_max_context_chars,
         challenge: None,
     };
-    launch_research_job(s, project_guid, req.effort, params, "research", None).await
+    launch_research_job(
+        s,
+        project_guid,
+        req.effort,
+        params,
+        "research",
+        None,
+        q.stream,
+    )
+    .await
 }
 
 /// `POST /v0/{project_guid}/research/{run_id}/challenge` — set an opponent on a
@@ -4834,9 +4887,14 @@ pub async fn post_research(
 /// verdict turn scores each claim CONFIRMED / DISPUTED / REFUTED in a
 /// server-dictated vocabulary.
 ///
-/// The stream is the ordinary research stream plus **one** extra event,
-/// `verdict` `{challenged_run_id, overall, grounded, claims: [{claim,
-/// verdict}]}`, emitted after `excerpts` (when any) and before `done`.
+/// The response is the ordinary research response with **one** addition, and it
+/// is the same addition in both modes: the `verdict`
+/// `{challenged_run_id, overall, grounded, claims: [{claim, verdict}]}` — a
+/// stream event after `excerpts` (when any) and before `done`, a field of the
+/// same name in the JSON body, and null there for an ordinary run exactly as the
+/// frame is absent from an ordinary stream. `?stream=` means here precisely what
+/// it means on `POST /research`, which is why both entrances read it through one
+/// function.
 /// `overall` is `confirmed`/`disputed`/`refuted`, or null when the verdict turn
 /// produced nothing parseable — "challenged, inconclusive", never an acquittal.
 /// `grounded: false` says the challenge's own report verified no citations,
@@ -4871,18 +4929,22 @@ pub async fn post_research(
     params(
         ("project_guid" = String, Path, description = "Project UUID (v4), 32-char simple or hyphenated form."),
         ("run_id" = String, Path, description = "The stored run to challenge."),
+        ResearchQuery,
     ),
     request_body = ChallengeRequest,
     responses(
-        (status = 200, description = "SSE stream of research events, exactly as `POST /v0/{project_guid}/research` emits them, plus one `verdict` event on this stream only — `{challenged_run_id, overall, grounded, claims}` after `excerpts` and before `done`. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`. On success with a parseable verdict this run **replaces** any existing challenge of the same subject — there is at most one standing challenge per report. An inconclusive run replaces nothing.", content_type = "text/event-stream"),
-        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`), or a model Ollama reports cannot call tools (`research.model_lacks_tools`).", body = ProblemDetails),
+        (status = 200, description = "Exactly what `POST /v0/{project_guid}/research` answers, in whichever mode `?stream=` selects, plus the challenge's `verdict` — `{challenged_run_id, overall, grounded, claims}`, a field of the JSON body and an event after `excerpts` and before `done` on a stream. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`. On success with a parseable verdict this run **replaces** any existing challenge of the same subject — there is at most one standing challenge per report. An inconclusive run replaces nothing.", body = ResearchResponse),
+        (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`), a model Ollama reports cannot call tools (`research.model_lacks_tools`), or a `?stream=` value other than `yes`/`no`.", body = ProblemDetails),
         (status = 404, description = "This project has no such run.", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
+        (status = 500, description = "Non-streaming mode only: the run produced no usable report (`research.no_report`).", body = ProblemDetails),
+        (status = 503, description = "Non-streaming mode only: Ollama was unreachable (`ollama.unavailable`) or answered with an error (`ollama.error`).", body = ProblemDetails),
     ),
 )]
 #[debug_handler]
 pub async fn post_research_challenge(
     ResearchScope((project_guid, run_id), _auth): ResearchScope<(UUIDv4, String)>,
+    ApiQuery(q): ApiQuery<ResearchQuery>,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ChallengeRequest>,
 ) -> Result<Response, ApiError> {
@@ -5012,15 +5074,22 @@ pub async fn post_research_challenge(
         params,
         "challenge",
         Some(run_id),
+        q.stream,
     )
     .await
 }
 
 /// The shared tail of `POST /research` and `POST /research/{run_id}/challenge`:
 /// admission, run identity, journal context, registry entry, job spawn and the
-/// SSE response. One function so the two entrances cannot drift on any of the
+/// response. One function so the two entrances cannot drift on any of the
 /// invariants that live here (permit-in-the-job, registry-in-the-job, the
-/// `started`-first frame).
+/// `started`-first frame) — and, since the response mode moved in here too, so
+/// that `?stream=` cannot mean one thing on research and another on a challenge.
+///
+/// Everything above the spawn is identical in both modes, deliberately: the
+/// pre-flight refusals, the permit, the minted `run_id`, the registry entry and
+/// the `started` frame all happen before anything knows how the answer will be
+/// shaped. Only the tail forks.
 async fn launch_research_job(
     s: RouterState,
     project_guid: UUIDv4,
@@ -5028,6 +5097,7 @@ async fn launch_research_job(
     params: crate::research::ResearchParams,
     kind: &'static str,
     challenged_run_id: Option<String>,
+    stream: Option<StreamChoice>,
 ) -> Result<Response, ApiError> {
     // Before the permit, and before the scope count: a run is a tool-calling loop, so
     // a model that cannot call tools spends a slot, a model load and a turn only to
@@ -5112,6 +5182,10 @@ async fn launch_research_job(
         "Starting a research job."
     );
 
+    // Kept behind for the JSON mode's failure path: `research.model_lacks_tools`
+    // names the model, and by the time the run reports it `params` is long gone
+    // into the job.
+    let model_for_refusals = params.model.clone();
     let ollama = s.research_ollama.clone();
     // The model's identity at admission, from the catalog worker's snapshot — no
     // network call on the request path. `(None, None)` when the catalog has not
@@ -5239,12 +5313,121 @@ async fn launch_research_job(
         .await;
     });
 
-    let stream = SseEventStream::new(rx, token);
-    Ok(axum::response::sse::Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-        )
-        .into_response())
+    if stream == Some(StreamChoice::Yes) {
+        let stream = SseEventStream::new(rx, token);
+        return Ok(axum::response::sse::Sse::new(stream)
+            .keep_alive(
+                axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+            )
+            .into_response());
+    }
+
+    // JSON mode. The handler stays on the receiving end for the whole run, so the
+    // cancellation shape is `post_index`'s and not the stream's: a disconnect makes
+    // axum drop this future mid-await, the guard's `Drop` cancels the token, and the
+    // detached job unwinds — releasing its permit and its registry entry exactly as
+    // a dropped stream does. Disconnecting still cancels the run; what changes is
+    // that a caller no longer has to keep reading in order not to cancel it.
+    let _guard = http3::CancellationGuard(token);
+    collect_research_run(rx, &model_for_refusals).await
+}
+
+/// Drain a research job's event channel into the one body a non-streaming caller
+/// gets, or into the failure that ended it.
+///
+/// Every field of [`ResearchResponse`] is a frame's own `data()`, so this reads as
+/// a transcription rather than a second rendering — which is the property that
+/// keeps the JSON mode from becoming a fifth copy of the SSE contract. What it
+/// drops is `thinking`, `step` and `progress`: a caller that wanted to watch the
+/// run asked for the stream.
+///
+/// `model` is carried in only for [`ApiError::from_research_failure`], which needs
+/// it to re-raise `research.model_lacks_tools` in the same words the pre-flight
+/// check uses.
+async fn collect_research_run(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::research::ResearchEvent>,
+    model: &str,
+) -> Result<Response, ApiError> {
+    use crate::research::ResearchEvent as E;
+
+    let mut identity: Option<(String, String, &'static str, u64, u64)> = None;
+    let mut report = String::new();
+    let mut citations = None;
+    let mut excerpts = None;
+    let mut verdict = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            E::Started {
+                ref run_id,
+                model: ref run_model,
+                effort,
+                granted_seconds,
+                worst_case_ms,
+            } => {
+                identity = Some((
+                    run_id.clone(),
+                    run_model.clone(),
+                    effort,
+                    granted_seconds,
+                    worst_case_ms,
+                ));
+            }
+            // The report arrives as deltas, exactly as it does on the wire; the
+            // difference is only who concatenates them.
+            E::Summary { ref text } => report.push_str(text),
+            E::Citations { .. } => citations = Some(event.data()),
+            E::Excerpts { .. } => excerpts = Some(event.data()),
+            E::Verdict { .. } => verdict = Some(event.data()),
+            E::Done { .. } => {
+                let done = event.data();
+                let Some((run_id, run_model, effort, granted_seconds, worst_case_ms)) = identity
+                else {
+                    // `started` is sent before the job is spawned, so this is
+                    // unreachable rather than merely unlikely — and a body that
+                    // could not name its own run is not a partial answer.
+                    error!(
+                        "A research run reached `done` without a `started` frame; \
+                         the run cannot be named. This is a bug in launch_research_job."
+                    );
+                    return Err(ApiError::Internal);
+                };
+                return Ok(Json(ResearchResponse {
+                    run_id,
+                    model: run_model,
+                    effort: effort.to_string(),
+                    granted_seconds,
+                    worst_case_ms,
+                    report,
+                    citations,
+                    excerpts,
+                    verdict,
+                    done,
+                })
+                .into_response());
+            }
+            // There is no "after the stream started" here: the failure that would
+            // have been an `error` frame under a 200 is this request's answer, so
+            // it answers as problem+json like every other refusal.
+            E::Error { code, detail } => {
+                return Err(ApiError::from_research_failure(&code, detail, model));
+            }
+            E::Thinking { .. } | E::Step { .. } | E::Progress { .. } => {}
+        }
+    }
+
+    // The channel closed with no terminal event — the job panicked or was torn
+    // out. `SseEventStream` synthesises an `error` frame here; this raises the
+    // same sentence as a status, so the two modes describe one failure one way.
+    let E::Error { code, detail } = <E as SseWireEvent>::abnormal_end() else {
+        unreachable!("abnormal_end is an Error by construction")
+    };
+    warn!(
+        %code,
+        "A research job's channel closed without a terminal event; answering with the \
+         same failure the stream would have synthesised."
+    );
+    Err(ApiError::from_research_failure(&code, detail, model))
 }
 
 // ─── Management endpoints ───────────────────────────────────────────────────
@@ -8518,6 +8701,203 @@ mod tests {
         assert_eq!(drain_frames(&mut stream), 1);
         assert!(stream.saw_terminal);
         assert!(!stream.ended, "nothing should have been synthesised");
+    }
+
+    // ── the non-streaming research mode ──────────────────────────────────────
+
+    /// A `RunProgress` with distinguishable numbers, so a test can tell the
+    /// `done` payload apart from a default-constructed one.
+    fn some_progress() -> crate::research::RunProgress {
+        crate::research::RunProgress {
+            steps: 3,
+            max_steps: 8,
+            elapsed_ms: 1234,
+            max_ms: 300_000,
+            tokens: 900,
+            max_tokens: 400_000,
+            prompt_tokens: 700,
+            eval_tokens: 200,
+            peak_prompt_tokens: 700,
+            num_ctx: 65536,
+            turns: 4,
+            generation_ms: 1000,
+            model_load_ms: 0,
+            unaccounted_ms: 234,
+            eval_tokens_per_second: 200.0,
+        }
+    }
+
+    fn started_frame() -> crate::research::ResearchEvent {
+        crate::research::ResearchEvent::Started {
+            run_id: "run-1".into(),
+            model: "some-model".into(),
+            effort: "low",
+            granted_seconds: 300,
+            worst_case_ms: 420_000,
+        }
+    }
+
+    fn done_frame() -> crate::research::ResearchEvent {
+        crate::research::ResearchEvent::Done {
+            progress: some_progress(),
+            context_fraction: 0.5,
+            reason: crate::research::DoneReason::Finalized,
+            recorded: Some(crate::research::RecordedRun {
+                id: "run-1".into(),
+                seq: 7,
+                replaced: 0,
+            }),
+        }
+    }
+
+    /// Feed a whole run through the collector and read its JSON body back.
+    async fn collected(
+        events: Vec<crate::research::ResearchEvent>,
+    ) -> Result<serde_json::Value, ApiError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for e in events {
+            tx.send(e).expect("the receiver is alive");
+        }
+        drop(tx);
+        let response = collect_research_run(rx, "some-model").await?;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is in memory");
+        Ok(serde_json::from_slice(&bytes).expect("the body is JSON"))
+    }
+
+    /// **The invariant the whole mode rests on**: every field of the body is the
+    /// frame of the same name, rendered by the same `ResearchEvent::data()`.
+    ///
+    /// Written as an equality against `data()` rather than against literals on
+    /// purpose. Literals would pass while quietly becoming a *second* rendering of
+    /// the citation report and the run cost — which is the fifth copy of the SSE
+    /// contract this design exists to avoid, and the kind that drifts by going
+    /// quiet rather than by failing.
+    #[tokio::test]
+    async fn the_json_body_carries_the_frames_the_stream_would_have_sent() {
+        let citations = crate::research::ResearchEvent::Citations {
+            report: crate::research::CitationReport {
+                total: 2,
+                verified: 2,
+                ..Default::default()
+            },
+            revalidation: None,
+            server_written: false,
+            shown_paths: 3,
+            hearsay_only: false,
+        };
+        let done = done_frame();
+        let (citations_json, done_json) = (citations.data(), done.data());
+
+        let body = collected(vec![
+            started_frame(),
+            // Dropped: the caller did not ask to watch the run.
+            crate::research::ResearchEvent::Thinking { text: "hmm".into() },
+            crate::research::ResearchEvent::Progress {
+                progress: some_progress(),
+                context_fraction: 0.5,
+            },
+            // The report arrives in deltas here exactly as it does on the wire.
+            crate::research::ResearchEvent::Summary {
+                text: "# Title\n".into(),
+            },
+            crate::research::ResearchEvent::Summary {
+                text: "body\n".into(),
+            },
+            citations,
+            done,
+        ])
+        .await
+        .expect("a finished run is a 200");
+
+        assert_eq!(body["run_id"], "run-1");
+        assert_eq!(body["model"], "some-model");
+        assert_eq!(body["effort"], "low");
+        assert_eq!(body["granted_seconds"], 300);
+        assert_eq!(body["worst_case_ms"], 420_000);
+        assert_eq!(
+            body["report"], "# Title\nbody\n",
+            "the deltas must be concatenated in order"
+        );
+        assert_eq!(body["citations"], citations_json);
+        assert_eq!(body["done"], done_json);
+        assert!(
+            body["excerpts"].is_null() && body["verdict"].is_null(),
+            "frames this run never sent must be null, not fabricated"
+        );
+        assert!(
+            body.get("steps").is_none() && body.get("progress").is_none(),
+            "the trace is what this mode exists to omit"
+        );
+    }
+
+    /// A challenge's extra frame is the body's extra field, and an ordinary run's
+    /// body says nothing about a verdict — the same asymmetry
+    /// `an_ordinary_run_emits_no_verdict_event` pins on the wire.
+    #[tokio::test]
+    async fn a_challenge_body_carries_the_verdict_and_an_ordinary_one_does_not() {
+        let verdict = crate::research::ResearchEvent::Verdict {
+            challenged_run_id: "subject-1".into(),
+            overall: Some("disputed"),
+            grounded: false,
+            claims: Vec::new(),
+        };
+        let expected = verdict.data();
+
+        let body = collected(vec![started_frame(), verdict, done_frame()])
+            .await
+            .expect("a finished challenge is a 200");
+        assert_eq!(body["verdict"], expected);
+        assert_eq!(body["verdict"]["overall"], "disputed");
+
+        let ordinary = collected(vec![started_frame(), done_frame()])
+            .await
+            .expect("a finished run is a 200");
+        assert!(ordinary["verdict"].is_null());
+    }
+
+    /// The one place the two modes deliberately differ. On a stream the status is
+    /// already 200 when the run fails, so the failure is an `error` frame; with no
+    /// stream open it is the answer, and an answer is problem+json.
+    #[tokio::test]
+    async fn a_failed_run_is_a_status_rather_than_an_error_frame() {
+        let err = collected(vec![
+            started_frame(),
+            crate::research::ResearchEvent::Error {
+                code: "ollama.unavailable".into(),
+                detail: "The Ollama chat call failed: connection refused".into(),
+            },
+        ])
+        .await
+        .expect_err("a failed run must not be a 200");
+
+        assert_eq!(err.code(), "ollama.unavailable");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.detail().contains("connection refused"),
+            "the run's own words are what say which call failed: {}",
+            err.detail()
+        );
+    }
+
+    /// The JSON twin of `a_stream_whose_job_dies_without_a_terminal_event_still_
+    /// ends_in_error`. A detached job that panics drops its sender, which is
+    /// byte-for-byte a completed run to whoever is holding the receiver — so
+    /// without this the caller would get a 200 carrying an empty report.
+    #[tokio::test]
+    async fn a_job_that_dies_without_a_terminal_is_a_failure_not_an_empty_report() {
+        let err = collected(vec![
+            started_frame(),
+            crate::research::ResearchEvent::Summary {
+                text: "half a report".into(),
+            },
+        ])
+        .await
+        .expect_err("a channel that closed without `done` is not a finished run");
+
+        assert_eq!(err.code(), "internal.error");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// The trust status is derived, like validity: severity wins across valid

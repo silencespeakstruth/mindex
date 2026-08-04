@@ -6,14 +6,25 @@ measurement history. Read it before modifying `research.rs`,
 `models/ollama.rs`, the budget machinery or the SSE contract.
 
 
-`POST /v0/{guid}/research` — long-lived one-way SSE: a local Ollama model
-(`[research]` config, TOML-only) loops search/symbols **via internal cores**
+`POST /v0/{guid}/research` — a local Ollama model (`[research]` config,
+TOML-only) loops search/symbols **via internal cores**
 (`search_core`/`symbols_core` in `handlers.rs`; never HTTP-to-self), then
-streams a Markdown report. Non-obvious invariants:
+produces a Markdown report. Non-obvious invariants:
 
-- **Cancellation = cancelling the job token.** `SseEventStream`'s `Drop` does it
-  on disconnect (axum drops the SSE body); a closed mpsc channel is the same
-  signal from the other side. Since 2026-08-01 `DELETE
+- **Streaming is opt-in (`?stream=yes`); the default is one JSON body.**
+  Since 2026-08-04 — see *The stream stopped being compulsory* below. The run is
+  identical either way; the query picks only who assembles the terminal, which is
+  `/index`'s shape. The body is `ResearchResponse` (`models.rs`), and every field
+  of it is a frame's own `ResearchEvent::data()`, so the JSON mode is a
+  transcription rather than a second rendering — that is what keeps the
+  four-place SSE contract from becoming a five-place one. `thinking`/`step`/
+  `progress` are dropped (they exist to be watched); a terminal `error` becomes
+  an HTTP status via `ApiError::from_research_failure`.
+- **Cancellation = cancelling the job token, in both modes.** `SseEventStream`'s
+  `Drop` does it on disconnect (axum drops the SSE body); in the JSON mode a
+  `CancellationGuard` held across the drain does the same when axum drops the
+  handler future, which is `post_index`'s JSON-mode shape. A closed mpsc channel
+  is the same signal from the other side. Since 2026-08-01 `DELETE
   /research/active/{run_id}` is a second hand on the same lever, for the case
   disconnect cannot reach — see *A run became something you can see and stop*
   below. The semaphore permit rides **in the spawned job**, not the stream — the
@@ -586,7 +597,11 @@ streams a Markdown report. Non-obvious invariants:
   Code client (`tools/vscode/src/api.ts` + `researchView.ts`) and scout's
   reader (`tools/mcp/scout/.../server.py`) — whose `if/elif` chain and field
   whitelists (`_STEP_KEYS`, `_USAGE_KEYS`, `_CITATION_KEYS`) **silently drop**
-  anything unknown, so a change that skips them fails by going quiet. Both
+  anything unknown, so a change that skips them fails by going quiet. The
+  non-streaming body is deliberately **not** a fifth: it is assembled from the
+  same `data()` values, so `*_wire_fields_are_stable` covers both modes and
+  `the_json_body_carries_the_frames_the_stream_would_have_sent` pins that it
+  keeps doing so. Both
   consumers read SSE *per line*, safe only because the payload is
   `serde_json::to_string` (newlines escaped → one `data:` line per frame) —
   keep it that way. Shapes pinned by `progress_wire_fields_are_stable`,
@@ -1417,3 +1432,95 @@ back is the better outcome.
 
 `PROMPT_VERSION` 2.3 → 2.4 covers all three: the path clause in `REPORT_ROLE`
 and `section_request`, the ambiguity bucket, and the new complaint.
+
+## The stream stopped being compulsory (2026-08-04)
+
+`/research` was, until this change, the one endpoint whose response was forced
+into frames. `/index` had made streaming opt-in long before: `?stream=yes`, both
+modes through one `run_index_job`, the query picking only who builds the
+terminal. Research never got that treatment, and the asymmetry was historical
+rather than decided.
+
+The cost fell on the caller the endpoint is written for. Frames make
+disconnection the cancellation interface — that is the design, and it is right —
+but it also means **reading the response to the end is compulsory**. A caller
+that issued `POST /research` and did not stay to read it spent the whole budget,
+received nothing, and raised no error anywhere: no failed run, no metric, no log
+line saying a client had given up. The commonest way to meet this is not
+carelessness but shape: a model asked to "call the research endpoint" produces
+one request and reads one response, and a seventy-minute one-way stream is not
+what that produces.
+
+So the default is now one JSON body and `?stream=yes` asks for frames. Safe
+behaviour became what you get by not asking, which fixes the class rather than
+the instances.
+
+**`aud=agent` as the trigger was considered and rejected.** The tempting version
+is to keep the streaming default and force the JSON mode for tokens labelled
+`agent`. It fails on the axiom already written into `backend/auth.rs`: nothing in
+an HTTP request identifies the process behind it. `aud` is a label the holder
+chose for itself, so a check there stops exactly the caller honest enough to
+label itself and stops no one else — and it would put a server-side read on the
+one claim `the_audience_is_not_an_authority_axis_and_does_not_bind_delegation`
+exists to keep unread. Changing the default needs no claim about who is calling.
+
+### What the body is, and what it is not
+
+`ResearchResponse` (`models.rs`) carries `run_id` and the `started` frame's
+grants, the concatenated `summary` deltas as `report`, and the `citations`,
+`excerpts`, `verdict` and `done` objects. **Each of those four is the frame's own
+`ResearchEvent::data()`, verbatim.** The alternative — typed structs mirroring
+each payload — would have been a second serialization of the citation report and
+the run cost, which is a fifth copy of a contract that already lives in four
+places and drifts by going quiet. Transcription costs the schema some precision
+(the four are `value_type = Object` in OpenAPI, documented by pointing at the
+frame descriptions) and buys the guarantee that the two modes cannot disagree.
+
+`thinking`, `step` and `progress` are dropped. They exist to be watched, and a
+caller that wanted to watch asked for the stream; the step count survives on
+`done` and the full trace is journalled in `research_run_steps`.
+
+### Failures became statuses, which needed three new `ApiError` variants
+
+Mid-stream, a failure is an `error` event because the status is already 200 — so
+`ollama.unavailable`, `ollama.error` and `research.no_report` existed as string
+literals in `research.rs` and nowhere else. With no stream open there is no such
+moment: the failure is the answer, and an answer is problem+json. Hence the three
+variants (503/503/500) and `ApiError::from_research_failure`, the one place the
+crossing happens. The codes an index lookup contributes
+(`database.busy`, `internal.error`, …) already had variants and are read back by
+name.
+
+That inverse is a match on strings, which is exactly the kind of thing that rots
+silently — a missing arm still produces a well-formed 500, and the only symptom
+is a caller told the wrong reason. `FAILURE_CODES` (`research.rs`, `#[cfg(test)]`)
+plus `every_research_failure_code_rebuilds_itself` is the guard; it was checked
+against the bug by deleting an arm and watching it go red.
+
+### The clients
+
+**VS Code sends `?stream=yes`** — the panel exists to show a run arriving and
+reads every frame. **scout sends it too**, which is the less obvious call, since
+scout returns one result to its caller and drops `thinking` anyway. Two reasons,
+both properties of that file: its `READ_TIMEOUT` (120 s) is an *idle* timeout
+resting on mindex's 15 s keep-alive and is the only thing there that can tell a
+working server from a wedged one — against one silent body it would have to be
+raised to `TOTAL_TIMEOUT` (4200 s), and a hung server would then hold the MCP
+tool for seventy minutes looking exactly like a healthy `high` run. And the
+partial-report salvage (`truncated_by_client`, `live_run_id`, `still_running`)
+only works because bytes arrive as they are produced. scout is the caller the
+streaming mode is *for*; the new default is for the caller that is not.
+
+### Consequences worth knowing
+
+- A non-streaming run is **silent for its whole length** — up to
+  `worst_case_seconds`. The gateway already allows it (`proxy_read_timeout 4200s`
+  in `deploy/gate/mindex.nginx.conf`, whose comment now says both halves of why),
+  but any other intermediary must.
+- `STREAMING_ENDPOINTS` keeps all three rows: the field says an endpoint *can*
+  answer in frames, which is the reading `/index` always needed.
+- `research_events()` in `tests/integration/test_research.py` sends
+  `?stream=yes`, so all nineteen existing tests still cover the stream;
+  `run_once` in `test_research_history.py` was moved to the default mode on
+  purpose, so what a finished run leaves in the corpus is checked not to depend
+  on how the caller asked to be told about it.

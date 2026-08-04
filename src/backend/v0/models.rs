@@ -248,6 +248,26 @@ pub struct IndexQuery {
     pub stream: Option<StreamChoice>,
 }
 
+/// `POST /v0/{project_guid}/research` and `.../research/{run_id}/challenge` query.
+///
+/// The same `?stream=yes|no` opt-in `/index` has, and for a sharper reason.
+/// Research was the one endpoint whose response was *forced* into frames, which
+/// makes disconnecting the cancellation interface — so a caller that issues the
+/// request and does not read it to `done` spends the whole budget and receives
+/// nothing, with no error raised anywhere. That is the default a naive caller
+/// gets, and no amount of documentation reaches one that has not read it.
+/// Streaming is worth asking for when the run is being watched; it is a trap when
+/// it is not, so it is now the thing you ask for rather than the thing you get.
+#[derive(Deserialize, Debug, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchQuery {
+    /// `yes` streams the run as SSE (see the endpoint description); `no` or absent
+    /// answers one [`ResearchResponse`] when the run ends. Same enum, same 400 on
+    /// a typo, for the same reason it is an enum on `/index`.
+    pub stream: Option<StreamChoice>,
+}
+
 /// The two spellings of `?stream=`. A typo is a 400 (`request.malformed_body`),
 /// never a silent fallback to the JSON mode the caller did not ask for.
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
@@ -703,8 +723,64 @@ pub struct ListFilesResponse {
     pub total: u64,
 }
 
-/// `POST /v0/{project_guid}/research` body. The response is a one-way SSE stream
-/// (`text/event-stream`); see the endpoint description for the event contract.
+/// What a research or challenge run answers when the caller did not ask for
+/// frames (`?stream=yes` absent) — the whole run in one body, once it has ended.
+///
+/// **Every field here is the payload of the frame of the same name, rendered by
+/// the same `ResearchEvent::data()` the stream uses.** That is the entire design
+/// and it is not an implementation detail: the alternative was a second
+/// serialization of the report, the citations and the cost, which is a fifth copy
+/// of a contract that already lives in four places and drifts by going quiet. So
+/// this type documents *where* each object is described rather than describing it
+/// again, and the `*_wire_fields_are_stable` tests keep covering both modes.
+///
+/// What is absent is as deliberate: `thinking`, `step` and `progress` are dropped.
+/// A caller that wanted to watch the run asks for the stream; one that did not
+/// wanted the answer, and the trace is exactly the volume it did not want. The
+/// step count survives on `done`, and the full trace is journalled — see
+/// `GET /projects/{project_guid}/research/{run_id}`.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchResponse {
+    /// The run's name for its whole life — what `GET /research/active` lists and
+    /// `DELETE /research/active/{run_id}` cancels. Always present, unlike
+    /// `done.run_id`, which is null when the best-effort journal write failed:
+    /// this one names the run that happened, that one names the row it became.
+    pub run_id: String,
+    /// The model that drove the loop, resolved (the request's, or the server's
+    /// `[research].default_model`).
+    pub model: String,
+    /// The effort level, and what it granted. The `started` frame's fields.
+    pub effort: String,
+    pub granted_seconds: u64,
+    /// `max_seconds * 1000 + report_timeout_ms` — the longest this call could
+    /// legitimately have taken. Reported after the fact because it is what makes
+    /// an elapsed time readable.
+    pub worst_case_ms: u64,
+    /// The Markdown report: every `summary` delta, concatenated. Empty only when
+    /// the run produced nothing at all, which the `done.reason` explains.
+    pub report: String,
+    /// The `citations` frame — the server's provenance and freshness check on the
+    /// report above. Absent only if the run ended before it was scored.
+    #[schema(value_type = Object)]
+    pub citations: Option<serde_json::Value>,
+    /// The `excerpts` frame — the indexed code at every verified citation. Absent
+    /// when nothing verified, and best-effort besides.
+    #[schema(value_type = Object)]
+    pub excerpts: Option<serde_json::Value>,
+    /// The `verdict` frame. Challenge runs only; always absent for
+    /// `POST /research`, exactly as the frame is.
+    #[schema(value_type = Object)]
+    pub verdict: Option<serde_json::Value>,
+    /// The `done` frame — `reason`, `prompt_version`, `run_id`/`seq` and the run's
+    /// full cost. Always present: a body without it would be a run that never
+    /// terminated, which is a 500 here rather than a partial answer.
+    #[schema(value_type = Object)]
+    pub done: serde_json::Value,
+}
+
+/// `POST /v0/{project_guid}/research` body. The response is one
+/// [`ResearchResponse`], or an SSE stream under `?stream=yes`; see the endpoint
+/// description for the event contract.
 #[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct ResearchRequest {
     /// The research question — same contract as `/search`'s `query` (natural
@@ -2159,9 +2235,10 @@ pub struct DescriptorEndpoint {
     pub summary: String,
     /// OpenAPI tag group, absent for routes outside the spec.
     pub tag: Option<String>,
-    /// How the response arrives when it is not a single JSON body: `"sse"` for
-    /// the research streams, `"ndjson"` for `/index` under `?stream=yes`.
-    /// `null` for everything else.
+    /// How the response arrives when the caller asks for frames instead of a
+    /// single JSON body: `"sse"` for the research streams, `"ndjson"` for
+    /// `/index` — all three under `?stream=yes`, and all three answering one body
+    /// without it. `null` for everything else.
     ///
     /// The one fact here a maintainer must keep by hand — the spec records the
     /// response body, not that it arrives in frames — so a new streaming
@@ -2565,6 +2642,23 @@ mod tests {
         assert_eq!(q.stream, None);
         assert!(serde_urlencoded::from_str::<IndexQuery>("stream=true").is_err());
         assert!(serde_urlencoded::from_str::<IndexQuery>("streem=yes").is_err());
+    }
+
+    /// The same contract on `/research`, where getting it wrong is worse than on
+    /// `/index`: a `?stream=true` silently read as "absent" would hand a caller
+    /// that asked to watch the run a body it only sees seventy minutes later,
+    /// while a typo'd key on the *other* side would stream at a caller that will
+    /// not read the frames and cancel the run by disconnecting.
+    #[test]
+    fn the_research_stream_choice_parses_yes_and_no_only() {
+        let q: ResearchQuery = serde_urlencoded::from_str("stream=yes").expect("yes parses");
+        assert_eq!(q.stream, Some(StreamChoice::Yes));
+        let q: ResearchQuery = serde_urlencoded::from_str("stream=no").expect("no parses");
+        assert_eq!(q.stream, Some(StreamChoice::No));
+        let q: ResearchQuery = serde_urlencoded::from_str("").expect("absent parses");
+        assert_eq!(q.stream, None);
+        assert!(serde_urlencoded::from_str::<ResearchQuery>("stream=true").is_err());
+        assert!(serde_urlencoded::from_str::<ResearchQuery>("streem=yes").is_err());
     }
 
     // ── the language checklist, as far as one crate can check it ─────────────

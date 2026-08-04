@@ -601,21 +601,50 @@ let GC clean up.
   answer ("indexed, and search will still find nothing"). That distinction is
   what lets the VS Code pickers offer only `chunks_active > 0`.
 
-## /research (SSE, Ollama-driven)
+## /research (Ollama-driven; SSE under `?stream=yes`)
 
-`POST /v0/{guid}/research` — long-lived one-way SSE: a local Ollama model
+`POST /v0/{guid}/research` — a local Ollama model
 (`[research]` config, TOML-only) loops tools **via internal cores**
 (`search_core`/`symbols_core` in `handlers.rs`; never HTTP-to-self), then
-streams a Markdown report. **Full rationale, rejected alternatives and the
+produces a Markdown report. **Full rationale, rejected alternatives and the
 measurement record live in `docs/claude/research.md` — read it before
 modifying `research.rs`, `models/ollama.rs`, the budgets or the SSE
 contract.** (Design decisions marked "measured" point to the 2026-07-28
 108-run and 2026-07-30 28-run corpora summarized there; the corpus of record
 is the `research_runs` table.) The hard invariants:
 
-- **Cancellation = cancelling the job token; two hands reach it.**
+- **Streaming is opt-in (`?stream=yes`), and the default answers one JSON body.**
+  `/index`'s shape, adopted late and for a sharper reason: frames make
+  disconnection the cancellation interface, which also makes *reading to `done`*
+  compulsory — so a caller that issued the request and did not stay spent the
+  whole budget, got nothing, and raised no error anywhere. Safe behaviour is now
+  what you get by not asking. Both entrances read the query through
+  `launch_research_job`, so it cannot mean one thing on research and another on a
+  challenge; everything above the spawn (pre-flight refusals, permit, minted
+  `run_id`, registry entry, `started` frame) is identical and only the tail forks.
+  **Every field of `ResearchResponse` is a frame's own `ResearchEvent::data()`**,
+  so the JSON mode is a transcription and not a fifth copy of the SSE contract —
+  `the_json_body_carries_the_frames_the_stream_would_have_sent` asserts against
+  `data()` rather than literals precisely so it cannot become one.
+  `thinking`/`step`/`progress` are dropped (they exist to be watched; the count is
+  on `done`, the trace in `research_run_steps`). Gating this on `aud=agent` was
+  rejected: `aud` is not an authority axis and a check there stops only the caller
+  honest enough to label itself.
+- **A mid-run failure is an `error` frame on a stream and an HTTP status without
+  one** — the one deliberate difference between the modes, and the reason
+  `ollama.unavailable`/`ollama.error`/`research.no_report` became real `ApiError`
+  variants (503/503/500) instead of string literals in `research.rs`. The crossing
+  lives in `ApiError::from_research_failure` alone; it is a match on **strings**,
+  where a missing arm still answers — as a well-formed 500 with the wrong code —
+  so `FAILURE_CODES` (`#[cfg(test)]`, beside `ResearchAbort`) +
+  `every_research_failure_code_rebuilds_itself` is what makes adding a failure
+  code fail loudly.
+- **Cancellation = cancelling the job token; two hands reach it, in both modes.**
   `SseEventStream`'s `Drop` (disconnect) is the primary one and still the only one
-  the loop knows about; `DELETE /research/active/{run_id}` is the second, for the
+  the loop knows about; without a stream a `CancellationGuard` held across the
+  drain does the same when axum drops the handler future (`post_index`'s JSON-mode
+  shape), so the JSON mode removes the obligation to keep reading and **not** the
+  cancel-on-disconnect rule. `DELETE /research/active/{run_id}` is the second, for the
   case disconnect cannot cover — a caller that abandoned the run while its socket
   stays open (scout holds its connection up to `RESEARCH_TOTAL_TIMEOUT`, 70 min).
   The semaphore permit rides **in the spawned job**, not the stream (releasing on
@@ -1329,12 +1358,17 @@ is the `research_runs` table.) The hard invariants:
   `run_id`/`seq` (null when the journal write failed; rendered as "not
   saved" in VS Code). `started` is always the **first** frame; event order after
   the report is fixed: `summary` → `citations` → `excerpts` (only with a verified
-  citation) → `verdict` (challenge streams only) → `done`.
+  citation) → `verdict` (challenge streams only) → `done`. The non-streaming body
+  is **not** a fifth place: it transcribes the same `data()` values, so every test
+  above covers both modes.
 - **A stream ending without a terminal event is a failure**:
   `SseEventStream` synthesises one `error` (`internal.error`) when the
   channel closes without `done`/`error` (a detached-job panic otherwise reads
   as a completed stream); `SseWireEvent` is generic, so streaming `/index`
-  gets it free; `a_stream_that_ended_properly_gets_no_synthetic_terminal`.
+  gets it free; `a_stream_that_ended_properly_gets_no_synthetic_terminal`. The
+  JSON collector raises that same synthesised failure as a 500 rather than a 200
+  with an empty report (`abnormal_end` is the one sentence both use;
+  `a_job_that_dies_without_a_terminal_is_a_failure_not_an_empty_report`).
 - **A report is arbitrary UTF-8 — never index it by byte**
   (`a_report_is_arbitrary_utf8_and_must_never_panic_the_parser`); the only
   safe indexes into model output are `char_indices` or ASCII-derived
@@ -1606,10 +1640,13 @@ problem+json 413 (`request.body_too_large`), not axum's plain-text.
 **`?stream=yes` reports the same pipeline as SSE**, and the pipeline is one
 function either way: `run_index_job` is shared verbatim; the query only picks
 who builds the terminal (`Json` body vs a `done`/`error` event), so the modes
-cannot drift. The cancellation shapes differ on purpose, mirroring research's:
-JSON mode keeps its `CancellationGuard` (handler-future drop = cancel); SSE
-mode spawns the job detached and the *stream's* Drop cancels the token (a
-guard in the handler would fire the instant the response is constructed).
+cannot drift. The cancellation shapes differ on purpose, and research now shares
+both of them: JSON mode keeps its `CancellationGuard` (handler-future drop =
+cancel); SSE mode spawns the job detached and the *stream's* Drop cancels the
+token (a guard in the handler would fire the instant the response is
+constructed). Research's JSON mode is the same pair with the roles as here —
+which is what makes "the default does not weaken cancel-on-disconnect" true
+rather than merely intended.
 Recovery runs inside the job, so a disconnected streaming client still lands
 its batch in `cancelled`. The event vocabulary
 (`started`/`prepared`/`skipped`/`embedded`/`indexed`/`done`/`error`,
@@ -2219,7 +2256,15 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, two tools —
   `research`, a thin SSE client over `POST /v0/{guid}/research`, and
   `challenge`, the same client pointed at
-  `POST /v0/{guid}/research/{run_id}/challenge` (one `_run` consumer for both,
+  `POST /v0/{guid}/research/{run_id}/challenge`. Both send **`?stream=yes`**
+  (`STREAM_QUERY`) now that frames are opt-in, and the reason is local to that
+  file rather than a preference: `READ_TIMEOUT` (120 s) is an *idle* timeout
+  resting on the 15 s keep-alive and is the only thing there that separates a
+  working server from a wedged one, and the partial-report salvage
+  (`truncated_by_client`/`live_run_id`/`still_running`) only works because bytes
+  arrive as they are produced. scout is the caller the streaming mode is *for* —
+  it reads to `done` by construction; the new default is for the caller that does
+  not. (One `_run` consumer for both,
   so the reader whitelists cannot drift; `_VERDICT_KEYS` reads the challenge
   stream's extra event, and `_INSTRUCTIONS` teach the caller the trust field
   and the two rules a verdict must be read under — inconclusive ≠ acquittal,

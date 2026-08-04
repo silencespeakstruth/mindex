@@ -132,7 +132,7 @@ request/response schemas (rendered at `/swagger-ui`).
 `POST /v0/{project_guid}/research` starts an investigation on the server's
 local model. It plans, loops over its internal tools — search, grep, symbols,
 outline, list_files, read_chunks, file history, prior research, and two that
-let it take notes and revise its own plan — and streams back a cited Markdown
+let it take notes and revise its own plan — and answers with a cited Markdown
 report.
 
 Request: `{"question": "..."}` plus optional `model` (from `research.models`
@@ -147,18 +147,41 @@ what the caller already suspects removes exactly that. Scope filters are the
 place to be specific instead — and a question whose answer might live outside
 the scope is better left unscoped.
 
-### The stream
+### The response
 
-The response is a **one-way SSE stream**, one JSON frame per `data:` line.
-Event order is fixed: `started` (carries `run_id`) → any number of `step` and
-`progress` → the report text → `summary` → `citations` → `excerpts` (only
-when something verified) → `done`. Disconnecting cancels the run.
+By default the answer is **one JSON body**, sent when the run ends: `run_id`,
+the resolved `model`/`effort` and their grants, the Markdown `report`, and the
+`citations`, `excerpts` and `done` objects described below. Nothing arrives
+before then, so the connection is silent for as long as the run takes — up to
+the level's `worst_case_seconds`, published per effort level in the live section
+at the end of this page.
 
+`?stream=yes` asks for the same run as a **one-way SSE stream** instead, one
+JSON frame per `data:` line. Event order is fixed: `started` (carries `run_id`)
+→ any number of `step` and `progress` → the report text → `summary` →
+`citations` → `excerpts` (only when something verified) → `done`.
+
+Which one to ask for follows from a single fact: **disconnecting cancels the
+run**. Frames are worth it to a caller that is showing the run to somebody, or
+that wants to stop it early on what it sees — and such a caller is reading to
+`done` anyway. A caller that will not read every frame to `done` is better
+served by the default, because for it the stream is not a feature: leaving early
+spends the whole budget and returns nothing, and that failure raises no error
+anywhere. The two modes run the same investigation and store the same report;
+only the delivery differs.
+
+The stream-only frames are the ones there is nothing to watch without.
 `step` reports each tool call together with the file spans it landed on.
 `progress` reports spent against granted on every budget axis; its `binding`
 field names the axis with the **largest share spent** — a maximum, not a
 warning about what is about to stop the run — and `shares` gives all four
-percentages it was chosen from.
+percentages it was chosen from. The JSON body omits both.
+
+Failures differ in one way, and only because they can. On a stream the status is
+already `200` by the time a run fails, so the failure is an `error` frame. With
+no stream open it is the response: `503 ollama.unavailable` (the model server
+did not answer), `503 ollama.error` (it answered with an error — nearly always
+a model that is not pulled) or `500 research.no_report`.
 
 `excerpts` carries the indexed code at every verified citation, verbatim.
 That is what makes the report's own prose free to describe rather than
@@ -226,9 +249,10 @@ descendants invalid rather than silently leaving them standing.
 investigation whose subject is a stored report: same loop, same budgets, its
 own citation gate. The subject is injected as hearsay under examination and
 never seeds the evidence — re-deriving every location through the tools is
-what the refutation consists of. The stream is identical plus one event
-before `done`: `verdict`, carrying per-claim `CONFIRMED` / `DISPUTED` /
-`REFUTED` and an `overall`.
+what the refutation consists of. `?stream=` means what it means on
+`POST /v0/{project_guid}/research`, and the answer is identical plus one thing: `verdict`,
+carrying per-claim `CONFIRMED` / `DISPUTED` / `REFUTED` and an `overall` — a
+field of the JSON body, an event before `done` on a stream.
 
 Two properties of `overall` govern how it reads:
 

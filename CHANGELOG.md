@@ -12,7 +12,28 @@ changes of its own is still released, so "which version am I running" has one an
 ## [Unreleased]
 
 Makes the server discoverable by an agent that was handed nothing but a URL, including
-the ones whose harness will not read prose off the network.
+the ones whose harness will not read prose off the network. Stops `POST /research`
+charging a caller a whole GPU budget for not having stayed to read the answer.
+
+### Upgrading — a caller that wants research frames must now ask for them
+
+`POST /v0/{guid}/research` and `POST /v0/{guid}/research/{run_id}/challenge` answer
+**one JSON body** unless the request carries `?stream=yes`. Both shipped clients already
+do: `tools/mcp/scout` and the VS Code extension were changed in the same commit, so an
+upgrade is invisible from either. A hand-written SSE client is what has to change, and
+the symptom if it does not is unambiguous rather than subtle — the body parses as zero
+frames, so a run reads as one that never terminated.
+
+The failure shapes move with the default, and only because they can. With no stream open
+there is no "after the status was already 200", so what would have been an `error` frame
+is a problem+json status: **503** `ollama.unavailable` (unreachable or mute), **503**
+`ollama.error` (Ollama answering *with* an error — nearly always a model that is not
+pulled) and **500** `research.no_report`. Under `?stream=yes` all three remain `error`
+events on a 200, byte-for-byte as before.
+
+One operational consequence: without frames the whole run is one silent request, so any
+intermediary between caller and server must tolerate `worst_case_seconds` of quiet —
+`GET /config` publishes it per effort level, and for `high` it is over an hour.
 
 ### Added
 
@@ -37,6 +58,48 @@ the ones whose harness will not read prose off the network.
 - `UNDOCUMENTED_ROUTES` in `http3.rs` is the single list of routes deliberately outside
   the spec; the `/llms.txt` route guard and the descriptor read it instead of holding a
   copy each.
+- **Research streams are opt-in, and the safe behaviour is what you get by not asking.**
+  Frames were compulsory, which made *reading the response to the end* compulsory too,
+  since a disconnect cancels the run. So a caller that issued the request and did not
+  stay spent the whole budget, received nothing, and raised no error anywhere — the
+  expensive failure, and the silent one. `/index` had adopted the opposite default long
+  before; research now matches it. Both entrances read the query through one
+  `launch_research_job`, so `?stream=yes` cannot come to mean one thing on a research run
+  and another on a challenge: everything above the spawn — pre-flight refusals, the
+  permit, the minted `run_id`, the registry entry, the `started` frame — is identical, and
+  only the tail forks.
+- **The JSON body is a transcription of the stream, not a second contract.** Every field
+  of `ResearchResponse` is the `data()` of the frame with the same name, produced by the
+  same code: report, `summary`, `citations`, `excerpts`, a challenge's `verdict`, and the
+  `done` payload. It omits `thinking`, `step` and `progress`, which exist to be watched —
+  the step count rides on `done` and the trace is journalled in `research_run_steps`.
+  `the_json_body_carries_the_frames_the_stream_would_have_sent` asserts against `data()`
+  rather than against literals, precisely so the body cannot drift into being a fifth copy
+  of the SSE contract.
+- **Cancel-on-disconnect is unchanged, by a second hand rather than by the stream's.** In
+  SSE mode `SseEventStream`'s `Drop` still cancels the job token; in JSON mode a
+  `CancellationGuard` held across the drain does the same when axum drops the handler
+  future. So the new default removes the obligation to keep reading, and not the rule.
+  `DELETE /research/active/{run_id}` remains the answer for a caller that abandoned a run
+  while its socket stayed open.
+- `ollama.unavailable`, `ollama.error` and `research.no_report` are now real `ApiError`
+  variants instead of string literals in `research.rs`. The crossing lives in
+  `ApiError::from_research_failure` alone, and it matches on strings — where a missing arm
+  would still answer, as a well-formed 500 carrying the wrong code. `FAILURE_CODES` beside
+  `ResearchAbort` plus `every_research_failure_code_rebuilds_itself` is what makes adding a
+  failure code fail loudly instead.
+- A stream that dies without a terminal event was already synthesised into one `error`;
+  the JSON collector now raises that same synthesised failure as a **500** rather than a
+  200 with an empty report. Both spell it with one sentence, `abnormal_end`.
+- `?stream=` is `deny_unknown_fields` and accepts only `yes`/`no`: `?stream=true` or a
+  typo'd key is a 400, never a silent fall-through to the default — which for this
+  endpoint would cost a caller an hour of GPU before it noticed.
+- `tools/mcp/scout` and the VS Code research panel both request `?stream=yes` explicitly,
+  each with the reason recorded in its own file. scout's is not a preference: its
+  `READ_TIMEOUT` is an *idle* clock resting on the server's 15 s keep-alive and is the only
+  thing there separating a working server from a wedged one, and its partial-report salvage
+  (`truncated_by_client`, `live_run_id`, `still_running`) works only because bytes arrive as
+  they are produced.
 
 ## [1.1.0] — 2026-08-03
 

@@ -7,7 +7,7 @@ queries the index step by step (semantic search + exact symbol lookup), reads
 the matching code, and writes a report. Only that report and a one-line-per-step
 trace cross the MCP boundary back.
 
-    question (a few dozen tokens)  →  mindex POST /research (SSE)
+    question (a few dozen tokens)  →  mindex POST /research?stream=yes (SSE)
                                    →  local model loops search/symbols, reads code
                                    →  Markdown report + step trace come back
 
@@ -50,6 +50,23 @@ READ_TIMEOUT = float(os.environ.get("RESEARCH_READ_TIMEOUT", "120"))
 # a report written one section at a time; this comment is the thing that has to be
 # re-read whenever either server number changes.
 TOTAL_TIMEOUT = float(os.environ.get("RESEARCH_TOTAL_TIMEOUT", "4200"))
+
+# mindex answers `/research` with one JSON body unless frames are asked for, because
+# a caller that does not read a stream to `done` cancels the run by disconnecting.
+# This client is not that caller: it reads every frame to the end. It asks for the
+# stream anyway, for two reasons that are this file's own.
+#
+# First, READ_TIMEOUT above is an *idle* timeout, and it is the only thing here that
+# can tell a working server from a wedged one. It rests on mindex's 15 s keep-alive;
+# against a single silent body it would have to be raised to TOTAL_TIMEOUT, and a
+# hung server would then hold this tool for seventy minutes looking exactly like a
+# healthy high-effort run.
+#
+# Second, the partial-report salvage below (`truncated_by_client`, `live_run_id`,
+# `still_running`) exists only because bytes arrive as they are produced. Against one
+# buffered body a client timeout returns nothing at all — including for a run that
+# had already written its report.
+STREAM_QUERY = "?stream=yes"
 
 # Effort used when the caller doesn't say. It selects a server-configured budget
 # (wall-clock, local tokens and tool calls), so it is also the main latency lever.
@@ -633,7 +650,7 @@ async def research(
     # instructions sell return the same report for the same question. Do not add it
     # as an oversight-fix.
 
-    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research"
+    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research{STREAM_QUERY}"
     return await _run(url, body, include_excerpts)
 
 
@@ -1019,7 +1036,9 @@ async def challenge(
     if budget:
         body["budget"] = budget
 
-    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research/{run_id}/challenge"
+    url = (
+        f"{SERVER}/{PROTOCOL}/{project_guid}/research/{run_id}/challenge{STREAM_QUERY}"
+    )
     return await _run(url, body, include_excerpts)
 
 

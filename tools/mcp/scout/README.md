@@ -6,7 +6,7 @@ reading the code — and sends back a cited Markdown report. `challenge` points 
 machinery at a report that already exists, to try to break it.
 
 ```
-your question (a few dozen tokens)  →  mindex POST /research (SSE)
+your question (a few dozen tokens)  →  mindex POST /research?stream=yes (SSE)
                                     →  local model loops search/symbols, reads code
                                     →  report + step trace come back
 ```
@@ -18,6 +18,13 @@ and one briefing out.
 
 The machinery lives in mindex itself (`src/research.rs`); this server is a thin SSE
 client and remains fully removable.
+
+mindex answers `/research` with one JSON body unless frames are asked for — a caller
+that does not read a stream to `done` cancels the run by disconnecting, so the safe
+mode is the default. This client asks for the stream anyway (`STREAM_QUERY`), because
+its idle read timeout is the only thing here that separates a working server from a
+wedged one, and because salvaging a partially-written report on a client timeout only
+works while bytes arrive as they are produced.
 
 ## The contract with the caller
 

@@ -236,6 +236,27 @@ pub enum ApiError {
     /// converse does not hold — `capabilities: ["tools"]` is not proof the template
     /// drives them — so the symptom check stays exactly where it is.
     ResearchModelLacksTools { model: String },
+    /// The Ollama chat call could not be made, or the connection produced no
+    /// token of any channel before `[research].first_token_timeout_ms`. 503.
+    ///
+    /// These three variants exist because a research run has **two** planes to
+    /// fail on and only one of them used to be an HTTP status. Mid-stream a
+    /// failure is an `error` *event* — the status is already 200 by then — so
+    /// these codes lived as string literals in `research.rs` and never needed an
+    /// `ApiError`. Without frames there is no "after the stream started": the
+    /// same failure is the answer to the request, and the answer to a request is
+    /// problem+json. One fault, one code, at whichever plane sees it.
+    OllamaUnavailable { detail: String },
+    /// Ollama answered *with* an error — nearly always a model that is not
+    /// pulled. 503, and deliberately a different code from
+    /// [`ApiError::OllamaUnavailable`]: collapsed into one, a client can neither
+    /// word the message nor decide whether re-reading `/health` would say
+    /// anything, since for a mistyped model name health is green every time.
+    OllamaError { detail: String },
+    /// The report turn produced nothing usable as a report — empty, or one more
+    /// tool call — twice. 500. The run happened and cost what it cost; there is
+    /// simply no document at the end of it.
+    ResearchNoReport { detail: String },
 }
 
 impl ApiError {
@@ -294,6 +315,9 @@ impl ApiError {
             }
             ApiError::ResearchScopeEmpty { .. } => "research.scope_matches_nothing",
             ApiError::ResearchModelLacksTools { .. } => "research.model_lacks_tools",
+            ApiError::OllamaUnavailable { .. } => "ollama.unavailable",
+            ApiError::OllamaError { .. } => "ollama.error",
+            ApiError::ResearchNoReport { .. } => "research.no_report",
         }
     }
 
@@ -304,7 +328,17 @@ impl ApiError {
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::EmbedderUnavailable
             | ApiError::QdrantUnavailable
-            | ApiError::DatabaseBusy => StatusCode::SERVICE_UNAVAILABLE,
+            | ApiError::DatabaseBusy
+            // A dependency that is down or refusing, exactly like the embedder
+            // above it — retryable, and an operator's problem rather than the
+            // caller's. `ollama.error` sits here too: a model that is not pulled
+            // is fixed on the host, not in the request.
+            | ApiError::OllamaUnavailable { .. }
+            | ApiError::OllamaError { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            // The run reached its report turn and produced nothing usable. Nothing
+            // the caller sent was wrong and nothing is unavailable — this end
+            // failed to answer.
+            ApiError::ResearchNoReport { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::GcRunning => StatusCode::CONFLICT,
             ApiError::FileInFlight | ApiError::ResearchBusy => StatusCode::TOO_MANY_REQUESTS,
             ApiError::ProjectNotFound
@@ -372,6 +406,9 @@ impl ApiError {
             ApiError::ChallengeSubjectIsChallenge { .. } => "Cannot challenge a challenge",
             ApiError::ResearchScopeEmpty { .. } => "Research scope matches no indexed file",
             ApiError::ResearchModelLacksTools { .. } => "Research model cannot call tools",
+            ApiError::OllamaUnavailable { .. } => "Ollama unavailable",
+            ApiError::OllamaError { .. } => "Ollama returned an error",
+            ApiError::ResearchNoReport { .. } => "Research produced no report",
         }
     }
 
@@ -604,6 +641,74 @@ impl ApiError {
                  to fail on its first turn. Pick a model that lists `tools` in `ollama show \
                  {model}`; GET /config lists the ones this server will accept."
             ),
+            // These three carry the detail the run itself wrote, because it is the
+            // only thing that says *which* call failed and what it said. The
+            // sentence around it is what a caller can act on.
+            ApiError::OllamaUnavailable { detail } => format!(
+                "{detail} The research model server did not answer. Check that Ollama is \
+                 running and reachable from this host; GET /health reports it under \
+                 `checks.ollama`."
+            ),
+            ApiError::OllamaError { detail } => format!(
+                "{detail} Ollama answered with an error rather than being unreachable, \
+                 which nearly always means the model is not pulled — `ollama pull` it on \
+                 the server's host. GET /health stays green for this, since Ollama itself \
+                 is up."
+            ),
+            ApiError::ResearchNoReport { detail } => format!(
+                "{detail} The run completed its investigation but its report turn produced \
+                 nothing usable, twice. The run is not stored. Retry, and if it repeats, \
+                 try another model — this is a property of the model's template rather \
+                 than of the question."
+            ),
+        }
+    }
+
+    /// Rebuild the error behind a research run's terminal `error` frame.
+    ///
+    /// A research run fails on two planes. Mid-stream the HTTP status is already
+    /// 200, so the failure is an `error` *event* carrying a code and a sentence —
+    /// which is why several of these codes existed as string literals in
+    /// `research.rs` and nowhere else. Without frames there is no mid-stream: the
+    /// failure *is* the answer, and an answer is problem+json. This is the one
+    /// place that crossing happens, so the two planes cannot report the same
+    /// fault differently.
+    ///
+    /// `model` is needed only by `research.model_lacks_tools`, which carries it —
+    /// and carrying it is what makes that fault read identically whether it was
+    /// caught by the pre-flight `/api/show` (a 400 before the run) or by the
+    /// symptom check inside the loop.
+    ///
+    /// An unrecognized code cannot be honestly re-coded, so it becomes a 500 and
+    /// says so in the log rather than being renamed into a code that means
+    /// something else. [`tests::every_research_failure_code_rebuilds_itself`]
+    /// keeps the known set from silently reaching that branch.
+    pub fn from_research_failure(code: &str, detail: String, model: &str) -> ApiError {
+        match code {
+            "ollama.unavailable" => ApiError::OllamaUnavailable { detail },
+            "ollama.error" => ApiError::OllamaError { detail },
+            "research.no_report" => ApiError::ResearchNoReport { detail },
+            "research.model_lacks_tools" => ApiError::ResearchModelLacksTools {
+                model: model.to_string(),
+            },
+            // An index lookup failed during the run: `From<ApiError> for
+            // ResearchAbort` flattened one of these to its code, and this reads it
+            // back.
+            "embedder.unavailable" => ApiError::EmbedderUnavailable,
+            "qdrant.unavailable" => ApiError::QdrantUnavailable,
+            "database.busy" => ApiError::DatabaseBusy,
+            "request.cancelled" => ApiError::Cancelled,
+            "internal.error" => ApiError::Internal,
+            other => {
+                tracing::warn!(
+                    code = %other,
+                    %detail,
+                    "A research run failed with a code that has no ApiError; answering \
+                     internal.error. Add it to ApiError::from_research_failure — the \
+                     caller is being told the wrong thing about why its run failed."
+                );
+                ApiError::Internal
+            }
         }
     }
 
@@ -852,7 +957,48 @@ mod tests {
             ApiError::ResearchModelLacksTools {
                 model: String::new(),
             },
+            ApiError::OllamaUnavailable {
+                detail: String::new(),
+            },
+            ApiError::OllamaError {
+                detail: String::new(),
+            },
+            ApiError::ResearchNoReport {
+                detail: String::new(),
+            },
         ]
+    }
+
+    /// Every code a research run can fail with must rebuild into an `ApiError`
+    /// carrying **that same code**.
+    ///
+    /// The failure this guards is quiet by construction. Without `?stream=yes` a
+    /// run's terminal `error` frame becomes the HTTP answer, and the crossing is
+    /// a match on strings; a code with no arm still produces a perfectly
+    /// well-formed 500 `internal.error`, so the only symptom is a caller being
+    /// told the wrong thing about why its run failed. Adding a failure code in
+    /// `research.rs` therefore means adding it to `FAILURE_CODES` and to
+    /// [`ApiError::from_research_failure`] — and this fails until both happen.
+    #[test]
+    fn every_research_failure_code_rebuilds_itself() {
+        for code in crate::research::FAILURE_CODES {
+            let rebuilt = ApiError::from_research_failure(code, "detail".to_string(), "some-model");
+            assert_eq!(
+                rebuilt.code(),
+                *code,
+                "a research failure must not be renamed on its way to a status"
+            );
+        }
+    }
+
+    /// The failure the branch above cannot prevent, made visible: an unknown code
+    /// answers rather than panicking, and answers as an internal error rather
+    /// than borrowing a code that means something else.
+    #[test]
+    fn an_unknown_research_failure_code_becomes_an_internal_error() {
+        let rebuilt = ApiError::from_research_failure("research.invented", "detail".into(), "m");
+        assert_eq!(rebuilt.code(), "internal.error");
+        assert_eq!(rebuilt.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Every variant's `code`, in sorted order. This is the public error-code
@@ -875,6 +1021,8 @@ mod tests {
             "gc.already_running",
             "index.file_in_flight",
             "internal.error",
+            "ollama.error",
+            "ollama.unavailable",
             "project.not_found",
             "qdrant.unavailable",
             "request.body_too_large",
@@ -887,6 +1035,7 @@ mod tests {
             "research.model_lacks_tools",
             "research.model_missing",
             "research.model_not_allowed",
+            "research.no_report",
             "research.run_not_found",
             "research.scope_matches_nothing",
             "search.no_match",

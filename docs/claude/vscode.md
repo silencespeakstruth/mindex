@@ -9,7 +9,12 @@ modifying `tools/vscode`.
   the QuickPick (live editor preview + Esc restore), research streams into
   its WebviewPanel tab (steps + live thinking + `marked`-rendered report).
   The SSE client is hand-rolled in `api.ts` (no reconnects — a drop is a
-  cancel, by contract). Force reindex lives in the Drift view's overflow
+  cancel, by contract), and since 2026-08-04 both research paths must send
+  **`?stream=yes`**: the server answers one JSON body by default, because a
+  caller that does not read a stream to `done` cancels its own run. This panel
+  is not that caller — it renders every frame — so it asks. Without the query
+  the body parses as zero frames and `streamResearch` reports a run that never
+  terminated. Force reindex lives in the Drift view's overflow
   menu.
   **Research History** (`researchRunsPanel.ts` + `webview/runs.ts`) is an
   editor-area panel, not a third sidebar view (the `icons.test.ts` argument).

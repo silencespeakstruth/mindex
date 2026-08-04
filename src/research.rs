@@ -5604,6 +5604,37 @@ pub async fn run_research(
     });
 }
 
+/// Every code a run can put on its terminal `error` frame.
+///
+/// The frame carries a code as a *string*, which was harmless while the only
+/// consumer was a client reading a 200 stream. It is not harmless now: without
+/// `?stream=yes` the same failure is the HTTP answer, so
+/// [`ApiError::from_research_failure`] has to turn each of these back into the
+/// error it came from. That inverse is a match on strings, and this is the list
+/// it is checked against — the codes here and the arms there are one contract,
+/// pinned by `every_research_failure_code_rebuilds_itself`.
+///
+/// The first four are written in this file; the rest arrive through
+/// `From<ApiError> for ResearchAbort`, which flattens an index-lookup failure to
+/// its own code. A code missing from that inverse still answers — as 500
+/// `internal.error`, with a `warn!` naming what was lost.
+///
+/// `#[cfg(test)]` because nothing in production reads a *list* of codes — the same
+/// shape as `every_variant()` in `backend/error.rs`, a fixture that doubles as the
+/// written form of a contract.
+#[cfg(test)]
+pub const FAILURE_CODES: &[&str] = &[
+    "ollama.unavailable",
+    "ollama.error",
+    "research.no_report",
+    "research.model_lacks_tools",
+    "embedder.unavailable",
+    "qdrant.unavailable",
+    "database.busy",
+    "request.cancelled",
+    "internal.error",
+];
+
 enum ResearchAbort {
     Cancelled,
     Failed { code: String, detail: String },
