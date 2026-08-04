@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## 1.1.1
+
+Seven places where an action succeeded and the screen went on describing the world
+before it. None of them showed an error; each showed a panel disagreeing with
+itself.
+
+- **`Collect garbage` now ends when it deletes.** The review used to stay up
+  afterwards, listing the reports it had just deleted, still ticked, under a
+  `Delete N` that would have re-sent them — while the header above it already read
+  `Collect garbage (0)`.
+- **Reading a candidate no longer destroys the review.** The `read` link opens the
+  report as its own Markdown tab, the way stored reports open everywhere else;
+  before, it expanded the row underneath, which closed the review — and for a
+  report further down the corpus than the loaded page, left neither the review nor
+  the report.
+- **Pinning updates the numbers it changes.** The counts line and the
+  `Collect garbage` count moved only after a manual refresh, so unpinning an
+  out-of-date report left the button disabled over a corpus that now had something
+  to collect.
+- **A finished run reaches Research History.** The new report, the corpus counts
+  and — after a challenge — the subject's trust badge and its `Challenge` /
+  `Re-check` button all update on their own. A selection built by a filter survives
+  it: nothing the user chose is discarded because a background run landed.
+- **Deleted reports leave the Ask form.** They stayed attached as context for the
+  next question and came back as an error about a click made in another panel.
+- **Cancelling indexing releases the reindex button** immediately, instead of
+  refusing for up to one status poll on a count it had already invalidated.
+- **`Sync all` deletes what is still orphaned** after its own reindex, not what was
+  orphaned before it.
+
+## 1.1.0
 
 Indexing becomes something you can watch, and Research becomes a first-class
 surface rather than a panel you have to know about.

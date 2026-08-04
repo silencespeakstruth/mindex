@@ -454,6 +454,10 @@ export function activate(context: vscode.ExtensionContext): void {
                 if (researchPanel === panel) {
                     researchPanel = undefined;
                 }
+                // The corpus gained a report (or did not, if this run failed — in
+                // which case re-reading costs one request and says so honestly).
+                // Either way the History panel is describing the corpus as it was.
+                ResearchRunsPanel.notifyRunFinished();
             }
         }
         // Reported *after* the form is released, never inside the `catch`: an error
@@ -543,6 +547,10 @@ export function activate(context: vscode.ExtensionContext): void {
                 if (researchPanel === panel) {
                     researchPanel = undefined;
                 }
+                // More than a new row here: the subject's trust badge and its
+                // Challenge/Re-check button are exactly what this run just decided,
+                // and they are the two things a reader would go and check.
+                ResearchRunsPanel.notifyRunFinished();
             }
         }
         // After the handles are released, like `startResearch` — see the comment
@@ -979,7 +987,19 @@ export function activate(context: vscode.ExtensionContext): void {
                 await reindex(toReindex, "");
             }
             if (deleting) {
-                await deleteOrphans(orphans);
+                // Reindexing runs its own drift check, which rebuilds this view —
+                // so `orphans` now describes the tree as it was two round trips
+                // ago. Delete only what the fresh check still calls orphaned: the
+                // confirmation bounds the set, and the later check decides.
+                const stillOrphaned = new Set(driftProvider.allPaths("orphaned"));
+                const condemned = orphans.filter((p) => stillOrphaned.has(p));
+                if (condemned.length === 0) {
+                    void vscode.window.showInformationMessage(
+                        say("nothing left to delete — the reindex accounted for it.")
+                    );
+                } else {
+                    await deleteOrphans(condemned);
+                }
             }
         }),
 
@@ -996,6 +1016,11 @@ export function activate(context: vscode.ExtensionContext): void {
                     say(`cancelled ${n} in-flight file(s) (best-effort).`)
                 );
                 await checkDrift();
+                // The claim count comes from the status poll, not from the drift
+                // check, and `reindex` refuses on it — so without this the user
+                // cancels and then cannot reindex until the next tick, which is the
+                // one thing they cancelled in order to do.
+                await statusProvider.refresh();
             } catch (e) {
                 await reportError("Cancel failed", e);
             }
@@ -1039,6 +1064,9 @@ export function activate(context: vscode.ExtensionContext): void {
                     },
                     challenge: (run) => {
                         void startChallenge(run);
+                    },
+                    runsDeleted: (ids) => {
+                        askProvider.dropContextRuns(ids);
                     },
                     reAsk: (run) => {
                         const effort =

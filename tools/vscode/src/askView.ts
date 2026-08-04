@@ -366,6 +366,23 @@ export class AskViewProvider implements vscode.WebviewViewProvider {
         this.postContextRuns();
     }
 
+    /**
+     * Drop runs that no longer exist.
+     *
+     * Unlike `setContextRuns` this is a prune, not a replace: the caller is
+     * reporting a deletion, not stating what the attachment should now be, and the
+     * runs it says nothing about are still the user's choice.
+     */
+    dropContextRuns(ids: readonly string[]): void {
+        const gone = new Set(ids);
+        const kept = this.contextRuns.filter((r) => !gone.has(r.id));
+        if (kept.length === this.contextRuns.length) {
+            return;
+        }
+        this.contextRuns = kept;
+        this.postContextRuns();
+    }
+
     /** What is currently attached — the picker seeds its selection from this. */
     get currentContextRuns(): readonly ResearchRunSummary[] {
         return this.contextRuns;

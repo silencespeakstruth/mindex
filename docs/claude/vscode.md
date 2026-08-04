@@ -82,7 +82,24 @@ modifying `tools/vscode`.
   id *list* so one path serves both deletes, and it must release `activeId`
   when the open report is the one going (removing the row now takes its
   expansion with it, but a live `activeId` would still key a later
-  `challengeState` on a run that is gone). The header's refresh button is in-panel, not a
+  `challengeState` on a run that is gone). **`removed` also ends the garbage-collection
+  review**, which is the same rule one level up: the review describes a corpus that no
+  longer exists, and left standing it kept the deleted reports on screen still ticked,
+  under a `Delete N` that would re-post ids the server had already dropped — while the
+  header above it, which `totals` does refresh, read `Collect garbage (0)`. On the host
+  side the release is three maps and two fields (`rows`/`summaries`/`selected`,
+  `previewed`/`challengeState`) plus `actions.runsDeleted`, because the Ask form's
+  context chips are set from this panel and pruned by nothing else — a deleted run
+  stayed attached to the next question and came back as a 400 about a click made in
+  another panel. **A run finishing elsewhere refreshes the panel too**
+  (`notifyRunFinished`, called from `startResearch`/`startChallenge`'s `finally`), and
+  it is deliberately *not* the refresh button: an involuntary refresh does **not**
+  `dropBulkSelection()`, because that rule is about the filters that defined the
+  selection and none of them changed — discarding several hundred chosen ids because a
+  background run landed is a worse surprise than a briefly stale count. Pinning
+  re-reads the page for the same reason a delete does: it moves `gc_candidates`, so the
+  counts line and the `Collect garbage (N)` label describe the corpus as it was.
+  The header's refresh button is in-panel, not a
   `webview/title` menu — three contribution surfaces for one button that
   would then sit in the tab bar, away from the filters it re-runs; it
   supersedes any pending keystroke (`search.cancel()`) and re-fetches the
@@ -119,7 +136,13 @@ modifying `tools/vscode`.
   multi-select QuickPick either: it can pre-select items but cannot show *why*
   each row is proposed or that four later reports were built on it — the two
   things a reviewer unchecks a row over — and each row carries a `read` link
-  back into the list for the report itself. Each run appears in **one** group
+  that opens the report as its own **Markdown tab**, the way stored reports open
+  everywhere else. Expanding the row underneath was the earlier call and it destroyed
+  the screen it was being read for: `preview` closes the review, and for a candidate
+  off the loaded page `renderDetail` then found no row and dropped the answer too,
+  leaving neither. That is also why `openRun` resolves through `summaries` and not
+  `rows` — the proposal comes from a pass that ran to exhaustion, so most of what it
+  offers to open is off-page. Each run appears in **one** group
   (its most serious reason) with the others as labels; three checkboxes for
   one report would let an uncheck in one group not stick. The classification
   is client-side, which is safe *here specifically* because that pass runs to

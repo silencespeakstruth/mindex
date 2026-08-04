@@ -46,6 +46,14 @@ export interface ResearchRunsActions {
      * `extension.ts`, which owns the single-flight handles.
      */
     challenge(run: ResearchRunSummary): void;
+    /**
+     * These runs are gone. Whoever else is holding them has to let go.
+     *
+     * The Ask form is the one that does: its context chips are set from this panel
+     * and pruned by nothing else, so a deleted run stayed attached to the next
+     * question and came back as a 400 about a click made in another panel.
+     */
+    runsDeleted(ids: readonly string[]): void;
 }
 
 /** How long the box waits after the last keystroke before it asks the server. */
@@ -129,6 +137,15 @@ export class ResearchRunsPanel {
     private totals?: ResearchCorpusTotals;
     /** The challenge state of the previewed run, for the Re-check fork. */
     private challengeState?: { runId: string; state: ChallengeState };
+    /**
+     * The run whose row is expanded, as far as the host knows.
+     *
+     * Not derivable from `challengeState`, which is set only after that lookup
+     * lands and never at all for a challenge run. It exists so a refresh the user
+     * did not press — a run finishing elsewhere — can re-fetch what is open
+     * without asking the webview for its `activeId` first.
+     */
+    private previewed?: string;
     /**
      * A server too old for the query parameters added here.
      *
@@ -218,7 +235,9 @@ export class ResearchRunsPanel {
                     // act, and "two confirmation modals for one row" is what
                     // separate keys would still allow.
                     case "gcDelete":
-                        void this.busy.run("delete", () => this.remove(readIds(msg.ids)));
+                        void this.busy.run("delete", () =>
+                            this.remove(readIds(msg.ids), actions)
+                        );
                         break;
                     case "recheck":
                         void this.busy.run("preview", () =>
@@ -276,13 +295,23 @@ export class ResearchRunsPanel {
                         break;
                     }
                     case "delete":
-                        void this.busy.run("delete", () => this.remove([asString(msg.id)]));
+                        void this.busy.run("delete", () =>
+                            this.remove([asString(msg.id)], actions)
+                        );
                         break;
                     case "deleteSelected":
-                        void this.busy.run("delete", () => this.remove([...this.selected]));
+                        void this.busy.run("delete", () =>
+                            this.remove([...this.selected], actions)
+                        );
                         break;
                     case "openRun": {
-                        const run = this.rows.get(asString(msg.id));
+                        // Through `summaries` when the rendered page does not hold
+                        // it: the garbage-collection review reads from a pass that
+                        // ran to exhaustion, so most of what it offers to open is
+                        // off-page — and `pageAll` has put every one of those rows
+                        // in `summaries` already.
+                        const id = asString(msg.id);
+                        const run = this.rows.get(id) ?? this.summaries.get(id);
                         if (run !== undefined) {
                             actions.openReport(run);
                         }
@@ -326,6 +355,38 @@ export class ResearchRunsPanel {
                 d.dispose();
             }
         });
+    }
+
+    /**
+     * A run finished somewhere else and the corpus moved under the panel.
+     *
+     * Without this the panel is simply wrong after every run: the new row is
+     * absent, `totals` is a count of the corpus as it was, and the subject of a
+     * challenge still wears the trust badge and the `Challenge` button it had
+     * before it was refuted — the one moment those two are worth reading.
+     *
+     * Deliberately NOT the refresh button's behaviour: this one is involuntary, so
+     * it does not `dropBulkSelection()`. That rule exists because a selection is
+     * defined by the filters that built it, and none of them changed here —
+     * throwing away several hundred ids the user chose, because a background run
+     * happened to land, is a worse surprise than a count that is briefly stale.
+     *
+     * Static because the caller is `extension.ts`, which owns the run and not the
+     * panel — and there may be no panel open at all, which is not its business.
+     */
+    static notifyRunFinished(): void {
+        ResearchRunsPanel.current?.runFinished();
+    }
+
+    private runFinished(): void {
+        void this.load(this.query, undefined);
+        const open = this.previewed;
+        if (open !== undefined) {
+            // The verdict, the trust line and the Challenge/Re-check fork are all
+            // derived from this, and the stale copy is the one that would render.
+            this.challengeState = undefined;
+            void this.preview(open);
+        }
     }
 
     /** The cursor for the next page: the oldest row currently shown. */
@@ -667,6 +728,7 @@ export class ResearchRunsPanel {
         }
         this.summaries.set(detail.id, detail);
         this.challengeState = undefined;
+        this.previewed = detail.id;
         this.post({ type: "preview", run: detail });
         void this.loadChallengeState(guid, detail);
     }
@@ -837,10 +899,19 @@ export class ResearchRunsPanel {
         try {
             const updated = await this.api().pinResearchRun(guid, id, pinned);
             this.rows.set(updated.id, updated);
+            // `summaries` too, not just the rendered page: it is what the delete
+            // dialog and the challenge guard resolve ids through, and a stale
+            // `pinned`/`expires_at` there is a decision taken on the old answer.
+            this.summaries.set(updated.id, updated);
             // Re-post the server's answer rather than the state we guessed: pinning
             // rewrites `expires_at`, and unpinning an old run can make it eligible at
             // the very next sweep.
             this.post({ type: "updated", run: updated });
+            // Pinning moves `gc_candidates` — the exemption is the server's — so the
+            // counts line and the `Collect garbage (N)` label describe a corpus that
+            // has changed. Re-reading the current page is what refreshes them, as it
+            // is after a delete.
+            void this.load(this.query, undefined);
         } catch (e) {
             this.fail("pinning the report", e);
         }
@@ -855,7 +926,7 @@ export class ResearchRunsPanel {
      * silently invalidates every later report built on it — the caller is owed that
      * number before they agree, and `referenced_by_count` is why it is on the wire.
      */
-    private async remove(ids: string[]): Promise<void> {
+    private async remove(ids: string[], actions: ResearchRunsActions): Promise<void> {
         const guid = this.guid();
         if (guid === undefined || ids.length === 0) {
             return;
@@ -907,9 +978,23 @@ export class ResearchRunsPanel {
             this.rows.delete(id);
             this.summaries.delete(id);
             this.selected.delete(id);
+            // The webview lets go of `activeId` on `removed`; these are the host's
+            // half of the same release, and they must happen here rather than be
+            // left to the next preview — `challengeState` keyed on a deleted run
+            // would answer the Re-check fork for a report that is gone.
+            if (this.previewed === id) {
+                this.previewed = undefined;
+            }
+            if (this.challengeState?.runId === id) {
+                this.challengeState = undefined;
+            }
         }
         this.bulkSelection = false;
         this.post({ type: "removed", ids, selected: [...this.selected] });
+        // The Ask form may be holding these as context for the next question, and
+        // nothing else would ever take them off it: submitting them is a 400 about
+        // a click the user made in another panel.
+        actions.runsDeleted(ids);
         // The corpus just shrank, so the counts line and the GC button's number
         // are both stale. Re-reading the current page is what refreshes them.
         void this.load(this.query, undefined);

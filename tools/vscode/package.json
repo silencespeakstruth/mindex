@@ -2,7 +2,7 @@
   "name": "mindex-vscode",
   "displayName": "MINDex",
   "description": "Ask your codebase: semantic search with live preview, and a local model that investigates and writes a cited report. Plus drift detection and selective reindexing against a MINDex server.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "mindex",
   "license": "MIT",
   "author": {

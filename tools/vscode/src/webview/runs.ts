@@ -1024,7 +1024,14 @@ function renderGc(proposed: GcRow[], expected: number | null): void {
             open.className = "runs-subject-link";
             open.textContent = "read";
             open.title = "Open this report before deciding";
-            open.addEventListener("click", () => selectRun(r.id));
+            // A Markdown tab, not the row underneath: expanding the row goes
+            // through `preview`, which closes the review — so reading a candidate
+            // destroyed the decision screen it was being read for, and for a
+            // candidate off the loaded page `renderDetail` then found no row and
+            // dropped the answer too, leaving neither.
+            open.addEventListener("click", () =>
+                api.postMessage({ type: "openRun", id: r.id })
+            );
             li.appendChild(open);
             ul.appendChild(li);
         }
@@ -1210,6 +1217,14 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
                 if (activeId === id) {
                     activeId = undefined;
                 }
+            }
+            // The review described a corpus that no longer exists, so it goes with
+            // the rows it proposed. Left up, it kept the deleted reports on screen
+            // still ticked, under a `Delete N` that would re-post ids the server
+            // had already dropped — while the header above it, which the `totals`
+            // message does refresh, read `Collect garbage (0)`.
+            if (gcOpen) {
+                setGcOpen(false);
             }
             renderEmpty();
             refreshFooter();
