@@ -46,6 +46,14 @@ names the projects it reaches and the actions it permits (`search`, `research`,
 without already holding one, and no default value — a token comes from whoever
 runs the deployment, minted with `mindex mint-token` on the server's host.
 
+A caller that already holds a token carrying the `mint` action can derive a
+narrower one over `POST /auth/tokens`, which is worth knowing before delegating:
+a token handed to a subprocess or pasted into another context is better issued
+for that purpose than shared. What comes back can never exceed the token that
+asked for it — not in actions, not in projects, not in lifetime — so this widens
+nothing, and a non-expiring token is refused here regardless, being issuable only
+from the server's own host.
+
 A deployment reachable from outside a host usually also sits behind a gateway,
 and a gateway answers a credential-less request in one of two ways. It may
 reply `401` with a `WWW-Authenticate: Bearer` header and a `problem+json` body

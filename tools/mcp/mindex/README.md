@@ -52,8 +52,6 @@ Whole-project delete and `POST /gc` are deliberately **not** exposed.
 | `MINDEX_NO_VERIFY` | *(off)* | truthy → verify nothing (self-signed cert) |
 | `MINDEX_TOKEN` | *(unset)* | bearer token; the one credential mindex checks |
 | `MINDEX_TOKEN_FILE` | *(unset)* | a 0600 file holding the token — **prefer this here**, see below |
-| `MINDEX_TOKEN` | *(unset)* | bearer token; the one credential mindex checks |
-| `MINDEX_TOKEN_FILE` | *(unset)* | a 0600 file holding the token — **prefer this here**, see below |
 
 Neither is needed when the server's CA is installed system-wide, which is what
 mkcert and corporate roots do. Name the CA with `MINDEX_CACERT` when it is not;
@@ -64,23 +62,7 @@ succeed or fail together.
 
 **The credential, and why a path rather than a value.** A server running with
 `[auth]` on refuses every request that carries no token; issue one on its host with
-`mindex mint-token --sub mcp@$(hostname) --project '*' --can search,index,delete --for agent --days 0`.
-Both spellings work, and the second is the one to use for an MCP server: the
-environment block that launches one lives in an editor's own configuration file,
-so `MINDEX_TOKEN` there puts a bearer credential into plaintext JSON that no
-permission check governs. `MINDEX_TOKEN_FILE` leaves it in a file you can chmod.
-`MINDEX_TOKEN` wins when both are set — which is a trap worth naming, since a
-shell that exports it for the CLI passes it down to this process too; set
-`MINDEX_TOKEN` to the empty string in the same block to keep the narrow token in
-force.
-
-Mint one token per server rather than sharing one, and give each its own
-`--key-id`: deleting that key id from the server's key file withdraws exactly that
-server's access. This server needs `search` (search, symbols, the project listings and the drift check), `index` (`index_files`, `cancel_indexing`) and `delete` (`delete_files`) — it is not read-only, because keeping the index live after an edit is half of what it is for. It needs neither `research` nor `admin`.
-
-**The credential, and why a path rather than a value.** A server running with
-`[auth]` on refuses every request that carries no token; issue one on its host with
-`mindex mint-token --sub mcp@$(hostname) --project '*' --can search,index,delete --for agent --days 0`,
+`mindex mint-token --sub mcp@$(hostname) --project '*' --can search,index,delete --for cli,agent --days 0`,
 then name it here with **`MINDEX_TOKEN_FILE`** (a 0600 file holding the token) or
 `MINDEX_TOKEN` (the token itself). The file is the one to use for an MCP server:
 the environment block that launches one lives in an editor's own configuration
@@ -93,6 +75,14 @@ token in force.
 Mint one token per server rather than sharing one, and give each its own
 `--key-id`: deleting that key id from the server's key file withdraws exactly that
 server's access. This server needs `search` (search, symbols, the project listings and the drift check), `index` (`index_files`, `cancel_indexing`) and `delete` (`delete_files`) — it is not read-only, because keeping the index live after an edit is half of what it is for. It needs neither `research` nor `admin`.
+
+**`--for` must include `cli`, and the reason is the same one `MINDEX_CACERT` has.**
+`drift` shells out to `mindex-index`, which inherits `MINDEX_TOKEN` from this
+process — and that binary *refuses* a token whose `aud` does not name `cli`, rather
+than warning about it. So a token labelled `--for agent` alone leaves every other
+tool here working and breaks exactly one, which is the hardest shape of failure to
+attribute. `--for cli,agent` covers both holders; omitting `--for` entirely means
+every audience and works too.
 
 ## What else you should know
 

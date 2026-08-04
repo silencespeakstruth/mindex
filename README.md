@@ -58,7 +58,7 @@ no register to object to, so discovery still works where the prose does not. A t
 [VS Code extension](tools/vscode/README.md) drive the same API for humans; the extension
 ships as a `.vsix` on the
 [releases page](https://github.com/silencespeakstruth/mindex/releases), so
-`code --install-extension mindex-vscode-1.1.0.vsix` is the whole of installing it.
+`code --install-extension mindex-vscode-1.2.0.vsix` is the whole of installing it.
 
 ## Install
 
@@ -125,8 +125,17 @@ are absolute; substitute your own:
 
 ```toml
 [server]
-cert_path = "/path/to/config/cert.pem"            # TLS is the only transport security
+cert_path = "/path/to/config/cert.pem"            # TLS secures the transport
 key_path  = "/path/to/config/key.pem"
+
+[auth]
+enabled = false                                   # the default; with it off, TLS is
+                                                  # the only protection and this is an
+                                                  # internal service. Turn it on — and
+                                                  # it is mandatory behind a gateway —
+                                                  # and a bearer token then decides
+                                                  # which projects and which actions
+                                                  # each caller reaches.
 
 [model]
 server_url = "http://localhost:11211"             # the BGE-M3 embedder

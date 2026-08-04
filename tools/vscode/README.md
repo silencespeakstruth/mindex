@@ -128,7 +128,7 @@ Errors surface as the server's `code — detail`; infra failures offer *Retry*.
 the extension is pure TypeScript, so one file works on every platform VS Code does:
 
 ```sh
-code --install-extension mindex-vscode-1.1.0.vsix   # then: Developer: Reload Window
+code --install-extension mindex-vscode-1.2.0.vsix   # then: Developer: Reload Window
 ```
 
 You can also build that file yourself with `npm install && npm run package`.
@@ -139,7 +139,7 @@ with no reinstall step at all:
 
 ```sh
 npm install && npm run compile
-ln -s "$PWD" ~/.vscode/extensions/mindex.mindex-vscode-1.1.0
+ln -s "$PWD" ~/.vscode/extensions/mindex.mindex-vscode-1.2.0
 ```
 
 Day to day: leave `npm run watch` running, and hit *Developer: Reload Window* after a

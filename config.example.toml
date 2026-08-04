@@ -17,6 +17,42 @@ cert_path = "cert.pem"     # TLS certificate (PEM)
 key_path = "key.pem"       # TLS private key (PEM)
 max_body_mib = 256         # max /index request body (MiB); posts carry many files
 
+[auth]
+# Bearer-token authorization. OFF by default, and with it off a client-supplied
+# `Authorization` header decides nothing at all — the server is then an internal
+# service on a trusted network that authorizes nothing.
+#
+# MANDATORY behind deploy/gate/: nginx admits on the *presence* of a
+# Bearer-shaped header (it cannot verify a signature and does not try), so with
+# this off, `Authorization: Bearer x` is admitted and served everything.
+#
+# The token carries the whole decision — which projects (`prj`) and which actions
+# (`act`: search/research/index/delete/admin/mint) — so there is no user table,
+# no session and no per-request server-side state. Mint one with:
+#   mindex mint-token --sub alice --project '*' --can search,research --days 30
+enabled = false
+
+# Where the HS256 signing keys live. Created with one generated key at mode 0600
+# on first start if absent, and refused outright if any other account can read it
+# — whatever can read this file can mint a token for any project.
+#
+# Relative paths resolve beside the database rather than beside the config: this
+# is state the server owns and rewrites, not something an operator edits by hand,
+# and a config directory is routinely world-readable.
+signing_key_file = "mindex-signing-keys.toml"
+
+# Longest lifetime `mint-token` and POST /auth/tokens will issue. A ceiling on
+# what a leaked token can do, because there is no denylist by design: a token is
+# valid until it expires or until its `kid` is deleted from the key file. Give
+# each holder its own --key-id and withdrawing one is deleting one table.
+max_token_days = 90
+
+# Clock-skew tolerance, applied to `exp` and `nbf` alike. Both ends
+# deliberately: a token minted on another host whose clock is a few seconds ahead
+# is the ordinary case and not an attack, and refusing it produces a failure that
+# looks like a bad credential.
+leeway_seconds = 60
+
 [model]
 name = "BAAI/bge-m3"                 # embedding model id (one model supported today)
 server_url = "http://localhost:11211" # the BGE-M3 embedder
