@@ -47,13 +47,24 @@ without already holding one, and no default value — a token comes from whoever
 runs the deployment, minted with `mindex mint-token` on the server's host.
 
 A deployment reachable from outside a host usually also sits behind a gateway,
-and a gateway typically does not answer a credential-less request at all: it
-closes the connection with no status line and no body, which an HTTP client
-reports as a connection or protocol error rather than as `401`. **An empty reply
-from this host means a missing token far more often than it means the server is
-down.** Where the request does reach the server, the refusals are precise:
+and a gateway answers a credential-less request in one of two ways. It may
+reply `401` with a `WWW-Authenticate: Bearer` header and a `problem+json` body
+carrying `code: auth.token_missing` — the same envelope this server uses, so a
+caller that already reads its errors needs no special case. Or it may close the
+connection with no status line and no body at all, which an HTTP client reports
+as a connection or protocol error rather than as a status. Both mean the same
+thing, and neither means the server is down: **an empty reply from this host is
+far more often a missing token, a path that is not an endpoint here, or an
+address the gateway has blocked, than an outage.** The way to tell is
+`GET /health`, which is answered without a token by both the server and any
+gateway configured as its documentation describes — a reply there and silence
+elsewhere is a credential problem, silence at both is the host.
+
+Where the request reaches the server, the refusals are precise:
 `401 auth.token_missing`, `401 auth.token_invalid`, `401 auth.token_expired`,
-`403 auth.action_not_permitted` naming the action the token lacks.
+`403 auth.action_not_permitted` naming the action the token lacks. A `401` from
+the gateway and a `401` from the server are not distinguishable by status, and
+do not need to be: the remedy for both is a token that this deployment issued.
 
 One refusal is deliberately imprecise and it is worth knowing about. A project a
 token does not cover answers **`404 project.not_found`, byte-identical to a
