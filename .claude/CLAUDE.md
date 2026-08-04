@@ -2109,8 +2109,10 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   stay live under the same rule as above. It is a **hint** — `tokenAvailability`
   reads an unverified payload, so it decides what to offer while the server
   decides what to serve, the language-picker stance. The token reason **wins**
-  over the health reason for the mode it kills: a dependency comes back by
-  itself, a missing action does not. `#ollama-notice` therefore takes its
+  over the health reason — but only while `health.ask` is still true: a
+  dependency comes back by itself and a missing action does not, which stops
+  being the useful ordering once the server can serve nothing, where naming the
+  token sends the user to re-mint a credential that was never the problem. `#ollama-notice` therefore takes its
   sentence from the host (`#ollama-reason`) instead of naming Ollama in markup,
   since the same notice now has two causes with different remedies.
   `reindex()` checks `index` up front for the same reason — without it a batch
@@ -2297,6 +2299,21 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   assertions). Fresh project GUID per test. Suites map by filename
   (`test_e2e`, `test_filters…`, `test_management`, `test_validation`,
   `test_concurrency`).
+- **The stack holds two servers**, and the second one is why: `mindex-auth` runs
+  with `[auth].enabled` while `mindex` does not, because the whole existing suite
+  asserts the *unauthorized* behaviour and that is the coverage worth keeping —
+  an auth-off deployment must stay byte-for-byte what it was. `test_auth*.py`
+  drive the second (`auth` fixture, `AuthClient`), and every one of them skips
+  rather than fails when `MINDEX_AUTH_URL` is unset, since a missing authorized
+  server means the suite is being run some other way, not that something broke.
+  Two shapes it is easy to get wrong: the auth server **mints its own credentials
+  in its entrypoint before exec'ing the binary**, because `--abort-on-container-exit`
+  tears the run down when *any* container exits and a one-shot bootstrap service
+  exits by design; and its `--key-id … --new-key` falls back to plain `--key-id`,
+  because the key volume persists and `--new-key` rightly refuses an id that
+  already exists. Every narrow token is minted **from** the root one through
+  `POST /auth/tokens`, so the containment rule is exercised dozens of times as a
+  side effect of setting scenes.
 
 ## Linting (zero warnings everywhere — non-default flags matter)
 

@@ -225,9 +225,14 @@ export function tokenAvailability(
  * token changes only when someone stores one. Merging at the point of use is what
  * lets a token change repaint the form without waiting for the next poll.
  *
- * A token reason **wins** over a health reason for the mode it kills, and that
- * ordering is the useful one: a dependency that is down will come back by itself,
- * and a token that lacks an action will not.
+ * There is one `reason` field and two things that could claim it, so the rule is:
+ * a token reason wins over a health one **only while the server can still serve
+ * something**. A dependency that is down comes back by itself and a missing action
+ * does not, which is the argument for preferring the token — but it stops applying
+ * the moment the server can serve nothing at all, because then the server *is* the
+ * whole story. Reporting "your token does not carry research" to somebody whose
+ * Search is equally dead sends them to re-mint a credential that was never the
+ * problem.
  */
 export function mergeAvailability<
     T extends { ask: boolean; research: boolean; reason?: string },
@@ -235,13 +240,11 @@ export function mergeAvailability<
     if (token.ask && token.research) {
         return health;
     }
-    const ask = health.ask && token.ask;
-    const research = health.research && token.research;
     return {
         ...health,
-        ask,
-        research,
-        reason: token.reason ?? health.reason,
+        ask: health.ask && token.ask,
+        research: health.research && token.research,
+        reason: health.ask ? (token.reason ?? health.reason) : health.reason,
     };
 }
 

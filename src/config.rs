@@ -1459,10 +1459,11 @@ pub enum Command {
         /// Actions this token permits: search, research, index, delete, admin,
         /// mint. Repeatable or comma-separated.
         ///
-        /// A guest credential wants `search` alone, or `search,research`: an
-        /// agent reached over HTTP has no working tree, so it cannot reindex
-        /// anything and `index` buys it nothing while costing everything if the
-        /// token leaks.
+        /// A guest reached over HTTP wants `search` alone, or `search,research`:
+        /// it has no working tree, so `index` buys it nothing while costing
+        /// everything if the token leaks. An agent running *on* a machine that
+        /// holds the repository is the other case entirely and legitimately wants
+        /// `index` — the distinction is where the files are, not what is asking.
         #[arg(
             long = "can",
             value_name = "ACTION",

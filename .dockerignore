@@ -1,4 +1,9 @@
-target/
+# `**/target/`, not `target/`: the bare form matches only the repository root,
+# and `tools/{indexer,watcher,mindexfile}` are separate crates with their own
+# build directories. On a machine that has built them — which is any machine that
+# has run the test matrix — that was ~5.5 GB of build context sent to the daemon
+# on every build, for nothing: the image compiles from source inside itself.
+**/target/
 .git/
 .claude/
 tests/
@@ -6,3 +11,10 @@ docker-compose*.yml
 *.md
 .mypy_cache
 .ruff_cache
+# The same class of mistake in the other language ecosystems: none of this is in
+# the image, and `node_modules` alone is tens of thousands of files.
+**/node_modules/
+**/dist/
+**/out/
+**/.venv/
+**/__pycache__/

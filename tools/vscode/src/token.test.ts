@@ -319,6 +319,23 @@ describe("mergeAvailability", () => {
         assert.match(merged.reason ?? "", /token/);
     });
 
+    /**
+     * When the server itself is down, that is the whole story and the token's
+     * complaint is noise on top of it.
+     *
+     * The naive rule — "the token reason always wins, because it will not fix
+     * itself" — is right for a mode the server could still serve and wrong here:
+     * it reports "your token does not carry research" to somebody whose Search is
+     * also dead, sending them to re-mint a credential that was never the problem.
+     */
+    it("yields to the health reason when the server can serve nothing at all", () => {
+        const merged = mergeAvailability(
+            { ask: false, research: false, reason: "qdrant is not answering" },
+            { ask: true, research: false, reason: "your token does not carry research" }
+        );
+        assert.equal(merged.reason, "qdrant is not answering");
+    });
+
     /** Neither side may re-enable what the other closed. */
     it("closes a mode either side closes", () => {
         assert.deepEqual(

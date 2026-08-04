@@ -171,6 +171,15 @@ Three consequences, each pinned by a test:
   modal because the label is a hint and the person holding the token may know
   better than it does.
 
+**Two clients deliberately do not check it**, and the omission is stated here so
+it is not mistaken for one: `mindex-search.sh` and the two MCP servers. Both are
+configured once by an operator and then never touched, which is the case the
+check buys least in — the mistake it catches is a person moving a credential
+between places, and neither of these is a place a credential gets moved *to* by
+hand. Building it anyway would mean a base64/JSON decoder in bash and a third and
+fourth copy in Python, for a mechanism that enforces nothing. If they ever gain
+it, it belongs beside `_headers()` in each server, not in a fifth parser.
+
 ## Minting write actions
 
 `POST /auth/tokens` will issue `index` and `delete`, and the VS Code flow offers
@@ -335,8 +344,11 @@ CLAUDE.md's rule, for the same reason as with Ollama: a disabled tab is a dead
 end whose explanation lives behind it. Reading it as a *hint* is deliberate and
 matches the language pickers: this code reads the payload of a credential it
 cannot verify, so it decides what to offer, and the server decides what to serve.
-The token reason wins over the health reason for the mode it kills, because a
-dependency comes back by itself and a missing action does not.
+The token reason wins over the health reason — but only while the server can
+still serve something. A dependency comes back by itself and a missing action
+does not, which is the argument for preferring the token; it stops applying when
+`ask` is already false, because then the server is the whole story and naming the
+token sends the user to re-mint a credential that was never the problem.
 
 Beyond the Ask form, `reindex()` checks `index` up front. Without it a batch of
 uploads 403s file by file, which renders as a partial reindex with per-file
