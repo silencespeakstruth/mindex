@@ -1,6 +1,7 @@
 import * as https from "node:https";
 import * as http from "node:http";
 import {
+    ConfigurationError,
     MalformedResponseError,
     ProblemDetails,
     ProblemError,
@@ -831,12 +832,15 @@ export interface ApiOptions {
     ca?: Buffer;
     protocol?: string;
     /**
-     * Sent as `X-Api-Key` on every request. mindex has no authentication of its
-     * own and ignores the header; it is for a reverse proxy in front of it that
-     * refuses requests without a known key. Undefined sends no header, which is
-     * what a direct `https://127.0.0.1:11111` connection wants.
+     * Sent as `Authorization: Bearer` on every request — mindex's own token,
+     * naming the projects and actions it permits. Undefined sends no header,
+     * which is what a server running with `[auth]` off wants.
+     *
+     * It comes from `SecretStorage`, never from a setting: a settings string is
+     * written to a plaintext JSON file and carried between machines by Settings
+     * Sync, which for a bearer credential is a copy nobody decided to make.
      */
-    apiKey?: string;
+    token?: string;
     /**
      * Deadline for an ordinary request, in ms. `0` disables it.
      *
@@ -897,6 +901,33 @@ export function parseSseFrame(frame: string): { event: string; data: unknown } |
     } catch {
         return undefined; // malformed frame — skip rather than kill the stream
     }
+}
+
+/**
+ * Build the request URL, refusing a base the client cannot use.
+ *
+ * Both callers used to do a bare `new URL(this.base + path)` and hand the result to
+ * `https.request`. Neither failure mode was survivable as written: a malformed base
+ * throws here, and a non-`https:` one throws `ERR_INVALID_PROTOCOL` *inside* the
+ * Promise executor — synchronously, before any `try` that would wrap it — so both
+ * escaped the `UnreachableError` mapping and reached the user as
+ * "Something went wrong." The setting is the only thing that can fix either, so the
+ * error names it.
+ */
+function requestUrl(base: string, path: string): URL {
+    let url: URL;
+    try {
+        url = new URL(base + path);
+    } catch {
+        throw new ConfigurationError("mindex.serverUrl", `"${base}" is not a valid URL.`);
+    }
+    if (url.protocol !== "https:") {
+        throw new ConfigurationError(
+            "mindex.serverUrl",
+            `MINDex is served over HTTPS only, and this address is "${url.protocol}//".`
+        );
+    }
+    return url;
 }
 
 /** Parse one SSE frame (`event:` + `data:` lines) and route it to the callbacks. */
@@ -990,11 +1021,42 @@ export function routeIndexFrame(
     return undefined;
 }
 
+/** `POST /auth/tokens` request. Mirrors the server's `MintTokenRequest`. */
+export interface MintTokenRequest {
+    /** Label naming the holder; appears in the token and in the server's logs. */
+    sub: string;
+    /** Project GUIDs, or exactly `["*"]`. The wildcard must be spelled. */
+    projects: string[];
+    /** `search` / `research` / `index` / `delete` / `admin` / `mint`. */
+    actions: string[];
+    /** `cli` / `vscode` / `agent`, or omitted for every kind of holder. A label
+     *  clients honour; the server enforces none of it. */
+    audiences?: string[];
+    /** Lifetime in days. The server caps it by its own ceiling and by the
+     *  minting token's remaining life; `0` is refused over the network. */
+    days: number;
+    /** Sign under this key id, so revoking this one credential later is one
+     *  table deleted from the key file rather than a rotation. */
+    key_id?: string;
+}
+
+/** The issued token. Returned once and stored nowhere — by the server or here. */
+export interface MintTokenResponse {
+    token: string;
+    /** Unix seconds; never null from this endpoint, nullable all the same. */
+    expires_at?: number | null;
+    /** The normalized list actually written into the token. */
+    projects: string[];
+    actions: string[];
+    /** Echoed back sorted and deduplicated. Empty means every kind of holder. */
+    audiences?: string[];
+}
+
 export class MindexApi {
     private readonly base: string;
     private readonly protocol: string;
     private readonly agent: https.Agent;
-    private readonly apiKey?: string;
+    private readonly token?: string;
     /**
      * The same TLS settings the agent carries, repeated on every request.
      * Redundant against a plain Node `https`, and not against VS Code's: with
@@ -1012,7 +1074,7 @@ export class MindexApi {
     constructor(opts: ApiOptions) {
         this.base = opts.serverUrl.replace(/\/+$/, "");
         this.protocol = opts.protocol ?? "v0";
-        this.apiKey = opts.apiKey && opts.apiKey !== "" ? opts.apiKey : undefined;
+        this.token = opts.token && opts.token.trim() !== "" ? opts.token.trim() : undefined;
         this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
         this.streamIdleMs = opts.streamIdleMs ?? STREAM_IDLE_TIMEOUT_MS;
         // `noVerify` wins over `ca`: with verification off the extra CA can only
@@ -1070,6 +1132,19 @@ export class MindexApi {
             { files: manifest },
             signal
         ) as Promise<DriftResponse>;
+    }
+
+    /**
+     * Issues a token derived from this client's own — `POST /auth/tokens`.
+     *
+     * The server enforces containment: the new token can carry no action, no
+     * project and no expiry beyond the minting one's. So the caller cannot
+     * escalate by asking, and the narrowing this client applies before calling
+     * is a *usability* measure, not the security boundary — which is the right
+     * way round, because a security boundary in a webview is not one.
+     */
+    async mintToken(req: MintTokenRequest): Promise<MintTokenResponse> {
+        return (await this.request("POST", "/auth/tokens", req)) as MintTokenResponse;
     }
 
     /** Empty selector = requeue every failed file. Returns requeued count (204 → 0). */
@@ -1263,6 +1338,12 @@ export class MindexApi {
      * non-2xx response. Aborting `signal` closes the connection, which IS the
      * cancellation interface: the server cancels the job on disconnect. No
      * reconnects, by contract.
+     *
+     * `?stream=yes` is not optional here. The server answers one JSON body by
+     * default, because a caller that does not read a stream to `done` cancels the
+     * run it asked for — but this panel exists to show the run arriving, and it is
+     * reading every frame. Without the query the body would parse as zero SSE
+     * frames and `streamResearch` below would report a run that never terminated.
      */
     research(
         guid: string,
@@ -1270,10 +1351,59 @@ export class MindexApi {
         cb: ResearchCallbacks,
         signal: AbortSignal
     ): Promise<void> {
-        return this.streamRequest(`/${this.protocol}/${guid}/research`, req, signal, {
-            onFrame: (frame) => dispatchSseFrame(frame, cb),
+        return this.streamResearch(
+            `/${this.protocol}/${guid}/research?stream=yes`,
+            req,
+            cb,
+            signal
+        );
+    }
+
+    /**
+     * Both research streams, with one guarantee added: the caller sees exactly one
+     * terminal event, or an `error` saying it did not.
+     *
+     * The server already promises this on its side — `SseEventStream` synthesises an
+     * `error` when its channel closes without `done`, so a panicking job does not
+     * read as a completed run. Nothing made the same promise about the *transport*.
+     * A 200 that is not an event stream at all (a proxy's interstitial, a server that
+     * answered the request some other way) parses to no frames, ends cleanly and
+     * resolves — and the panel then sits at "thinking…" for as long as it is left
+     * open, with no report, no error, and nothing in the log.
+     *
+     * A user cancel is exempt: `abortResolves` is deliberate and there is no terminal
+     * to expect after it.
+     */
+    private streamResearch(
+        path: string,
+        req: ResearchRequest | ChallengeRequest,
+        cb: ResearchCallbacks,
+        signal: AbortSignal
+    ): Promise<void> {
+        let terminated = false;
+        const guarded: ResearchCallbacks = {
+            ...cb,
+            onDone: (d) => {
+                terminated = true;
+                cb.onDone(d);
+            },
+            onError: (code, detail) => {
+                terminated = true;
+                cb.onError(code, detail);
+            },
+        };
+        return this.streamRequest(path, req, signal, {
+            onFrame: (frame) => dispatchSseFrame(frame, guarded),
             // An abort is the user's cancel, not a failure.
             abortResolves: true,
+        }).then(() => {
+            if (!terminated && !signal.aborted) {
+                cb.onError(
+                    "internal.error",
+                    "The server closed the connection without finishing the run. " +
+                        "Nothing was stored."
+                );
+            }
         });
     }
 
@@ -1290,14 +1420,11 @@ export class MindexApi {
         cb: ResearchCallbacks,
         signal: AbortSignal
     ): Promise<void> {
-        return this.streamRequest(
-            `/${this.protocol}/${guid}/research/${encodeURIComponent(runId)}/challenge`,
+        return this.streamResearch(
+            `/${this.protocol}/${guid}/research/${encodeURIComponent(runId)}/challenge?stream=yes`,
             req,
-            signal,
-            {
-                onFrame: (frame) => dispatchSseFrame(frame, cb),
-                abortResolves: true,
-            }
+            cb,
+            signal
         );
     }
 
@@ -1446,7 +1573,7 @@ export class MindexApi {
             abortResolves: boolean;
         }
     ): Promise<void> {
-        const url = new URL(this.base + path);
+        const url = requestUrl(this.base, path);
         const payload = Buffer.from(JSON.stringify(body), "utf8");
         const firstFrameMs = this.timeoutMs;
         const idleMs = this.streamIdleMs;
@@ -1483,7 +1610,7 @@ export class MindexApi {
                         "Content-Type": "application/json",
                         "Content-Length": payload.length,
                         Accept: "text/event-stream",
-                        ...(this.apiKey ? { "X-Api-Key": this.apiKey } : {}),
+                        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
                     },
                     agent: this.agent,
                     ...this.tls,
@@ -1604,7 +1731,7 @@ export class MindexApi {
         body?: unknown,
         signal?: AbortSignal
     ): Promise<unknown> {
-        const url = new URL(this.base + path);
+        const url = requestUrl(this.base, path);
         const payload =
             body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
 
@@ -1612,8 +1739,8 @@ export class MindexApi {
 
         return new Promise((resolve, reject) => {
             const headers: http.OutgoingHttpHeaders = { Accept: "application/json" };
-            if (this.apiKey) {
-                headers["X-Api-Key"] = this.apiKey;
+            if (this.token) {
+                headers["Authorization"] = `Bearer ${this.token}`;
             }
             if (payload) {
                 headers["Content-Type"] = "application/json";

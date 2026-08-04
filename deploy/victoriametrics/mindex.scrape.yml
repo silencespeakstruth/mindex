@@ -11,9 +11,30 @@
 # 15s rather than the file's implicit 1m: the histograms only resolve a single
 # indexing pass at that rate. Keep it at or above `[metrics].refresh_interval_seconds`
 # (default 60) — inverting the two makes the per-project gauges render as a staircase.
+#
+# `bearer_token_file` is REQUIRED once `[auth].enabled` is on, and the reason is
+# structural rather than an oversight: `/metrics` is `admin`-scoped because
+# nothing about it is per-project, and mindex cannot tell a loopback scraper from
+# a request that arrived through a gateway. So the scraper needs a credential of
+# its own — mint it with
+#
+#     mindex mint-token --sub victoriametrics@$(hostname) --project '*' \
+#       --can admin --days 0 --key-id metrics-scraper --new-key
+#
+# `--days 0` (never expires) is right here and almost nowhere else: this is a
+# machine-local credential in a 0640 file that no context ever sees, and an expiry
+# would blank every dashboard at an hour nobody is watching. Its own `--key-id` is
+# what makes that tolerable — deleting one table from the key file withdraws this
+# holder and nothing else.
+#
+# The file must live outside $HOME: the unit runs `ProtectHome=true`, so a path
+# under it reads as absent. `/etc/victoriametrics/` works, 0640 root:<the unit's
+# user>. With `[auth].enabled = false` the whole line is unnecessary and harmless
+# — an auth-off server ignores the header entirely.
 
   - job_name: 'mindex'
     scheme: https
     scrape_interval: 15s
+    bearer_token_file: /etc/victoriametrics/mindex-token
     static_configs:
       - targets: ['localhost:11111']

@@ -135,6 +135,36 @@ const emptyTitle = el("runs-empty-title");
 const emptyHint = el("runs-empty-hint");
 const errorBox = el("runs-error");
 
+/**
+ * The banner is a message *and*, when the failure is retryable and the host kept
+ * something to retry, one button. Built here rather than in markup so the two can
+ * never disagree about whether there is anything to press.
+ */
+function showError(message: string, retryable: boolean, canRetry: boolean): void {
+    errorBox.textContent = "";
+    if (message === "") {
+        clearError();
+        return;
+    }
+    const text = document.createElement("span");
+    text.textContent = message;
+    errorBox.appendChild(text);
+    if (canRetry) {
+        const again = document.createElement("button");
+        again.className = "ghost runs-text-button";
+        again.textContent = "Retry";
+        again.addEventListener("click", () => {
+            clearError();
+            api.postMessage({ type: "retryFailed" });
+        });
+        errorBox.appendChild(again);
+    }
+    // Yellow when pressing the same thing again could work, red when it could not:
+    // `retryable` is the only thing that tells the user which of those this is.
+    errorBox.className = retryable ? "runs-error warn" : "runs-error";
+    errorBox.hidden = false;
+}
+
 function clearError(): void {
     errorBox.textContent = "";
     errorBox.className = "runs-error";
@@ -656,7 +686,7 @@ function renderDetail(run: RunDetail): void {
     reAsk.title =
         "Put this question back in the form with its scope and settings, and this " +
         "report as context — the usual way to follow one up.";
-    reAsk.dataset.busyKey = "preview";
+    reAsk.dataset.busyKey = "action";
     reAsk.addEventListener("click", (e) => {
         e.stopPropagation();
         api.postMessage({ type: "reAsk", id: run.id });
@@ -861,7 +891,7 @@ function challengeButton(
     const guard = challengeGuard(run, state);
     const b = document.createElement("button");
     b.className = "secondary";
-    b.dataset.busyKey = "preview";
+    b.dataset.busyKey = "action";
     if (!guard.ok) {
         b.append(icon("shield", true), document.createTextNode(" Challenge"));
         b.disabled = true;
@@ -1024,7 +1054,14 @@ function renderGc(proposed: GcRow[], expected: number | null): void {
             open.className = "runs-subject-link";
             open.textContent = "read";
             open.title = "Open this report before deciding";
-            open.addEventListener("click", () => selectRun(r.id));
+            // A Markdown tab, not the row underneath: expanding the row goes
+            // through `preview`, which closes the review — so reading a candidate
+            // destroyed the decision screen it was being read for, and for a
+            // candidate off the loaded page `renderDetail` then found no row and
+            // dropped the answer too, leaving neither.
+            open.addEventListener("click", () =>
+                api.postMessage({ type: "openRun", id: r.id })
+            );
             li.appendChild(open);
             ul.appendChild(li);
         }
@@ -1211,6 +1248,14 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
                     activeId = undefined;
                 }
             }
+            // The review described a corpus that no longer exists, so it goes with
+            // the rows it proposed. Left up, it kept the deleted reports on screen
+            // still ticked, under a `Delete N` that would re-post ids the server
+            // had already dropped — while the header above it, which the `totals`
+            // message does refresh, read `Collect garbage (0)`.
+            if (gcOpen) {
+                setGcOpen(false);
+            }
             renderEmpty();
             refreshFooter();
             save();
@@ -1254,12 +1299,11 @@ window.addEventListener("message", (event: MessageEvent<Record<string, unknown>>
             }
             break;
         case "error":
-            errorBox.textContent = typeof msg.message === "string" ? msg.message : "";
-            // Yellow when pressing the same thing again could work, red when it
-            // could not: `retryable` is the only thing that tells the user which
-            // of those they are looking at.
-            errorBox.className = msg.retryable === true ? "runs-error warn" : "runs-error";
-            errorBox.hidden = errorBox.textContent === "";
+            showError(
+                typeof msg.message === "string" ? msg.message : "",
+                msg.retryable === true,
+                msg.canRetry === true
+            );
             break;
     }
 });

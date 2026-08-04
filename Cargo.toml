@@ -1,6 +1,6 @@
 [package]
 name        = "mindex"
-version     = "1.1.0"
+version     = "1.2.0"
 edition     = "2024"
 authors     = ["Сергей Боголюбов"]
 license     = "MIT"
@@ -54,6 +54,17 @@ tree-sitter-yaml       = "0.7.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
+# Scoped bearer tokens (`backend/auth.rs`). All five were already in the tree
+# transitively, so this promotes them to direct dependencies rather than growing
+# it. A JWT crate was considered and declined: the requirement was control over
+# the signing secret's copies in memory, and a library that copies the key into
+# its own key type puts one beyond reach of any zeroing here. Owning ~100 lines
+# also closes the algorithm-confusion family by construction — see `verify`.
+hmac = "0.13.0"
+base64 = "0.22.1"
+subtle = "2.6.1"
+zeroize = "1.8.2"
+getrandom = "0.3.4"
 tokenizers = { version = "0.23.1", features = ["http"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
 tokio-util = { version = "0.7.18", features = ["rt", "futures-util"] }
@@ -87,3 +98,6 @@ http-body-util = "0.1"
 # Exercises the `?stream=` query grammar in unit tests exactly as axum's Query
 # extractor parses it (axum uses serde_urlencoded internally).
 serde_urlencoded = "0.7"
+# The signing key file's permission and round-trip tests need a real file: the
+# mode is the thing under test, so a fake filesystem would test nothing.
+tempfile = "3"

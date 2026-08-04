@@ -9,7 +9,12 @@ modifying `tools/vscode`.
   the QuickPick (live editor preview + Esc restore), research streams into
   its WebviewPanel tab (steps + live thinking + `marked`-rendered report).
   The SSE client is hand-rolled in `api.ts` (no reconnects — a drop is a
-  cancel, by contract). Force reindex lives in the Drift view's overflow
+  cancel, by contract), and since 2026-08-04 both research paths must send
+  **`?stream=yes`**: the server answers one JSON body by default, because a
+  caller that does not read a stream to `done` cancels its own run. This panel
+  is not that caller — it renders every frame — so it asks. Without the query
+  the body parses as zero frames and `streamResearch` reports a run that never
+  terminated. Force reindex lives in the Drift view's overflow
   menu.
   **Research History** (`researchRunsPanel.ts` + `webview/runs.ts`) is an
   editor-area panel, not a third sidebar view (the `icons.test.ts` argument).
@@ -82,7 +87,24 @@ modifying `tools/vscode`.
   id *list* so one path serves both deletes, and it must release `activeId`
   when the open report is the one going (removing the row now takes its
   expansion with it, but a live `activeId` would still key a later
-  `challengeState` on a run that is gone). The header's refresh button is in-panel, not a
+  `challengeState` on a run that is gone). **`removed` also ends the garbage-collection
+  review**, which is the same rule one level up: the review describes a corpus that no
+  longer exists, and left standing it kept the deleted reports on screen still ticked,
+  under a `Delete N` that would re-post ids the server had already dropped — while the
+  header above it, which `totals` does refresh, read `Collect garbage (0)`. On the host
+  side the release is three maps and two fields (`rows`/`summaries`/`selected`,
+  `previewed`/`challengeState`) plus `actions.runsDeleted`, because the Ask form's
+  context chips are set from this panel and pruned by nothing else — a deleted run
+  stayed attached to the next question and came back as a 400 about a click made in
+  another panel. **A run finishing elsewhere refreshes the panel too**
+  (`notifyRunFinished`, called from `startResearch`/`startChallenge`'s `finally`), and
+  it is deliberately *not* the refresh button: an involuntary refresh does **not**
+  `dropBulkSelection()`, because that rule is about the filters that defined the
+  selection and none of them changed — discarding several hundred chosen ids because a
+  background run landed is a worse surprise than a briefly stale count. Pinning
+  re-reads the page for the same reason a delete does: it moves `gc_candidates`, so the
+  counts line and the `Collect garbage (N)` label describe the corpus as it was.
+  The header's refresh button is in-panel, not a
   `webview/title` menu — three contribution surfaces for one button that
   would then sit in the tab bar, away from the filters it re-runs; it
   supersedes any pending keystroke (`search.cancel()`) and re-fetches the
@@ -119,7 +141,13 @@ modifying `tools/vscode`.
   multi-select QuickPick either: it can pre-select items but cannot show *why*
   each row is proposed or that four later reports were built on it — the two
   things a reviewer unchecks a row over — and each row carries a `read` link
-  back into the list for the report itself. Each run appears in **one** group
+  that opens the report as its own **Markdown tab**, the way stored reports open
+  everywhere else. Expanding the row underneath was the earlier call and it destroyed
+  the screen it was being read for: `preview` closes the review, and for a candidate
+  off the loaded page `renderDetail` then found no row and dropped the answer too,
+  leaving neither. That is also why `openRun` resolves through `summaries` and not
+  `rows` — the proposal comes from a pass that ran to exhaustion, so most of what it
+  offers to open is off-page. Each run appears in **one** group
   (its most serious reason) with the others as labels; three checkboxes for
   one report would let an uncheck in one group not stick. The classification
   is client-side, which is safe *here specifically* because that pass runs to
@@ -309,6 +337,24 @@ modifying `tools/vscode`.
   failure, not a cancellation (which would read as the user's own Stop).
   None of this is observable without `[mindex.statusPollSeconds]` (default
   30, `0` = off): every other refresh is event-driven.
+  **The form is destroyed whenever it is hidden, so the host replays what it
+  cannot recover.** The Ask view is registered without
+  `retainContextWhenHidden`: collapsing the sidebar tears the page down and
+  re-showing it builds a fresh one from the default HTML. Availability, the
+  server config and the context chips were already replayed; `running` and the
+  held `submit` key were not, and their absence was the sharpest dead end in
+  the extension — a rebuilt page drew Submit enabled and **Stop hidden**, so
+  pressing Submit earned "cancel it first" while the only control that could
+  cancel was the one missing. `AskFormState` (`src/askState.ts`, `vscode`-free,
+  `askState.test.ts`) now holds the pending mode, the run flag and the held
+  keys, and `replay()` emits only what differs from a default page. The
+  argument against replaying the busy key — "a webview rebuilt cannot be
+  mid-press" — was true of the *page* and beside the point: the press is held
+  by the host, which outlives it. `mindex.cancelResearch` is the second half,
+  gated by a `mindex.researchRunning` context key so the palette offers it
+  exactly while there is a run: the replay fixes a *hidden* sidebar, and a
+  closed one still leaves a run the form cannot draw a button for. Stop remains
+  the primary control; this is the way out, not the way.
   **Language marks are vendored, two-toned and tested.** `esbuild.mjs`
   generates `src/shared/langGlyphs.ts` from devicon's *monochrome* SVGs
   (fills stripped so CSS `color` drives them), committed; `sql` alone falls
@@ -396,14 +442,78 @@ modifying `tools/vscode`.
   touch): `#runs-delete` is disabled because nothing is selected, and an
   unrelated key clearing must not enable it. `{type:"loading"}` is retired —
   the runs spinner rides the same `list` key as the buttons, so the two can
-  no longer disagree. Keys in use: `list`/`more`/`gc`/`delete`/`preview`/
+  no longer disagree. Keys in use: `list`/`more`/`gc`/`delete`/`action`/
   `verify`/`row:<id>` (history), `refresh`/`retry`/`row:<path>` (status),
   `submit` (Ask — shared by the form and the `mindex.search` palette
   command, so five fast clicks are one search rather than five quick picks
-  racing to open). The status panel's `refresh` key is fed by
+  racing to open).
+  **One key, one authority** — the corollary of "the greyed state is an echo".
+  `list` had two: `load` posted it by hand while `BusyKeys` held it for
+  Select-all, so a keystroke completing a `load` mid-pass lit the button back
+  up while the host was still refusing it, and the press vanished (a refusal
+  posts nothing, by design). Select-all now supersedes through the same
+  `Supersedable` handle `load` uses and takes no key of its own. The same rule
+  retired the *shared* `preview` key: opening a row, re-asking, re-checking and
+  launching a challenge were one key, so clicking a row during a challenge was
+  refused — and the row, which carries no key, had already drawn itself open
+  and stayed open and empty forever. Row detail now **supersedes**
+  (`previewWanted`, newest click wins) and the three launches share `action`.
+  **`Supersedable`** (`src/supersede.ts`, `vscode`-free, `supersede.test.ts`) is
+  the read-side counterpart to `BusyKeys`, and it exists because the ownership
+  check that makes superseding safe — release only if you are still the owner —
+  was written in one of the panel's three writers of that handle and forgotten
+  in the other two. The status panel's `refresh` key is fed by
   `StatusMonitor.onDidChangeRefreshing`, not by the press, so a *background*
   poll greys it too — otherwise the panel visibly re-renders while the
   button that supposedly caused it sits idle and clickable.
+  **Issuing a token for an agent is on three surfaces, and that is the
+  feature.** The capability — `mindex.mintAgentToken` (`agentToken.ts`), a
+  project-scoped `agent`-audience token over `POST /auth/tokens`, seven days at
+  the most — shipped reachable only from the command palette, with an `$(key)`
+  icon declared in `package.json` and not one `menus` entry to render it in. A
+  credential mechanism nobody can find is not a narrower credential, it is a
+  shell on the server's host issuing a wider one, which is the exact failure the
+  command exists to prevent. So: the **Ask view's title bar** (`navigation@3`,
+  gated on `mindex.hasProject`, because without the gate the button opens a
+  dialog that ends in a silent return), the **Server Status panel's header**
+  (its own `mint` busy key, not `refresh`'s — this is a write and `BusyKeys`
+  refuses a second press rather than superseding, so two clicks cannot issue two
+  credentials), and a `command:` link in the **token indicator's tooltip**. The
+  third is deliberately the weakest: that indicator is hidden while the token is
+  healthy by design, so a button there is unreachable during ordinary work —
+  worth having as a hand-off from "your credential is dying" to "issue the other
+  kind", not worth breaking the hidden-while-healthy rule for. Its tooltip's
+  `isTrusted` is the **allow-list form**, naming only `mindex.setToken` and
+  `mindex.mintAgentToken`: parts of that tooltip are interpolated from the
+  token's own claims, and a blanket `true` would let a crafted `sub` render a
+  link to any command in the window. The panel button delegates to the command
+  rather than to `mintAgentToken` directly, so the project lookup and the
+  `auth.action_not_permitted` sentence stay in one place.
+  **The grant tables are data, in a `vscode`-free file, because the guard on
+  them has to run.** `tokenGrants.ts` holds `OFFERED_ACTIONS` and
+  `ACTION_PRESETS`; the rationale stays in `agentToken.ts`'s header beside the
+  flow it shapes. The split is the `token.ts` / `tokenStatusBar.ts` one — the
+  suite is bare `node --test`, so anything importing `vscode` is untestable, and
+  the claims worth pinning (`admin`/`mint` absent by construction, `delete`
+  reachable only through a tick) are precisely the kind a table gains in a
+  hurry. The two presets are an **ordering, not a narrowing**: read-only and
+  read-and-write are the shapes people actually want, the full tick list is one
+  item down the same menu, and the write modal fires for a preset exactly as it
+  does for a tick — the preset says which actions, the modal says what they
+  cost.
+  **A shown token is a read-only in-memory document, not an untitled buffer.**
+  The clipboard remains the default and `Show it` is a button on the
+  confirmation, so revealing a credential is an act rather than a side effect of
+  issuing one; it exists because a token pasted by hand into somebody else's
+  JSON cannot be served by a clipboard the next copy overwrites. `tokenDoc.ts`
+  serves it through a `TextDocumentContentProvider` (scheme `mindex-token`,
+  value in a module map keyed by a nonce, dropped on `onDidCloseTextDocument`).
+  An untitled buffer would have been one line of code and one absent-minded
+  `Ctrl+S` from the credential on disk in whatever directory happened to be
+  open — reintroducing "a file is a copy nobody decided to keep" by accident
+  rather than by decision. A window reload empties the map and the provider says
+  so, which is the honest rendering of "shown once and stored nowhere": VS Code
+  restores the tab and there is nothing left to put in it.
   **No raw error text reaches the user, anywhere.** `humanize(e)`
   (`problem.ts`, table-documented and pinned by `problem.test.ts`) returns
   `{text, retryable, cancelled, code}`; `text` is a sentence and **never
@@ -423,6 +533,40 @@ modifying `tools/vscode`.
   that had since loaded. `noteIfLegacy` had to stop reading the rendered
   message and became a shape test (`ProblemError`, 400, `detail` matching):
   matching English for a version check breaks the day the wording improves.
+  **A message with nothing to press is the other half of the rule**, and three
+  classes had exactly that. `Humanized` therefore carries an optional
+  `action` — a command id and a button label, strings, so `problem.ts` stays
+  `vscode`-free — which `reportError` renders instead of Retry (they are
+  mutually exclusive: none of these is retryable). **401** and **403** used to
+  fall through to the generic `<500` branch, so an expired credential surfaced
+  only as requests that quietly stopped working — the precise state the token
+  indicator exists to prevent, and one it *cannot* detect for an opaque
+  (non-JWT) token, where a 401 is the only signal that will ever arrive. The
+  two are worded apart on purpose: 401 offers `mindex.setToken`, while 403
+  leads with the server's own detail naming the missing action and offers
+  `mindex.mintAgentToken` — telling someone to replace a valid token is the
+  wrong advice, and it is why the mint command's own catch stopped prefixing a
+  cause of its own (`what` is an operation, not a sentence; the two composed
+  into "cannot issue a token: …`mint`: The server refused the request.").
+  **`ConfigurationError`** is the third: a `mindex.serverUrl` with the wrong
+  scheme makes `https.request` throw `ERR_INVALID_PROTOCOL` *synchronously
+  inside the Promise executor*, so it never reached the `UnreachableError` wrap
+  and landed on "Something went wrong." — the one failure whose remedy the
+  client knows exactly was the one it could not name. `requestUrl` refuses it
+  before the request is built. The history banner's `retryable` now also ships
+  a **Retry button** (the host keeps the thunk; the webview has no name for
+  what to re-run), and the research panel's error block stopped concatenating
+  `code` into `detail` — `ResearchPanel.error` had taken them as separate
+  arguments all along, and that one call site made the panel the last place in
+  the extension showing a user `ollama.unavailable: …`.
+  **A stream that ends without a terminal event is a failure, client-side
+  too.** The server synthesises an `error` when its own channel closes without
+  `done`; nothing made the same promise about the transport, so a 200 that is
+  not an event stream parsed to no frames, ended cleanly and resolved — leaving
+  the panel at "thinking…" indefinitely with no report, no error and no log
+  line. `streamResearch` wraps both research streams and synthesises the
+  terminal itself. A user cancel is exempt: `abortResolves` is deliberate and
+  there is no terminal to expect after it.
   **Requests have deadlines, and the stream's is idle-only.**
   `mindex.requestTimeoutSeconds` (15, `0` = off) arms **two** clocks per
   request — `req.setTimeout` for socket inactivity, plus a total deadline at
@@ -446,7 +590,15 @@ modifying `tools/vscode`.
   single-flight guard, a 20 s backstop deadline and an abort on `dispose` —
   the bug being that `reschedule` re-arms in a `.finally()`, so one
   never-settling poll ended health polling for the life of the window and
-  froze the indicator at whatever colour it had.
+  froze the indicator at whatever colour it had. That single-flight is a
+  **refusal**, which is right for a tick and wrong for the callers that await
+  it *after a write* — a retry, a delete, a reindex got an instant return
+  carrying a snapshot taken before their own change, so the panel could
+  re-render still listing the file they had just requeued (shortening
+  `statusPollSeconds` makes the collision routine rather than rare). Those
+  callers now use **`refreshNow`**, which waits the in-flight read out and then
+  takes its turn: at most one extra pass per write, and a tick still refuses,
+  so the request-storm the guard exists to prevent stays prevented.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, one tool —
 - VS Code (`tools/vscode`): `npm run check` = prettier + eslint + `tsc` + the
   `node --test` suite (`src/*.test.ts`, compiled to `dist/`).

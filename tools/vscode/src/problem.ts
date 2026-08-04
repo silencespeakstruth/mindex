@@ -72,6 +72,27 @@ export class MalformedResponseError extends Error {
     }
 }
 
+/**
+ * The request could not be built, because a setting is wrong.
+ *
+ * Not `UnreachableError`: nothing was contacted and starting the server would not
+ * help. The distinction is worth a class because the failure was previously
+ * invisible — a `mindex.serverUrl` with the wrong scheme makes `https.request`
+ * throw `ERR_INVALID_PROTOCOL` **synchronously inside the Promise executor**, so it
+ * never reached the `UnreachableError` wrap and landed in `humanize`'s terminal
+ * "Something went wrong." The one message that names the setting to fix was exactly
+ * the one the user could not get.
+ */
+export class ConfigurationError extends Error {
+    constructor(
+        public readonly setting: string,
+        public readonly problem_: string
+    ) {
+        super(`${setting}: ${problem_}`);
+        this.name = "ConfigurationError";
+    }
+}
+
 export function isCancellation(e: unknown): boolean {
     return e instanceof Error && e.name === "AbortError";
 }
@@ -96,6 +117,19 @@ export interface Humanized {
     cancelled: boolean;
     /** The stable machine code, for a `title=` and for the log. Never rendered as the message. */
     code?: string;
+    /**
+     * A command that addresses this failure, where one exists.
+     *
+     * Only a command id and a button label — a string pair, so this module stays
+     * `vscode`-free and testable; `reportError` is what turns it into a button.
+     *
+     * It exists for the credential failures. Every other class here is either
+     * retryable (the Retry button is the action) or something the user cannot do
+     * anything about from a notification. A rejected token is neither: pressing the
+     * button again cannot help, and the one thing that *would* help is a command
+     * the user has no reason to know the name of.
+     */
+    action?: { command: string; title: string };
 }
 
 const CANCELLED: Humanized = { text: "", retryable: false, cancelled: true };
@@ -109,8 +143,11 @@ const CANCELLED: Humanized = { text: "", retryable: false, cancelled: true };
  * | timeout `response` | did not answer within Ns | yes |
  * | timeout `idle` | went silent for Ns | yes |
  * | unreachable | not answering, check the two settings | yes |
+ * | configuration | the setting that is wrong | no, `action` |
  * | malformed | answer could not be read | yes |
  * | 400 / 409 / 429 | the server's own `detail` | 409, 429 |
+ * | 401 | the token was not accepted | no, `action` |
+ * | 403 | the token does not carry that action | no, `action` |
  * | 404 | not found, may already be gone | no |
  * | 413 | larger than the server accepts | no |
  * | 500 | internal error, its log has the detail | yes |
@@ -145,6 +182,14 @@ export function humanize(e: unknown): Humanized {
             cancelled: false,
         };
     }
+    if (e instanceof ConfigurationError) {
+        return {
+            text: `${e.problem_} Check the ${e.setting} setting.`,
+            retryable: false,
+            cancelled: false,
+            action: { command: "mindex.openSettings", title: "Open Settings" },
+        };
+    }
     if (e instanceof MalformedResponseError) {
         return {
             text:
@@ -167,6 +212,37 @@ function problem(e: ProblemError): Humanized {
     }
     const detail = e.detail.trim();
     switch (e.status) {
+        // The two credential refusals, which used to fall through to the generic
+        // `<500` branch: the server's raw `detail`, not retryable, and no way out.
+        // That undercut the whole token indicator, whose premise is that an expired
+        // credential otherwise shows up only as requests that stop working with
+        // nothing anywhere connecting them to the token — and it is worst for an
+        // opaque (non-JWT) token, where the indicator can never appear at all and
+        // this is the *only* signal the user will ever get.
+        case 401:
+            return {
+                text:
+                    "The server did not accept the stored token — it has expired, " +
+                    "been revoked, or was issued by a different server.",
+                retryable: false,
+                cancelled: false,
+                code,
+                action: { command: "mindex.setToken", title: "Set Token" },
+            };
+        // 403 is the *other* half and must not read the same way: the token is
+        // valid, and replacing it is exactly the wrong advice. The server names the
+        // missing action in its detail, so that sentence leads.
+        case 403:
+            return {
+                text:
+                    (detail || "The stored token does not carry that action.") +
+                    " A token grants a fixed set of actions and projects; this one " +
+                    "does not cover this request.",
+                retryable: false,
+                cancelled: false,
+                code,
+                action: { command: "mindex.mintAgentToken", title: "Issue a Token" },
+            };
         case 400:
             return {
                 text: detail || "The server refused the request.",

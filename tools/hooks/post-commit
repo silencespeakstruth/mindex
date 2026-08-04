@@ -33,6 +33,14 @@
 # Config (same MINDEX_* conventions as tools/search and the MCP servers):
 #   MINDEX_SERVER     mindex URL (default https://127.0.0.1:11111)
 #   MINDEX_NO_VERIFY  truthy → skip TLS verification (self-signed cert)
+#   MINDEX_TOKEN      bearer token, for a server running with [auth].enabled
+#
+# The token is read from the environment and never taken as an argument: git runs
+# this hook, so a flag would have to be hard-coded into a file in the repository.
+# `mindex-index` picks $MINDEX_TOKEN up by itself — this script only has to
+# forward it to the one call it makes with curl instead. A hook that lost the
+# credential on that one call would soft-delete nothing and report a 401 per
+# commit, which reads as the server being broken.
 
 set -u
 
@@ -77,9 +85,14 @@ command -v mindex-index >/dev/null 2>&1 ||
 guid="$(mindex-index --print-guid --root . 2>&1)" ||
     die ".mindex is present but unusable: $guid"
 
-# TLS + verify flags shared by the CLI (reindex) and curl (delete).
+# TLS, verify and credential flags shared by the CLI (reindex) and curl (delete).
+# Only curl is given the token: mindex-index reads $MINDEX_TOKEN itself, and
+# passing it as a flag would publish it in `ps` to every user on the machine.
 index_flags=(--server "$SERVER")
 curl_flags=(--silent --show-error)
+if [[ -n "${MINDEX_TOKEN:-}" ]]; then
+    curl_flags+=(--header "Authorization: Bearer $MINDEX_TOKEN")
+fi
 case "${MINDEX_NO_VERIFY:-}" in
     1 | true | yes | on | TRUE | YES | ON)
         index_flags+=(--no-verify)

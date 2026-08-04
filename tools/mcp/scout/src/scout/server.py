@@ -7,7 +7,7 @@ queries the index step by step (semantic search + exact symbol lookup), reads
 the matching code, and writes a report. Only that report and a one-line-per-step
 trace cross the MCP boundary back.
 
-    question (a few dozen tokens)  →  mindex POST /research (SSE)
+    question (a few dozen tokens)  →  mindex POST /research?stream=yes (SSE)
                                    →  local model loops search/symbols, reads code
                                    →  Markdown report + step trace come back
 
@@ -50,6 +50,23 @@ READ_TIMEOUT = float(os.environ.get("RESEARCH_READ_TIMEOUT", "120"))
 # a report written one section at a time; this comment is the thing that has to be
 # re-read whenever either server number changes.
 TOTAL_TIMEOUT = float(os.environ.get("RESEARCH_TOTAL_TIMEOUT", "4200"))
+
+# mindex answers `/research` with one JSON body unless frames are asked for, because
+# a caller that does not read a stream to `done` cancels the run by disconnecting.
+# This client is not that caller: it reads every frame to the end. It asks for the
+# stream anyway, for two reasons that are this file's own.
+#
+# First, READ_TIMEOUT above is an *idle* timeout, and it is the only thing here that
+# can tell a working server from a wedged one. It rests on mindex's 15 s keep-alive;
+# against a single silent body it would have to be raised to TOTAL_TIMEOUT, and a
+# hung server would then hold this tool for seventy minutes looking exactly like a
+# healthy high-effort run.
+#
+# Second, the partial-report salvage below (`truncated_by_client`, `live_run_id`,
+# `still_running`) exists only because bytes arrive as they are produced. Against one
+# buffered body a client timeout returns nothing at all — including for a run that
+# had already written its report.
+STREAM_QUERY = "?stream=yes"
 
 # Effort used when the caller doesn't say. It selects a server-configured budget
 # (wall-clock, local tokens and tool calls), so it is also the main latency lever.
@@ -258,14 +275,37 @@ def _verify() -> bool | str:
 
 
 def _headers() -> dict[str, str]:
-    """``X-Api-Key`` when ``MINDEX_API_KEY`` is set, nothing otherwise.
+    """The bearer token as a header, and nothing when none is configured.
 
-    mindex has no authentication of its own and ignores the header; it exists for
-    a reverse proxy in front of it (the nginx gate) that refuses requests without
-    a known key. Unset means "talking to mindex directly", the local default.
-    Mirrors tools/mcp/mindex."""
-    key = os.environ.get("MINDEX_API_KEY")
-    return {"X-Api-Key": key} if key else {}
+    It is the one credential mindex reads: a token it signed itself, naming the
+    projects and actions it permits. Issue one with ``mindex mint-token``. Nothing
+    configured means "talking to a server that authorizes nothing", the local
+    default — sending an empty header instead would turn that into a 401.
+
+    Two spellings, and the second is the one to use here. ``MINDEX_TOKEN`` carries
+    the token itself, which is right for a shell. ``MINDEX_TOKEN_FILE`` names a
+    file holding it, which is right for an MCP server: the environment block that
+    launches one lives in an editor's own configuration file, and putting a bearer
+    credential there puts it in plaintext JSON that no permission check governs.
+    A path leaves the credential in a 0600 file. The same two spellings, in the
+    same order, are read by ``mindex-index`` — which matters because ``drift``
+    shells out to it and inherits this process's environment.
+
+    Stripped, and the file's trailing newline with it: every way of writing that
+    file produces one, and it is not part of the token — sent as-is it makes a
+    header value the server rejects, and a 401 nobody can explain is worse than no
+    header at all.
+    """
+    token = (os.environ.get("MINDEX_TOKEN") or "").strip()
+    if not token:
+        path = (os.environ.get("MINDEX_TOKEN_FILE") or "").strip()
+        if path:
+            # A named file that cannot be read is an error, never a silent
+            # fallback to "no token": the 401 that would follow names neither
+            # the file nor the mistake.
+            with open(path, encoding="utf-8") as fh:
+                token = fh.read().strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 _INSTRUCTIONS = """\
@@ -610,7 +650,7 @@ async def research(
     # instructions sell return the same report for the same question. Do not add it
     # as an oversight-fix.
 
-    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research"
+    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research{STREAM_QUERY}"
     return await _run(url, body, include_excerpts)
 
 
@@ -996,7 +1036,9 @@ async def challenge(
     if budget:
         body["budget"] = budget
 
-    url = f"{SERVER}/{PROTOCOL}/{project_guid}/research/{run_id}/challenge"
+    url = (
+        f"{SERVER}/{PROTOCOL}/{project_guid}/research/{run_id}/challenge{STREAM_QUERY}"
+    )
     return await _run(url, body, include_excerpts)
 
 

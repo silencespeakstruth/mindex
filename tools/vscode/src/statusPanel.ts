@@ -13,10 +13,29 @@ export interface StatusActions {
      * covers the press.
      */
     refresh(): void | Promise<void>;
-    retryAll(): void;
-    retryFile(path: string): void;
+    /**
+     * Both return when the request has finished, for the reason `refresh` and
+     * `mintAgentToken` do. They used to be `void`-returning wrappers around
+     * `executeCommand`, so `Promise.resolve(...)` around them settled on the next
+     * microtask: the key was held for one frame, the button never visibly greyed,
+     * and a second click on a row's Retry sent a second request against a file the
+     * server had already requeued.
+     */
+    retryAll(): void | Promise<void>;
+    retryFile(path: string): void | Promise<void>;
     openFile(path: string): void;
     openSettings(): void;
+    /**
+     * Issue a short-lived token for an agent.
+     *
+     * Returns when the dialog has finished, so the button stays greyed for the
+     * whole chain rather than for one frame — the same reason `refresh` above is
+     * awaitable. It delegates to the `mindex.mintAgentToken` command rather than
+     * calling the flow directly: the command owns the project lookup and the
+     * `auth.action_not_permitted` sentence, and a second copy of either would be
+     * a second thing to keep in step.
+     */
+    mintAgentToken(): void | Promise<void>;
 }
 
 /**
@@ -103,13 +122,15 @@ export class StatusPanel {
                         void actions.refresh();
                         break;
                     case "retryAll":
-                        void this.busy("retry", () => Promise.resolve(actions.retryAll()));
+                        void this.busy("retry", async () => {
+                            await actions.retryAll();
+                        });
                         break;
                     case "retryFile": {
                         const path = asString(msg.path);
-                        void this.busy(`row:${path}`, () =>
-                            Promise.resolve(actions.retryFile(path))
-                        );
+                        void this.busy(`row:${path}`, async () => {
+                            await actions.retryFile(path);
+                        });
                         break;
                     }
                     case "openFile":
@@ -117,6 +138,11 @@ export class StatusPanel {
                         break;
                     case "openSettings":
                         actions.openSettings();
+                        break;
+                    case "mintAgentToken":
+                        void this.busy("mint", async () => {
+                            await actions.mintAgentToken();
+                        });
                         break;
                 }
             })

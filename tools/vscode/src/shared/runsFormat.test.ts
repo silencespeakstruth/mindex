@@ -203,6 +203,18 @@ describe("challengeStateLine", () => {
         assert.match(challengeStateLine({ state: "none" }), /Never challenged/);
     });
 
+    /**
+     * "Nobody challenged this" and "we could not find out" are opposite things to
+     * tell someone deciding whether to act on a report, and the panel used to render
+     * the second as the first: the lookup failed, the handler returned in silence,
+     * and the preview simply kept the `none` it had started with.
+     */
+    it("does not let a failed lookup read as an untouched report", () => {
+        const line = challengeStateLine({ state: "unknown" });
+        assert.doesNotMatch(line, /Never challenged/);
+        assert.match(line, /could not be read/i);
+    });
+
     for (const verdict of ["confirmed", "disputed", "refuted"] as const) {
         it(`states a ${verdict} verdict outright`, () => {
             const line = challengeStateLine(present({ verdict }));

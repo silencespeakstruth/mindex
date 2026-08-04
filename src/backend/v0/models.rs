@@ -248,6 +248,26 @@ pub struct IndexQuery {
     pub stream: Option<StreamChoice>,
 }
 
+/// `POST /v0/{project_guid}/research` and `.../research/{run_id}/challenge` query.
+///
+/// The same `?stream=yes|no` opt-in `/index` has, and for a sharper reason.
+/// Research was the one endpoint whose response was *forced* into frames, which
+/// makes disconnecting the cancellation interface — so a caller that issues the
+/// request and does not read it to `done` spends the whole budget and receives
+/// nothing, with no error raised anywhere. That is the default a naive caller
+/// gets, and no amount of documentation reaches one that has not read it.
+/// Streaming is worth asking for when the run is being watched; it is a trap when
+/// it is not, so it is now the thing you ask for rather than the thing you get.
+#[derive(Deserialize, Debug, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchQuery {
+    /// `yes` streams the run as SSE (see the endpoint description); `no` or absent
+    /// answers one [`ResearchResponse`] when the run ends. Same enum, same 400 on
+    /// a typo, for the same reason it is an enum on `/index`.
+    pub stream: Option<StreamChoice>,
+}
+
 /// The two spellings of `?stream=`. A typo is a 400 (`request.malformed_body`),
 /// never a silent fallback to the JSON mode the caller did not ask for.
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
@@ -703,8 +723,64 @@ pub struct ListFilesResponse {
     pub total: u64,
 }
 
-/// `POST /v0/{project_guid}/research` body. The response is a one-way SSE stream
-/// (`text/event-stream`); see the endpoint description for the event contract.
+/// What a research or challenge run answers when the caller did not ask for
+/// frames (`?stream=yes` absent) — the whole run in one body, once it has ended.
+///
+/// **Every field here is the payload of the frame of the same name, rendered by
+/// the same `ResearchEvent::data()` the stream uses.** That is the entire design
+/// and it is not an implementation detail: the alternative was a second
+/// serialization of the report, the citations and the cost, which is a fifth copy
+/// of a contract that already lives in four places and drifts by going quiet. So
+/// this type documents *where* each object is described rather than describing it
+/// again, and the `*_wire_fields_are_stable` tests keep covering both modes.
+///
+/// What is absent is as deliberate: `thinking`, `step` and `progress` are dropped.
+/// A caller that wanted to watch the run asks for the stream; one that did not
+/// wanted the answer, and the trace is exactly the volume it did not want. The
+/// step count survives on `done`, and the full trace is journalled — see
+/// `GET /projects/{project_guid}/research/{run_id}`.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct ResearchResponse {
+    /// The run's name for its whole life — what `GET /research/active` lists and
+    /// `DELETE /research/active/{run_id}` cancels. Always present, unlike
+    /// `done.run_id`, which is null when the best-effort journal write failed:
+    /// this one names the run that happened, that one names the row it became.
+    pub run_id: String,
+    /// The model that drove the loop, resolved (the request's, or the server's
+    /// `[research].default_model`).
+    pub model: String,
+    /// The effort level, and what it granted. The `started` frame's fields.
+    pub effort: String,
+    pub granted_seconds: u64,
+    /// `max_seconds * 1000 + report_timeout_ms` — the longest this call could
+    /// legitimately have taken. Reported after the fact because it is what makes
+    /// an elapsed time readable.
+    pub worst_case_ms: u64,
+    /// The Markdown report: every `summary` delta, concatenated. Empty only when
+    /// the run produced nothing at all, which the `done.reason` explains.
+    pub report: String,
+    /// The `citations` frame — the server's provenance and freshness check on the
+    /// report above. Absent only if the run ended before it was scored.
+    #[schema(value_type = Object)]
+    pub citations: Option<serde_json::Value>,
+    /// The `excerpts` frame — the indexed code at every verified citation. Absent
+    /// when nothing verified, and best-effort besides.
+    #[schema(value_type = Object)]
+    pub excerpts: Option<serde_json::Value>,
+    /// The `verdict` frame. Challenge runs only; always absent for
+    /// `POST /research`, exactly as the frame is.
+    #[schema(value_type = Object)]
+    pub verdict: Option<serde_json::Value>,
+    /// The `done` frame — `reason`, `prompt_version`, `run_id`/`seq` and the run's
+    /// full cost. Always present: a body without it would be a run that never
+    /// terminated, which is a 500 here rather than a partial answer.
+    #[schema(value_type = Object)]
+    pub done: serde_json::Value,
+}
+
+/// `POST /v0/{project_guid}/research` body. The response is one
+/// [`ResearchResponse`], or an SSE stream under `?stream=yes`; see the endpoint
+/// description for the event contract.
 #[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct ResearchRequest {
     /// The research question — same contract as `/search`'s `query` (natural
@@ -2020,6 +2096,222 @@ impl ResearchEffortInfo {
     }
 }
 
+// ─── The machine-readable service descriptor (`/.well-known/mindex.json`) ─────
+
+/// What this server is, as **data** rather than prose — the machine twin of
+/// `/llms.txt`, served at `/.well-known/mindex.json`.
+///
+/// It exists because the prose document is not always readable. `/llms.txt` is
+/// fetched over the network by a model whose client may classify a document
+/// addressed to it as a prompt injection, and at least one frontier assistant
+/// does exactly that; a caller that loses the narrative then has nothing left,
+/// because the narrative was the only entry point. JSON carries no register for
+/// a classifier to object to, so this is the floor: an agent that can reach the
+/// origin can always learn what the service is, which endpoints exist and what
+/// the current limits are, without reading a single imperative sentence.
+///
+/// [RFC 8615](https://www.rfc-editor.org/rfc/rfc8615) is why it lives under
+/// `/.well-known/`: an agent that knows only an origin can ask the host what it
+/// is without having been told a path first. The `mindex` suffix is **not**
+/// IANA-registered — stated plainly rather than glossed over; unregistered
+/// vendor suffixes are common practice, and the alternative (`/descriptor.json`)
+/// costs the zero-knowledge probe that is the whole point.
+///
+/// Unlike `/llms.txt`, this **is** in the OpenAPI spec, and the contrast is
+/// deliberate: `/llms.txt` serves prose to a reader, this serves JSON to a
+/// client, and JSON to a client is precisely what the spec is for.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct MindexDescriptor {
+    /// Always `"mindex"`. The identity check a caller makes before trusting the
+    /// rest of the document.
+    pub service: &'static str,
+    /// One sentence on what the service does, for a caller deciding whether to
+    /// read further.
+    pub summary: &'static str,
+    /// Running mindex version — the same value `GET /version` and
+    /// `GET /config` report, from the same source, so one document cannot
+    /// disagree with itself.
+    pub version: &'static str,
+    /// Applied `PRAGMA user_version`, as on `GET /version`.
+    pub db_schema_version: i32,
+    /// The shape version of *this* document, bumped when a field changes
+    /// meaning. Distinct from `version`: the server can be upgraded many times
+    /// without the descriptor's shape moving.
+    pub descriptor_version: u32,
+    pub documents: DescriptorDocuments,
+    /// `null` when this deployment authorizes nothing, a description of the
+    /// scheme when it does.
+    ///
+    /// Serialized either way rather than skipped: "authorizes nothing" and "too
+    /// old to say" must not look the same on the wire, which is why the field
+    /// existed as an always-`null` `Option<()>` before there was anything to put
+    /// in it. Now that there is, a caller handed only a URL can learn that it
+    /// needs a credential — instead of reading a closed connection or a 401 and
+    /// guessing.
+    pub authentication: Option<DescriptorAuthentication>,
+    pub transport: DescriptorTransport,
+    /// Every endpoint this build serves, derived from the OpenAPI spec rather
+    /// than written by hand — see [`DescriptorEndpoint`].
+    pub endpoints: Vec<DescriptorEndpoint>,
+    /// Where the project inventory lives. A pointer, not the list: reading it
+    /// costs a SQLite round trip, and this handler is deliberately I/O-free so
+    /// that discovery still answers when the database is busy — the one moment
+    /// a caller most needs to be told what the server is.
+    pub projects_url: &'static str,
+    pub health_url: &'static str,
+    /// Where [`MindexDescriptor::config`] came from. Kept beside the inlined
+    /// copy because two of its fields (`research.models`, `research.observed`)
+    /// are worker-refreshed, so a long-lived client must re-read rather than
+    /// cache this document once.
+    pub config_url: &'static str,
+    /// The live snapshot `GET /config` serves, inlined so that bootstrapping
+    /// costs one request. Built from the same `config_snapshot` call, so it
+    /// cannot drift from the endpoint it mirrors.
+    pub config: ConfigResponse,
+}
+
+/// Where the human- and machine-readable descriptions of this API live.
+/// How a caller proves it may do something, when this deployment requires it.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DescriptorAuthentication {
+    /// Always `"bearer-jwt"` today. Named rather than implied so a second scheme
+    /// can be added without a caller having to infer which one it is looking at.
+    pub kind: &'static str,
+    /// The header, spelled out. `Authorization: Bearer <token>`.
+    pub scheme: &'static str,
+    /// The action vocabulary a token may carry. Published because a caller
+    /// requesting one has to name what it needs, and guessing at the spelling is
+    /// a 400 it cannot debug from the outside.
+    pub actions: Vec<&'static str>,
+    /// The one thing a caller must be told and cannot discover: this server
+    /// answers **404** for a project outside the token's scope, exactly as it
+    /// does for a project that never existed. A client that renders that as
+    /// "no such project" will send its user hunting for an indexing problem
+    /// that does not exist.
+    pub note: &'static str,
+}
+
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DescriptorDocuments {
+    /// Full request/response schemas for every documented endpoint.
+    pub openapi: &'static str,
+    /// The same spec, rendered interactively.
+    pub openapi_ui: &'static str,
+    /// The prose companion to this document: the workflow, the reasoning behind
+    /// it, and the semantics no schema can carry.
+    pub narrative: &'static str,
+}
+
+/// How to talk to this server.
+///
+/// HTTP/3 is deliberately absent. It is an optional second listener whose
+/// availability the server announces per response in the `alt-svc` header, and a
+/// deployment is commonly reached through a proxy that forwards TCP only — so a
+/// descriptor field claiming h3 would be advertising a port that, from the
+/// caller's position, may forward nothing.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct DescriptorTransport {
+    /// Always `true`: TLS is the only transport this server has.
+    pub tls: bool,
+    /// ALPN protocols the TCP listener offers, in the order it offers them.
+    pub alpn: Vec<&'static str>,
+}
+
+/// One endpoint, as the descriptor reports it.
+///
+/// The list is **derived from the OpenAPI spec at first use**, never written out:
+/// the route table already has four copies in this repo (the router, the spec,
+/// the narrative document and the MCP tool sets), and a hand-written fifth would
+/// be the one nothing checks. What a maintainer edits is the handler's
+/// `#[utoipa::path]`; this follows.
+#[derive(Serialize, Debug, Clone, ToSchema)]
+pub struct DescriptorEndpoint {
+    /// Uppercase HTTP method.
+    pub method: String,
+    /// Path template, with `{project_guid}`-style parameters left in place.
+    pub path: String,
+    /// What the endpoint returns, one line, from the handler's own
+    /// documentation.
+    pub summary: String,
+    /// OpenAPI tag group, absent for routes outside the spec.
+    pub tag: Option<String>,
+    /// How the response arrives when the caller asks for frames instead of a
+    /// single JSON body: `"sse"` for the research streams, `"ndjson"` for
+    /// `/index` — all three under `?stream=yes`, and all three answering one body
+    /// without it. `null` for everything else.
+    ///
+    /// The one fact here a maintainer must keep by hand — the spec records the
+    /// response body, not that it arrives in frames — so a new streaming
+    /// endpoint needs an entry in `STREAMING_ENDPOINTS` beside its route.
+    pub streaming: Option<&'static str>,
+    /// Whether this route appears in the OpenAPI spec. `false` marks the
+    /// deliberately undocumented ones (the narrative, the spec itself, the UI),
+    /// which are real routes with no JSON contract to describe.
+    pub documented: bool,
+}
+
+/// `POST /auth/tokens` — issue a scoped bearer token.
+#[derive(Deserialize, Debug, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MintTokenRequest {
+    /// Label naming the holder. Appears in the token and in this server's logs;
+    /// never a decision input.
+    pub sub: String,
+    /// Project GUIDs the token may reach, or exactly `["*"]` for all of them.
+    ///
+    /// The wildcard must be spelled: an empty list is a token that reaches
+    /// nothing, and reading an omitted field as "everything" is how a minter
+    /// hands out full access by accident.
+    pub projects: Vec<String>,
+    /// `search` / `research` / `index` / `delete` / `admin` / `mint`.
+    ///
+    /// Every one of them is mintable here, write actions included — a token that
+    /// may index is an ordinary thing to need, and refusing to issue one would
+    /// only move that work to a shell on the server's host. What stops it being
+    /// an escalation is that the request is contained by the minting token, not
+    /// that some actions are unspeakable. The *asking* is what should be
+    /// deliberate, and a caller naming `index` in a JSON body has been.
+    pub actions: Vec<String>,
+    /// `cli` / `vscode` / `agent`: which kinds of holder this token is for.
+    ///
+    /// Optional, and an omitted or empty list means **every** kind. It is a label
+    /// clients honour, never something this server enforces — nothing about a
+    /// request identifies the process behind it. See `auth::Audience`.
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    /// Lifetime in days, capped by `[auth].max_token_days` **and** by the
+    /// minting token's own remaining life.
+    pub days: u64,
+    /// Sign under this key id rather than the active one, so revoking this
+    /// credential later is one line deleted from the key file instead of a
+    /// rotation that logs out every client.
+    #[serde(default)]
+    pub key_id: Option<String>,
+}
+
+/// The issued token. Returned once and stored nowhere.
+#[derive(Serialize, Debug, ToSchema)]
+pub struct MintTokenResponse {
+    pub token: String,
+    /// Unix seconds. Echoed so a caller can schedule a renewal without parsing
+    /// the token it was just handed.
+    ///
+    /// Never `null` from this endpoint: a non-expiring token is mintable only by
+    /// the local `mint-token` command, deliberately. The field is nullable all
+    /// the same, so that a client reading it does not have to be rewritten if
+    /// that ever changes.
+    pub expires_at: Option<u64>,
+    /// The normalized project list actually written into the token — dashless,
+    /// lowercased. Echoed because it is what the server will compare against,
+    /// and a caller that spelled a GUID differently should be able to see that
+    /// its request was understood.
+    pub projects: Vec<String>,
+    pub actions: Vec<String>,
+    /// The audiences written into the token, sorted and deduplicated. Empty means
+    /// it is labelled for no particular holder and every client will accept it.
+    pub audiences: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2350,6 +2642,23 @@ mod tests {
         assert_eq!(q.stream, None);
         assert!(serde_urlencoded::from_str::<IndexQuery>("stream=true").is_err());
         assert!(serde_urlencoded::from_str::<IndexQuery>("streem=yes").is_err());
+    }
+
+    /// The same contract on `/research`, where getting it wrong is worse than on
+    /// `/index`: a `?stream=true` silently read as "absent" would hand a caller
+    /// that asked to watch the run a body it only sees seventy minutes later,
+    /// while a typo'd key on the *other* side would stream at a caller that will
+    /// not read the frames and cancel the run by disconnecting.
+    #[test]
+    fn the_research_stream_choice_parses_yes_and_no_only() {
+        let q: ResearchQuery = serde_urlencoded::from_str("stream=yes").expect("yes parses");
+        assert_eq!(q.stream, Some(StreamChoice::Yes));
+        let q: ResearchQuery = serde_urlencoded::from_str("stream=no").expect("no parses");
+        assert_eq!(q.stream, Some(StreamChoice::No));
+        let q: ResearchQuery = serde_urlencoded::from_str("").expect("absent parses");
+        assert_eq!(q.stream, None);
+        assert!(serde_urlencoded::from_str::<ResearchQuery>("stream=true").is_err());
+        assert!(serde_urlencoded::from_str::<ResearchQuery>("streem=yes").is_err());
     }
 
     // ── the language checklist, as far as one crate can check it ─────────────

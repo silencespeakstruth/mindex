@@ -112,6 +112,22 @@ export function readHealth(health: HealthResponse): {
     return { state, requiredDown, researchAvailable };
 }
 
+/**
+ * Why a section could not be read, as a sentence that is never empty.
+ *
+ * `humanize` renders a cancellation as `""` — correct everywhere else, because the
+ * user's own Stop deserves no notification. Here the cancellation is the refresh
+ * *deadline* firing, which is news: with the empty string the panel drew three dim
+ * "unavailable" rows carrying no tooltip and no cause, and the one thing that had
+ * actually happened — the whole refresh ran out of time — was said nowhere.
+ */
+function sectionReason(e: unknown): string {
+    const humanized = humanize(e);
+    return humanized.cancelled
+        ? "The refresh ran out of time before this section was read."
+        : humanized.text;
+}
+
 export async function fetchStatus(
     api: MindexApi,
     guid: string | undefined,
@@ -174,7 +190,7 @@ export async function fetchStatus(
         next.runtime = await api.status(signal);
     } catch (e) {
         next.runtime = UNAVAILABLE;
-        sectionErrors.runtime = humanize(e).text;
+        sectionErrors.runtime = sectionReason(e);
     }
 
     try {
@@ -184,7 +200,7 @@ export async function fetchStatus(
         // never fails the refresh. It is still recorded: a stale model list that
         // nothing admits is stale is how a picker comes to offer a model the
         // server would refuse.
-        sectionErrors.config = humanize(e).text;
+        sectionErrors.config = sectionReason(e);
     }
 
     if (guid === undefined) {
@@ -213,14 +229,14 @@ export async function fetchStatus(
         // unknown, not empty, and not worth a reason line either.
         fan.onInventory(undefined);
         next.inventory = UNAVAILABLE;
-        sectionErrors.inventory = humanize(e).text;
+        sectionErrors.inventory = sectionReason(e);
     }
 
     try {
         next.failed = (await api.listFiles(guid, { status: "failed" }, signal)).files;
     } catch (e) {
         next.failed = UNAVAILABLE;
-        sectionErrors.failed = humanize(e).text;
+        sectionErrors.failed = sectionReason(e);
     }
 
     return next;

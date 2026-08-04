@@ -33,13 +33,39 @@ const CONFIG: &str = "Config";
 Async RAG indexing + search engine: tree-sitter AST chunking → BGE-M3 multi-vector \
 embeddings (dense / sparse / ColBERT) → Qdrant vectors + SQLite metadata.
 
-**Transport & auth.** Internal service. TLS is the only transport security — there is \
-**no API authentication**. Do not expose it on an untrusted network.
+**Transport & auth.** TLS is the only transport security. Authorization is \
+**opt-in** (`[auth].enabled`): with it off — the default, and every deployment that \
+has not chosen otherwise — this server checks nothing and must not be exposed on an \
+untrusted network.
 
-To reach it from outside anyway, put a reverse proxy in front and let the proxy \
-authenticate. The clients in `tools/` all support an optional `X-Api-Key` header \
-for exactly that (`--api-key`, `$MINDEX_API_KEY`, or the `api_key` config key); \
-the header is meaningless to this server, which ignores it.
+With it on, every route below except `/health`, `/version`, `/config`, `/llms.txt` \
+and `/.well-known/mindex.json` requires `Authorization: Bearer <token>`. The token \
+is issued by this server (`mindex mint-token`, or `POST /auth/tokens` with a token \
+carrying `mint`) and carries its own authority: the project GUIDs it may reach and \
+the actions it may take — `search`, `research`, `index`, `delete`, `admin`, `mint`. \
+Nothing about it is stored server-side, so there is no revocation list: a token is \
+valid until it expires or until the key id that signed it is removed from the key \
+file.
+
+A token may also carry `aud` (`cli` / `vscode` / `agent`, from `mint-token --for`), \
+naming the kind of holder it was issued to. **This server never reads it** — nothing \
+about a request identifies the process behind it, so a check here would be theatre. \
+The clients honour it, which catches a credential pasted into the wrong place and \
+catches nothing adversarial. An absent or empty list means every kind of holder.
+
+A project the token does not cover answers **404**, byte for byte as a project that \
+was never indexed does. That is deliberate, and a client must not read it as \
+plain absence: a distinguishable refusal would confirm which GUIDs exist. A missing \
+*action*, by contrast, is a distinguishable **403** — the caller has already proved \
+it holds the project, so naming what it lacks tells it nothing new.
+
+The token is the **only** credential. A shared `X-Api-Key`, checked by a gateway \
+and ignored here, used to sit alongside it and was removed rather than made \
+optional: it carried no scope, no expiry and no way to withdraw one holder, and \
+requiring it beside a token meant an agent handed a token still needed the shared \
+secret — which is the problem the token exists to remove. A gateway in front of \
+this server now admits on the token's *presence* and leaves every question about \
+its validity here.
 
 **Path versioning.** The data-plane endpoints (`/v0/{project_guid}/index`, \
 `/v0/{project_guid}/search`) carry a `/v0` version prefix; their request/response \
@@ -62,6 +88,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `internal.error`, `embedder.unavailable`, `qdrant.unavailable`, `database.busy`, \
 `gc.already_running`, \
 `project.not_found`, `search.no_match`, `selector.empty`, \
+`auth.token_missing`, `auth.token_invalid`, `auth.token_expired`, \
+`auth.action_not_permitted`, \
 `validation.path_invalid`, `validation.sha256_invalid`, `validation.top_k_out_of_range`, \
 `validation.query_empty`, `validation.query_too_long`, `validation.code_too_large`, \
 `validation.too_many_files`, `validation.selector_too_large`, \
@@ -75,7 +103,8 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.research_context_invalid`, `validation.research_delete_too_many`, \
 `validation.research_list_limit_out_of_range`, `research.run_not_found`, \
 `research.challenge_subject_invalid`, `research.challenge_subject_is_challenge`, \
-`research.scope_matches_nothing`, `research.model_lacks_tools`.",
+`research.scope_matches_nothing`, `research.model_lacks_tools`, \
+`ollama.unavailable`, `ollama.error`, `research.no_report`.",
     ),
     paths(
         // Indexing
@@ -106,12 +135,14 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         handlers::delete_project,
         // Garbage Collection
         handlers::post_gc,
+        handlers::post_auth_tokens,
         // Observability
         handlers::get_status,
         handlers::get_health,
         handlers::get_version,
         // Config
         handlers::get_config,
+        handlers::get_mindex_descriptor,
     ),
     components(schemas(
         crate::backend::error::ProblemDetails,
@@ -128,6 +159,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::SymbolInfo,
         crate::backend::v0::models::SymbolsResponse,
         crate::backend::v0::models::ResearchRequest,
+        crate::backend::v0::models::ResearchResponse,
         crate::backend::v0::models::ChallengeRequest,
         crate::backend::v0::models::ResearchBudgetOverride,
         crate::research::Effort,
@@ -149,6 +181,9 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::HistoryResponse,
         crate::backend::v0::models::HistoryPruneResponse,
         crate::backend::v0::models::GcResponse,
+        crate::backend::v0::models::DescriptorAuthentication,
+        crate::backend::v0::models::MintTokenRequest,
+        crate::backend::v0::models::MintTokenResponse,
         crate::backend::v0::models::ResearchFreshness,
         crate::backend::v0::models::ResearchKind,
         crate::backend::v0::models::ResearchCompleteness,
@@ -184,6 +219,10 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
         crate::backend::v0::models::ResearchSamplingInfo,
         crate::backend::v0::models::ResearchObservedInfo,
         crate::backend::v0::models::ResearchObservedEffort,
+        crate::backend::v0::models::MindexDescriptor,
+        crate::backend::v0::models::DescriptorDocuments,
+        crate::backend::v0::models::DescriptorTransport,
+        crate::backend::v0::models::DescriptorEndpoint,
     )),
     tags(
         (name = INDEXING, description = "Index lifecycle: (re)index files, cancel in-flight work, requeue failures, soft-delete files, and detect working-tree drift."),
@@ -220,8 +259,9 @@ mod tests {
         let json = serde_json::to_value(&doc).expect("spec must serialize to JSON");
         let paths = json["paths"].as_object().expect("paths object");
 
-        // Every routed path is documented (20 routes; three carry two methods each).
+        // Every routed path is documented (21 routes; three carry two methods each).
         for p in [
+            "/.well-known/mindex.json",
             "/v0/{project_guid}/index",
             "/v0/{project_guid}/search",
             "/v0/{project_guid}/symbols",
@@ -245,10 +285,11 @@ mod tests {
             "/config",
             "/health",
             "/version",
+            "/auth/tokens",
         ] {
             assert!(paths.contains_key(p), "missing path in OpenAPI spec: {p}");
         }
-        assert_eq!(paths.len(), 23, "unexpected number of documented paths");
+        assert_eq!(paths.len(), 25, "unexpected number of documented paths");
 
         // `/metrics` is routed but deliberately **not** documented: it serves
         // OpenMetrics text rather than JSON, is not versioned, does not speak
@@ -267,6 +308,16 @@ mod tests {
         assert!(
             !paths.contains_key("/llms.txt"),
             "/llms.txt must stay out of the OpenAPI spec — see the handler's doc comment"
+        );
+
+        // `/.well-known/mindex.json` takes the opposite decision to both of the
+        // above, and the contrast is the point rather than an inconsistency: it
+        // is the machine twin of `/llms.txt`, serving JSON to an API client
+        // instead of prose to a reader — which is exactly what this spec is for.
+        // Asserted here beside them so the three decisions are read together.
+        assert!(
+            paths.contains_key("/.well-known/mindex.json"),
+            "the service descriptor is JSON for a client and belongs in the spec"
         );
 
         // The two dual-method routes expose both verbs.

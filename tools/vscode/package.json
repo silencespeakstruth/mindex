@@ -2,7 +2,7 @@
   "name": "mindex-vscode",
   "displayName": "MINDex",
   "description": "Ask your codebase: semantic search with live preview, and a local model that investigates and writes a cited report. Plus drift detection and selective reindexing against a MINDex server.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "mindex",
   "license": "MIT",
   "author": {
@@ -157,6 +157,12 @@
         "icon": "$(stop-circle)"
       },
       {
+        "command": "mindex.cancelResearch",
+        "title": "Cancel the Research Run",
+        "category": "MINDex",
+        "icon": "$(stop-circle)"
+      },
+      {
         "command": "mindex.refreshStatus",
         "title": "Refresh Server Status",
         "category": "MINDex",
@@ -221,6 +227,18 @@
         "title": "Open Settings",
         "category": "MINDex",
         "icon": "$(gear)"
+      },
+      {
+        "command": "mindex.setToken",
+        "title": "Set Bearer Token",
+        "category": "MINDex",
+        "icon": "$(key)"
+      },
+      {
+        "command": "mindex.mintAgentToken",
+        "title": "Issue a Token for an Agent",
+        "category": "MINDex",
+        "icon": "$(key)"
       }
     ],
     "menus": {
@@ -234,6 +252,11 @@
           "command": "mindex.openResearchHistory",
           "when": "view == mindexAsk",
           "group": "navigation@2"
+        },
+        {
+          "command": "mindex.mintAgentToken",
+          "when": "view == mindexAsk && mindex.hasProject",
+          "group": "navigation@3"
         },
         {
           "command": "mindex.openSettings",
@@ -292,7 +315,7 @@
         },
         {
           "command": "mindex.openSettings",
-          "when": "view == mindexDrift",
+          "when": "view == mindexDrift && mindex.hasProject",
           "group": "9_force@9"
         }
       ],
@@ -304,6 +327,10 @@
         {
           "command": "mindex.openResearchReport",
           "when": "false"
+        },
+        {
+          "command": "mindex.cancelResearch",
+          "when": "mindex.researchRunning"
         }
       ],
       "editor/title": [
@@ -317,15 +344,18 @@
     "keybindings": [
       {
         "command": "mindex.search",
-        "key": "ctrl+alt+/"
+        "key": "ctrl+alt+/",
+        "when": "mindex.hasProject"
       },
       {
         "command": "mindex.research",
-        "key": "ctrl+alt+."
+        "key": "ctrl+alt+.",
+        "when": "mindex.hasProject"
       },
       {
         "command": "mindex.openResearchHistory",
-        "key": "ctrl+alt+,"
+        "key": "ctrl+alt+,",
+        "when": "mindex.hasProject"
       }
     ],
     "configuration": {
@@ -346,11 +376,12 @@
           "default": "",
           "description": "Path to a CA certificate (PEM) to trust for the server, e.g. the mkcert root CA."
         },
-        "mindex.apiKey": {
-          "type": "string",
-          "default": "",
-          "description": "API key sent as X-Api-Key on every request. MINDex itself has no authentication and ignores this — set it only when a reverse proxy in front of the server requires a key. Leave empty when connecting straight to a local MINDex.",
-          "scope": "machine-overridable"
+        "mindex.tokenWarningHours": {
+          "type": "number",
+          "default": 24,
+          "minimum": 0,
+          "maximum": 720,
+          "description": "How long before a bearer token expires to start showing a warning in the status bar (0 disables the early notice). Under an hour the warning turns red regardless. The token itself is not a setting — it is stored in the OS keychain by “MINDex: Set Bearer Token”, so that Settings Sync cannot carry a credential between machines."
         },
         "mindex.statusPollSeconds": {
           "type": "number",

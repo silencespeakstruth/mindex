@@ -136,6 +136,10 @@ export class DriftTreeProvider implements vscode.TreeDataProvider<DriftNode> {
         this.roots = [];
         this.selected = emptySelection();
         this.checkedAt = undefined;
+        // The claim count too: this is the wholesale reset, and "3 file(s) in
+        // flight" outliving the project it was counted for is the same defect the
+        // rest of this method exists to prevent.
+        this.serverClaims = 0;
         this.changed.fire(undefined);
     }
 

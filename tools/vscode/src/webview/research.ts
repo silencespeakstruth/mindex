@@ -589,6 +589,12 @@ window.addEventListener("message", (e: MessageEvent<Incoming>) => {
             const div = document.createElement("div");
             div.className = "error";
             div.textContent = msg.detail;
+            // The machine code belongs on the tooltip, never in the sentence — the
+            // rule `humanize` keeps everywhere else. It is what a bug report needs
+            // and what a reader does not.
+            if (typeof msg.code === "string" && msg.code !== "") {
+                div.title = msg.code;
+            }
             report.parentNode?.insertBefore(div, report);
             break;
         }

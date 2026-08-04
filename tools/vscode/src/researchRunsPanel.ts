@@ -10,6 +10,7 @@ import type {
 } from "./api";
 import { asString, mediaRoots, readMedia, renderPage } from "./webview";
 import { BusyKeys } from "./busy";
+import { Supersedable } from "./supersede";
 import { humanize, logError, ProblemError } from "./errors";
 import { debounce, type Debounced } from "./shared/debounce";
 import {
@@ -46,6 +47,14 @@ export interface ResearchRunsActions {
      * `extension.ts`, which owns the single-flight handles.
      */
     challenge(run: ResearchRunSummary): void;
+    /**
+     * These runs are gone. Whoever else is holding them has to let go.
+     *
+     * The Ask form is the one that does: its context chips are set from this panel
+     * and pruned by nothing else, so a deleted run stayed attached to the next
+     * question and came back as a 400 about a click made in another panel.
+     */
+    runsDeleted(ids: readonly string[]): void;
 }
 
 /** How long the box waits after the last keystroke before it asks the server. */
@@ -94,8 +103,13 @@ export class ResearchRunsPanel {
 
     private readonly panel: vscode.WebviewPanel;
     private readonly disposables: vscode.Disposable[] = [];
-    /** Supersedes the in-flight list request. */
-    private inFlight?: AbortController;
+    /** The in-flight list request. Newest wins; see `supersede.ts`. */
+    private readonly listRead = new Supersedable();
+    /**
+     * The row whose detail was asked for last, so a slower earlier answer cannot
+     * land on top of it. `getResearchRun` takes no signal, so this is the supersede.
+     */
+    private previewWanted?: string;
     /**
      * Single-flight per button, and the wire that greys them.
      *
@@ -127,8 +141,23 @@ export class ResearchRunsPanel {
     private kind: "all" | "research" | "challenge" = "all";
     private completeness: "all" | "finalized" | "partial" = "all";
     private totals?: ResearchCorpusTotals;
+    /**
+     * What to run if the user presses Retry on the error banner. Set by `fail` and
+     * spent by the press, so a banner cleared by a successful render cannot leave a
+     * stale action armed behind it.
+     */
+    private retryFailed?: () => void;
     /** The challenge state of the previewed run, for the Re-check fork. */
     private challengeState?: { runId: string; state: ChallengeState };
+    /**
+     * The run whose row is expanded, as far as the host knows.
+     *
+     * Not derivable from `challengeState`, which is set only after that lookup
+     * lands and never at all for a challenge run. It exists so a refresh the user
+     * did not press — a run finishing elsewhere — can re-fetch what is open
+     * without asking the webview for its `activeId` first.
+     */
+    private previewed?: string;
     /**
      * A server too old for the query parameters added here.
      *
@@ -208,8 +237,15 @@ export class ResearchRunsPanel {
                         // arrived.
                         this.search(this.query, true);
                         break;
+                    // Not wrapped in `BusyKeys`, unlike its neighbours. It is a read,
+                    // and it already owns the `list` key the way `load` does — an
+                    // `Supersedable` handle of its own, released only by its owner. Two
+                    // authorities over one key is what this used to be: a search
+                    // landing mid-pass posted `list: false` from `load`, the button
+                    // lit up, and `BusyKeys` — which posts nothing when it refuses —
+                    // then swallowed the press in silence.
                     case "selectAllMatching":
-                        void this.busy.run("list", () => this.selectAllMatching());
+                        void this.selectAllMatching();
                         break;
                     case "gcPropose":
                         void this.busy.run("gc", () => this.proposeGarbage());
@@ -218,10 +254,12 @@ export class ResearchRunsPanel {
                     // act, and "two confirmation modals for one row" is what
                     // separate keys would still allow.
                     case "gcDelete":
-                        void this.busy.run("delete", () => this.remove(readIds(msg.ids)));
+                        void this.busy.run("delete", () =>
+                            this.remove(readIds(msg.ids), actions)
+                        );
                         break;
                     case "recheck":
-                        void this.busy.run("preview", () =>
+                        void this.busy.run("action", () =>
                             this.recheck(asString(msg.id), actions)
                         );
                         break;
@@ -254,15 +292,23 @@ export class ResearchRunsPanel {
                     case "challenge": {
                         const run = this.summaries.get(asString(msg.id));
                         if (run !== undefined) {
-                            void this.busy.run("preview", () =>
+                            void this.busy.run("action", () =>
                                 this.confirmAndChallenge(run, actions)
                             );
                         }
                         break;
                     }
+                    // No key: `preview` supersedes rather than refusing, and the
+                    // row it opens has no key to echo a refusal with.
                     case "select":
-                        void this.busy.run("preview", () => this.preview(asString(msg.id)));
+                        void this.preview(asString(msg.id));
                         break;
+                    case "retryFailed": {
+                        const again = this.retryFailed;
+                        this.retryFailed = undefined;
+                        again?.();
+                        break;
+                    }
                     case "toggle":
                         this.toggle(asString(msg.id), msg.checked === true);
                         break;
@@ -276,20 +322,30 @@ export class ResearchRunsPanel {
                         break;
                     }
                     case "delete":
-                        void this.busy.run("delete", () => this.remove([asString(msg.id)]));
+                        void this.busy.run("delete", () =>
+                            this.remove([asString(msg.id)], actions)
+                        );
                         break;
                     case "deleteSelected":
-                        void this.busy.run("delete", () => this.remove([...this.selected]));
+                        void this.busy.run("delete", () =>
+                            this.remove([...this.selected], actions)
+                        );
                         break;
                     case "openRun": {
-                        const run = this.rows.get(asString(msg.id));
+                        // Through `summaries` when the rendered page does not hold
+                        // it: the garbage-collection review reads from a pass that
+                        // ran to exhaustion, so most of what it offers to open is
+                        // off-page — and `pageAll` has put every one of those rows
+                        // in `summaries` already.
+                        const id = asString(msg.id);
+                        const run = this.rows.get(id) ?? this.summaries.get(id);
                         if (run !== undefined) {
                             actions.openReport(run);
                         }
                         break;
                     }
                     case "reAsk":
-                        void this.busy.run("preview", () =>
+                        void this.busy.run("action", () =>
                             this.reAsk(asString(msg.id), actions)
                         );
                         break;
@@ -320,12 +376,44 @@ export class ResearchRunsPanel {
             // fires into a disposed webview and surfaces as an error the user can do
             // nothing about.
             this.search.cancel();
-            this.inFlight?.abort();
+            this.listRead.abort();
             this.busy.reset();
             for (const d of this.disposables) {
                 d.dispose();
             }
         });
+    }
+
+    /**
+     * A run finished somewhere else and the corpus moved under the panel.
+     *
+     * Without this the panel is simply wrong after every run: the new row is
+     * absent, `totals` is a count of the corpus as it was, and the subject of a
+     * challenge still wears the trust badge and the `Challenge` button it had
+     * before it was refuted — the one moment those two are worth reading.
+     *
+     * Deliberately NOT the refresh button's behaviour: this one is involuntary, so
+     * it does not `dropBulkSelection()`. That rule exists because a selection is
+     * defined by the filters that built it, and none of them changed here —
+     * throwing away several hundred ids the user chose, because a background run
+     * happened to land, is a worse surprise than a count that is briefly stale.
+     *
+     * Static because the caller is `extension.ts`, which owns the run and not the
+     * panel — and there may be no panel open at all, which is not its business.
+     */
+    static notifyRunFinished(): void {
+        ResearchRunsPanel.current?.runFinished();
+    }
+
+    private runFinished(): void {
+        void this.load(this.query, undefined);
+        const open = this.previewed;
+        if (open !== undefined) {
+            // The verdict, the trust line and the Challenge/Re-check fork are all
+            // derived from this, and the stale copy is the one that would render.
+            this.challengeState = undefined;
+            void this.preview(open);
+        }
     }
 
     /** The cursor for the next page: the oldest row currently shown. */
@@ -410,10 +498,18 @@ export class ResearchRunsPanel {
         return false;
     }
 
-    /** Hand the list spinner and key back, but only if this request still owns them. */
+    /**
+     * Hand the list spinner and key back, but only if this request still owns them.
+     *
+     * Every writer releases through here — `load`, `selectAllMatching` and
+     * `proposeGarbage`. The latter two used to clear the handle unconditionally in a
+     * `finally`, so a keystroke landing mid-pass installed `load`'s controller and
+     * was then disowned by the pass it had just superseded: the spinner went out
+     * while a fetch was still running, and the *next* keystroke aborted nothing,
+     * which is how a stale page could render over a newer one.
+     */
     private releaseList(controller: AbortController): void {
-        if (this.inFlight === controller) {
-            this.inFlight = undefined;
+        if (this.listRead.end(controller)) {
             this.post({ type: "busy", key: "list", busy: false });
         }
     }
@@ -427,7 +523,7 @@ export class ResearchRunsPanel {
      * sentence goes to the banner and the raw error to the output channel, and
      * `where` is what makes the log line worth having.
      */
-    private fail(where: string, e: unknown): void {
+    private fail(where: string, e: unknown, retry?: () => void): void {
         if (isAbort(e)) {
             return;
         }
@@ -436,10 +532,16 @@ export class ResearchRunsPanel {
             return;
         }
         logError(`Research History: ${where}`, e);
+        // A retryable failure with nothing to press is the shape this panel had:
+        // the banner turned yellow to say "this could work if you tried again" and
+        // then offered no way to. The thunk is kept here rather than sent, because
+        // what is retried is a host call and the webview has no name for it.
+        this.retryFailed = humanized.retryable ? retry : undefined;
         this.post({
             type: "error",
             message: humanized.text,
             retryable: humanized.retryable,
+            canRetry: this.retryFailed !== undefined,
         });
     }
 
@@ -449,9 +551,7 @@ export class ResearchRunsPanel {
             this.post({ type: "runs", runs: [], nextBeforeSeq: null, reset: true });
             return;
         }
-        this.inFlight?.abort();
-        const controller = new AbortController();
-        this.inFlight = controller;
+        const controller = this.listRead.begin();
         const reset = beforeSeq === undefined;
         this.post({ type: "busy", key: "list", busy: true });
 
@@ -476,12 +576,12 @@ export class ResearchRunsPanel {
                 await this.load(q, beforeSeq);
                 return;
             }
-            this.fail("loading the list", e);
+            this.fail("loading the list", e, () => void this.load(q, beforeSeq));
             return;
         } finally {
             // Only the current owner clears the spinner and the key. A superseded
             // request turning them off while its successor is still running is how
-            // the panel came to look idle mid-fetch — and clearing `inFlight` from a
+            // the panel came to look idle mid-fetch — and clearing the handle from a
             // stale controller would leave the next keystroke aborting nothing.
             this.releaseList(controller);
         }
@@ -570,9 +670,7 @@ export class ResearchRunsPanel {
         if (guid === undefined) {
             return;
         }
-        this.inFlight?.abort();
-        const controller = new AbortController();
-        this.inFlight = controller;
+        const controller = this.listRead.begin();
         this.post({ type: "busy", key: "list", busy: true });
         try {
             const { rows, truncated } = await this.pageAll(
@@ -594,10 +692,13 @@ export class ResearchRunsPanel {
                 cap: this.maxDelete(),
             });
         } catch (e) {
-            this.fail("selecting everything that matches", e);
+            this.fail(
+                "selecting everything that matches",
+                e,
+                () => void this.selectAllMatching()
+            );
         } finally {
-            this.inFlight = undefined;
-            this.post({ type: "busy", key: "list", busy: false });
+            this.releaseList(controller);
         }
     }
 
@@ -616,9 +717,7 @@ export class ResearchRunsPanel {
         if (guid === undefined) {
             return;
         }
-        this.inFlight?.abort();
-        const controller = new AbortController();
-        this.inFlight = controller;
+        const controller = this.listRead.begin();
         this.post({ type: "busy", key: "list", busy: true });
         try {
             const { rows } = await this.pageAll(
@@ -645,28 +744,43 @@ export class ResearchRunsPanel {
                 expected: this.totals?.gc_candidates ?? null,
             });
         } catch (e) {
-            this.fail("proposing garbage", e);
+            this.fail("proposing garbage", e, () => void this.proposeGarbage());
         } finally {
-            this.inFlight = undefined;
-            this.post({ type: "busy", key: "list", busy: false });
+            this.releaseList(controller);
         }
     }
 
+    /**
+     * Fetch and post one row's detail.
+     *
+     * Superseded, never refused — the list's rule, for the same reason. The webview
+     * marks a row open the moment it is clicked, before the host has answered, so a
+     * *refused* select left that row expanded with no body, no spinner and no error,
+     * permanently: `BusyKeys` posts nothing when it refuses, by design, and the row
+     * carries no key that could have echoed one. Clicking a second row while the
+     * first is still loading is an ordinary thing to do, and the answer the user
+     * wants is the newest one.
+     */
     private async preview(id: string): Promise<void> {
         const guid = this.guid();
         if (guid === undefined) {
             return;
         }
+        this.previewWanted = id;
         let detail: ResearchRunDetail;
         try {
             detail = await this.api().getResearchRun(guid, id);
         } catch (e) {
             // `fail` drops aborts itself — one place, not eight.
-            this.fail("opening the report", e);
+            this.fail("opening the report", e, () => void this.preview(id));
             return;
+        }
+        if (this.previewWanted !== id) {
+            return; // another row was clicked while this was in flight
         }
         this.summaries.set(detail.id, detail);
         this.challengeState = undefined;
+        this.previewed = detail.id;
         this.post({ type: "preview", run: detail });
         void this.loadChallengeState(guid, detail);
     }
@@ -715,7 +829,15 @@ export class ResearchRunsPanel {
                 // rather than guessing — the trust badge still carries the verdict.
                 return;
             }
-            return;
+            if (isAbort(e) || humanize(e).cancelled) {
+                return;
+            }
+            // Not silent. This is best-effort in that it must never cost the
+            // preview — but returning with no state at all rendered as "never
+            // challenged", which is the one wrong answer available here, and left
+            // nothing in the log to explain the missing line either.
+            logError("Research History: reading the challenge history", e);
+            state = { state: "unknown" };
         }
         this.challengeState = { runId: run.id, state };
         this.post({ type: "challengeState", runId: run.id, state });
@@ -837,10 +959,19 @@ export class ResearchRunsPanel {
         try {
             const updated = await this.api().pinResearchRun(guid, id, pinned);
             this.rows.set(updated.id, updated);
+            // `summaries` too, not just the rendered page: it is what the delete
+            // dialog and the challenge guard resolve ids through, and a stale
+            // `pinned`/`expires_at` there is a decision taken on the old answer.
+            this.summaries.set(updated.id, updated);
             // Re-post the server's answer rather than the state we guessed: pinning
             // rewrites `expires_at`, and unpinning an old run can make it eligible at
             // the very next sweep.
             this.post({ type: "updated", run: updated });
+            // Pinning moves `gc_candidates` — the exemption is the server's — so the
+            // counts line and the `Collect garbage (N)` label describe a corpus that
+            // has changed. Re-reading the current page is what refreshes them, as it
+            // is after a delete.
+            void this.load(this.query, undefined);
         } catch (e) {
             this.fail("pinning the report", e);
         }
@@ -855,7 +986,7 @@ export class ResearchRunsPanel {
      * silently invalidates every later report built on it — the caller is owed that
      * number before they agree, and `referenced_by_count` is why it is on the wire.
      */
-    private async remove(ids: string[]): Promise<void> {
+    private async remove(ids: string[], actions: ResearchRunsActions): Promise<void> {
         const guid = this.guid();
         if (guid === undefined || ids.length === 0) {
             return;
@@ -907,9 +1038,23 @@ export class ResearchRunsPanel {
             this.rows.delete(id);
             this.summaries.delete(id);
             this.selected.delete(id);
+            // The webview lets go of `activeId` on `removed`; these are the host's
+            // half of the same release, and they must happen here rather than be
+            // left to the next preview — `challengeState` keyed on a deleted run
+            // would answer the Re-check fork for a report that is gone.
+            if (this.previewed === id) {
+                this.previewed = undefined;
+            }
+            if (this.challengeState?.runId === id) {
+                this.challengeState = undefined;
+            }
         }
         this.bulkSelection = false;
         this.post({ type: "removed", ids, selected: [...this.selected] });
+        // The Ask form may be holding these as context for the next question, and
+        // nothing else would ever take them off it: submitting them is a 400 about
+        // a click the user made in another panel.
+        actions.runsDeleted(ids);
         // The corpus just shrank, so the counts line and the GC button's number
         // are both stale. Re-reading the current page is what refreshes them.
         void this.load(this.query, undefined);

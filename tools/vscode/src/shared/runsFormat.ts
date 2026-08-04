@@ -104,7 +104,14 @@ export function trustBadge(run: RunLike): BadgeSpec | undefined {
 export type ChallengeState =
     | { state: "none" }
     | ChallengeStatePresent
-    | { state: "several"; count: number; latest: ChallengeStatePresent };
+    | { state: "several"; count: number; latest: ChallengeStatePresent }
+    /**
+     * The lookup itself failed. Distinct from `none`, and the distinction is the
+     * point: "nobody has challenged this" and "we could not find out" are opposite
+     * things to tell someone deciding whether to act on a report, and the panel used
+     * to render the second as the first by returning early in silence.
+     */
+    | { state: "unknown" };
 
 /** One challenge aimed at the report, as the panel resolves it. */
 export interface ChallengeStatePresent {
@@ -138,6 +145,13 @@ export function standingChallenge(s: ChallengeState): ChallengeStatePresent | un
  * preview is the place that answers outright.
  */
 export function challengeStateLine(s: ChallengeState): string {
+    if (s.state === "unknown") {
+        return (
+            "Challenge history could not be read — the server did not answer that " +
+            "query. This report may or may not have been challenged; the trust badge " +
+            "beside it is the last thing that was known."
+        );
+    }
     if (s.state === "none") {
         return "Never challenged — no run has tried to re-derive this report's claims.";
     }

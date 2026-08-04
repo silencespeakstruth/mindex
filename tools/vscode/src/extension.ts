@@ -10,7 +10,7 @@ import { challengeGuard } from "./shared/runsFormat";
 import { MindexFile, parseMindexFile } from "./mindexFile";
 import { buildManifest, scanWorkspace } from "./scanner";
 import { DRIFT_MESSAGE, DriftTreeProvider } from "./driftView";
-import { StatusMonitor, UNAVAILABLE } from "./statusMonitor";
+import { Availability, StatusMonitor, UNAVAILABLE } from "./statusMonitor";
 import { StatusPanel } from "./statusPanel";
 import { ResearchRunsPanel } from "./researchRunsPanel";
 import { pickContextRuns } from "./researchContextPick";
@@ -21,10 +21,21 @@ import {
     runIdOf,
 } from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
+import { mintAgentToken } from "./agentToken";
+import { forgetIfToken, TOKEN_SCHEME, TokenDocumentProvider } from "./tokenDoc";
+import {
+    audienceRefusal,
+    describeToken,
+    mergeAvailability,
+    tokenAvailability,
+    tokenCovers,
+    tokenPermits,
+} from "./token";
+import { TokenStatusBar } from "./tokenStatusBar";
 import { IndexStatusBar } from "./indexStatusBar";
 import { IndexingPanel, IndexingPanelPlacement } from "./indexingPanel";
 import { reindexPaths, showReindexSummary } from "./indexer";
-import { runSearch } from "./search";
+import { promptForQuery, runSearch, SearchOptions } from "./search";
 import { ResearchPanel, ResearchSubmission } from "./researchView";
 import { AskSubmission, AskViewProvider } from "./askView";
 import { createProjectFile } from "./createProject";
@@ -44,12 +55,76 @@ interface Project {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-    let api = createApi();
+    // The bearer token, cached here because `SecretStorage` is async and
+    // `createApi` is called from a dozen synchronous places. The cache is the only
+    // copy the extension keeps in memory, and it is kept in step by exactly two
+    // things: the load below and `onDidChange`, which fires for writes made in
+    // *this* window and in every other one sharing the store.
+    let token: string | undefined;
+    let api = createApi(token);
+    const rebuildApi = (): void => {
+        api.dispose();
+        api = createApi(token);
+    };
+
+    const tokenStatus = new TokenStatusBar(
+        vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 89),
+        config().get<number>("tokenWarningHours", 24) * 60 * 60 * 1000
+    );
+    context.subscriptions.push(tokenStatus);
+
+    // What the last health refresh said, kept so the token layer can be re-applied
+    // without waiting for the next poll. A token stored at 12:00 must not leave the
+    // form frozen until 12:00:30.
+    let healthAvailability: Availability = { ask: true, research: true };
+    const pushAvailability = (): void => {
+        const merged = mergeAvailability(
+            healthAvailability,
+            tokenAvailability(describeToken(token), project?.mindex.guid)
+        );
+        askProvider.setAvailability(merged);
+        if (!merged.ask) {
+            abortRunsForDegradation(merged.reason);
+        }
+    };
+
+    const reloadToken = async (): Promise<void> => {
+        try {
+            token = await context.secrets.get(TOKEN_SECRET_KEY);
+        } catch (e) {
+            // A keychain that cannot be read is not a reason to have no extension:
+            // an unauthenticated server needs no token at all, so this degrades to
+            // "no credential" with a line in the log rather than a failed activation.
+            logError("read the stored token", e);
+            token = undefined;
+        }
+        rebuildApi();
+        tokenStatus.setToken(token);
+        pushAvailability();
+    };
+    void reloadToken();
+
     context.subscriptions.push(
+        context.secrets.onDidChange((e) => {
+            if (e.key === TOKEN_SECRET_KEY) {
+                void reloadToken();
+            }
+        }),
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration("mindex")) {
-                api.dispose();
-                api = createApi();
+                rebuildApi();
+            }
+            if (e.affectsConfiguration("mindex.tokenWarningHours")) {
+                tokenStatus.setQuietBefore(
+                    config().get<number>("tokenWarningHours", 24) * 60 * 60 * 1000
+                );
+            }
+        }),
+        // A machine that slept through the scheduled tick wakes with a stale
+        // reading; regaining focus is the moment someone is about to look at it.
+        vscode.window.onDidChangeWindowState((st) => {
+            if (st.focused) {
+                tokenStatus.refresh();
             }
         }),
         new vscode.Disposable(() => api.dispose())
@@ -114,6 +189,9 @@ export function activate(context: vscode.ExtensionContext): void {
             "mindex.hasProject",
             project !== undefined
         );
+        // A different GUID can be a different answer to "does your token reach
+        // this?" — most sharply right after the welcome button writes a fresh one.
+        pushAvailability();
     };
 
     // Async purely to keep every call site unchanged; the read now happens in
@@ -158,11 +236,13 @@ export function activate(context: vscode.ExtensionContext): void {
         () => config().get<string>("serverUrl", "https://127.0.0.1:11111"),
         // The health refresh is the only thing that knows what the server can still
         // do; the Ask view is where that costs the user something.
+        // The token's own grant is folded in here rather than inside the fetch: the
+        // two have different lifetimes (health is polled, a token changes when
+        // someone stores one), and merging at the point of use is what lets either
+        // one repaint the form on its own.
         (availability) => {
-            askProvider.setAvailability(availability);
-            if (!availability.ask) {
-                abortRunsForDegradation(availability.reason);
-            }
+            healthAvailability = availability;
+            pushAvailability();
         },
         // Same shape, and for the same reason: the refresh is what knows what the
         // index holds, the Ask view is what has to stop offering the rest.
@@ -199,8 +279,16 @@ export function activate(context: vscode.ExtensionContext): void {
      */
     const statusActions = {
         refresh: () => void statusProvider.refresh(),
-        retryAll: () => void vscode.commands.executeCommand("mindex.retryAllFailed"),
-        retryFile: (p: string) => void vscode.commands.executeCommand("mindex.retryFile", p),
+        // Awaited, like `mintAgentToken` below and for the same reason: these are
+        // writes, the panel greys the button for as long as they are pending, and a
+        // `void` released it on the first frame — which is not a slower spinner but
+        // no single-flight at all.
+        retryAll: async (): Promise<void> => {
+            await vscode.commands.executeCommand("mindex.retryAllFailed");
+        },
+        retryFile: async (p: string): Promise<void> => {
+            await vscode.commands.executeCommand("mindex.retryFile", p);
+        },
         openFile: (p: string) => {
             if (project !== undefined) {
                 void vscode.window.showTextDocument(
@@ -209,6 +297,13 @@ export function activate(context: vscode.ExtensionContext): void {
             }
         },
         openSettings: () => openSettings(),
+        // Awaited, unlike its neighbours: the panel greys the button for as long
+        // as this is pending, and the dialog behind it is a four-step chain the
+        // user is walking. `void`ing it here would release the button on the
+        // first frame and invite a second press mid-dialog.
+        mintAgentToken: async (): Promise<void> => {
+            await vscode.commands.executeCommand("mindex.mintAgentToken");
+        },
     };
 
     // ── Research: sidebar form → SSE stream → output tab ─────────────────────
@@ -225,10 +320,39 @@ export function activate(context: vscode.ExtensionContext): void {
      */
     const liveSearches = new Set<AbortController>();
 
+    /**
+     * The form's Stop button and the `mindex.researchRunning` context key are the
+     * same fact, so they are set in one place.
+     *
+     * The key exists because Stop is not always reachable. The Ask sidebar is a
+     * `WebviewView` without `retainContextWhenHidden`: collapsing it destroys the
+     * page, and while `AskFormState` now replays the run into the rebuilt one, a
+     * user who has closed the sidebar entirely still has a run and no button. The
+     * key is what lets `mindex.cancelResearch` appear in the palette exactly while
+     * there is something to cancel, and disappear when there is not.
+     */
+    /**
+     * Resolves once the previous run's connection has finished unwinding.
+     *
+     * `cancelResearch` clears `researchAbort` synchronously — it must, or Stop would
+     * not release the form until the socket closed. But the *server* frees the
+     * research slot on disconnect, and that happens some milliseconds later, so a
+     * question asked immediately after a Stop could reach a server that still
+     * believes its one slot is taken and answer 429 `research.busy`. Awaiting this
+     * before launching costs nothing in the ordinary case (it is already resolved)
+     * and closes the window in the one case it is not.
+     */
+    let researchSettled: Promise<void> = Promise.resolve();
+
+    const setResearchRunning = (running: boolean): void => {
+        askProvider.setRunning(running);
+        void vscode.commands.executeCommand("setContext", "mindex.researchRunning", running);
+    };
+
     const cancelResearch = (): void => {
         researchAbort?.abort(); // closing the connection IS the server-side cancel
         researchAbort = undefined;
-        askProvider.setRunning(false);
+        setResearchRunning(false);
         researchPanel?.cancelled();
         researchPanel = undefined;
     };
@@ -254,7 +378,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
         researchAbort = undefined;
         researchPanel = undefined;
-        askProvider.setRunning(false);
+        setResearchRunning(false);
         liveSearches.clear();
 
         abort?.abort();
@@ -263,7 +387,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         const detail = reason ?? "a required dependency stopped answering";
-        panel?.error(`mindex.degraded: ${detail} — the run was aborted.`);
+        panel?.error(`${detail} — the run was aborted.`, "mindex.degraded");
         void vscode.window.showErrorMessage(
             say(`server health degraded — ${detail}. The run in progress was aborted.`)
         );
@@ -288,7 +412,13 @@ export function activate(context: vscode.ExtensionContext): void {
             panel.verdict(verdict),
         onDone: (info: Parameters<ResearchPanel["done"]>[0]) => panel.done(info),
         onError: (code: string, detail: string) => {
-            panel.error(`${code}: ${detail}`, code);
+            // Passed apart, not concatenated. `ResearchPanel.error` has taken the
+            // code as its own argument all along and renders only the detail; this
+            // one call site glued them together, so the panel was the last place in
+            // the extension showing a user `ollama.unavailable: …` — the exact
+            // shape `humanize` exists to prevent. The code still travels, and the
+            // webview hangs it on the block's tooltip.
+            panel.error(detail, code);
             // The run just proved Ollama is unreachable — re-read health
             // so the status bar and the Ask notice say so too. Deliberately not
             // `ollama.error`, which is Ollama answering *with* an error (usually a
@@ -301,6 +431,7 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     const startResearch = async (s: ResearchSubmission): Promise<void> => {
+        await researchSettled;
         if (researchAbort !== undefined) {
             void vscode.window.showInformationMessage(
                 say("a research run is already in progress — cancel it first.")
@@ -339,7 +470,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const abort = new AbortController();
         researchAbort = abort;
-        askProvider.setRunning(true);
+        let settle: () => void = () => {};
+        researchSettled = new Promise<void>((resolve) => {
+            settle = resolve;
+        });
+        setResearchRunning(true);
         let failure: unknown;
         try {
             await api.research(
@@ -369,13 +504,22 @@ export function activate(context: vscode.ExtensionContext): void {
             // Only clear if this run is still the active one (not a newer restart).
             if (researchAbort === abort) {
                 researchAbort = undefined;
-                askProvider.setRunning(false);
+                setResearchRunning(false);
                 // The tab stays open with its finished report, but it is no longer the
                 // live run — closing it must not fire a cancel for work already done.
                 if (researchPanel === panel) {
                     researchPanel = undefined;
                 }
+                // The corpus gained a report (or did not, if this run failed — in
+                // which case re-reading costs one request and says so honestly).
+                // Either way the History panel is describing the corpus as it was.
+                ResearchRunsPanel.notifyRunFinished();
             }
+            // Unconditional, unlike everything above it: this says the connection
+            // is done, which is true whether or not this run is still the current
+            // one — and a handle left unresolved would block the next launch for
+            // the life of the window.
+            settle();
         }
         // Reported *after* the form is released, never inside the `catch`: an error
         // notification's thenable resolves only when the user dismisses it, and VS Code
@@ -396,6 +540,7 @@ export function activate(context: vscode.ExtensionContext): void {
      * subject.
      */
     const startChallenge = async (subject: ResearchRunSummary): Promise<void> => {
+        await researchSettled;
         if (researchAbort !== undefined) {
             void vscode.window.showInformationMessage(
                 say("a research run is already in progress — cancel it first.")
@@ -441,7 +586,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const abort = new AbortController();
         researchAbort = abort;
-        askProvider.setRunning(true);
+        let settle: () => void = () => {};
+        researchSettled = new Promise<void>((resolve) => {
+            settle = resolve;
+        });
+        setResearchRunning(true);
         let failure: unknown;
         try {
             await api.challenge(
@@ -460,11 +609,20 @@ export function activate(context: vscode.ExtensionContext): void {
         } finally {
             if (researchAbort === abort) {
                 researchAbort = undefined;
-                askProvider.setRunning(false);
+                setResearchRunning(false);
                 if (researchPanel === panel) {
                     researchPanel = undefined;
                 }
+                // More than a new row here: the subject's trust badge and its
+                // Challenge/Re-check button are exactly what this run just decided,
+                // and they are the two things a reader would go and check.
+                ResearchRunsPanel.notifyRunFinished();
             }
+            // Unconditional, unlike everything above it: this says the connection
+            // is done, which is true whether or not this run is still the current
+            // one — and a handle left unresolved would block the next launch for
+            // the life of the window.
+            settle();
         }
         // After the handles are released, like `startResearch` — see the comment
         // there for the un-clicked-toast trap.
@@ -531,6 +689,35 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
+    /**
+     * Run a search under the `submit` key and report a failure only once the key is
+     * back.
+     *
+     * The order is the whole point, and it is `startResearch`'s: an error
+     * notification's thenable resolves when the user *dismisses* it, so awaiting one
+     * inside `askKeys.run` held `submit` for as long as the toast sat on screen —
+     * Submit greyed and spinning over a search that had already failed. Retry
+     * re-enters here, so the retried search is single-flighted like any other.
+     */
+    const guardedSearch = async (opts: Omit<SearchOptions, "registry">): Promise<void> => {
+        let failure: unknown;
+        await askKeys.run("submit", async () => {
+            try {
+                const proj = await loadProject();
+                await runSearch(api, proj.mindex.guid, proj.root, {
+                    ...opts,
+                    registry: liveSearches,
+                });
+            } catch (e) {
+                failure = e;
+            }
+        });
+        if (failure === undefined || isCancellation(failure)) {
+            return;
+        }
+        await reportError("Search failed", failure, () => guardedSearch(opts));
+    };
+
     const onAsk = async (s: AskSubmission): Promise<void> => {
         if (s.mode === "research") {
             // Spread the whole submission minus the fields a research run has no
@@ -544,21 +731,11 @@ export function activate(context: vscode.ExtensionContext): void {
             await startResearch({ question: text, ...research });
             return;
         }
-        await askKeys.run("submit", async () => {
-            try {
-                const proj = await loadProject();
-                await runSearch(api, proj.mindex.guid, proj.root, {
-                    topK: s.topK,
-                    query: s.text,
-                    include: s.include,
-                    exclude: s.exclude,
-                    registry: liveSearches,
-                });
-            } catch (e) {
-                if (!isCancellation(e)) {
-                    await reportError("Search failed", e);
-                }
-            }
+        await guardedSearch({
+            topK: s.topK,
+            query: s.text,
+            include: s.include,
+            exclude: s.exclude,
         });
     };
 
@@ -587,10 +764,17 @@ export function activate(context: vscode.ExtensionContext): void {
     // opened in a tab from anywhere that knows its id — the picker, the History
     // rows, a dependency chip in a live run's header.
     const researchDocs = new ResearchDocumentProvider(() => api);
+    // A freshly minted token is served the same way, and for the opposite reason:
+    // not so it can be kept, but so it can be looked at without ever becoming a
+    // file. See `tokenDoc.ts`.
+    const tokenDocs = new TokenDocumentProvider();
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(AskViewProvider.viewId, askProvider),
         vscode.workspace.registerTextDocumentContentProvider(RESEARCH_SCHEME, researchDocs),
         researchDocs,
+        vscode.workspace.registerTextDocumentContentProvider(TOKEN_SCHEME, tokenDocs),
+        tokenDocs,
+        vscode.workspace.onDidCloseTextDocument(forgetIfToken),
         new vscode.Disposable(cancelResearch)
     );
 
@@ -652,7 +836,7 @@ export function activate(context: vscode.ExtensionContext): void {
             await checkDrift();
             // Same reason as after a reindex, in the other direction: a language may
             // have just lost its last searchable chunk.
-            await statusProvider.refresh();
+            await statusProvider.refreshNow();
         } catch (e) {
             await reportError("Delete from index failed", e);
         }
@@ -700,6 +884,21 @@ export function activate(context: vscode.ExtensionContext): void {
             }
             return;
         }
+        // A read-only token is a legitimate way to run this extension, and the
+        // cost of not saying so here is a batch of uploads that each 403 halfway
+        // through — a partial reindex reported as a failure per file, when the
+        // single true sentence is that this credential does not index. The button
+        // stays live: the explanation lives behind it, and a dead button with no
+        // reason is what this replaces.
+        if (!tokenPermits(describeToken(token), "index")) {
+            void vscode.window.showWarningMessage(
+                say(
+                    "your token does not carry `index`, so the server would refuse these " +
+                        "uploads. Search and Research are unaffected."
+                )
+            );
+            return;
+        }
         const proj = await currentProject();
         if (proj === undefined) {
             return;
@@ -734,14 +933,37 @@ export function activate(context: vscode.ExtensionContext): void {
             IndexingPanel.current?.finishedWithInFlight(inFlight);
             // The inventory just changed: a language may have gained its first
             // searchable chunk, which is what the Ask view's pickers offer.
-            await statusProvider.refresh();
+            await statusProvider.refreshNow();
         }
     };
 
     context.subscriptions.push(
         // The one command that works *without* a project: it is how you get one.
         vscode.commands.registerCommand("mindex.createProjectFile", () =>
-            createProjectFile(reloadProject)
+            createProjectFile(reloadProject, (guid) => {
+                // A GUID nobody has ever indexed and one this token may not reach
+                // are the same 404 by design, so nothing the server says later can
+                // tell them apart. Here they can be: the token is in hand and the
+                // GUID was written a line ago.
+                //
+                // No offer to mint a covering token, because there is never one to
+                // make: a token that already reaches everything covers this GUID
+                // too and never gets here, and one scoped to named projects is
+                // refused by `may_mint` when it asks for a project it does not
+                // hold. The remedy is genuinely on the server's host.
+                if (tokenCovers(describeToken(token), guid)) {
+                    return;
+                }
+                void vscode.window.showWarningMessage(
+                    say(
+                        `this project's GUID is not in your token, so the server will answer ` +
+                            `every request about it as though it did not exist — which is what ` +
+                            `it answers for a project nobody has indexed, deliberately, so the ` +
+                            `two cannot be told apart. Mint a token naming ${guid} (or one ` +
+                            `covering "*") on the server's host.`
+                    )
+                );
+            })
         ),
 
         vscode.commands.registerCommand("mindex.checkDrift", checkDrift),
@@ -862,7 +1084,19 @@ export function activate(context: vscode.ExtensionContext): void {
                 await reindex(toReindex, "");
             }
             if (deleting) {
-                await deleteOrphans(orphans);
+                // Reindexing runs its own drift check, which rebuilds this view —
+                // so `orphans` now describes the tree as it was two round trips
+                // ago. Delete only what the fresh check still calls orphaned: the
+                // confirmation bounds the set, and the later check decides.
+                const stillOrphaned = new Set(driftProvider.allPaths("orphaned"));
+                const condemned = orphans.filter((p) => stillOrphaned.has(p));
+                if (condemned.length === 0) {
+                    void vscode.window.showInformationMessage(
+                        say("nothing left to delete — the reindex accounted for it.")
+                    );
+                } else {
+                    await deleteOrphans(condemned);
+                }
             }
         }),
 
@@ -879,6 +1113,11 @@ export function activate(context: vscode.ExtensionContext): void {
                     say(`cancelled ${n} in-flight file(s) (best-effort).`)
                 );
                 await checkDrift();
+                // The claim count comes from the status poll, not from the drift
+                // check, and `reindex` refuses on it — so without this the user
+                // cancels and then cannot reindex until the next tick, which is the
+                // one thing they cancelled in order to do.
+                await statusProvider.refreshNow();
             } catch (e) {
                 await reportError("Cancel failed", e);
             }
@@ -922,6 +1161,9 @@ export function activate(context: vscode.ExtensionContext): void {
                     },
                     challenge: (run) => {
                         void startChallenge(run);
+                    },
+                    runsDeleted: (ids) => {
+                        askProvider.dropContextRuns(ids);
                     },
                     reAsk: (run) => {
                         const effort =
@@ -1033,6 +1275,70 @@ export function activate(context: vscode.ExtensionContext): void {
 
         vscode.commands.registerCommand("mindex.openSettings", () => openSettings()),
 
+        vscode.commands.registerCommand("mindex.mintAgentToken", async () => {
+            const proj = await currentProject();
+            if (proj === undefined) {
+                return;
+            }
+            try {
+                await mintAgentToken(api, proj.mindex.guid, path.basename(proj.root));
+            } catch (e) {
+                // `what` is the operation, and `reportError` appends the sentence —
+                // so it must not be a sentence itself. Naming the likely cause here
+                // produced "cannot issue a token: the stored token does not carry
+                // `mint`: The server refused the request." The cause now lives where
+                // it belongs: `humanize`'s 403 branch says what a 403 means for any
+                // request, and offers the button that issues a wider credential.
+                await reportError(say("could not issue a token"), e);
+            }
+        }),
+
+        vscode.commands.registerCommand("mindex.setToken", async () => {
+            const entered = await promptForToken(token);
+            // `undefined` is a dismissed box and must leave the stored token alone;
+            // an empty string is a deliberate clear. The same distinction the
+            // research-context picker makes, for the same reason.
+            if (entered === undefined) {
+                return;
+            }
+            if (entered === "") {
+                await context.secrets.delete(TOKEN_SECRET_KEY);
+                void vscode.window.showInformationMessage(say("stored token cleared."));
+                return;
+            }
+            const facts = describeToken(entered);
+            // Refused before it is stored, not after: the server does not check
+            // `aud`, so this token would work, and the mistake it catches — the
+            // agent's credential pasted into the editor's keychain — is invisible
+            // from every other surface. Overridable, because the label is a hint
+            // and the person holding the token may know better than it does.
+            const wrongAudience = audienceRefusal(facts);
+            if (wrongAudience !== undefined) {
+                const STORE = "Store it anyway";
+                const choice = await vscode.window.showWarningMessage(
+                    say(wrongAudience),
+                    { modal: true },
+                    STORE
+                );
+                if (choice !== STORE) {
+                    return;
+                }
+            }
+            await context.secrets.store(TOKEN_SECRET_KEY, entered);
+            // `onDidChange` refreshes the cache and the indicator; this only says
+            // what the token turned out to be, which is the half a paste can get
+            // wrong without any error — the wrong token is a perfectly valid one.
+            const scope =
+                facts.projects === undefined
+                    ? ""
+                    : ` — ${facts.projects.join(", ")} / ${(facts.actions ?? []).join(", ")}`;
+            const life =
+                facts.expiresAtMs === undefined
+                    ? " It does not expire."
+                    : ` It expires ${new Date(facts.expiresAtMs).toLocaleString()}.`;
+            void vscode.window.showInformationMessage(say(`token stored${scope}.${life}`));
+        }),
+
         vscode.commands.registerCommand("mindex.retryAllFailed", async () => {
             try {
                 const proj = await loadProject();
@@ -1044,7 +1350,7 @@ export function activate(context: vscode.ExtensionContext): void {
                           )
                         : say("no failed files in this project to retry.")
                 );
-                await statusProvider.refresh();
+                await statusProvider.refreshNow();
             } catch (e) {
                 await reportError("Retry failed", e);
             }
@@ -1067,7 +1373,7 @@ export function activate(context: vscode.ExtensionContext): void {
                         ? say(`requeued ${filePath}.`)
                         : say(`${filePath} is not failed anymore.`)
                 );
-                await statusProvider.refresh();
+                await statusProvider.refreshNow();
             } catch (e) {
                 await reportError("Retry failed", e);
             }
@@ -1077,25 +1383,39 @@ export function activate(context: vscode.ExtensionContext): void {
             askProvider.focus("research")
         ),
 
+        // The palette's copy of the form's Stop button, gated by
+        // `mindex.researchRunning` so it is offered exactly while there is a run.
+        // Stop is the primary control and stays so; this is the way out for a user
+        // whose sidebar is closed, which is a state the form cannot draw itself out
+        // of. It reports rather than staying silent when there is nothing to stop:
+        // a palette command that does nothing at all reads as broken.
+        vscode.commands.registerCommand("mindex.cancelResearch", () => {
+            if (researchAbort === undefined) {
+                void vscode.window.showInformationMessage(
+                    say("no research run is in progress.")
+                );
+                return;
+            }
+            cancelResearch();
+        }),
+
         vscode.commands.registerCommand("mindex.ask", () => askProvider.focus()),
 
         vscode.commands.registerCommand("mindex.search", async () => {
-            // The same key the form's Submit takes: the palette and the form are
-            // two doors into one search, and a keybinding pressed while the form's
-            // search is in flight must not open a second quick pick.
-            await askKeys.run("submit", async () => {
-                try {
-                    const proj = await loadProject();
-                    // The palette entry point stays deliberately scope-free: it
-                    // prompts for a query and has no form to read a scope from.
-                    const topK = config().get<number>("topK", 10);
-                    await runSearch(api, proj.mindex.guid, proj.root, { topK });
-                } catch (e) {
-                    if (!isCancellation(e)) {
-                        await reportError("Search failed", e);
-                    }
-                }
-            });
+            // Prompted before the key is taken, not inside `runSearch`: the box is
+            // open for as long as the user is typing, and holding `submit` across it
+            // would make the form's Submit dead for that whole time — for a search
+            // that has not started and may never be asked for.
+            const query = await promptForQuery();
+            if (query === undefined) {
+                return;
+            }
+            // `guardedSearch` takes the same key the form's Submit does: the palette
+            // and the form are two doors into one search, and a keybinding pressed
+            // while the form's search is in flight must not open a second quick pick.
+            // The palette entry point stays deliberately scope-free — it has no form
+            // to read a scope from.
+            await guardedSearch({ topK: config().get<number>("topK", 10), query });
         })
     );
 
@@ -1171,9 +1491,10 @@ function config(): vscode.WorkspaceConfiguration {
  *
  * The `@ext:` filter is `publisher.name` from `package.json` — the *identifier*, so
  * it stays lowercase while everything the user reads says MINDex. Everything the
- * server needs to be reachable (`serverUrl`, `noVerify`, `caCert`, `apiKey`) lives
- * there, and the panel that reports "unreachable" is exactly where a link to it
- * belongs.
+ * server needs to be reachable (`serverUrl`, `noVerify`, `caCert`) lives there,
+ * and the panel that reports "unreachable" is exactly where a link to it belongs.
+ * The bearer token is the one exception and is deliberately not a setting — see
+ * `mindex.setToken`.
  */
 function openSettings(): void {
     void vscode.commands.executeCommand(
@@ -1193,10 +1514,59 @@ function openSettings(): void {
  * unreadable CA leaves the connection to succeed by whatever other means is
  * configured, and says out loud which path was ignored.
  */
-function createApi(): MindexApi {
+/**
+ * Where the bearer token lives, and the reason it is not a setting.
+ *
+ * `SecretStorage` is the platform keychain. A `mindex.token` setting would sit in
+ * a plaintext `settings.json` and — being a string setting — would be carried to
+ * every other machine by Settings Sync, which for a credential is a copy nobody
+ * decided to make. That is what `mindex.apiKey` used to do, and removing it is
+ * half of why this key exists.
+ *
+ * It is deliberately **not** the only home for a credential on this machine: the
+ * CLI tools read `~/.config/mindex/credentials.toml`, which no extension's
+ * keychain can be, since a store one application can read is not an answer to
+ * "who holds the credential". The two are separate copies on purpose, and the
+ * runbook says to mint one token per holder rather than share one.
+ */
+const TOKEN_SECRET_KEY = "mindex.token";
+
+/**
+ * The paste box. Returns `undefined` when dismissed, `""` to clear.
+ *
+ * `password: true` keeps the value out of the screen and out of the input's own
+ * history. The validation is deliberately shallow — shape, never validity: this
+ * process cannot check a signature, and a box that refused a token the server
+ * would have accepted is a worse failure than one that lets a bad paste through
+ * to a 401 that says exactly what is wrong.
+ */
+async function promptForToken(current: string | undefined): Promise<string | undefined> {
+    const facts = describeToken(current);
+    const held =
+        current === undefined
+            ? "none stored"
+            : facts.subject !== undefined
+              ? `replacing the one issued to ${facts.subject}`
+              : "replacing the stored one";
+    const entered = await vscode.window.showInputBox({
+        title: say("set the bearer token"),
+        prompt: `Mint one on the server's host with \`mindex mint-token\` (${held}). Leave empty to clear.`,
+        password: true,
+        ignoreFocusOut: true,
+        validateInput: (value) => {
+            const v = value.trim();
+            if (v === "" || v.split(".").length === 3) {
+                return undefined;
+            }
+            return "that does not look like a token — mindex mint-token prints one line of three dot-separated parts";
+        },
+    });
+    return entered?.trim();
+}
+
+function createApi(token: string | undefined): MindexApi {
     const cfg = config();
     const caCert = cfg.get<string>("caCert", "").trim();
-    const apiKey = cfg.get<string>("apiKey", "").trim();
     const noVerify = cfg.get<boolean>("noVerify", false);
     let ca: Buffer | undefined;
     if (caCert !== "" && !noVerify) {
@@ -1217,7 +1587,7 @@ function createApi(): MindexApi {
         serverUrl: cfg.get<string>("serverUrl", "https://127.0.0.1:11111"),
         noVerify,
         ca,
-        apiKey: apiKey === "" ? undefined : apiKey,
+        token,
         timeoutMs: cfg.get<number>("requestTimeoutSeconds", 15) * 1000,
         streamIdleMs: cfg.get<number>("streamIdleTimeoutSeconds", 180) * 1000,
     });

@@ -179,6 +179,146 @@ pub(crate) fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Runs a subcommand and returns. Nothing here opens the database, the vector
+/// store or the embedder.
+fn run_command(command: &config::Command, cfg: &config::Config) -> Result<(), BoxError> {
+    match command {
+        config::Command::MintToken {
+            sub,
+            projects,
+            actions,
+            audiences,
+            days,
+            key_id,
+            new_key,
+        } => {
+            let parsed: Vec<backend::auth::Action> = actions
+                .iter()
+                .map(|a| {
+                    backend::auth::Action::parse(a.trim()).ok_or_else(|| {
+                        format!(
+                            "unknown action {a:?}; the vocabulary is {}",
+                            backend::auth::Action::ALL
+                                .iter()
+                                .map(|a| a.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            let for_whom: Vec<backend::auth::Audience> = audiences
+                .iter()
+                .map(|a| {
+                    backend::auth::Audience::parse(a.trim()).ok_or_else(|| {
+                        format!(
+                            "unknown audience {a:?}; the vocabulary is {}",
+                            backend::auth::Audience::ALL
+                                .iter()
+                                .map(|a| a.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            if *days > cfg.auth.max_token_days && *days != 0 {
+                return Err(format!(
+                    "--days {days} exceeds [auth].max_token_days = {}. With no revocation \
+                     list by design, that ceiling is the bound on how long a leaked token \
+                     stays usable.",
+                    cfg.auth.max_token_days
+                )
+                .into());
+            }
+
+            // `load_or_create`, not `load`: minting on a host that has never run
+            // the server is the ordinary bootstrap, and failing there with "no
+            // such file" would leave an operator with nothing to do about it.
+            let ring = backend::auth::Keyring::load_or_create(&cfg.auth.signing_key_file)?;
+            let ring = if *new_key {
+                let kid = key_id.as_deref().unwrap_or_default();
+                backend::auth::add_key(
+                    &cfg.auth.signing_key_file,
+                    kid,
+                    &format!("minted for {sub}"),
+                )?;
+                eprintln!(
+                    "Added key id {kid:?}. Deleting that table from {} later withdraws every \
+                     token signed under it, and nothing else.",
+                    cfg.auth.signing_key_file.display()
+                );
+                backend::auth::Keyring::load(&cfg.auth.signing_key_file)?
+            } else {
+                ring
+            };
+            let (token, claims) = backend::auth::mint_with_key(
+                &ring,
+                key_id.as_deref(),
+                sub,
+                projects.clone(),
+                parsed,
+                for_whom,
+                *days,
+            )?;
+
+            // Everything explanatory goes to stderr and the token alone to
+            // stdout, so `--quiet 2>/dev/null` pipes cleanly into a credentials
+            // file. It is printed once and stored nowhere: there is no record of
+            // issued tokens, by design.
+            eprintln!(
+                "Minted for {:?}: projects {:?}, actions {:?}, {}, {}.",
+                claims.sub,
+                claims.prj,
+                claims.act.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                // Spelled out rather than printed as `[]`, because "no audience"
+                // and "every audience" are the same list and the wrong reading
+                // of it is the dangerous one.
+                if claims.aud.is_empty() {
+                    "usable by any client".to_string()
+                } else {
+                    format!(
+                        "for {}",
+                        claims
+                            .aud
+                            .iter()
+                            .map(|a| a.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    )
+                },
+                if claims.exp.is_some() {
+                    format!("expires in {days} day(s)")
+                } else {
+                    "never expires".to_string()
+                },
+            );
+            if claims.exp.is_none() {
+                eprintln!(
+                    "WARNING: this token never expires. There is no revocation list, so the \
+                     only way to withdraw it is to delete key id {:?} from \
+                     [auth].signing_key_file — which also withdraws every other token signed \
+                     under it. Right for a machine-local credential in a 0600 file that no \
+                     context ever sees (the metrics scraper is the case this exists for); \
+                     wrong for anything else.",
+                    key_id.as_deref().unwrap_or("default")
+                );
+            }
+            if claims.is_wildcard() {
+                eprintln!(
+                    "WARNING: this token reaches every project on the server. That is right \
+                     for a working credential on a machine holding the repositories, and \
+                     wrong for anything that will be pasted into a model's context."
+                );
+            }
+            println!("{token}");
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     tracing_subscriber::registry()
@@ -202,6 +342,13 @@ async fn main() -> Result<(), BoxError> {
                 .with_span_list(true)
                 .flatten_event(true)
                 .with_ansi(std::env::var("RUST_ENV") == Ok("dev".into()))
+                // stderr, not stdout. Conventional for a service, and
+                // load-bearing for `mint-token`: that command's whole output is
+                // one credential on stdout, so a log line sharing the stream
+                // lands in whatever file the operator redirected it to. systemd
+                // and Docker capture both streams identically, so nothing that
+                // reads these logs today notices.
+                .with_writer(std::io::stderr)
                 .pretty(),
         )
         .init();
@@ -236,6 +383,22 @@ async fn main() -> Result<(), BoxError> {
         }
     };
     info!(source = %config_source, "Configuration resolved.");
+
+    // Subcommands run and exit here, before anything is opened: minting a token
+    // must work while the database is unreachable and the embedder is down,
+    // because "nobody can reach the server" is the state it is most often needed
+    // in. It reads only the key file.
+    if let Some(command) = &cli.command {
+        // Printed and exited rather than returned: a `BoxError` out of `main` is
+        // rendered through `Debug`, which for these shows the enum variant around
+        // the sentence instead of the sentence — and this is the one path whose
+        // whole audience is a person at a terminal.
+        if let Err(e) = run_command(command, &cfg) {
+            eprintln!("mindex: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // Built before anything it measures, and unconditionally: `[metrics].enabled`
     // gates the endpoint and the collector, never the recording. Everything that
@@ -597,6 +760,36 @@ async fn main() -> Result<(), BoxError> {
     // being dropped mid-flight, which for an indexing batch means files left
     // `indexing` and for a research run means a client's stream cut without a
     // terminal event.
+    // Authorization, if this deployment opted in. Loaded before the listener so a
+    // key file that cannot be read stops the process here, naming the path —
+    // rather than letting the server come up and refuse every request, which is a
+    // total outage wearing the costume of a credential problem on the client side.
+    let auth_state = if cfg.auth.enabled {
+        let keyring = backend::auth::Keyring::load_or_create(&cfg.auth.signing_key_file)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot use the signing key file: {e}\n\
+                     Check: the path in [auth].signing_key_file, that this process may create \
+                     or read it, and that its mode is 0600."
+                )
+            });
+        info!(
+            key_ids = ?keyring.key_ids(),
+            leeway_seconds = cfg.auth.leeway_seconds,
+            max_token_days = cfg.auth.max_token_days,
+            "Authorization is on: every non-public route requires a bearer token. \
+             Key ids are logged because they are not secret and are what makes a \
+             refused token diagnosable."
+        );
+        Some(Arc::new(backend::http3::AuthState {
+            keyring,
+            leeway_seconds: cfg.auth.leeway_seconds,
+            max_token_days: cfg.auth.max_token_days,
+        }))
+    } else {
+        None
+    };
+
     let server = backend::http3::run(
         cfg.server.bind,
         (
@@ -673,6 +866,7 @@ async fn main() -> Result<(), BoxError> {
             },
             research_models: research_models.clone(),
             metrics: metrics.clone(),
+            auth: auth_state,
         },
         cfg.server.max_body_mib * 1024 * 1024,
         cfg.server.http3,

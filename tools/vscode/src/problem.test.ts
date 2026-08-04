@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
+    ConfigurationError,
     humanize,
     MalformedResponseError,
     ProblemError,
@@ -111,6 +112,60 @@ describe("humanize", () => {
             humanize(new ProblemError(429, "research.busy", "No slot is free.")).text,
             /Active Research Runs/
         );
+    });
+
+    /**
+     * The two credential refusals. They used to fall through to the generic `<500`
+     * branch: the server's raw detail, not retryable, and nothing to press — which
+     * left an expired token showing up only as requests that quietly stop working,
+     * exactly the state the token indicator exists to prevent and cannot detect for
+     * an opaque (non-JWT) token.
+     */
+    it("offers a way to replace a token the server would not accept", () => {
+        const h = humanize(new ProblemError(401, "auth.token_expired", "expired"));
+        assert.equal(h.retryable, false);
+        assert.equal(h.action?.command, "mindex.setToken");
+        assert.ok(h.text.length > 0);
+        assert.ok(!h.text.includes("auth.token_expired"), "the code stays off the sentence");
+        assert.equal(h.code, "auth.token_expired");
+    });
+
+    /**
+     * 403 must not read as 401. The token is valid and replacing it is the wrong
+     * advice; the missing *action* is what the server names, so that leads.
+     */
+    it("distinguishes a token that is not accepted from one that is too narrow", () => {
+        const h = humanize(
+            new ProblemError(
+                403,
+                "auth.action_not_permitted",
+                "This token does not carry `mint`."
+            )
+        );
+        assert.match(h.text, /does not carry `mint`/);
+        assert.equal(h.retryable, false);
+        assert.notEqual(h.action?.command, "mindex.setToken");
+        assert.ok(h.action !== undefined, "a refusal with no way forward is the bug");
+    });
+
+    /**
+     * A wrong `mindex.serverUrl` is the one failure whose remedy the client knows
+     * exactly, and it was the one that reached "Something went wrong." — the throw
+     * happens synchronously inside the request Promise's executor, so it escaped the
+     * UnreachableError wrap entirely.
+     */
+    it("names the setting when the server address cannot be used", () => {
+        const h = humanize(
+            new ConfigurationError("mindex.serverUrl", "MINDex is served over HTTPS only.")
+        );
+        assert.match(h.text, /mindex\.serverUrl/);
+        assert.equal(
+            h.retryable,
+            false,
+            "a wrong setting does not fix itself on a second press"
+        );
+        assert.equal(h.action?.command, "mindex.openSettings");
+        assert.notEqual(h.text, "Something went wrong.");
     });
 
     it("says something bounded about anything it has never seen", () => {

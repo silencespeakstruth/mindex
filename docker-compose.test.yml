@@ -69,17 +69,98 @@ services:
       mock-ollama:
         condition: service_healthy
 
+  # ── The authorized half of the stack ────────────────────────────────────────
+  # A second mindex with [auth].enabled, because the suite above asserts the
+  # unauthorized behaviour and that coverage is the point: an auth-off deployment
+  # must stay byte-for-byte what it was. Its own database and collections, so the
+  # two cannot disturb each other's fixtures.
+
+  # The credentials are minted by this container *before* it becomes the server,
+  # rather than by an init service, because `--abort-on-container-exit` aborts the
+  # whole run when any container exits — and a one-shot bootstrap exits by design,
+  # which tore the stack down before a single test ran.
+  #
+  # Minting first is also what the ordering has to be: `mint-token` creates the key
+  # file itself (0600, O_EXCL) when absent, and a server that generated its own
+  # would sign with a secret no token here was minted under. It doubles as a check
+  # that the cold-volume bootstrap works, since the volume starts empty.
+  #
+  # The root token is wildcard + every action — exactly what must never be pasted
+  # anywhere. Here it is only the *minter*; what the tests exercise are the narrow
+  # tokens derived from it through POST /auth/tokens.
+  mindex-auth:
+    build: .
+    volumes:
+      - test_auth_db:/data
+      - test_auth_certs:/certs
+      - test_auth_keys:/keys
+      - test_auth_tokens:/tokens
+      - hf_cache:/root/.cache/huggingface
+      - ./tests/integration/mindex-auth-config.toml:/config/mindex-auth-config.toml:ro
+    environment:
+      RUST_LOG: info
+      MINDEX_CONFIG: /config/mindex-auth-config.toml
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mindex mint-token --sub 'root@test' --project '*' \
+          --can search,research,index,delete,admin,mint --days 30 > /tokens/root.jwt
+        # A token under a *second* key id, so a test can establish that a `kid`
+        # other than the active one is a first-class credential — which is what
+        # makes deleting one key a way to withdraw one holder. Minted here rather
+        # than over the network because `--key-id --new-key` is deliberately
+        # local-only: creating signing material is not a thing a token may do.
+        #
+        # The `||` is not defensive noise. The key volume persists between runs and
+        # `--new-key` refuses an id that already exists — deliberately, since
+        # replacing one would invalidate every token signed under it — so the second
+        # run of this stack takes the other branch. That is the same path an
+        # operator re-minting for an existing holder takes.
+        mindex mint-token --sub 'revocable@test' --project '*' --can search \
+          --days 30 --key-id doomed --new-key > /tokens/revocable.jwt \
+        || mindex mint-token --sub 'revocable@test' --project '*' --can search \
+          --days 30 --key-id doomed > /tokens/revocable.jwt
+        # Only now the server, and only via the image's own entrypoint — it is what
+        # generates the self-signed certificate.
+        exec /entrypoint.sh \
+          --config=/config/mindex-auth-config.toml \
+          --bind=0.0.0.0:11111 \
+          --db-path=/data/mindex.db \
+          --cert-path=/certs/cert.pem \
+          --key-path=/certs/key.pem \
+          --qdrant-server=http://qdrant:6334 \
+          --model-server=http://mock-embedder:11211 \
+          --db-pool-size=16
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      mock-embedder:
+        condition: service_healthy
+      mock-ollama:
+        condition: service_healthy
+
   test-runner:
     build:
       context: tests/integration
     environment:
       MINDEX_URL: https://mindex:11111
+      MINDEX_AUTH_URL: https://mindex-auth:11111
+      MINDEX_ROOT_TOKEN_FILE: /tokens/root.jwt
+      MINDEX_REVOCABLE_TOKEN_FILE: /tokens/revocable.jwt
       MOCK_EMBEDDER_URL: http://mock-embedder:11211
       MOCK_OLLAMA_URL: http://mock-ollama:11434
+    volumes:
+      - test_auth_tokens:/tokens:ro
     depends_on:
       - mindex
+      - mindex-auth
 
 volumes:
   test_mindex_db:
   test_mindex_certs:
+  test_auth_db:
+  test_auth_certs:
+  test_auth_keys:
+  test_auth_tokens:
   hf_cache:

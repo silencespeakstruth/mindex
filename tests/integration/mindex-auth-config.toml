@@ -1,0 +1,34 @@
+# Config for the *second* mindex in the test stack: the one with authorization on.
+#
+# It is a separate service rather than a flag on the first because the whole
+# existing suite asserts the unauthorized behaviour, and turning `[auth]` on for
+# it would rewrite every test to carry a credential — which would also delete the
+# coverage that matters most, that an auth-off deployment is byte-for-byte what it
+# always was.
+#
+# Its database and Qdrant collections are its own, so nothing here can disturb the
+# other stack's fixtures.
+
+[auth]
+enabled = true
+# Lives in a volume shared with the bootstrap container, which creates it (0600,
+# O_EXCL) while minting the root token. That ordering is the real bootstrap: the
+# key exists before the server does, and the first credential is issued by
+# somebody with shell access to the host rather than over the network.
+signing_key_file = "/keys/signing-keys.toml"
+# Deliberately lower than the 90-day default, so the tests can assert that the
+# server's own ceiling binds a request asking for more.
+max_token_days = 30
+leeway_seconds = 60
+
+# The research endpoints are reachable in this stack too, so the `research` action
+# has something to refuse. Pointed at the same scripted mock.
+[research]
+ollama_url = "http://mock-ollama:11434"
+default_model = "mock-model"
+worker_threads = 1
+max_concurrent = 1
+
+[metrics]
+refresh_interval_seconds = 5
+probe_dependencies = false

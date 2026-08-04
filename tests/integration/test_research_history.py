@@ -45,13 +45,21 @@ def ollama_session() -> Iterator[object]:
 
 
 def run_once(client: httpx.Client, project: str, question: str) -> dict:
-    """Drive one full research run and return its `done` payload."""
-    status, events = research_events(
-        client, project, {"question": question, "effort": "low"}
+    """Drive one full research run and return its `done` payload.
+
+    Deliberately through the **default** (non-streaming) mode, while `run_with`
+    below stays on the stream: what this file tests is what a finished run leaves
+    in the corpus, and that must not depend on how the caller chose to be told
+    about it. Splitting the two runners is what makes a difference show up here
+    rather than in nobody's test.
+    """
+    resp = client.post(
+        f"{MINDEX_URL}/v0/{project}/research",
+        json={"question": question, "effort": "low"},
+        timeout=30.0,
     )
-    assert status == 200, events
-    assert events[-1][0] == "done", events
-    return json.loads(events[-1][1])
+    assert resp.status_code == 200, resp.text
+    return resp.json()["done"]
 
 
 def list_runs(client: httpx.Client, project: str, **params: str | int | bool) -> dict:

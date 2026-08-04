@@ -50,11 +50,15 @@ index cannot honestly claim to have.
 → [`tools/mcp/mindex`](tools/mcp/mindex/README.md) (search, symbols, live reindex) and
 [`tools/mcp/scout`](tools/mcp/scout/README.md) (research, challenge). A running server
 also serves **`/llms.txt`** — the whole workflow as one document, so pointing an agent
-at that URL is enough to get it started. A terminal frontend and a
+at that URL is enough to get it started — and **`/.well-known/mindex.json`**, the same
+thing as data: identity, endpoint inventory and the live `/config` snapshot in one JSON
+document. Two channels rather than one because some agent harnesses classify a fetched
+document that addresses the model as a prompt injection and refuse to read it; JSON has
+no register to object to, so discovery still works where the prose does not. A terminal frontend and a
 [VS Code extension](tools/vscode/README.md) drive the same API for humans; the extension
 ships as a `.vsix` on the
 [releases page](https://github.com/silencespeakstruth/mindex/releases), so
-`code --install-extension mindex-vscode-1.1.0.vsix` is the whole of installing it.
+`code --install-extension mindex-vscode-1.2.0.vsix` is the whole of installing it.
 
 ## Install
 
@@ -121,8 +125,17 @@ are absolute; substitute your own:
 
 ```toml
 [server]
-cert_path = "/path/to/config/cert.pem"            # TLS is the only transport security
+cert_path = "/path/to/config/cert.pem"            # TLS secures the transport
 key_path  = "/path/to/config/key.pem"
+
+[auth]
+enabled = false                                   # the default; with it off, TLS is
+                                                  # the only protection and this is an
+                                                  # internal service. Turn it on — and
+                                                  # it is mandatory behind a gateway —
+                                                  # and a bearer token then decides
+                                                  # which projects and which actions
+                                                  # each caller reaches.
 
 [model]
 server_url = "http://localhost:11211"             # the BGE-M3 embedder
@@ -189,14 +202,27 @@ intersected — because a sync only drops what your refs no longer reach.
 
 ## What else you should know
 
-- **No API auth.** TLS only; mindex is meant for a trusted local machine or network.
-  To reach it from anywhere else, terminate at a reverse proxy and let *that*
-  authenticate. Every client can send an optional `X-Api-Key` for such a proxy —
-  `--api-key` for the CLI tools, `MINDEX_API_KEY` for all of them (preferred: a
-  flag value is visible in `ps`), `api_key` in `indexer.toml`/`watcher.toml`, the
-  `mindex.apiKey` setting in VS Code. Unset means no header is sent, so a direct
-  `https://127.0.0.1:11111` connection is unchanged. mindex itself ignores the
-  header — it is entirely the proxy's business.
+- **Authorization is opt-in and off by default.** Without it, TLS is the only
+  transport security and mindex answers every caller that can reach the port — fine
+  for a trusted local machine, and the reason an unconfigured deployment must not
+  be exposed. Turning on `[auth]` makes the server mint and verify its own bearer
+  tokens: each names the projects it reaches and the actions it permits
+  (`search`, `research`, `index`, `delete`, `admin`, `mint`), and the check is one
+  HMAC with no server-side session state. Issue one with `mindex mint-token`.
+
+  Every client sends the same header, `Authorization: Bearer` — `--token` for the
+  CLI tools, `$MINDEX_TOKEN` for all of them, `$MINDEX_TOKEN_FILE` naming a 0600
+  file for anything configured through an environment block (an MCP server list),
+  `token` in `indexer.toml`/`watcher.toml`, a `credentials.toml` entry per server
+  URL, and the OS keychain in VS Code (**MINDex: Set Bearer Token**, never a
+  setting — Settings Sync would carry it between machines). Prefer the file or the
+  environment: a flag value is visible in `ps`. **MINDex: Issue a Token for an
+  Agent** derives a short-lived read-and-research token for the current project
+  from the one the extension holds, so handing an agent a credential does not
+  need a shell on the server's host; the server refuses anything the minting
+  token does not already hold. Unset sends no header, so a direct
+  `https://127.0.0.1:11111` connection to a server with `[auth]` off is unchanged.
+  Full rationale and runbook: `docs/claude/auth.md`.
 - **Certificates.** A CA the host already trusts needs nothing: every client reads
   the OS trust store, which is where mkcert and corporate roots install themselves.
   A CA that is *not* installed there is named explicitly — `--ca-cert` for the CLI
@@ -206,7 +232,12 @@ intersected — because a sync only drops what your refs no longer reach.
   on first start, which no store can vouch for. Where both are set, the skip wins:
   in VS Code `mindex.noVerify` overrides `mindex.caCert`, and a `caCert` naming a
   file this machine does not have is a warning naming the path, not a dead
-  extension.
+  extension. One consequence worth planning for: those settings exist only in *our*
+  clients. A third-party agent driving the HTTP API has no `--ca-cert` and no
+  `noVerify`, so a locally-issued certificate makes the server simply unreachable to
+  it. Reaching mindex from a machine whose trust store you do not control wants a
+  publicly-trusted certificate; where the listener has no inbound `80`, ACME **DNS-01**
+  is the challenge that still works.
 - **Everything is a knob, documented once.** `mindex --help` and each tool's `--help`;
   the full HTTP API with schemas is live at **`/swagger-ui`** (OpenAPI at
   `/api-docs/openapi.json`). Errors are RFC 7807 `problem+json` with stable machine

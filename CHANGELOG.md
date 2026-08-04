@@ -9,6 +9,300 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
+## [1.2.0] — 2026-08-04
+
+Gives the server **one credential that says what it may do and who holds it**, and
+retires the shared API key a gateway used to check. Makes the service discoverable by an
+agent handed nothing but a URL, including the harnesses that will not read prose off the
+network. Stops `POST /research` charging a caller a whole GPU budget for not having
+stayed to read the answer.
+
+### Upgrading — REQUIRED if this server is reachable through a gateway
+
+**`[auth].enabled = true` is mandatory behind `deploy/gate/`.** The gateway admits on the
+*presence* of a Bearer-shaped header — nginx cannot verify a signature and does not try —
+so every question of validity, scope and action is answered in the server. With
+authorization off, `Authorization: Bearer x` is admitted and served everything.
+`enabled = false` now means exactly one thing: a server on a trusted network that
+authorizes nothing (the Docker test stack, a loopback-only install). It remains the
+default, and an auth-off deployment is byte-for-byte what it was.
+
+Migrate in this order, which is the only safe one: **turn `[auth]` on first, then switch
+the gateway map.** While mindex checked nothing, the API key was the only thing guarding
+the remote path; nothing breaks at the second step that the first did not already break,
+since a caller holding only the old key is refused by mindex the moment authorization
+comes on.
+
+```sh
+mindex mint-token --sub alice --project '*' --can search,research,index --days 30
+```
+
+**The shared `X-Api-Key` is gone rather than deprecated.** Two credentials where one is
+strictly stronger is not defence in depth — the weaker one sets the floor, and that one
+carried no scope, no expiry and no way to withdraw a single holder. Remove it from every
+client; nothing reads it.
+
+**A metrics scraper needs a credential of its own.** `/metrics` is `admin`-scoped, which
+is structural rather than a choice: nothing about it is per-project, and mindex cannot
+tell a loopback scraper from a request that arrived through a gateway. So enabling
+`[auth]` blanks every dashboard until the scrape carries a token. Two details worth
+stating, because both fail in the direction that looks like it worked: Prometheus's
+`bearer_token_file` must point **outside `$HOME`** (a unit running `ProtectHome=true`
+reads a path there as absent, and the symptom is a scrape that stops rather than a
+permissions message), and `--days 0` with **its own `--key-id`** is right here and almost
+nowhere else — an expiry would blank the dashboards at an hour nobody is watching, and a
+separate key id makes withdrawal one table deleted from the key file rather than a
+rotation that logs out every other client.
+
+There is **no denylist, by design**: revocation is expiry or deleting a `kid`. That is
+the per-request server-side state this design removes, and `--key-id … --new-key` is what
+makes per-holder ids one flag rather than hand-edited base64.
+
+### Upgrading — a caller that wants research frames must now ask for them
+
+`POST /v0/{guid}/research` and `POST /v0/{guid}/research/{run_id}/challenge` answer
+**one JSON body** unless the request carries `?stream=yes`. Both shipped clients already
+do: `tools/mcp/scout` and the VS Code extension were changed in the same commit, so an
+upgrade is invisible from either. A hand-written SSE client is what has to change, and
+the symptom if it does not is unambiguous rather than subtle — the body parses as zero
+frames, so a run reads as one that never terminated.
+
+The failure shapes move with the default, and only because they can. With no stream open
+there is no "after the status was already 200", so what would have been an `error` frame
+is a problem+json status: **503** `ollama.unavailable` (unreachable or mute), **503**
+`ollama.error` (Ollama answering *with* an error — nearly always a model that is not
+pulled) and **500** `research.no_report`. Under `?stream=yes` all three remain `error`
+events on a 200, byte-for-byte as before.
+
+One operational consequence: without frames the whole run is one silent request, so any
+intermediary between caller and server must tolerate `worst_case_seconds` of quiet —
+`GET /config` publishes it per effort level, and for `high` it is over an hour.
+
+### Added
+
+- **`[auth]` — opt-in authorization, one HMAC and no server-side state.** HS256, written
+  here rather than taken from a crate, so every copy of the secret is owned (no `Debug`,
+  zeroized, key file 0600 created with `O_EXCL`) and algorithm confusion is closed by
+  construction: `verify` reads `kid` and nothing else before checking the MAC, pinned by
+  `the_algorithm_header_cannot_select_the_algorithm`. The TLS key is not reused. Keys:
+  `enabled`, `signing_key_file`, `max_token_days`, `leeway_seconds`.
+- **The token is the mapping, and there is no schema change.** `prj` (dashless GUIDs, or
+  exactly `["*"]`, which must be *spelled* — an empty list reaches nothing) and `act`
+  (`search`/`research`/`index`/`delete`/`admin`/`mint`) are signed into it. The rejected
+  alternative was a `tenant_id` column, and it cost a table rebuild, a trigger, an
+  in-process cache, a startup warm, a rule for pre-existing rows and an in-transaction
+  re-read — none of which survives, along with one bug class: only a caller whose token
+  already names a GUID can create that project, so `POST /index` stops being an existence
+  oracle.
+- **`POST /auth/tokens`** — mint a narrower token from the one presented. A minted token
+  can never exceed its minter in actions, projects or expiry; without that, a read-only
+  `mint` credential becomes `admin` one call later. `--days 0` mints a non-expiring token
+  and **only the local CLI may**: a network-reachable way to issue an eternal credential
+  is a different and worse thing, so the endpoint refuses it.
+- **`mindex mint-token`** — `--sub`, `--project`, `--can`, `--for`, `--days`,
+  `--key-id`, `--new-key`. Its whole output is one credential on stdout; logs go to
+  stderr so a redirect cannot mix them.
+- **`aud` labels the kind of holder a token is for (`--for cli,vscode,agent`), and it is
+  the one claim nothing in the server reads.** No part of an HTTP request identifies the
+  process behind it, so a server-side check would be theatre. The **clients** refuse
+  instead — `mindexfile::token::audience_refusal` for the Rust CLIs, `token.ts`'s
+  `audienceRefusal` for the extension (overridable through a modal). It stops the editor's
+  credential landing in a shell profile; it stops no attacker. Absent or empty means every
+  audience. Containment deliberately does not cover it: audience is not authority, and
+  binding it would refuse the VS Code button minting an `agent` token from a `vscode` one.
+- **Four ways to give a client the token, first wins:** `--token` > `$MINDEX_TOKEN` >
+  `$MINDEX_TOKEN_FILE` (a path to a 0600 file) > `token` in `indexer.toml`/`watcher.toml`
+  > the per-server entry in `~/.config/mindex/credentials.toml`. `MINDEX_TOKEN_FILE`
+  exists for a caller configured by an environment block inside somebody else's config
+  file — an MCP server list lives in an editor's own JSON, where a token sits in plaintext
+  under no permission check and a path does not. Its trap is the precedence: a shell
+  exporting `MINDEX_TOKEN` passes it to every child, so such a block must also set
+  `MINDEX_TOKEN=""`.
+- **The VS Code extension keeps its own copy in `SecretStorage`, and can issue tokens.**
+  Not because a keychain answers "who holds the credential" — it cannot, the CLI needs the
+  same kind and no shell can read it — but because the alternative *inside the extension*
+  was a settings string, which Settings Sync copies to every other machine. It watches
+  `exp` and warns in the status bar, verifying nothing: a client asserting validity would
+  claim a fact only the server establishes. `mindex.mintAgentToken` derives a
+  project-scoped token capped at seven days and labelled `agent`, reachable from three
+  surfaces (the Ask view's title bar, the Server Status header, and a `command:` link in
+  the token indicator's tooltip) because a capability behind a palette title nobody knows
+  is one that does not exist. The issued token goes to the clipboard, and `Show it` opens
+  a **read-only in-memory document** rather than an untitled buffer — one accidental
+  `Ctrl+S` from the credential on disk.
+- **`GET /.well-known/mindex.json`** — the machine twin of `/llms.txt`: service
+  identity, the full endpoint inventory (method, path, one-line summary, which ones
+  stream and in what encoding) and the live `GET /config` snapshot inlined, so
+  bootstrapping costs one request. The endpoint inventory is derived from the OpenAPI
+  spec rather than hand-written, and three tests pin it against the spec and against
+  the router's own `.route(...)` table. Documented in OpenAPI, unlike `/llms.txt` and
+  `/metrics` — it is JSON for a client, which is what the spec is for.
+
+### Changed
+
+- **An out-of-scope project answers 404 `project.not_found`, byte-identical to one that
+  never existed.** A distinguishable refusal confirms which GUIDs exist, and a GUID is a
+  bearer identifier — so `auth.forbidden` cannot exist on that path however much better it
+  would read in a log. The missing *action* **is** named (403): the caller has already
+  proved it holds the project. Pinned on response bytes rather than on status.
+- **Two enforcement layers, deliberately overlapping.** Typed scope extractors are the
+  mechanism — a type is what a source-text guard can see — and they check `covers(guid)`
+  **then** `permits(action)`, in that order, so a caller that cannot see a project learns
+  nothing about the action vocabulary. `enforce_route_policy` is the runtime half and
+  **fails closed**: a routed path with no `ROUTE_POLICY` row is refused, not served.
+  `ROUTE_POLICY` names every route, with three guards, one of which drives the whole
+  refusal table so it stays exhaustive as routes are added.
+- **Five routes are public and each says why:** `/health` and `/version` are liveness — a
+  probe needing a credential reports the credential's health and not the server's — and
+  `/config`, `/llms.txt` and the descriptor are discovery, which cannot be discovered from
+  behind a credential. `admin` covers `/gc`, `/status` and `/metrics`; there is no `gc`
+  action, because `POST /gc` holds the process-wide guard and walks every collection, so a
+  project list cannot describe it.
+- **The gate now refuses legibly instead of invisibly.** A keyless request to a route that
+  exists gets **401** with `WWW-Authenticate` and a problem+json body naming `/llms.txt`
+  and the routes served without a token — the same envelope and shape of machine `code`
+  mindex uses everywhere else, so a client parsing its errors needs no special case for
+  the gateway's. `/.env`, `/js/config.js` and `/` still get 444, and a banned address gets
+  444 whatever it asked for. `444` bought invisibility and paid for it with legibility: an
+  empty reply is indistinguishable from a dead host, so a correctly refused agent reported
+  the deployment as broken rather than as needing a credential. That was worth it while
+  the host answered nothing at all; it stopped being worth it once five routes went
+  public and the descriptor began listing every endpoint.
+- **The gate's keyless set is now `ROUTE_POLICY`'s public set** (GET and HEAD, anchored so
+  `/configuration` is not `/config`). Opening only one of the five added no security — it
+  moved the refusal from the server, which answers 200 to all five by design, to a
+  boundary that answers nothing, and the cost fell entirely on callers doing the right
+  thing. Measured over three hours: one configured client produced 840 closed connections
+  on `GET /health`, and an agent that followed `/llms.txt` to `/config` met the same wall
+  and was then banned for doing what the document it had just read told it to do — 1065 of
+  1168 log lines the jail called attacks. The public surface also carries
+  `X-Robots-Tag: noindex`; nothing there is secret, but a search result is a directory
+  entry for scanners.
+- **The fail2ban jail counts a keyless 401 on `key_ok:0` alone.** mindex issues its own
+  401s and 403s for a token that is real but expired or scoped elsewhere, and those carry
+  `key_ok:1`: they are the signature of a client to re-credential, not an attacker to ban.
+  Banning them turns one stale editor into an outage that also swallows its own `/health`.
+- **`/llms.txt` is rewritten to argue rather than order.** The document addressed the
+  model in the second person and told it what to do — which is the prompt-injection
+  signature, and GitHub Copilot refused to read it on a corporate machine, leaving that
+  agent with no entry point at all. Every recommendation now carries its reason and the
+  reader is "a caller"; nothing operational was dropped, and the document leads with the
+  problem the service solves rather than with a list of endpoints. Pinned by
+  `llms_doc_avoids_the_injection_signature`. A refusal is now survivable in any case,
+  since the JSON descriptor above carries the same discovery data.
+- `UNDOCUMENTED_ROUTES` in `http3.rs` is the single list of routes deliberately outside
+  the spec; the `/llms.txt` route guard and the descriptor read it instead of holding a
+  copy each.
+- **Research streams are opt-in, and the safe behaviour is what you get by not asking.**
+  Frames were compulsory, which made *reading the response to the end* compulsory too,
+  since a disconnect cancels the run. So a caller that issued the request and did not
+  stay spent the whole budget, received nothing, and raised no error anywhere — the
+  expensive failure, and the silent one. `/index` had adopted the opposite default long
+  before; research now matches it. Both entrances read the query through one
+  `launch_research_job`, so `?stream=yes` cannot come to mean one thing on a research run
+  and another on a challenge: everything above the spawn — pre-flight refusals, the
+  permit, the minted `run_id`, the registry entry, the `started` frame — is identical, and
+  only the tail forks.
+- **The JSON body is a transcription of the stream, not a second contract.** Every field
+  of `ResearchResponse` is the `data()` of the frame with the same name, produced by the
+  same code: report, `summary`, `citations`, `excerpts`, a challenge's `verdict`, and the
+  `done` payload. It omits `thinking`, `step` and `progress`, which exist to be watched —
+  the step count rides on `done` and the trace is journalled in `research_run_steps`.
+  `the_json_body_carries_the_frames_the_stream_would_have_sent` asserts against `data()`
+  rather than against literals, precisely so the body cannot drift into being a fifth copy
+  of the SSE contract.
+- **Cancel-on-disconnect is unchanged, by a second hand rather than by the stream's.** In
+  SSE mode `SseEventStream`'s `Drop` still cancels the job token; in JSON mode a
+  `CancellationGuard` held across the drain does the same when axum drops the handler
+  future. So the new default removes the obligation to keep reading, and not the rule.
+  `DELETE /research/active/{run_id}` remains the answer for a caller that abandoned a run
+  while its socket stayed open.
+- `ollama.unavailable`, `ollama.error` and `research.no_report` are now real `ApiError`
+  variants instead of string literals in `research.rs`. The crossing lives in
+  `ApiError::from_research_failure` alone, and it matches on strings — where a missing arm
+  would still answer, as a well-formed 500 carrying the wrong code. `FAILURE_CODES` beside
+  `ResearchAbort` plus `every_research_failure_code_rebuilds_itself` is what makes adding a
+  failure code fail loudly instead.
+- A stream that dies without a terminal event was already synthesised into one `error`;
+  the JSON collector now raises that same synthesised failure as a **500** rather than a
+  200 with an empty report. Both spell it with one sentence, `abnormal_end`.
+- `?stream=` is `deny_unknown_fields` and accepts only `yes`/`no`: `?stream=true` or a
+  typo'd key is a 400, never a silent fall-through to the default — which for this
+  endpoint would cost a caller an hour of GPU before it noticed.
+- `tools/mcp/scout` and the VS Code research panel both request `?stream=yes` explicitly,
+  each with the reason recorded in its own file. scout's is not a preference: its
+  `READ_TIMEOUT` is an *idle* clock resting on the server's 15 s keep-alive and is the only
+  thing there separating a working server from a wedged one, and its partial-report salvage
+  (`truncated_by_client`, `live_run_id`, `still_running`) works only because bytes arrive as
+  they are produced.
+
+### Removed
+
+- **The shared `X-Api-Key`.** See the first Upgrading section — it is gone, not
+  deprecated. A token is worth pasting into a context because it is narrow, and a
+  deployment demanding the API key *beside* it would put the shared secret back into that
+  same context, which is the leak the token closes.
+- **`mindex.browseResearch`.** One reading surface for stored research, not two;
+  `ctrl+alt+,` opens the panel.
+
+### Fixed
+
+- **`mindex-watch` could not be built for Windows.** `tokio::signal::unix` is absent
+  there, not empty, so the unconditional import broke the build before any `cfg` could
+  help; the SIGTERM handler is `#[cfg(unix)]` now. Ctrl+C was already registered
+  separately and tokio maps a Windows service stop onto it, so no platform loses a
+  shutdown path. The tool had been Linux-only by accident since it was written, and
+  nothing said so because nothing had ever built it elsewhere — the release workflow is
+  what found it.
+- **The gate's ban list was tested before its keyless exception**, so a ban closed
+  `/llms.txt` — the one URI served without a credential, whose whole job is to tell an
+  unauthenticated caller that it needs one. Fetch the published document, ask for
+  `/favicon.ico` nine times as browsers do, trip the jail on those 444s, and the ban
+  swallows the document; from outside that is indistinguishable from a dead host. Both
+  fail2ban files now live in `deploy/gate/` beside the nginx one they are half of.
+- **Three service sandbox protections read as armed and were inert.** `IPAddressDeny=`,
+  `SocketBindDeny=` and `RestrictNetworkInterfaces=` are enforced by BPF a `--user`
+  manager cannot load, while `systemd-analyze` scores the unit as confined. Measured: a
+  user unit denying everything but localhost fetched `example.com` and got 200. All three
+  services move to system units, which also makes their ordering real rather than lucky.
+- **VS Code: an action that succeeded left the screen describing the old world.** The
+  garbage-collection review survived its own delete — the deleted reports stayed on
+  screen, still ticked, under a `Delete N` that would re-post ids the server had already
+  dropped. Six more of the same class were found by walking the destructive paths: the
+  review's `read` link destroyed the screen it was being read for; `pin` wrote only the
+  rendered page, so the delete dialog read a pre-pin copy; a finished run reached the
+  panel through nothing at all, leaving its subject still wearing the trust badge it had
+  before it was refuted; a deleted run stayed attached to the Ask form as context; and
+  `cancelIndexing` refreshed the drift check but not the poll `reindex` refuses on — so
+  the user cancelled and then could not do the thing they had cancelled in order to do.
+  None of these surface as an error. They surface as a screen that disagrees with itself.
+- **VS Code: a page rebuilt mid-run drew Submit enabled and Stop hidden.** The Ask view is
+  registered without `retainContextWhenHidden`, so collapsing the sidebar destroys it, and
+  `running` was not among the state replayed into the rebuilt page — pressing Submit then
+  earned "cancel it first" while the only control that could cancel was the one missing.
+  `AskFormState` holds what outlives the page; `mindex.cancelResearch` covers a sidebar
+  closed rather than hidden.
+- **VS Code: 401 and 403 fell through to the generic error branch**, so an expired
+  credential surfaced only as requests that quietly stopped working — exactly the state
+  the token indicator exists to prevent and cannot detect for an opaque token. 401 now
+  offers Set Token and 403 leads with the missing action.
+- **VS Code: the token reason could outrank a server that could serve nothing.** A user
+  whose Qdrant was down and whose token lacked `research` was told to re-mint a credential
+  that was never the problem. The token reason now wins only while `health.ask` holds — a
+  dependency comes back by itself and a missing action does not, which stops being the
+  useful ordering once the server can serve nothing at all.
+- **`.dockerignore` said `target/`, which matches only the repository root**, so every
+  build shipped `tools/{indexer,watcher,mindexfile}/target` to the daemon — 2.2 GB of
+  context per build on a machine that had run the test matrix.
+- **The documented stale-collection symptom was the rarer of two.** A
+  `COLLECTION_SCHEMA_VERSION` bump leaves search silent only once something has indexed
+  the project since; a project nobody has touched has no collection at all and `/search`
+  answers **503 `qdrant.unavailable`**, which reads as Qdrant being down rather than as an
+  index that needs rebuilding. Observed on the maintainer's host during the v1 → v2
+  upgrade, with `mindex_stale_collections` sitting at 1 and naming the project. Both
+  halves are written down now, because an operator who has read only the silent one goes
+  looking for a network fault.
+
 ## [1.1.0] — 2026-08-03
 
 Gives research reports an **opponent** and an **offline re-verification**, writes them
@@ -577,7 +871,8 @@ server.
 - **Tools**: `mindex-index`, `mindex-watch`, `mindex-search.sh`, the `mindex` and
   `scout` MCP servers, and a VS Code extension.
 
-[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/silencespeakstruth/mindex/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/silencespeakstruth/mindex/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/silencespeakstruth/mindex/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/silencespeakstruth/mindex/releases/tag/v1.0.0

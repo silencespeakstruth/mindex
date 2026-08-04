@@ -1,6 +1,55 @@
 # Changelog
 
-## Unreleased
+## 1.1.1
+
+Issuing a short-lived token for an agent was already here and effectively could not
+be found: one command, palette-only, with an icon declared and no menu entry to
+render it in. A credential mechanism nobody can reach is not a narrower credential
+— it is a shell on the server's host issuing a wider one.
+
+- **Three ways in.** A key button in the **Ask** view's title bar, another in the
+  **Server Status** header, and a link in the token indicator's tooltip. The third
+  appears only when that indicator does, which is shortly before the stored token
+  expires — it is the hand-off from "your credential is dying" to "issue the other
+  kind", not a general entry point.
+- **Read-only and read-and-write presets.** The two shapes anyone actually wants,
+  offered before the checkboxes rather than assembled from them each time. The full
+  tick list is one item down the same menu and is still the only way to reach
+  `delete`; the confirmation naming what a write token costs fires either way.
+- **`Show it`.** The token still goes to the clipboard. When it has to be edited
+  into somebody else's config by hand, this opens it in a read-only tab that cannot
+  be saved to disk and does not survive a window reload — it is still shown once
+  and stored nowhere.
+
+And seven places where an action succeeded and the screen went on describing the
+world before it. None of them showed an error; each showed a panel disagreeing
+with itself.
+
+- **`Collect garbage` now ends when it deletes.** The review used to stay up
+  afterwards, listing the reports it had just deleted, still ticked, under a
+  `Delete N` that would have re-sent them — while the header above it already read
+  `Collect garbage (0)`.
+- **Reading a candidate no longer destroys the review.** The `read` link opens the
+  report as its own Markdown tab, the way stored reports open everywhere else;
+  before, it expanded the row underneath, which closed the review — and for a
+  report further down the corpus than the loaded page, left neither the review nor
+  the report.
+- **Pinning updates the numbers it changes.** The counts line and the
+  `Collect garbage` count moved only after a manual refresh, so unpinning an
+  out-of-date report left the button disabled over a corpus that now had something
+  to collect.
+- **A finished run reaches Research History.** The new report, the corpus counts
+  and — after a challenge — the subject's trust badge and its `Challenge` /
+  `Re-check` button all update on their own. A selection built by a filter survives
+  it: nothing the user chose is discarded because a background run landed.
+- **Deleted reports leave the Ask form.** They stayed attached as context for the
+  next question and came back as an error about a click made in another panel.
+- **Cancelling indexing releases the reindex button** immediately, instead of
+  refusing for up to one status poll on a count it had already invalidated.
+- **`Sync all` deletes what is still orphaned** after its own reindex, not what was
+  orphaned before it.
+
+## 1.1.0
 
 Indexing becomes something you can watch, and Research becomes a first-class
 surface rather than a panel you have to know about.

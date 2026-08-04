@@ -65,11 +65,17 @@ def ollama_knobs() -> Iterator[object]:
 def research_events(
     client: httpx.Client, project: str, body: dict, timeout: float = 30.0
 ) -> tuple[int, list[tuple[str, str]]]:
-    """POST /research and drain the SSE stream into (status, [(event, data)])."""
+    """POST /research?stream=yes and drain the SSE stream into (status, [(event, data)]).
+
+    The query is not decoration: streaming is opt-in, and without it the server
+    answers one JSON body. Everything below this helper is a test *of the stream*,
+    which is why it asks for one; the default mode has its own tests.
+    """
     events: list[tuple[str, str]] = []
     with client.stream(
         "POST",
         f"{MINDEX_URL}/v0/{project}/research",
+        params={"stream": "yes"},
         json=body,
         timeout=timeout,
     ) as resp:
@@ -114,6 +120,66 @@ def test_full_run_streams_steps_and_summary(client: httpx.Client, project: str) 
     # cut short — that distinction is what scout keys on.
     assert done["reason"] == "finalized", done
     assert isinstance(done["elapsed_ms"], int), done
+
+
+def test_the_default_response_is_one_json_body(
+    client: httpx.Client, project: str
+) -> None:
+    """Streaming is opt-in, and the default carries the whole run in one body.
+
+    The two modes run the same investigation, so this asserts against the *same*
+    scripted session `test_full_run_streams_steps_and_summary` above reads frame by
+    frame — which is what makes the pair a comparison rather than two unrelated
+    tests.
+    """
+    assert index(client, project, RUST_V1).status_code == 200
+
+    resp = client.post(
+        f"{MINDEX_URL}/v0/{project}/research",
+        json={"question": QUESTION, "effort": "low"},
+        timeout=30.0,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("application/json"), resp.headers
+    body = resp.json()
+
+    # The `started` frame's fields, so a caller can name the run it just paid for
+    # even when the journal write failed and `done.run_id` is null.
+    assert body["run_id"], body
+    assert body["effort"] == "low", body
+    assert body["worst_case_ms"] > 0, body
+
+    assert body["report"].startswith("# Mock Report"), body["report"]
+    assert "src/pipeline.rs" in body["report"]
+
+    assert body["citations"] is not None, body
+    assert body["done"]["reason"] == "finalized", body["done"]
+    assert body["done"]["steps"] == 1, body["done"]
+
+    # An ordinary run has no verdict, exactly as an ordinary stream has no frame.
+    assert body["verdict"] is None, body
+    # The trace is what this mode exists to omit; the count survives on `done`.
+    assert "steps" not in body and "progress" not in body, sorted(body)
+
+
+def test_a_stream_typo_is_refused_rather_than_ignored(
+    client: httpx.Client, project: str
+) -> None:
+    """`?stream=true` must not silently mean "no".
+
+    A caller that asks for frames and is handed one body seventy minutes later has
+    no way to tell that from a slow run, so the spelling is exactly `yes`/`no` and
+    anything else is a 400 — the same rule `/index` has.
+    """
+    for query in ({"stream": "true"}, {"streem": "yes"}):
+        resp = client.post(
+            f"{MINDEX_URL}/v0/{project}/research",
+            params=query,
+            json={"question": QUESTION, "effort": "low"},
+        )
+        assert resp.status_code == 400, (query, resp.text)
+    # And a refusal at the extractor must not have cost a slot.
+    assert client.get(f"{MINDEX_URL}/research/active").json()["slots_busy"] == 0
 
 
 def test_orientation_tools_list_and_outline(
@@ -174,6 +240,7 @@ def test_reindexing_during_a_run_is_not_blocked_and_is_reported_as_stale(
     with client.stream(
         "POST",
         f"{MINDEX_URL}/v0/{project}/research",
+        params={"stream": "yes"},
         json={"question": QUESTION, "effort": "medium"},
         timeout=60.0,
     ) as resp:
@@ -408,6 +475,7 @@ def test_a_live_run_can_be_listed_and_cancelled_by_name(
     with client.stream(
         "POST",
         f"{MINDEX_URL}/v0/{project}/research",
+        params={"stream": "yes"},
         json={"question": QUESTION, "effort": "low"},
         timeout=30.0,
     ) as resp:
@@ -526,6 +594,7 @@ def test_busy_second_request_gets_429(
     with client.stream(
         "POST",
         f"{MINDEX_URL}/v0/{project}/research",
+        params={"stream": "yes"},
         json={"question": QUESTION, "effort": "low"},
         timeout=30.0,
     ) as first:
@@ -549,6 +618,7 @@ def test_disconnect_cancels_and_frees_the_slot(
     with client.stream(
         "POST",
         f"{MINDEX_URL}/v0/{project}/research",
+        params={"stream": "yes"},
         json={"question": QUESTION, "effort": "low"},
         timeout=30.0,
     ) as resp:
@@ -590,6 +660,32 @@ def test_ollama_failure_becomes_an_error_event(
     # word the message nor decide whether re-reading `/health` would say anything.
     assert "ollama.error" in data, data
     assert "ollama.unavailable" not in data, data
+
+
+def test_the_same_ollama_failure_is_a_status_without_a_stream(
+    client: httpx.Client, project: str, ollama_knobs: object
+) -> None:
+    """The one place the two modes deliberately differ.
+
+    On a stream the status is already 200 when the run fails, so the failure has
+    nowhere to go but an `error` frame — the test above. With no stream open there
+    is no such moment: the failure *is* the answer, and an answer is problem+json
+    like every other refusal this server makes. Same fault, same code, two planes.
+    """
+    assert index(client, project, RUST_V1).status_code == 200
+    ollama_knobs(fail_next_chats=1.0)  # type: ignore[operator]
+
+    resp = client.post(
+        f"{MINDEX_URL}/v0/{project}/research",
+        json={"question": QUESTION, "effort": "low"},
+        timeout=30.0,
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    body = resp.json()
+    assert body["code"] == "ollama.error", body
+    # The failure must not have left the slot held.
+    assert client.get(f"{MINDEX_URL}/research/active").json()["slots_busy"] == 0
 
 
 def test_dead_ollama_degrades_health_and_carries_no_detail(

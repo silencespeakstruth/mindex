@@ -5,7 +5,7 @@ Only what is **not obvious from reading the code**: invariants, non-trivial
 no language table (the `ProgrammingLanguage` enum + `Cargo.toml`), no struct/SQL
 dumps. Accepted limitations are stated next to the invariant they qualify.
 Detail companions live in `docs/claude/` (research, git history, VS Code,
-Qdrant) —
+Qdrant, auth) —
 this file keeps the invariants; read the matching companion before modifying
 that area.
 
@@ -13,8 +13,10 @@ that area.
 
 `mindex` is an async RAG indexing + search engine in Rust. HTTPS API →
 `tree-sitter` AST chunking → `BGE-M3` multi-vector embeddings
-(dense/sparse/ColBERT) → `Qdrant` vectors + `SQLite3` metadata. Internal
-service: TLS is the only transport security, no API auth.
+(dense/sparse/ColBERT) → `Qdrant` vectors + `SQLite3` metadata. TLS is the only
+transport security; authorization is opt-in (`[auth]`, below) and off by
+default, so an unconfigured deployment is still an internal service that must
+not be exposed.
 
 TLS verification is uniform across every client: **OS trust store** by default
 (where mkcert/corporate roots live), extra CA via `--ca-cert` / `ca_cert` /
@@ -27,14 +29,155 @@ both CLI tools once); and the MCP `drift` tool **shells out to `mindex-index`**,
 so a CA setting that misses the child process breaks one tool while the rest
 work.
 
-Remote access is a *proxy's* job; the server stays unauthenticated and
-loopback-bound. For such a proxy every client carries one optional header,
-`X-Api-Key` (`--api-key` / `api_key` / `$MINDEX_API_KEY` / `mindex.apiKey`).
-**Additive**: unset sends no header (direct path byte-for-byte unchanged;
-mindex never reads it), and it travels on the *client*, not per-request, so it
-reaches every endpoint — including `mindex-search.sh`'s `/config` probe, which
-behind a gate would otherwise quietly fall back to its built-in language list.
-Prefer the env var; a flag value is visible in `ps`.
+**There is one credential, and it is the token.** The shared `X-Api-Key` a
+gateway used to check and mindex ignored is *gone*, not deprecated: two
+credentials where one is strictly stronger is not defence in depth — the weaker
+one sets the floor, and that one had no scope, no expiry and no way to withdraw
+a single holder. The decisive argument is narrower: a token is worth pasting
+into a context because it is narrow, and a deployment demanding the API key
+*beside* it would put the shared secret back into that same context, which is
+the leak the token closes. So `deploy/gate/` admits on the token's **presence**
+(nginx cannot verify a signature and does not try) and every question of
+validity, scope and action is answered in the server. The consequence is written
+into that file and is not optional: **`[auth].enabled = true` is mandatory
+behind a gateway** — with authorization off, `Authorization: Bearer x` is
+admitted and served everything, so `enabled = false` now means exactly one
+thing, a server on a trusted network that authorizes nothing (the Docker test
+stack, a loopback-only install).
+
+Four sources per client, first wins: `--token` > `$MINDEX_TOKEN` >
+`$MINDEX_TOKEN_FILE` (a path to a 0600 file) > `token` in
+`indexer.toml`/`watcher.toml` > the per-server entry in
+`~/.config/mindex/credentials.toml`. `MINDEX_TOKEN_FILE` exists for a caller
+configured by an environment block inside somebody else's config file — an MCP
+server list lives in an editor's own JSON, where a token sits in plaintext under
+no permission check and a path does not; its trap is the precedence, since a
+shell exporting `MINDEX_TOKEN` passes it to every child, so such a block must
+also set `MINDEX_TOKEN=""`. The header travels on the *client*, not per
+request, so it reaches every endpoint — including `mindex-search.sh`'s `/config`
+probe, which behind a gateway would otherwise quietly fall back to its built-in
+language list. **VS Code is the one holder that keeps its own copy**, in
+`SecretStorage`: not because a keychain answers "who holds the credential" (it
+cannot — the CLI needs the same kind and no shell can read it), but because the
+alternative *inside the extension* was a settings string, which Settings Sync
+copies to every other machine. It also watches `exp` and warns in the status bar
+(`src/token.ts`), verifying nothing — a client asserting validity would claim a
+fact only the server establishes. It is also the one surface that *issues*
+tokens: `mindex.mintAgentToken` (`agentToken.ts`) derives a token for the open
+project, capped at seven days and labelled `agent`, over `POST /auth/tokens`.
+Its action list is **two presets over a ticked list, not a fixed one**
+(`tokenGrants.ts`, split out of `agentToken.ts` only because that file imports
+`vscode` and the guard on these tables has to run under bare `node --test`):
+read-only and read-and-write are offered first, `search`+`research` start ticked,
+`index`/`delete` are offered off behind a second modal naming what they cost, and
+`admin`/`mint` are absent from the list by construction. The presets are an
+*ordering*, not a narrowing — the full tick list is one item down the same menu
+and is still the only way to reach `delete`, and the write modal fires for the
+preset exactly as it does for a tick. Offering only reads was
+the earlier call and it was wrong in one direction — it does not prevent a write
+token, it moves the minting to a shell, where what gets issued is usually wider.
+Every one of those narrowings is **usability, not enforcement** — a command
+palette is not a security boundary and does not need to be, because `may_mint`
+refuses anything exceeding the minting token regardless of what the client
+asked for. It is reachable from **three** surfaces, because a capability behind a
+palette title nobody knows is one that does not exist: the Ask view's title bar
+(the `$(key)` button, gated on `mindex.hasProject`), the Server Status panel's
+header, and a `command:` link in the token indicator's tooltip — that last one
+visible only when the indicator is, since it stays hidden while the token is
+healthy by design. The issued token goes to the clipboard, and `Show it` opens it
+in a **read-only in-memory document** (`tokenDoc.ts`, scheme `mindex-token`) —
+not an untitled buffer, which is one accidental `Ctrl+S` from the credential on
+disk that "a file is a copy nobody decided to keep" rules out. A window reload
+loses it, and the provider says so rather than serving an empty tab.
+
+## Authorization (`[auth]`, opt-in)
+
+**The server used to authenticate nothing, and now optionally does.** That
+sentence was an invariant in four places and is retired here rather than left to
+rot. The break is bounded and the bound is the point: no user table, no
+password, no session, no per-request server-side state. One HMAC check, and
+every fact the decision needs rides inside the credential. **Full rationale,
+the refusal table, the revocation story and the runbook live in
+`docs/claude/auth.md` — read it before modifying `backend/auth.rs`, the scope
+extractors or `ROUTE_POLICY`.** The hard invariants:
+
+- **The token is the mapping; there is no schema change.** `prj` (dashless
+  GUIDs, or exactly `["*"]`, which must be *spelled* — an empty list reaches
+  nothing) and `act` (`search`/`research`/`index`/`delete`/`admin`/`mint`) are
+  signed into it. The rejected alternative was a `tenant_id` column, and it cost
+  a table rebuild, a trigger pinning one tenant per GUID, an in-process cache, a
+  startup warm, a rule for pre-existing rows and an in-transaction re-read
+  against `ON CONFLICT DO NOTHING` — none of which survives, along with one bug
+  class: only a caller whose token already names a GUID can create that project,
+  so `POST /index` stops being an existence oracle.
+- **Gateway-only was never possible.** `GET /projects` enumerates every GUID in
+  a response *body*, which no proxy filters without parsing, and a GUID is a
+  bearer identifier. That listing is why this lives in the server.
+- **An out-of-scope project answers 404 `project.not_found`, byte-identical to
+  one that never existed.** A distinguishable refusal confirms which GUIDs
+  exist, and an error `code` is the field clients are told to key on — so
+  `auth.forbidden` cannot exist on that path however much better it reads in a
+  log. The missing *action* **is** named (403): the caller already proved it
+  holds the project. Pinned on response bytes, not status, by
+  `an_out_of_scope_project_is_byte_identical_to_one_that_never_existed`.
+- **Two enforcement layers, deliberately overlapping.** Typed extractors
+  (`SearchScope`/`IndexScope`/…) are the mechanism — a **type** is what a
+  source-text guard can see, which a `RouterState` helper is not (the
+  `set_file_status` lesson) — and they check `covers(guid)` **then**
+  `permits(action)`, in that order, so a caller that cannot see the project
+  learns nothing about the action vocabulary. `enforce_route_policy` is the
+  runtime half and **fails closed**: a routed path with no `ROUTE_POLICY` row is
+  refused, not served. The layer deliberately does *not* do the project check —
+  `/drift` must answer an out-of-scope project as it answers an unknown one,
+  `/index` must create, and two listings filter a body, so a blanket answer
+  needs a per-route exception table, the fifth copy nothing checks.
+- **`ROUTE_POLICY` names every route**, in the `UNDOCUMENTED_ROUTES` idiom, with
+  three guards: `every_route_is_named_by_the_authorization_policy` (both
+  directions), `every_scoped_handler_takes_the_extractor_its_policy_names`, and
+  `every_route_refuses_every_way_it_should` — the last drives the *table* and so
+  stays exhaustive as routes are added, which a hand-written per-endpoint suite
+  cannot. Public: `/health`, `/version`, `/config`, `/llms.txt`, the descriptor,
+  plus `PUBLIC_PATH_PREFIXES` (`/swagger-ui`, `/api-docs/` — `merge`d, not
+  routed, so absent from the table and otherwise refused as build defects).
+  Liveness must not report the credential's health; discovery telling a caller
+  it needs a credential cannot itself require one.
+- **`admin` covers `/gc`, `/status`, `/metrics`; there is no `gc` action** —
+  `POST /gc` holds the process-wide guard and walks every collection, so a
+  project list cannot describe it. Consequence for this host: with `[auth]` on,
+  the VictoriaMetrics scrape needs its own admin token (`bearer_token_file`),
+  because mindex cannot tell a loopback scraper from a gated one.
+- **HS256, written here rather than taken from a crate**, so every copy of the
+  secret is owned (no `Debug`, zeroized, key file 0600 with `O_EXCL`) — and so
+  algorithm confusion is closed *by construction*: `verify` reads `kid` and
+  nothing else before checking the MAC, pinned by
+  `the_algorithm_header_cannot_select_the_algorithm`. The TLS key is not reused.
+- **Revocation is expiry or deleting a `kid`** — no denylist, by design, since
+  that is the per-request state this removes. `--key-id … --new-key` is what
+  makes per-holder ids one flag rather than hand-edited base64.
+- **`--days 0` mints a non-expiring token, and only the local CLI may.**
+  `POST /auth/tokens` refuses it: a network-reachable way to issue an eternal
+  credential is a different and worse thing. A minted token can never exceed its
+  minter (actions, projects, expiry) — without that, a read-only `mint`
+  credential becomes `admin` one call later.
+- **`aud` is the one claim nothing in the server reads, and that is the design.**
+  `--for cli,vscode,agent` labels which kind of holder a token is for; no part of
+  an HTTP request identifies the process behind it, so a server-side check would
+  be theatre. The **clients** refuse — `mindexfile::token::audience_refusal` for
+  the Rust CLIs (called once where the token is fully resolved, and it refuses
+  rather than warns, since the request would otherwise succeed), `token.ts`'s
+  `audienceRefusal` for the extension (overridable through a modal). It stops the
+  editor's credential landing in a shell profile; it stops no attacker. Absent or
+  empty means **every** audience — `skip_serializing_if` keeps the key off an
+  unlabelled token so a client keying on presence never meets `"aud": []` and
+  reads it as reaching nobody. **`may_mint` deliberately does not contain it**:
+  audience is not authority, delegation is a change of holder, and containment
+  would refuse the VS Code button minting an `agent` token from a `vscode` one —
+  pinned by `the_audience_is_not_an_authority_axis_and_does_not_bind_delegation`,
+  which exists because the inconsistency with the other three axes reads as a bug.
+  There is no `Claims::intended_for`: a predicate with no production caller reads
+  as a check the server performs.
+- **Off by default**, and `authorization_off_ignores_the_header_entirely` pins
+  that a client-supplied `Authorization` decides nothing when it is.
 
 ## Configuration (TOML file + CLI flags)
 
@@ -407,6 +550,34 @@ let GC clean up.
   search frontend); `/files?status=failed` is the dead-letter view. `/config`
   is static **except `research.models` and `research.observed`** — both worker
   -refreshed on a tick; don't cache it once.
+- **Two discovery documents, and the second exists because the first is
+  refusable.** `/llms.txt` is prose for a model; `/.well-known/mindex.json` is
+  the same service as data (identity, endpoint inventory, the inlined `/config`
+  snapshot). The split is not tidiness: a network-fetched document written *at*
+  a model is a prompt-injection signature, GitHub Copilot refused the original
+  `llms_doc.md` on those grounds, and losing it left an agent with nothing —
+  it was the only entry point. So the prose now **argues instead of ordering**
+  (every recommendation carries its reason, the reader is "a caller", never
+  "you"), guarded by `llms_doc_avoids_the_injection_signature`; and JSON, which
+  has no register to object to, is the floor under it. The descriptor **is** in
+  the OpenAPI spec — the opposite call from `/llms.txt` and `/metrics`, because
+  it is JSON for a client rather than prose for a reader or exposition for a
+  scraper, and all three assertions sit together in
+  `openapi_spec_is_complete_and_versioned` so the contrast reads as a decision.
+  Its `endpoints[]` is **derived from the spec at first use**, never written:
+  the route table already had four copies, and a hand-kept fifth is the one
+  nothing checks. Three things are hand-kept and each has a guard —
+  `UNDOCUMENTED_ROUTES` (the routes deliberately outside the spec; read by the
+  descriptor *and* by `llms_doc_mentions_only_routes_that_exist`, one list
+  because it was two), `DESCRIPTOR_HIDDEN_ROUTES` (`/metrics` alone: routed only
+  under `[metrics].enabled`, so advertising it promises a 404), and
+  `STREAMING_ENDPOINTS` (OpenAPI records a response's shape, not that it arrives
+  in frames). `the_route_table_holds_no_path_the_descriptor_omits` scans
+  `http3.rs`'s **production half** for `.route(` literals — neither axum nor
+  utoipa enumerates routes at runtime, so a source-text test is what exists;
+  it must skip the `#[cfg(test)]` module, whose throwaway routers are not API.
+  `authentication` is serialized as an explicit `null`: "authenticates nothing"
+  and "too old to say" must not look the same on the wire.
 - **`GET /health` is tri-state, and the server owns the verdict**
   (`HealthChecks::verdict`, next to the data so nothing computes it twice):
   `ok`; `degraded` = only the **optional** Ollama is failing, which is exactly
@@ -430,21 +601,50 @@ let GC clean up.
   answer ("indexed, and search will still find nothing"). That distinction is
   what lets the VS Code pickers offer only `chunks_active > 0`.
 
-## /research (SSE, Ollama-driven)
+## /research (Ollama-driven; SSE under `?stream=yes`)
 
-`POST /v0/{guid}/research` — long-lived one-way SSE: a local Ollama model
+`POST /v0/{guid}/research` — a local Ollama model
 (`[research]` config, TOML-only) loops tools **via internal cores**
 (`search_core`/`symbols_core` in `handlers.rs`; never HTTP-to-self), then
-streams a Markdown report. **Full rationale, rejected alternatives and the
+produces a Markdown report. **Full rationale, rejected alternatives and the
 measurement record live in `docs/claude/research.md` — read it before
 modifying `research.rs`, `models/ollama.rs`, the budgets or the SSE
 contract.** (Design decisions marked "measured" point to the 2026-07-28
 108-run and 2026-07-30 28-run corpora summarized there; the corpus of record
 is the `research_runs` table.) The hard invariants:
 
-- **Cancellation = cancelling the job token; two hands reach it.**
+- **Streaming is opt-in (`?stream=yes`), and the default answers one JSON body.**
+  `/index`'s shape, adopted late and for a sharper reason: frames make
+  disconnection the cancellation interface, which also makes *reading to `done`*
+  compulsory — so a caller that issued the request and did not stay spent the
+  whole budget, got nothing, and raised no error anywhere. Safe behaviour is now
+  what you get by not asking. Both entrances read the query through
+  `launch_research_job`, so it cannot mean one thing on research and another on a
+  challenge; everything above the spawn (pre-flight refusals, permit, minted
+  `run_id`, registry entry, `started` frame) is identical and only the tail forks.
+  **Every field of `ResearchResponse` is a frame's own `ResearchEvent::data()`**,
+  so the JSON mode is a transcription and not a fifth copy of the SSE contract —
+  `the_json_body_carries_the_frames_the_stream_would_have_sent` asserts against
+  `data()` rather than literals precisely so it cannot become one.
+  `thinking`/`step`/`progress` are dropped (they exist to be watched; the count is
+  on `done`, the trace in `research_run_steps`). Gating this on `aud=agent` was
+  rejected: `aud` is not an authority axis and a check there stops only the caller
+  honest enough to label itself.
+- **A mid-run failure is an `error` frame on a stream and an HTTP status without
+  one** — the one deliberate difference between the modes, and the reason
+  `ollama.unavailable`/`ollama.error`/`research.no_report` became real `ApiError`
+  variants (503/503/500) instead of string literals in `research.rs`. The crossing
+  lives in `ApiError::from_research_failure` alone; it is a match on **strings**,
+  where a missing arm still answers — as a well-formed 500 with the wrong code —
+  so `FAILURE_CODES` (`#[cfg(test)]`, beside `ResearchAbort`) +
+  `every_research_failure_code_rebuilds_itself` is what makes adding a failure
+  code fail loudly.
+- **Cancellation = cancelling the job token; two hands reach it, in both modes.**
   `SseEventStream`'s `Drop` (disconnect) is the primary one and still the only one
-  the loop knows about; `DELETE /research/active/{run_id}` is the second, for the
+  the loop knows about; without a stream a `CancellationGuard` held across the
+  drain does the same when axum drops the handler future (`post_index`'s JSON-mode
+  shape), so the JSON mode removes the obligation to keep reading and **not** the
+  cancel-on-disconnect rule. `DELETE /research/active/{run_id}` is the second, for the
   case disconnect cannot cover — a caller that abandoned the run while its socket
   stays open (scout holds its connection up to `RESEARCH_TOTAL_TIMEOUT`, 70 min).
   The semaphore permit rides **in the spawned job**, not the stream (releasing on
@@ -1158,12 +1358,17 @@ is the `research_runs` table.) The hard invariants:
   `run_id`/`seq` (null when the journal write failed; rendered as "not
   saved" in VS Code). `started` is always the **first** frame; event order after
   the report is fixed: `summary` → `citations` → `excerpts` (only with a verified
-  citation) → `verdict` (challenge streams only) → `done`.
+  citation) → `verdict` (challenge streams only) → `done`. The non-streaming body
+  is **not** a fifth place: it transcribes the same `data()` values, so every test
+  above covers both modes.
 - **A stream ending without a terminal event is a failure**:
   `SseEventStream` synthesises one `error` (`internal.error`) when the
   channel closes without `done`/`error` (a detached-job panic otherwise reads
   as a completed stream); `SseWireEvent` is generic, so streaming `/index`
-  gets it free; `a_stream_that_ended_properly_gets_no_synthetic_terminal`.
+  gets it free; `a_stream_that_ended_properly_gets_no_synthetic_terminal`. The
+  JSON collector raises that same synthesised failure as a 500 rather than a 200
+  with an empty report (`abnormal_end` is the one sentence both use;
+  `a_job_that_dies_without_a_terminal_is_a_failure_not_an_empty_report`).
 - **A report is arbitrary UTF-8 — never index it by byte**
   (`a_report_is_arbitrary_utf8_and_must_never_panic_the_parser`); the only
   safe indexes into model output are `char_indices` or ASCII-derived
@@ -1435,10 +1640,13 @@ problem+json 413 (`request.body_too_large`), not axum's plain-text.
 **`?stream=yes` reports the same pipeline as SSE**, and the pipeline is one
 function either way: `run_index_job` is shared verbatim; the query only picks
 who builds the terminal (`Json` body vs a `done`/`error` event), so the modes
-cannot drift. The cancellation shapes differ on purpose, mirroring research's:
-JSON mode keeps its `CancellationGuard` (handler-future drop = cancel); SSE
-mode spawns the job detached and the *stream's* Drop cancels the token (a
-guard in the handler would fire the instant the response is constructed).
+cannot drift. The cancellation shapes differ on purpose, and research now shares
+both of them: JSON mode keeps its `CancellationGuard` (handler-future drop =
+cancel); SSE mode spawns the job detached and the *stream's* Drop cancels the
+token (a guard in the handler would fire the instant the response is
+constructed). Research's JSON mode is the same pair with the roles as here —
+which is what makes "the default does not weaken cancel-on-disconnect" true
+rather than merely intended.
 Recovery runs inside the job, so a disconnected streaming client still lands
 its batch in `cancelled`. The event vocabulary
 (`started`/`prepared`/`skipped`/`embedded`/`indexed`/`done`/`error`,
@@ -1943,6 +2151,32 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   resetting handles **before** any notification (its thenable resolves only
   on dismissal), reported as a failure, not a cancellation; none of it is
   observable without `[mindex.statusPollSeconds]` (default 30, `0` = off).
+  **The stored token is the second input to that same `Availability`**, folded in
+  by `mergeAvailability` at the point of use rather than inside `fetchStatus` —
+  the two have different lifetimes, and merging late is what lets a token stored
+  now repaint the form without waiting for the next poll. So a `search`-only
+  credential is a *supported way to run the extension*, not a broken one: it
+  never refuses to activate (a read-only client is what a narrow token is for),
+  it freezes the Research controls and names the missing action, and the tabs
+  stay live under the same rule as above. It is a **hint** — `tokenAvailability`
+  reads an unverified payload, so it decides what to offer while the server
+  decides what to serve, the language-picker stance. The token reason **wins**
+  over the health reason — but only while `health.ask` is still true: a
+  dependency comes back by itself and a missing action does not, which stops
+  being the useful ordering once the server can serve nothing, where naming the
+  token sends the user to re-mint a credential that was never the problem. `#ollama-notice` therefore takes its
+  sentence from the host (`#ollama-reason`) instead of naming Ollama in markup,
+  since the same notice now has two causes with different remedies.
+  `reindex()` checks `index` up front for the same reason — without it a batch
+  403s file by file and renders as a partial reindex.
+  **A brand-new project is the sharp case**: `createProjectFile` writes a fresh
+  UUID no token names, and every later request answers 404 `project.not_found`,
+  byte-identical to a GUID nobody indexed. Nothing downstream can tell them
+  apart, so `createProjectFile` hands the GUID to its caller and the caller says
+  so. Deliberately **no button on that message**: a wildcard token already covers
+  the GUID and never gets there, and a named-project token is refused by
+  `may_mint` for a project it does not hold — the remedy is genuinely on the
+  host.
   **Every server-touching button single-flights through `BusyKeys`**
   (`src/busy.ts`; `[data-busy-key]` + `applyBusy`/`setEnabled` in the
   webview) — supersede reads, **refuse** writes and paging, and the greyed
@@ -2022,7 +2256,15 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
 - MCP `scout` (`tools/mcp/scout/`): token-economy layer, two tools —
   `research`, a thin SSE client over `POST /v0/{guid}/research`, and
   `challenge`, the same client pointed at
-  `POST /v0/{guid}/research/{run_id}/challenge` (one `_run` consumer for both,
+  `POST /v0/{guid}/research/{run_id}/challenge`. Both send **`?stream=yes`**
+  (`STREAM_QUERY`) now that frames are opt-in, and the reason is local to that
+  file rather than a preference: `READ_TIMEOUT` (120 s) is an *idle* timeout
+  resting on the 15 s keep-alive and is the only thing there that separates a
+  working server from a wedged one, and the partial-report salvage
+  (`truncated_by_client`/`live_run_id`/`still_running`) only works because bytes
+  arrive as they are produced. scout is the caller the streaming mode is *for* —
+  it reads to `done` by construction; the new default is for the caller that does
+  not. (One `_run` consumer for both,
   so the reader whitelists cannot drift; `_VERDICT_KEYS` reads the challenge
   stream's extra event, and `_INSTRUCTIONS` teach the caller the trust field
   and the two rules a verdict must be read under — inconclusive ≠ acquittal,
@@ -2117,6 +2359,21 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   assertions). Fresh project GUID per test. Suites map by filename
   (`test_e2e`, `test_filters…`, `test_management`, `test_validation`,
   `test_concurrency`).
+- **The stack holds two servers**, and the second one is why: `mindex-auth` runs
+  with `[auth].enabled` while `mindex` does not, because the whole existing suite
+  asserts the *unauthorized* behaviour and that is the coverage worth keeping —
+  an auth-off deployment must stay byte-for-byte what it was. `test_auth*.py`
+  drive the second (`auth` fixture, `AuthClient`), and every one of them skips
+  rather than fails when `MINDEX_AUTH_URL` is unset, since a missing authorized
+  server means the suite is being run some other way, not that something broke.
+  Two shapes it is easy to get wrong: the auth server **mints its own credentials
+  in its entrypoint before exec'ing the binary**, because `--abort-on-container-exit`
+  tears the run down when *any* container exits and a one-shot bootstrap service
+  exits by design; and its `--key-id … --new-key` falls back to plain `--key-id`,
+  because the key volume persists and `--new-key` rightly refuses an id that
+  already exists. Every narrow token is minted **from** the root one through
+  `POST /auth/tokens`, so the containment rule is exercised dozens of times as a
+  side effect of setting scenes.
 
 ## Linting (zero warnings everywhere — non-default flags matter)
 

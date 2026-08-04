@@ -100,10 +100,21 @@
 }
 
 .runs-error {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
     padding: 8px 14px;
     color: var(--vscode-inputValidation-errorForeground, var(--vscode-foreground));
     background: var(--vscode-inputValidation-errorBackground, rgba(190, 40, 40, 0.15));
     border-bottom: 1px solid var(--vscode-inputValidation-errorBorder, var(--mx-bad));
+}
+/* The Retry button, when there is something to retry. It inherits the banner's
+ * colour rather than the panel's: a link-coloured button on a warning strip reads
+ * as belonging to the page behind it. */
+.runs-error .runs-text-button {
+    flex: none;
+    color: inherit;
+    text-decoration: underline;
 }
 /* A failure a second press could survive — a timeout, a busy server, a
  * dependency that is coming back. Red for those says "this will not work",

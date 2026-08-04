@@ -30,10 +30,10 @@ use crate::backend::openapi::api_doc;
 use crate::backend::v0::handlers::{
     delete_files, delete_history, delete_project, delete_research_active, delete_research_run,
     delete_research_runs, get_config, get_files, get_health, get_llms_txt, get_metrics,
-    get_project_stats, get_projects, get_research_active, get_research_run, get_research_runs,
-    get_research_verification, get_status, get_version, post_cancel, post_drift, post_gc,
-    post_history, post_index, post_research, post_research_challenge, post_research_pin,
-    post_retry, post_search, post_symbols,
+    get_mindex_descriptor, get_project_stats, get_projects, get_research_active, get_research_run,
+    get_research_runs, get_research_verification, get_status, get_version, post_auth_tokens,
+    post_cancel, post_drift, post_gc, post_history, post_index, post_research,
+    post_research_challenge, post_research_pin, post_retry, post_search, post_symbols,
 };
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
@@ -182,6 +182,22 @@ pub struct RouterState {
     /// Everything this process measures about itself. Always present and always
     /// written into — `[metrics].enabled` gates the endpoint, not the recording.
     pub metrics: Arc<Metrics>,
+    /// Bearer-token verification, or `None` when `[auth].enabled` is false.
+    ///
+    /// An `Option` rather than a `bool` beside a keyring, so that "authorization
+    /// is off" and "authorization is on but there is no key" are not two states
+    /// the code has to keep consistent: without a keyring there is nothing to
+    /// verify against, and startup refuses to reach this point in that case.
+    pub auth: Option<Arc<AuthState>>,
+}
+
+/// Everything a request needs to decide whether a token permits it.
+pub struct AuthState {
+    pub keyring: crate::backend::auth::Keyring,
+    /// `[auth].leeway_seconds`, applied to `exp` and `nbf` alike.
+    pub leeway_seconds: u64,
+    /// `[auth].max_token_days`, the ceiling `POST /auth/tokens` enforces.
+    pub max_token_days: u64,
 }
 
 impl RouterState {
@@ -442,6 +458,337 @@ fn build_quic_endpoint(
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
+/// Routes this server serves that are **not** in the OpenAPI spec, each with the
+/// one-line summary the service descriptor reports for it.
+///
+/// Every one is a deliberate omission rather than an oversight, and
+/// `openapi_spec_is_complete_and_versioned` asserts the absence of the two that
+/// have handlers so that nobody "fixes" it. They are here because two different
+/// readers need the same list for opposite purposes: the descriptor
+/// (`/.well-known/mindex.json`) reports them as real endpoints with
+/// `documented: false`, and `llms_doc_mentions_only_routes_that_exist` allows
+/// the narrative to name them. Keeping one list is what stops those two drifting
+/// apart — they held separate copies of the same four strings before this.
+///
+/// `/metrics` is in the list but the descriptor filters it out: it is an
+/// operator surface, routed only when `[metrics].enabled`, and a discovery
+/// document that advertises a route which 404s on half of all deployments is
+/// worse than one that stays quiet about it.
+pub const UNDOCUMENTED_ROUTES: &[(&str, &str)] = &[
+    (
+        "/llms.txt",
+        "Prose companion to the service descriptor: the workflow this API is built around.",
+    ),
+    (
+        "/metrics",
+        "Prometheus/OpenMetrics exposition, when [metrics].enabled.",
+    ),
+    ("/swagger-ui", "The OpenAPI spec, rendered interactively."),
+    (
+        "/api-docs/openapi.json",
+        "Full request/response schemas for every documented endpoint.",
+    ),
+];
+
+/// Paths in [`UNDOCUMENTED_ROUTES`] the descriptor must not advertise.
+///
+/// One entry, and the reason is in that constant's own doc comment.
+pub const DESCRIPTOR_HIDDEN_ROUTES: &[&str] = &["/metrics"];
+
+/// Which endpoints answer in frames rather than one body, and in what encoding.
+///
+/// The only fact in the descriptor's endpoint inventory that is written by hand:
+/// OpenAPI records the shape of a response, not that it arrives incrementally,
+/// so this cannot be derived from the spec. A new streaming endpoint needs a row
+/// here, next to its `.route(...)` line — a caller that buffers an SSE stream to
+/// completion is exactly the failure this field exists to prevent, and it fails
+/// as a seventy-minute silence rather than as an error.
+///
+/// All three rows describe what the endpoint answers **under `?stream=yes`**; each
+/// answers one JSON body without it. The field says an endpoint *can* stream, not
+/// that it always does — which is the reading `/index` has always needed, and now
+/// research does too.
+pub const STREAMING_ENDPOINTS: &[(&str, &str, &str)] = &[
+    ("POST", "/v0/{project_guid}/index", "ndjson"),
+    ("POST", "/v0/{project_guid}/research", "sse"),
+    (
+        "POST",
+        "/v0/{project_guid}/research/{run_id}/challenge",
+        "sse",
+    ),
+];
+
+/// What a token must carry to reach each route.
+///
+/// **Documentation with a guard, not a dispatch mechanism.** Nothing reads this
+/// at request time — the extractors in `backend/extract.rs` do the deciding. It
+/// exists so that the question "what does this endpoint require?" has one answer
+/// a reviewer can read in one place, and so that
+/// `every_route_is_named_by_the_authorization_policy` can fail the build when a
+/// new route ships without anybody deciding.
+///
+/// That guard is the whole point. The failure it prevents is not a wrong entry
+/// here; it is a new endpoint added to the route table below, with no extractor,
+/// that is therefore reachable by any token at all — which produces no error, no
+/// warning and no failing test, and is discovered by whoever finds it first.
+pub const ROUTE_POLICY: &[(&str, &str, RoutePolicy)] = &[
+    ("POST", "/v0/{project_guid}/index", RoutePolicy::Index),
+    ("POST", "/v0/{project_guid}/search", RoutePolicy::Search),
+    ("POST", "/v0/{project_guid}/symbols", RoutePolicy::Search),
+    ("POST", "/v0/{project_guid}/research", RoutePolicy::Research),
+    (
+        "POST",
+        "/v0/{project_guid}/research/{run_id}/challenge",
+        RoutePolicy::Research,
+    ),
+    ("POST", "/v0/{project_guid}/history", RoutePolicy::Index),
+    ("DELETE", "/v0/{project_guid}/history", RoutePolicy::Delete),
+    ("GET", "/projects", RoutePolicy::ListProjects),
+    ("GET", "/projects/{project_guid}", RoutePolicy::Search),
+    ("DELETE", "/projects/{project_guid}", RoutePolicy::Delete),
+    ("GET", "/projects/{project_guid}/files", RoutePolicy::Search),
+    (
+        "DELETE",
+        "/projects/{project_guid}/files",
+        RoutePolicy::Delete,
+    ),
+    (
+        "POST",
+        "/projects/{project_guid}/cancel",
+        RoutePolicy::Index,
+    ),
+    ("POST", "/projects/{project_guid}/retry", RoutePolicy::Index),
+    ("POST", "/projects/{project_guid}/drift", RoutePolicy::Drift),
+    (
+        "GET",
+        "/projects/{project_guid}/research",
+        RoutePolicy::Research,
+    ),
+    (
+        "DELETE",
+        "/projects/{project_guid}/research",
+        RoutePolicy::Delete,
+    ),
+    (
+        "GET",
+        "/projects/{project_guid}/research/{run_id}",
+        RoutePolicy::Research,
+    ),
+    (
+        "DELETE",
+        "/projects/{project_guid}/research/{run_id}",
+        RoutePolicy::Delete,
+    ),
+    (
+        "POST",
+        "/projects/{project_guid}/research/{run_id}/pin",
+        RoutePolicy::Research,
+    ),
+    (
+        "GET",
+        "/projects/{project_guid}/research/{run_id}/verification",
+        RoutePolicy::Research,
+    ),
+    ("GET", "/research/active", RoutePolicy::ActiveRuns),
+    (
+        "DELETE",
+        "/research/active/{run_id}",
+        RoutePolicy::ActiveRuns,
+    ),
+    ("POST", "/gc", RoutePolicy::Admin),
+    ("POST", "/auth/tokens", RoutePolicy::Mint),
+    ("GET", "/status", RoutePolicy::Admin),
+    ("GET", "/metrics", RoutePolicy::Admin),
+    // Public, and each for a reason rather than by omission. `/health` and
+    // `/version` are liveness: a probe that needs a credential is a probe that
+    // reports the credential's health, not the server's. `/config`, `/llms.txt`
+    // and the descriptor are discovery, and a discovery document behind a
+    // credential cannot be discovered — which is the failure that started this
+    // whole feature, an agent handed a URL with no way to learn what to do next.
+    ("GET", "/health", RoutePolicy::Public),
+    ("GET", "/version", RoutePolicy::Public),
+    ("GET", "/config", RoutePolicy::Public),
+    ("GET", "/llms.txt", RoutePolicy::Public),
+    ("GET", "/.well-known/mindex.json", RoutePolicy::Public),
+];
+
+/// Path prefixes that are public and are **not** in [`ROUTE_POLICY`], because
+/// they are not in the route table either.
+///
+/// The Swagger UI is `merge`d rather than `.route`d, so it registers paths this
+/// build never spells as literals — the asset routes underneath `/swagger-ui`
+/// have shapes only the crate knows. Prefix-matched for that reason, and
+/// hardcoded rather than derived, because there is nothing to derive them from.
+///
+/// Public for the same reason `/llms.txt` and the descriptor are: they are how a
+/// caller learns what this server offers, and a specification behind a
+/// credential cannot be read by anyone deciding whether to ask for one. They
+/// describe the API's *shape*; they hold no project, no chunk and no report.
+///
+/// Without this list the default-deny layer refuses them as unconfigured routes
+/// — an accidental refusal, logged as a build defect, on every visit to the
+/// documentation.
+pub const PUBLIC_PATH_PREFIXES: &[&str] = &["/swagger-ui", "/api-docs/"];
+
+/// One row of [`ROUTE_POLICY`]. Each non-public variant names the extractor that
+/// enforces it, so the guard test can check the handler actually took it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutePolicy {
+    Public,
+    Search,
+    Research,
+    Index,
+    Delete,
+    /// `POST /drift`, whose refusal is a rewrite rather than an error.
+    Drift,
+    Mint,
+    ListProjects,
+    ActiveRuns,
+    Admin,
+}
+
+impl RoutePolicy {
+    /// The action a token must carry, or `None` for a public route.
+    pub fn action(self) -> Option<crate::backend::auth::Action> {
+        use crate::backend::auth::Action;
+        match self {
+            RoutePolicy::Public => None,
+            // `search`, not a fourth action: `/drift` is a read over indexed
+            // content that happens to be posted, and giving it its own action
+            // would mean every client that checks drift needs a wider token.
+            RoutePolicy::Search | RoutePolicy::Drift | RoutePolicy::ListProjects => {
+                Some(Action::Search)
+            }
+            RoutePolicy::Research | RoutePolicy::ActiveRuns => Some(Action::Research),
+            RoutePolicy::Index => Some(Action::Index),
+            RoutePolicy::Delete => Some(Action::Delete),
+            RoutePolicy::Admin => Some(Action::Admin),
+            RoutePolicy::Mint => Some(Action::Mint),
+        }
+    }
+
+    /// The extractor type name a handler under this policy must name. Read only
+    /// by the guard test — the extractors themselves are named in the handler
+    /// signatures, which is the point.
+    #[cfg(test)]
+    pub fn extractor(self) -> Option<&'static str> {
+        match self {
+            RoutePolicy::Public => None,
+            RoutePolicy::Search => Some("SearchScope"),
+            RoutePolicy::Research => Some("ResearchScope"),
+            RoutePolicy::Index => Some("IndexScope"),
+            RoutePolicy::Delete => Some("DeleteScope"),
+            RoutePolicy::Drift => Some("DriftScope"),
+            RoutePolicy::ListProjects => Some("ListProjectsScope"),
+            RoutePolicy::ActiveRuns => Some("ActiveRunsScope"),
+            RoutePolicy::Admin => Some("AdminScope"),
+            RoutePolicy::Mint => Some("MintScope"),
+        }
+    }
+}
+
+/// Default-deny authorization, applied to every request before it reaches a
+/// handler.
+///
+/// # Why this exists alongside the extractors
+///
+/// The extractors in `backend/extract.rs` are the mechanism, and a build-time
+/// guard proves every route has one. This is the runtime half of the same
+/// promise, and it exists because those two facts protect against different
+/// mistakes. The guard catches a route added without a policy row **when the
+/// suite runs**. This catches it **when the request arrives**, and it is the
+/// difference between a leak that fails a test and a leak that ships.
+///
+/// It fails closed in the one direction that matters: a routed path with no
+/// [`ROUTE_POLICY`] entry is **refused**, not served. Serving it would be
+/// deciding its authorization by omission, which is exactly how an endpoint ends
+/// up reachable by anything holding any token.
+///
+/// What it deliberately does **not** do is the project check. That one is not
+/// uniform — `/drift` must answer an out-of-scope project as it answers an
+/// unknown one rather than 404, `/index` must be able to create, and the two
+/// listings filter a body — so a blanket answer here would need a per-route
+/// exception table, which is the hand-kept fifth copy of the route list that
+/// nothing checks. The extractors keep that, and re-check the action too: the
+/// overlap is deliberate, since a defence that is only in one place is one
+/// refactor away from being nowhere.
+async fn enforce_route_policy(
+    auth: Option<Arc<AuthState>>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let Some(auth) = auth else {
+        return next.run(req).await;
+    };
+
+    // No `MatchedPath` means no route matched, so the request is on its way to a
+    // 404 that touches nothing. Refusing here instead would turn every typo into
+    // a credential error and hide the real one.
+    let Some(matched) = req.extensions().get::<MatchedPath>().map(|m| m.as_str()) else {
+        return next.run(req).await;
+    };
+    let method = req.method().as_str();
+
+    if PUBLIC_PATH_PREFIXES.iter().any(|p| matched.starts_with(p)) {
+        return next.run(req).await;
+    }
+
+    let Some((_, _, policy)) = ROUTE_POLICY
+        .iter()
+        .find(|(m, p, _)| *m == method && *p == matched)
+    else {
+        tracing::error!(
+            method = %method,
+            path = %matched,
+            "Refused a routed endpoint that ROUTE_POLICY does not name. \
+             Hint for the sysadmin: this is a defect in this build, not in the \
+             request — the endpoint is served by the router but nobody decided \
+             what a token needs to reach it, so it fails closed. \
+             `every_route_is_named_by_the_authorization_policy` should have caught it."
+        );
+        return crate::backend::error::ApiError::RouteNotConfigured.into_response();
+    };
+
+    let Some(action) = policy.action() else {
+        return next.run(req).await;
+    };
+
+    let token = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::backend::auth::bearer_from_header);
+    let Some(token) = token else {
+        return crate::backend::error::ApiError::TokenMissing.into_response();
+    };
+
+    match crate::backend::auth::verify(&auth.keyring, token, auth.leeway_seconds) {
+        Err(crate::backend::auth::AuthError::Expired) => {
+            crate::backend::error::ApiError::TokenExpired.into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                method = %method,
+                path = %matched,
+                "Refused a bearer token. Hint for the sysadmin: an unknown key id usually \
+                 means the key was rotated out of [auth].signing_key_file while tokens \
+                 signed under it were still in use."
+            );
+            crate::backend::error::ApiError::TokenInvalid.into_response()
+        }
+        Ok(claims) if !claims.permits(action) => {
+            crate::backend::error::ApiError::ActionNotPermitted {
+                action: action.as_str(),
+            }
+            .into_response()
+        }
+        Ok(_) => next.run(req).await,
+    }
+}
+
 fn build_router(
     state: RouterState,
     body_limit_bytes: usize,
@@ -511,12 +858,21 @@ fn build_router(
             axum::routing::delete(delete_research_active),
         )
         .route("/gc", post(post_gc))
+        // Minting over the network. Deliberately *not* the bootstrap path — it
+        // needs a token to call, and `mindex mint-token` is what issues the
+        // first one. A mint endpoint reachable without a credential would be a
+        // vending machine on the open port.
+        .route("/auth/tokens", post(post_auth_tokens))
         .route("/status", get(get_status))
         .route("/config", get(get_config))
         // The AI-agent bootstrap document (llms.txt convention). Unconditional,
         // unlike `/metrics`: there is no config gate whose absence it should
         // mirror, and a 404 here would read as "this server has no such doc".
         .route("/llms.txt", get(get_llms_txt))
+        // The machine twin of `/llms.txt`, and the floor under it: a client
+        // whose harness refuses the prose can still learn what this server is
+        // from JSON. Unconditional for the same reason.
+        .route("/.well-known/mindex.json", get(get_mindex_descriptor))
         .route("/health", get(get_health))
         .route("/version", get(get_version));
 
@@ -530,6 +886,20 @@ fn build_router(
 
     router
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api_doc()))
+        // Default-deny authorization. Placed here so it is *inside* the metrics
+        // layer — a 401 is a request that happened and must be counted — and
+        // *outside* everything else, so no handler and no body-limit
+        // short-circuit runs before the token has been checked. It must be a
+        // `Router::layer` for the same reason the metrics one is: `MatchedPath`
+        // exists only inside the router, and without it this could not tell one
+        // route from another.
+        .layer(axum::middleware::from_fn({
+            let auth = state.auth.clone();
+            move |req: Request<Body>, next: Next| {
+                let auth = auth.clone();
+                async move { enforce_route_policy(auth, req, next).await }
+            }
+        }))
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         // Advertise HTTP/3 availability on every TCP/TLS response.
         .layer(axum::middleware::from_fn(
@@ -871,6 +1241,61 @@ async fn pump_response<S: ResponseSink>(
     Ok(())
 }
 
+/// A router carrying one route that `ROUTE_POLICY` deliberately does not name.
+///
+/// The only way to test the default-deny layer against the mistake it exists
+/// for: the real table has no such hole, so the alternative is waiting for
+/// somebody to make one. It sits behind `#[cfg(test)]` and **before** the test
+/// module on purpose — the route scanner cuts the file at the first
+/// `#[cfg(test)]`, so this fabricated route is invisible to
+/// `every_route_is_named_by_the_authorization_policy`, which would otherwise
+/// fail on it.
+/// The **real** router, for tests that must exercise authorization on every
+/// route rather than on a hand-picked few.
+///
+/// Reaching for `build_router` itself is the point: a fixture that rebuilt the
+/// route table would be testing its own copy of it, which is exactly the class
+/// of drift `ROUTE_POLICY` exists to stop.
+#[cfg(test)]
+pub fn production_router_for_test(state: RouterState) -> Router {
+    build_router(
+        state,
+        1024 * 1024,
+        0,
+        // Metrics on, so `/metrics` is actually routed: it is `admin` in
+        // ROUTE_POLICY, and a fixture that left it unrouted would silently skip
+        // the one route where an unauthorized read leaks every project's GUID
+        // and chunk counts at once.
+        MetricsRouting {
+            enabled: true,
+            per_project_http_labels: false,
+        },
+    )
+}
+
+#[cfg(test)]
+pub async fn enforce_route_policy_for_test(
+    auth: Option<Arc<AuthState>>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    enforce_route_policy(auth, req, next).await
+}
+
+#[cfg(test)]
+pub fn build_router_for_test(state: RouterState) -> Router {
+    let auth = state.auth.clone();
+    Router::new()
+        .route("/a-future-endpoint", get(|| async { "leaked" }))
+        .layer(axum::middleware::from_fn(
+            move |req: Request<Body>, next: Next| {
+                let auth = auth.clone();
+                async move { enforce_route_policy(auth, req, next).await }
+            },
+        ))
+        .with_state(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,6 +1304,163 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use std::time::Duration;
+
+    /// Every `(method, path)` the production route table registers.
+    ///
+    /// A source-text scan because neither axum nor utoipa enumerates routes at
+    /// runtime — the same technique, and the same two hazards, as
+    /// `the_route_table_holds_no_path_the_descriptor_omits`: the `#[cfg(test)]`
+    /// half of this file stands up throwaway routers (`/slow`, and the fixture
+    /// right below this function) which are not API, and an extractor that
+    /// silently matched nothing would make every assertion below vacuously true,
+    /// so it self-checks its own yield.
+    fn routed_methods_and_paths() -> Vec<(String, String)> {
+        let src = include_str!("http3.rs");
+        let src = src.split_once("\n#[cfg(test)]").map_or(src, |(h, _)| h);
+
+        let mut out = Vec::new();
+        for (i, m) in src.match_indices(".route(") {
+            let rest = src[i + m.len()..].trim_start();
+            let Some(body) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = body.find('"') else { continue };
+            let path = &body[..end];
+
+            // The methods are the `get(...)`/`post(...)`/`delete(...)` calls
+            // between this path literal and the end of its `.route(` call. The
+            // scan stops at the next `.route(` so a chained table cannot bleed
+            // one route's methods into the previous one's.
+            let tail = &body[end..];
+            let tail = tail.split(".route(").next().unwrap_or(tail);
+            for (verb, name) in [
+                ("get(", "GET"),
+                ("post(", "POST"),
+                ("delete(", "DELETE"),
+                ("axum::routing::delete(", "DELETE"),
+            ] {
+                if tail.contains(verb) {
+                    out.push((name.to_string(), path.to_string()));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        assert!(
+            out.len() > 20,
+            "the route scanner found {} routes — it is broken, not the router",
+            out.len()
+        );
+        out
+    }
+
+    /// Every route the server serves is named by [`ROUTE_POLICY`], and every row
+    /// of that table is a route the server serves.
+    ///
+    /// Both directions, because they fail differently and only one of them is
+    /// dangerous. A stale row is untidy. A **missing** row is a new endpoint that
+    /// nobody decided the authorization of — reachable by any token at all,
+    /// producing no error and no warning, and found by whoever finds it first.
+    #[test]
+    fn every_route_is_named_by_the_authorization_policy() {
+        let routed = routed_methods_and_paths();
+        let policy: Vec<(String, String)> = ROUTE_POLICY
+            .iter()
+            .map(|(m, p, _)| (m.to_string(), p.to_string()))
+            .collect();
+
+        for (method, path) in &routed {
+            assert!(
+                policy.contains(&(method.clone(), path.clone())),
+                "{method} {path} is registered in http3.rs but ROUTE_POLICY does not say what \
+                 a token needs to reach it — so nothing decided, and it is open"
+            );
+        }
+        for (method, path) in &policy {
+            assert!(
+                routed.contains(&(method.clone(), path.clone())),
+                "ROUTE_POLICY names {method} {path}, which this server does not route"
+            );
+        }
+    }
+
+    /// Every handler behind a non-public route takes the extractor its policy
+    /// names, and no scoped handler takes a bare `ApiPath` project guid.
+    ///
+    /// This is the half that catches the mistake worth catching: adding a route
+    /// *and* remembering the policy row, while writing the handler with the
+    /// extractor the route next to it happened to use.
+    #[test]
+    fn every_scoped_handler_takes_the_extractor_its_policy_names() {
+        // From `build_router` onward, not the whole file: every path literal in
+        // ROUTE_POLICY above is also a string in this source, and searching from
+        // the top finds the policy row instead of the route.
+        let router_src = {
+            let s = include_str!("http3.rs");
+            let s = s.split_once("\n#[cfg(test)]").map_or(s, |(h, _)| h);
+            s.split_once("fn build_router(")
+                .expect("build_router is in this file")
+                .1
+        };
+        let handlers_src = include_str!("v0/handlers.rs");
+
+        let mut checked = 0usize;
+        for (method, path, policy) in ROUTE_POLICY {
+            let Some(wanted) = policy.extractor() else {
+                continue;
+            };
+
+            // The handler name is the ident inside the method call for this
+            // route, e.g. `post(post_search)`.
+            let verb = match *method {
+                "GET" => "get(",
+                "POST" => "post(",
+                _ => "delete(",
+            };
+            let route_at = router_src
+                .find(&format!("\"{path}\""))
+                .unwrap_or_else(|| panic!("{path} is not in the route table"));
+            let tail = &router_src[route_at..];
+            let tail = tail.split(".route(").next().unwrap_or(tail);
+            let call = tail
+                .find(verb)
+                .unwrap_or_else(|| panic!("{method} {path}: no {verb} in its .route( call"));
+            let after = &tail[call + verb.len()..];
+            let handler: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                !handler.is_empty(),
+                "{method} {path}: could not read the handler name"
+            );
+
+            // Its signature is everything up to the opening brace.
+            let sig_at = handlers_src
+                .find(&format!("pub async fn {handler}("))
+                .unwrap_or_else(|| panic!("no handler named {handler} in handlers.rs"));
+            let sig = &handlers_src[sig_at..];
+            let sig = &sig[..sig.find(" {\n").unwrap_or(sig.len().min(2000))];
+
+            assert!(
+                sig.contains(wanted),
+                "{method} {path} is {policy:?} in ROUTE_POLICY, but `{handler}` does not take \
+                 `{wanted}` — so the route is registered, the policy is written down, and \
+                 nothing enforces it"
+            );
+            assert!(
+                !sig.contains("ApiPath<UUIDv4>") && !sig.contains("ApiPath<(UUIDv4"),
+                "{handler} still takes a bare ApiPath project guid alongside {wanted}; the \
+                 scope extractor already yields the guid, and two sources for it is how they \
+                 come to disagree"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 20,
+            "only {checked} handlers were checked — the extractor is broken, not the handlers"
+        );
+    }
 
     /// A router carrying only the metrics layer, so these tests exercise the
     /// middleware rather than the service.

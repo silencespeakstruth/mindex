@@ -162,6 +162,37 @@ export class StatusMonitor {
         if (this.inFlight !== undefined || this.disposed) {
             return;
         }
+        this.pending = this.runRefresh();
+        await this.pending;
+    }
+
+    /**
+     * A refresh whose result is guaranteed to be *newer than this call*.
+     *
+     * `refresh` refuses while one is in flight, which is right for a tick and wrong
+     * for the callers that await it after a write — a retry, a delete, a reindex.
+     * Those got an instant return carrying a snapshot taken before their own change,
+     * so the panel could re-render still showing the file they had just requeued.
+     * Shortening `mindex.statusPollSeconds` makes that collision the common case
+     * rather than a rare one.
+     *
+     * It waits out the in-flight read rather than aborting it — that one has its own
+     * awaiting caller — and then takes its turn. At most one extra pass per write,
+     * which is why this is a separate method and not a change to `refresh`: the
+     * chaining the single-flight exists to prevent is a *tick* colliding with a slow
+     * read, and a tick still refuses.
+     */
+    async refreshNow(): Promise<void> {
+        if (this.disposed) {
+            return;
+        }
+        await this.pending;
+        await this.refresh();
+    }
+
+    private pending?: Promise<void>;
+
+    private async runRefresh(): Promise<void> {
         const controller = new AbortController();
         this.inFlight = controller;
         this.refreshingChanged.fire(true);
