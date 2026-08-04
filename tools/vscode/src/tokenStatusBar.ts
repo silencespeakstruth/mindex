@@ -96,6 +96,14 @@ export class TokenStatusBar {
     private tooltip(severity: ExpirySeverity): vscode.MarkdownString {
         const md = new vscode.MarkdownString();
         md.supportThemeIcons = true;
+        // Required for the `command:` links below, and deliberately *not* the
+        // blanket `true`: parts of this tooltip are interpolated from the token's
+        // own claims, which is arbitrary text from whatever was pasted in. A
+        // wide-open trusted string would let a crafted `sub` render a link to any
+        // command in the window. Both commands named here open a dialog and take
+        // no arguments, so the worst an injected copy can do is what the button
+        // beside it already does.
+        md.isTrusted = { enabledCommands: ["mindex.setToken", "mindex.mintAgentToken"] };
         const { subject, projects, actions, expiresAtMs } = this.facts;
 
         if (severity === "expired") {
@@ -124,10 +132,18 @@ export class TokenStatusBar {
         if (actions !== undefined) {
             md.appendMarkdown(`Actions: \`${actions.join("`, `")}\`\n\n`);
         }
+        // Two remedies, and they are not the same act. Replacing *this* credential
+        // has to happen on the host: a token whose own life is nearly over cannot
+        // mint itself a longer-lived successor, because `may_mint` refuses a later
+        // `exp` than the minter's. Issuing a token for an agent is a different
+        // credential with a different holder, is not bound by this one's remaining
+        // life in the same way, and is reachable from here — so it is offered as a
+        // link rather than as a sentence about a terminal.
         md.appendMarkdown(
             "_Mint a replacement with_ `mindex mint-token` _on the server's host, " +
-                "then click here to paste it._"
+                "then_ [paste it here](command:mindex.setToken)_._\n\n"
         );
+        md.appendMarkdown("[Issue a token for an agent](command:mindex.mintAgentToken)");
         return md;
     }
 

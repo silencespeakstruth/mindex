@@ -248,6 +248,11 @@
           "group": "navigation@2"
         },
         {
+          "command": "mindex.mintAgentToken",
+          "when": "view == mindexAsk && mindex.hasProject",
+          "group": "navigation@3"
+        },
+        {
           "command": "mindex.openSettings",
           "when": "view == mindexAsk",
           "group": "navigation@4"

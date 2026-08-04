@@ -46,6 +46,7 @@ for (const id of ["refresh", "health-refresh"]) {
 for (const id of ["settings", "unreachable-settings"]) {
     el(id).addEventListener("click", () => api.postMessage({ type: "openSettings" }));
 }
+el("mint-token").addEventListener("click", () => api.postMessage({ type: "mintAgentToken" }));
 retryAll.addEventListener("click", () => api.postMessage({ type: "retryAll" }));
 
 interface HostMessage {

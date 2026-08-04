@@ -1,6 +1,13 @@
 import * as vscode from "vscode";
 import { MindexApi } from "./api";
 import { say } from "./brand";
+import { showIssuedToken } from "./tokenDoc";
+import {
+    ACTION_PRESETS,
+    actionsForPreset,
+    AGENT_AUDIENCE,
+    OFFERED_ACTIONS,
+} from "./tokenGrants";
 
 /**
  * Issue a scoped token from the one this extension already holds.
@@ -25,6 +32,14 @@ import { say } from "./brand";
  * - **This project only, never `*`.** A wildcard token is exactly as dangerous as
  *   the shared API key this whole mechanism replaced. There is no menu entry for
  *   one; minting it is a deliberate act on the server's host.
+ * - **Two presets over the tick list, not instead of it.** Read-only and
+ *   read-and-write are the two shapes people actually want, and assembling either
+ *   from four checkboxes every time is work that teaches nothing. The presets are
+ *   an ordering, not a narrowing: the full list is one item down the same menu, it
+ *   is unchanged, and it is still the only way to reach `delete` — a destructive
+ *   grant should not be one keystroke from the top of a list. The write modal fires
+ *   for the preset exactly as it does for a tick, because the preset says *which*
+ *   actions and the modal says what they cost.
  * - **Write actions are offered and pre-ticked off.** They used to be absent, on
  *   the argument that an agent has no working tree so `index` buys it nothing.
  *   That is true of an agent handed a URL and false of the case people actually
@@ -48,7 +63,10 @@ import { say } from "./brand";
  *   keychain is refused by the editor, with a sentence naming both audiences.
  * - **Clipboard, not a file and not a notification body.** A file is a copy
  *   nobody decided to keep; a notification truncates a 300-character token and
- *   puts it in a log. The clipboard is where it is going anyway.
+ *   puts it in a log. The clipboard is where it is going anyway — and when it is
+ *   not (a config that has to be edited by hand, a token that has to be read out),
+ *   `Show it` opens the read-only in-memory document in `tokenDoc.ts`, which is
+ *   the same refusal to write a file wearing a different hat.
  */
 
 /** The lifetimes offered. See the note above on why seven is the ceiling. */
@@ -59,51 +77,14 @@ const LIFETIMES: readonly { label: string; days: number; detail: string }[] = [
 ];
 
 /**
- * What may be ticked, and what starts ticked.
+ * The tick list, as it was before the presets arrived.
  *
- * `admin` and `mint` are absent by construction rather than filtered later — a
- * list that holds them and hides them is one edit away from offering them.
+ * `undefined` is a dismissed picker and `[]` is a deliberate empty tick — two
+ * different things, and only the second is worth a sentence. An empty grant is
+ * refused rather than issued, because the server would issue it happily and the
+ * holder would discover it one 403 at a time.
  */
-export const OFFERED_ACTIONS: readonly {
-    action: string;
-    label: string;
-    detail: string;
-    default: boolean;
-}[] = [
-    {
-        action: "search",
-        label: "search",
-        detail: "read the index: search, symbols, outline, file lists, drift",
-        default: true,
-    },
-    {
-        action: "research",
-        label: "research",
-        detail: "run investigations and challenges, and read stored reports",
-        default: true,
-    },
-    {
-        action: "index",
-        label: "index",
-        detail: "WRITE — upload file contents, reindex, cancel, retry",
-        default: false,
-    },
-    {
-        action: "delete",
-        label: "delete",
-        detail: "DESTRUCTIVE — remove files, history and stored reports from the index",
-        default: false,
-    },
-];
-
-/** What this command labels the tokens it issues. */
-export const AGENT_AUDIENCE = "agent";
-
-export async function mintAgentToken(
-    api: MindexApi,
-    projectGuid: string,
-    projectLabel: string
-): Promise<void> {
+async function pickActions(projectLabel: string): Promise<string[] | undefined> {
     const picked = await vscode.window.showQuickPick(
         OFFERED_ACTIONS.map((a) => ({
             label: a.label,
@@ -119,18 +100,38 @@ export async function mintAgentToken(
         }
     );
     if (picked === undefined) {
-        return;
+        return undefined;
     }
-    // An empty tick list is a token that can do nothing. Refused rather than
-    // issued, because the server would issue it happily and the holder would
-    // discover it one 403 at a time.
     if (picked.length === 0) {
         void vscode.window.showWarningMessage(
             say("no actions were selected, so there is no token worth issuing.")
         );
+        return undefined;
+    }
+    return picked.map((p) => p.action);
+}
+
+export async function mintAgentToken(
+    api: MindexApi,
+    projectGuid: string,
+    projectLabel: string
+): Promise<void> {
+    const preset = await vscode.window.showQuickPick(
+        ACTION_PRESETS.map((p) => ({ label: p.label, description: p.detail, id: p.id })),
+        {
+            title: say(`token for an agent — ${projectLabel}`),
+            placeHolder: "what may it do? (this project only)",
+            ignoreFocusOut: true,
+        }
+    );
+    if (preset === undefined) {
         return;
     }
-    const actions = picked.map((p) => p.action);
+    const granted = actionsForPreset(preset.id);
+    const actions = granted === undefined ? await pickActions(projectLabel) : [...granted];
+    if (actions === undefined) {
+        return;
+    }
     const writes = actions.filter((a) => a === "index" || a === "delete");
 
     // A second, modal confirmation for the write actions only. The tick already
@@ -193,10 +194,23 @@ export async function mintAgentToken(
     // the person about to paste this is the last one who can notice it is wrong,
     // and they cannot read a base64 payload. The server's echo is used rather
     // than the request, so a grant the server narrowed is reported as narrowed.
-    void vscode.window.showInformationMessage(
+    //
+    // `Show it` is a button rather than the default because revealing a credential
+    // should be an act, not a side effect of issuing one — the clipboard already
+    // serves the case where it is pasted straight on.
+    const SHOW = "Show it";
+    const choice = await vscode.window.showInformationMessage(
         say(
             `token copied to the clipboard — ${issued.actions.join(" + ")} on this project ` +
                 `only${until}. It is shown once and stored nowhere.`
-        )
+        ),
+        SHOW
     );
+    if (choice === SHOW) {
+        await showIssuedToken(issued.token, {
+            actions: issued.actions,
+            projects: issued.projects,
+            expiresAt: issued.expires_at,
+        });
+    }
 }

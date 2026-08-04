@@ -427,6 +427,54 @@ modifying `tools/vscode`.
   `StatusMonitor.onDidChangeRefreshing`, not by the press, so a *background*
   poll greys it too — otherwise the panel visibly re-renders while the
   button that supposedly caused it sits idle and clickable.
+  **Issuing a token for an agent is on three surfaces, and that is the
+  feature.** The capability — `mindex.mintAgentToken` (`agentToken.ts`), a
+  project-scoped `agent`-audience token over `POST /auth/tokens`, seven days at
+  the most — shipped reachable only from the command palette, with an `$(key)`
+  icon declared in `package.json` and not one `menus` entry to render it in. A
+  credential mechanism nobody can find is not a narrower credential, it is a
+  shell on the server's host issuing a wider one, which is the exact failure the
+  command exists to prevent. So: the **Ask view's title bar** (`navigation@3`,
+  gated on `mindex.hasProject`, because without the gate the button opens a
+  dialog that ends in a silent return), the **Server Status panel's header**
+  (its own `mint` busy key, not `refresh`'s — this is a write and `BusyKeys`
+  refuses a second press rather than superseding, so two clicks cannot issue two
+  credentials), and a `command:` link in the **token indicator's tooltip**. The
+  third is deliberately the weakest: that indicator is hidden while the token is
+  healthy by design, so a button there is unreachable during ordinary work —
+  worth having as a hand-off from "your credential is dying" to "issue the other
+  kind", not worth breaking the hidden-while-healthy rule for. Its tooltip's
+  `isTrusted` is the **allow-list form**, naming only `mindex.setToken` and
+  `mindex.mintAgentToken`: parts of that tooltip are interpolated from the
+  token's own claims, and a blanket `true` would let a crafted `sub` render a
+  link to any command in the window. The panel button delegates to the command
+  rather than to `mintAgentToken` directly, so the project lookup and the
+  `auth.action_not_permitted` sentence stay in one place.
+  **The grant tables are data, in a `vscode`-free file, because the guard on
+  them has to run.** `tokenGrants.ts` holds `OFFERED_ACTIONS` and
+  `ACTION_PRESETS`; the rationale stays in `agentToken.ts`'s header beside the
+  flow it shapes. The split is the `token.ts` / `tokenStatusBar.ts` one — the
+  suite is bare `node --test`, so anything importing `vscode` is untestable, and
+  the claims worth pinning (`admin`/`mint` absent by construction, `delete`
+  reachable only through a tick) are precisely the kind a table gains in a
+  hurry. The two presets are an **ordering, not a narrowing**: read-only and
+  read-and-write are the shapes people actually want, the full tick list is one
+  item down the same menu, and the write modal fires for a preset exactly as it
+  does for a tick — the preset says which actions, the modal says what they
+  cost.
+  **A shown token is a read-only in-memory document, not an untitled buffer.**
+  The clipboard remains the default and `Show it` is a button on the
+  confirmation, so revealing a credential is an act rather than a side effect of
+  issuing one; it exists because a token pasted by hand into somebody else's
+  JSON cannot be served by a clipboard the next copy overwrites. `tokenDoc.ts`
+  serves it through a `TextDocumentContentProvider` (scheme `mindex-token`,
+  value in a module map keyed by a nonce, dropped on `onDidCloseTextDocument`).
+  An untitled buffer would have been one line of code and one absent-minded
+  `Ctrl+S` from the credential on disk in whatever directory happened to be
+  open — reintroducing "a file is a copy nobody decided to keep" by accident
+  rather than by decision. A window reload empties the map and the provider says
+  so, which is the honest rendering of "shown once and stored nowhere": VS Code
+  restores the tab and there is nothing left to put in it.
   **No raw error text reaches the user, anywhere.** `humanize(e)`
   (`problem.ts`, table-documented and pinned by `problem.test.ts`) returns
   `{text, retryable, cancelled, code}`; `text` is a sentence and **never

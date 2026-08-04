@@ -65,15 +65,30 @@ copies to every other machine. It also watches `exp` and warns in the status bar
 fact only the server establishes. It is also the one surface that *issues*
 tokens: `mindex.mintAgentToken` (`agentToken.ts`) derives a token for the open
 project, capped at seven days and labelled `agent`, over `POST /auth/tokens`.
-Its action list is **ticked, not fixed**: `search`+`research` start on,
+Its action list is **two presets over a ticked list, not a fixed one**
+(`tokenGrants.ts`, split out of `agentToken.ts` only because that file imports
+`vscode` and the guard on these tables has to run under bare `node --test`):
+read-only and read-and-write are offered first, `search`+`research` start ticked,
 `index`/`delete` are offered off behind a second modal naming what they cost, and
-`admin`/`mint` are absent from the list by construction. Offering only reads was
+`admin`/`mint` are absent from the list by construction. The presets are an
+*ordering*, not a narrowing — the full tick list is one item down the same menu
+and is still the only way to reach `delete`, and the write modal fires for the
+preset exactly as it does for a tick. Offering only reads was
 the earlier call and it was wrong in one direction — it does not prevent a write
 token, it moves the minting to a shell, where what gets issued is usually wider.
 Every one of those narrowings is **usability, not enforcement** — a command
 palette is not a security boundary and does not need to be, because `may_mint`
 refuses anything exceeding the minting token regardless of what the client
-asked for.
+asked for. It is reachable from **three** surfaces, because a capability behind a
+palette title nobody knows is one that does not exist: the Ask view's title bar
+(the `$(key)` button, gated on `mindex.hasProject`), the Server Status panel's
+header, and a `command:` link in the token indicator's tooltip — that last one
+visible only when the indicator is, since it stays hidden while the token is
+healthy by design. The issued token goes to the clipboard, and `Show it` opens it
+in a **read-only in-memory document** (`tokenDoc.ts`, scheme `mindex-token`) —
+not an untitled buffer, which is one accidental `Ctrl+S` from the credential on
+disk that "a file is a copy nobody decided to keep" rules out. A window reload
+loses it, and the provider says so rather than serving an empty tab.
 
 ## Authorization (`[auth]`, opt-in)
 

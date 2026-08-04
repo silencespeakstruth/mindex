@@ -183,7 +183,8 @@ it, it belongs beside `_headers()` in each server, not in a fifth parser.
 ## Minting write actions
 
 `POST /auth/tokens` will issue `index` and `delete`, and the VS Code flow offers
-them, unticked, behind a second modal naming what they cost. The rejected
+them behind a second modal naming what they cost — `index` also through a
+read-and-write preset, `delete` only by ticking it. The rejected
 alternative was a read-only vocabulary at the network endpoint. It does not
 prevent a write token existing — it moves the minting to a shell on the host,
 where what actually gets issued is usually *wider* than what was asked for. What

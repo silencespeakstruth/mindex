@@ -2,9 +2,28 @@
 
 ## 1.1.1
 
-Seven places where an action succeeded and the screen went on describing the world
-before it. None of them showed an error; each showed a panel disagreeing with
-itself.
+Issuing a short-lived token for an agent was already here and effectively could not
+be found: one command, palette-only, with an icon declared and no menu entry to
+render it in. A credential mechanism nobody can reach is not a narrower credential
+— it is a shell on the server's host issuing a wider one.
+
+- **Three ways in.** A key button in the **Ask** view's title bar, another in the
+  **Server Status** header, and a link in the token indicator's tooltip. The third
+  appears only when that indicator does, which is shortly before the stored token
+  expires — it is the hand-off from "your credential is dying" to "issue the other
+  kind", not a general entry point.
+- **Read-only and read-and-write presets.** The two shapes anyone actually wants,
+  offered before the checkboxes rather than assembled from them each time. The full
+  tick list is one item down the same menu and is still the only way to reach
+  `delete`; the confirmation naming what a write token costs fires either way.
+- **`Show it`.** The token still goes to the clipboard. When it has to be edited
+  into somebody else's config by hand, this opens it in a read-only tab that cannot
+  be saved to disk and does not survive a window reload — it is still shown once
+  and stored nowhere.
+
+And seven places where an action succeeded and the screen went on describing the
+world before it. None of them showed an error; each showed a panel disagreeing
+with itself.
 
 - **`Collect garbage` now ends when it deletes.** The review used to stay up
   afterwards, listing the reports it had just deleted, still ticked, under a

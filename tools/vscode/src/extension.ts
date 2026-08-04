@@ -22,6 +22,7 @@ import {
 } from "./researchDocs";
 import { paintStatusBar } from "./statusBar";
 import { mintAgentToken } from "./agentToken";
+import { forgetIfToken, TOKEN_SCHEME, TokenDocumentProvider } from "./tokenDoc";
 import {
     audienceRefusal,
     describeToken,
@@ -288,6 +289,13 @@ export function activate(context: vscode.ExtensionContext): void {
             }
         },
         openSettings: () => openSettings(),
+        // Awaited, unlike its neighbours: the panel greys the button for as long
+        // as this is pending, and the dialog behind it is a four-step chain the
+        // user is walking. `void`ing it here would release the button on the
+        // first frame and invite a second press mid-dialog.
+        mintAgentToken: async (): Promise<void> => {
+            await vscode.commands.executeCommand("mindex.mintAgentToken");
+        },
     };
 
     // ── Research: sidebar form → SSE stream → output tab ─────────────────────
@@ -674,10 +682,17 @@ export function activate(context: vscode.ExtensionContext): void {
     // opened in a tab from anywhere that knows its id — the picker, the History
     // rows, a dependency chip in a live run's header.
     const researchDocs = new ResearchDocumentProvider(() => api);
+    // A freshly minted token is served the same way, and for the opposite reason:
+    // not so it can be kept, but so it can be looked at without ever becoming a
+    // file. See `tokenDoc.ts`.
+    const tokenDocs = new TokenDocumentProvider();
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(AskViewProvider.viewId, askProvider),
         vscode.workspace.registerTextDocumentContentProvider(RESEARCH_SCHEME, researchDocs),
         researchDocs,
+        vscode.workspace.registerTextDocumentContentProvider(TOKEN_SCHEME, tokenDocs),
+        tokenDocs,
+        vscode.workspace.onDidCloseTextDocument(forgetIfToken),
         new vscode.Disposable(cancelResearch)
     );
 

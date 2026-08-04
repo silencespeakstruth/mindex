@@ -15,6 +15,21 @@
                 >
                     <span class="codicon codicon-refresh" data-busy-icon></span>
                 </button>
+                <!--
+                    Minting sits here because this panel is where everything about
+                    the server and the credential reaching it already lives. Its
+                    busy key is its own, not `refresh`: this is a write, and
+                    `BusyKeys` refuses a second press rather than superseding the
+                    first — two clicks must not issue two credentials.
+                -->
+                <button
+                    id="mint-token"
+                    class="ghost"
+                    data-busy-key="mint"
+                    title="Issue a token for an agent"
+                >
+                    <span class="codicon codicon-key" data-busy-icon></span>
+                </button>
                 <button id="settings" class="ghost" title="Open MINDex settings">
                     <span class="codicon codicon-gear"></span>
                 </button>

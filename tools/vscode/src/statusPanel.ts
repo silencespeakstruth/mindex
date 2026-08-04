@@ -17,6 +17,17 @@ export interface StatusActions {
     retryFile(path: string): void;
     openFile(path: string): void;
     openSettings(): void;
+    /**
+     * Issue a short-lived token for an agent.
+     *
+     * Returns when the dialog has finished, so the button stays greyed for the
+     * whole chain rather than for one frame — the same reason `refresh` above is
+     * awaitable. It delegates to the `mindex.mintAgentToken` command rather than
+     * calling the flow directly: the command owns the project lookup and the
+     * `auth.action_not_permitted` sentence, and a second copy of either would be
+     * a second thing to keep in step.
+     */
+    mintAgentToken(): void | Promise<void>;
 }
 
 /**
@@ -117,6 +128,11 @@ export class StatusPanel {
                         break;
                     case "openSettings":
                         actions.openSettings();
+                        break;
+                    case "mintAgentToken":
+                        void this.busy("mint", () =>
+                            Promise.resolve(actions.mintAgentToken())
+                        );
                         break;
                 }
             })
