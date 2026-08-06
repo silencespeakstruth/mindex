@@ -216,6 +216,16 @@ ROCm) are in `deploy/embedder/README.md`.
 - **The release workflow published no Docker image**, although the README calls Docker
   the supported way to run the server anywhere but Linux x86-64, and **no embedder**,
   although mindex now ships none and cannot start without one. Both are jobs.
+- **`mindex-cli-x86_64-apple-darwin` was missing from 1.1.0 and 1.2.0**, while the README
+  promised "macOS (Intel and Apple silicon)". Its `macos-13` runner is retired, so the job
+  was never picked up, queued for GitHub's 24-hour maximum and was auto-cancelled — and
+  because the other five jobs succeeded and uploaded, the only symptom was the run's
+  overall conclusion reading `cancelled` a day after anyone was looking. Both macOS
+  targets now build on `macos-14`, the Intel one as a cross-compile, which is safe for
+  two pure-Rust binaries and fails in minutes rather than queueing for a day if it ever
+  is not. `--target` is passed on every target besides: without it cargo built for the
+  host and the archive named `mindex-cli-<triple>` carried whatever the runner happened
+  to be — a label rather than a fact, correct only by coincidence.
 
 ## [1.2.0] — 2026-08-04
 

@@ -62,16 +62,35 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          # BOTH macOS targets build on macos-14 (Apple silicon), and the Intel
+          # one is a CROSS-COMPILE. It used to have its own `macos-13` runner,
+          # and that runner is retired: the job was never picked up, sat queued
+          # for GitHub's 24-hour maximum and was auto-cancelled — on v1.1.0 and
+          # again on v1.2.0. Two consequences, and the second is why this went
+          # unnoticed for two releases. `mindex-cli-x86_64-apple-darwin.tar.gz`
+          # was silently absent from both release pages while README.md promised
+          # "macOS (Intel and Apple silicon)". And because the other five jobs
+          # succeeded and uploaded, the only symptom was the run's overall
+          # conclusion reading `cancelled` a day after anyone stopped looking.
+          #
+          # Cross-compiling is safe for these two binaries specifically: they are
+          # pure Rust over reqwest+rustls with no tree-sitter C grammars and no
+          # protoc (the reason the server is Linux-only and these are not), and
+          # Xcode ships both architectures' SDK. If a C dependency ever does
+          # refuse, it fails the job in minutes rather than queueing for a day —
+          # which is itself the improvement.
+          - os: macos-14
+            target: x86_64-apple-darwin
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v5
 
       # rust-toolchain.toml pins the channel; `rustup show` materialises it.
       - name: Install the pinned toolchain
-        run: rustup show
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - uses: actions/cache@v4
         with:
@@ -85,10 +104,18 @@ jobs:
       # tools/indexer and tools/watcher are SEPARATE workspaces with their own
       # Cargo.lock — they are not members of the root workspace, so they must be
       # built by manifest path rather than with -p from the root.
+      # `--target` is passed on EVERY target, not only the cross one. Without it
+      # cargo builds for the host and writes to `target/release/`, so the archive
+      # named `mindex-cli-<triple>` carried whatever the runner happened to be —
+      # a label rather than a fact, and correct only by coincidence. With it the
+      # output is always `target/<triple>/release/`, which the packaging steps
+      # below now read, so the name and the binary cannot disagree.
       - name: Build
         run: |
-          cargo build --release --locked --manifest-path tools/indexer/Cargo.toml
-          cargo build --release --locked --manifest-path tools/watcher/Cargo.toml
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --manifest-path tools/indexer/Cargo.toml
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --manifest-path tools/watcher/Cargo.toml
 
       # Staging and dist are separate directories on purpose: the upload step globs
       # `dist/*`, so anything in there must be an artefact. Globbing by extension
@@ -101,8 +128,8 @@ jobs:
           set -euo pipefail
           name="mindex-cli-${{ matrix.target }}"
           mkdir -p "staging/$name" dist
-          cp tools/indexer/target/release/mindex-index "staging/$name/"
-          cp tools/watcher/target/release/mindex-watch "staging/$name/"
+          cp tools/indexer/target/${{ matrix.target }}/release/mindex-index "staging/$name/"
+          cp tools/watcher/target/${{ matrix.target }}/release/mindex-watch "staging/$name/"
           cp LICENSE README.md "staging/$name/"
           tar -czf "dist/$name.tar.gz" -C staging "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
@@ -114,8 +141,8 @@ jobs:
           set -euo pipefail
           name="mindex-cli-${{ matrix.target }}"
           mkdir -p "staging/$name" dist
-          cp tools/indexer/target/release/mindex-index.exe "staging/$name/"
-          cp tools/watcher/target/release/mindex-watch.exe "staging/$name/"
+          cp tools/indexer/target/${{ matrix.target }}/release/mindex-index.exe "staging/$name/"
+          cp tools/watcher/target/${{ matrix.target }}/release/mindex-watch.exe "staging/$name/"
           cp LICENSE README.md "staging/$name/"
           (cd staging && 7z a "../dist/$name.zip" "$name" > /dev/null)
           (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
