@@ -614,6 +614,31 @@ impl OllamaHttpClient {
                 return ShowFacts::default();
             }
         };
+        // Announce the window here rather than at every use. `effective_num_ctx` is
+        // called once per turn and the facts behind it cannot change for the life of
+        // the process, so logging there restated one immutable fact seventeen times
+        // for a single `medium` run — enough to bury the lines that do move. This
+        // path runs exactly once per model, and only on success, which is also the
+        // only case with a window worth naming.
+        let ceiling = self.tuning.max_num_ctx_tokens;
+        match facts.context_limit {
+            Some(limit) if limit > ceiling => info!(
+                %model,
+                model_limit = limit,
+                requested = ceiling,
+                "Model's context window exceeds [research].max_num_ctx_tokens; \
+                 capping. Raise that ceiling to use the whole window if the GPU \
+                 has room for the KV cache."
+            ),
+            Some(limit) => info!(
+                %model,
+                requested = limit,
+                ceiling,
+                "Requesting the model's full context window."
+            ),
+            None => {}
+        }
+
         self.show_facts
             .lock()
             .await
@@ -633,29 +658,14 @@ impl OllamaHttpClient {
     ///
     /// When the model's length is unknowable (old Ollama, odd `model_info`) the
     /// ceiling is used as-is — a missing hint must not fail a run.
+    ///
+    /// Deliberately silent: it is called once per turn over a fact that cannot
+    /// change, so the window is announced by `show_facts` on the one pass that
+    /// establishes it.
     async fn effective_num_ctx(&self, model: &str) -> u64 {
         let ceiling = self.tuning.max_num_ctx_tokens;
         match self.show_facts(model).await.context_limit {
-            Some(limit) if limit > ceiling => {
-                info!(
-                    %model,
-                    model_limit = limit,
-                    requested = ceiling,
-                    "Model's context window exceeds [research].max_num_ctx_tokens; \
-                     capping. Raise that ceiling to use the whole window if the GPU \
-                     has room for the KV cache."
-                );
-                ceiling
-            }
-            Some(limit) => {
-                info!(
-                    %model,
-                    requested = limit,
-                    ceiling,
-                    "Requesting the model's full context window."
-                );
-                limit
-            }
+            Some(limit) => limit.min(ceiling),
             None => ceiling,
         }
     }
