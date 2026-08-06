@@ -317,6 +317,94 @@ the same grounds. `run.py` prints which of the two regimes it chose; a run that
 quietly did less work than the protocol says would be the exact failure this
 section exists to prevent.
 
+### 3.4 The identifier query set — a projection, not a new gold set
+
+Declared 2026-08-06, for family F10 (§5.3). Everything measured before it asked
+its questions in **documentation prose**: §3.0's descriptive corpus is written
+prose by construction, and §3.2's issue tier takes `problem_statement`, which is
+a bug report. §12.12 closed the second-leg question on that evidence and named
+this as its own limit — CoIR measures BM25 varying **56×** across datasets, so a
+corpus of identifier-heavy queries is the one shape that could return a
+different answer. This section builds it.
+
+**It is not a new ground truth.** The builder (`build_ident_qrels.py`) reads the
+frozen issue-tier qrels, copies `gold_files`, `gold_functions`, `base_commit`,
+`repo` and `datasets` **byte-identically**, and changes exactly one field:
+`query`. The copy is asserted per instance and a mismatch is a hard failure.
+Provenance, the §3.2 exclusions and the §3.3 snapshot verification are therefore
+inherited whole and are not re-litigated — which is the only reason a query set
+nobody published can carry any weight at all.
+
+**Why the issue tier and not the descriptive one.** This inverts §1's own
+argument and the inversion is deliberate. The descriptive tier's gold *is* the
+file defining the symbol a section references (`build_docs_qrels.py` resolves
+`:class:`/`:func:` roles to their definitions), so an identifier query over it
+is gold-by-definition — it would measure that exact strings match exact strings.
+The issue tier's gold is the files a fix patch **touched**, and the identifiers
+a bug report names are symptom-side: the public API the reporter called, not
+the module that has to change. It is the only source here where an identifier
+query has non-definitional gold *and* published provenance. §1's objection to
+the issue tier was that its queries demand inference; the projection strips the
+symptom narrative that demanded it, and the claim is comparative between two
+legs on one fixed query set rather than an absolute statement about quality.
+
+**Arms.** All arms of one source instance carry its `base_commit`, so they cost
+one checkout between them; `instance_id` is `<source_id>#<projection>`.
+
+| arm | `projection` | query text |
+|---|---|---|
+| A0 | `prose` | `problem_statement`, verbatim. The reference — and *not* a re-run of §12.12, which measured the descriptive corpus; fusion has never been measured on this tier at all. |
+| A1 | `ident` | identifier-shaped tokens only, first-appearance order, deduplicated, space-joined. |
+| A2 | `ident-mangled` | A1 with one seeded perturbation per token. |
+| A3 | `ident-intent` | A1 plus the issue's title line. The realistic mixed query. |
+| C | `symbol-defn` | **positive control**, built from the descriptive corpus: bare symbol name, gold = its defining file. Deliberately tautological. |
+
+**Extraction (A1).** A candidate must carry an underscore, a dot or a camel
+boundary — `snake_case`, `CamelCase`, `dotted.name` — be 4 to 40 characters,
+and not be an English word of a short stop list. Order is first appearance,
+duplicates are dropped, and the list is cut at **12** identifiers: past that a
+query stops being a caller naming a few things and becomes a bag of tokens that
+retrieves well because it quotes half the file.
+
+The one exemption from the shape rule is an **inline backtick**, which is an
+author writing "this token is a name" — so `bisect` counts there and not in a
+sentence. **A fenced block gets no such exemption**, and that rule was written
+by the audit rather than by reasoning: fences in these reports are dumps, and
+under the first draft a single ripgrep instance contributed its version banner,
+its `--version` output, a commit SHA and an entire pasted DNA sequence to what
+was supposed to be an identifier query. Requiring shape inside fences keeps what
+should be kept — `_fetch_all` and `query.py` out of a traceback, the richest
+identifier source these reports have — and drops the rest by construction.
+
+**A directory path is not an identifier.** Tokenization does not cross `/`, so
+a cited `django/db/models/query.py` contributes its basename and nothing more.
+Admitting whole paths would maximise §9.2 leakage by construction — the query
+would spell the answer — and that axis already has its own stratum; merging it
+into this one would make the corpus tautological in the way this section exists
+to avoid.
+
+**Perturbation (A2).** One rule per token, chosen by a seed recorded on the
+instance: camel↔snake flip, vowel-drop abbreviation, or a single-character
+transposition. A2 is a **synthetic stress arm** — real users mistype in ways a
+seeded rule only approximates — so it is reported beside A1 and never merged
+into a pooled headline.
+
+**Arm C is calibration and carries no claim.** If FTS5 does not beat the dense
+leg decisively there, the apparatus is broken and nothing else in F10 may be
+read. It is simultaneously the test of whether a positive result would argue
+for a *leg* at all or merely for `symbols`, which already ships.
+
+**Inherited but inert: §4.2's vector-limit exclusion.** The source qrels carry
+it, so it is inherited. It was a Qdrant multivector bound on ColBERT and has no
+v3 analogue, and identifier queries fall far below it regardless. It is stated
+rather than quietly undone: re-deriving the corpus to drop it would break the
+byte-identical inheritance that is this section's whole argument.
+
+**`lexical_overlap` is recomputed for the projected query** and will move
+sharply upward from A0 to A1 — that is the point of the projection and is
+reported in §12.13, not treated as a defect. Bucket thresholds are §3.0.1's,
+imported rather than restated.
+
 ---
 
 ## 4. Metrics
@@ -480,12 +568,13 @@ several of them.
   One test per model per corpus. Candidates are MIT/Apache only and named in
   `baselines/external_embedder.py::MODELS`; a model whose prompting convention
   is not recorded there cannot be run.
-- **F6 — the sparse leg.** Each candidate sparse/lexical retriever vs the
-  BGE-M3 sparse head, same chunk set, same depth. One test per model per
-  corpus. The incumbent is the thing to beat and it is **not** BM25: §12
-  measures the BGE-M3 sparse head at +0.035 nDCG@10 over FTS5 BM25 on django
-  short, so replacing the learned sparse head with a lexical one is a
-  regression that has to be argued for, not a simplification.
+- **F6 — the sparse leg. WITHDRAWN 2026-08-06, unrun** (§11). It was framed as
+  "each candidate sparse retriever vs the BGE-M3 sparse head", and that
+  incumbent no longer exists: F7 removed the second leg and the v3 migration
+  removed BGE-M3 with it. A family whose comparator cannot be built is not
+  pending, it is void, and leaving it standing would read as work still owed.
+  The question it was for — *should anything lexical score a chunk here* — is
+  live and is asked by F10 on the corpus F7 named as its own limit.
 - **F7 — the combination rule.** The chosen fusion rule vs the deployed
   ordering, and vs the best single leg it contains. One test per corpus.
 - **F8 — reranking.** A reranker over the first stage's own candidates vs that
@@ -499,8 +588,23 @@ several of them.
   per corpus. This family cannot be run until that corpus exists, and no
   routing claim may be made before it does.
 
-**Two rules bind all five, and both exist because of what they cost if
-omitted.**
+**Third round, declared 2026-08-06** (§11), after F5 and F7 chose one dense leg
+and removed the second.
+
+- **F10 — the lexical leg, on identifier-shaped queries.** The chosen fusion
+  rule over the dense leg plus an FTS5/BM25 leg, vs the dense leg alone, on the
+  §3.4 identifier corpus. One test per corpus per direction, weights trained on
+  the corpus the result is not reported on. Reported per arm, per the
+  `ident_in_gold` stratum of §9.6, and per §3.0.1 bucket. This family exists
+  because F7's verdict is sound and narrow at once: it PASSed TOST at δ = 0.01
+  in both directions, and it did so on documentation prose, which is not the
+  query shape a lexical leg would exist to serve. The incumbent is the shipped
+  dense-only pipeline; **BM25 is the challenger**, which is the exact reverse of
+  withdrawn F6's framing and follows from there being no learned sparse head
+  left to defend.
+
+**Two rules bind every family from F5 onward, F10 included, and both exist
+because of what they cost if omitted.**
 
 *The held-out rule.* Any weight, depth, α or normalisation is chosen on one
 corpus and **reported on another**. The effects in play (~0.015 for a fusion
@@ -547,6 +651,79 @@ numbers are recorded in §12 when §5.1 completes.
 - A run that aborts is discarded whole and rerun; partial runs are never
   analysed, because their instance ordering is chronological and therefore
   not exchangeable.
+
+### 5.7 Feasibility gate for F10, checked before its comparison
+
+An identifier projection can destroy a query rather than reshape it. If it
+does, every arm sits near the floor, all differences are noise, and a fusion
+comparison run there would report a confident number about nothing.
+
+So one gate is checked **after the first corpus's dense-only arm and before any
+comparison**, and it is a property of a single arm, never a difference — which
+is what keeps it outside the confirmatory accounting:
+
+> On the corpus being gated, the dense-only arm on A1 must (a) reach nDCG@10 ≥
+> **0.5 ×** its own A0 score, and (b) beat the `random` baseline on the same
+> queries with a 95% CI lower bound above 0, by `stats.py`'s ordinary paired
+> comparison.
+
+Half (a) says the projection reshaped the query rather than destroying it;
+half (b) says the arm is off the floor. Neither is a comparison between the two
+legs F10 exists to compare, which is what keeps the gate outside the
+confirmatory accounting.
+
+Half (b) replaces a "10 × random" threshold this section carried for one day
+(§11). That number was arithmetically impossible: `random`'s nDCG@10 is not
+near zero on a corpus of a few hundred files — the ripgrep smoke measured it at
+**0.1475** — so ten times it exceeds the metric's maximum and no arm could ever
+pass. A significance test against the same floor is what the threshold was
+reaching for and needs no magic multiplier.
+
+The gate applies to the **confirmatory corpora** (django, scikit-learn). ripgrep
+is the tier-0 smoke corpus at n = 11 per arm and carries no F10 claim.
+
+Failing it **withdraws F10 and is itself a publishable §12 result**:
+*identifier-only queries at this corpus's difficulty are not answerable by any
+leg*, which is a finding about the projection and about what `/search` can be
+asked, not a null result about fusion. It is stated this way so that the cheap
+outcome cannot be quietly reported as the expensive one.
+
+The gate is deliberately checked on scikit-learn first (§12.13 order): it is the
+smaller issue-tier corpus, and a projection that fails there fails everywhere,
+so django's 812 per-instance checkouts are never spent to learn it.
+
+**The decision rule, fixed before any F10 arm is scored.**
+
+*Ship a lexical leg* only if **all** of the following hold:
+
+- the held-out Δ is ≥ **+0.01** nDCG@10 with a 95% CI lower bound above 0, in
+  **both** train→test directions;
+- the effect **survives on the `ident_in_gold = false` stratum**. §12.13
+  measures that stratum at 146 instances on django and **10 on scikit-learn**,
+  which is below the n ≥ 20 floor `stats.py` applies to every stratum before
+  it will report one — so this criterion is testable on django
+  alone, and **a positive result reported only on scikit-learn is not a pass**.
+  Recorded now, because after the fact it would read as choosing which corpus
+  to believe. Confined to `ident_in_gold = true`, a gain is the §9.2 verdict:
+  the method has been shown to be good at string matching;
+- the lexical leg beats `baselines/symbol_lookup.py` on the same queries. If
+  exact symbol lookup recovers the same gold, the answer is "route to
+  `symbols`", which already ships, and not "add a leg to `/search`";
+- Δ ≥ 2 × the pooled between-run SD of §5.1. **That number does not exist for
+  the v3 pipeline** — §12.5 still lists it as pending — so `noise_floor.py`
+  must be re-run before any F10 verdict is final. Stated as a gap rather than
+  quietly replaced by the 0.01 floor, because a threshold with no measured
+  noise behind it is an assumption wearing a rule's clothes.
+
+*Close the question* if TOST at δ = 0.01 PASSes in both directions on the larger
+identifier arm (A1 or A3). That is the verdict §12.12 already reached, delivered
+on the query shape §12.12 named as its own limit — at which point `llms.txt`'s
+retrieval prose stays as it is, F6 stays withdrawn, and the answer is that a
+lexical leg was measured where it was supposed to win and did not.
+
+*Underpowered middle* — the CI contains 0 but its upper bound exceeds +0.01:
+report as underpowered, compute n for 80% power at δ = 0.02 per §5.2, and leave
+the question open. Nothing ships on a point estimate.
 
 ---
 
@@ -681,6 +858,51 @@ matter here and are not portable claims.
 Instances are processed in commit order, so a truncated run is a biased
 sample of a repository's history. Hence the discard-and-rerun rule in §5.6.
 
+### 9.6 The identifier corpus can only confirm unless it is stratified
+
+§3.4's corpus is built to give a lexical leg its best case, and a corpus built
+to give a method its best case will report that the method works. That is not a
+reason to build a different corpus — the point of F10 is precisely to look
+where F7 said it had not looked — but it *is* a reason to declare, before the
+runs, the ways the result can come back negative. A design with no such route is
+a demonstration wearing a confidence interval.
+
+Three routes, each measured rather than argued:
+
+1. **The `ident_in_gold` stratum.** Per instance, the builder records whether
+   any query identifier occurs as a literal case-sensitive substring in any gold
+   file at `base_commit`. Where it does not, the lexical leg has no string to
+   match while the dense leg still has meaning to match — so a gain confined to
+   the `true` stratum is the §9.2 verdict in another costume: the method has
+   been shown to be good at string matching. **The stratum's size is measured in
+   §12.13, before any comparison exists to fit it to.**
+2. **A2 (`ident-mangled`).** The literal string is absent from the whole
+   repository by construction. `unicode61` must fail there; `trigram` may partly
+   survive. This is the arm where the lexical leg is *expected* to lose, and it
+   answers a question the pooled number cannot: whether "identifier query" means
+   "identifier the caller spelled correctly".
+3. **Collisions, where matching is free and ranking is the task.** Each instance
+   carries `ident_df_min`: the document frequency of its **rarest** identifier —
+   the number of files at the snapshot containing it. The minimum is the
+   discriminating statistic, not the maximum: it says that even the most
+   selective string the caller supplied still matches that many files, so
+   matching is free for the whole query and `bm25()` has only IDF and length
+   normalisation left to order them with. That is where a dense vector which
+   read the surrounding intent should win. Computed by literal case-sensitive
+   substring against the tree at `base_commit`, the same predicate as
+   `ident_in_gold`, over every identifier the query kept.
+
+   **Only identifiers that occur at all are counted**, and that is not a
+   detail. Over the whole list the minimum is 0 for nearly every instance,
+   because a bug report reliably contributes one token the tree has never
+   contained — so the statistic would silently become route 1's, reported under
+   route 3's name. How many identifiers were absent is published separately in
+   §12.13, and an instance whose identifiers are *all* absent has no `df_min`
+   at all rather than a zero.
+
+Arm C (§3.4) is not one of these routes. It is instrument calibration and
+carries no claim in either direction.
+
 ---
 
 ## 10. Reproducibility
@@ -709,9 +931,12 @@ Any change to this document after the first measurement is recorded here with
 a date and a reason, and the affected results are re-run or withdrawn. Silent
 edits defeat the purpose of the file.
 
-All three amendments below were made **before any retrieval was measured** —
+The **2026-08-04 rows** were all made *before any retrieval was measured* —
 they came out of building and auditing the query set, which is what that step
-is for. No result existed that they could have been fitted to.
+is for. No result existed that they could have been fitted to. Later rows are
+each dated and say for themselves what had already been measured when they were
+made, because that is the fact a reader needs and a blanket assurance covering
+the whole table would stop being true the moment one row stopped qualifying.
 
 | date | change | reason |
 |---|---|---|
@@ -726,6 +951,12 @@ is for. No result existed that they could have been fitted to.
 | 2026-08-05 | **families F5–F9 declared** (§5.3), with the held-out rule and the search-vs-comparison rule | The first round asked what each stage of the deployed pipeline contributes. It answered, and the answer moved the question: the largest measured effect in the whole investigation is the *embedder* (+0.051 nDCG@10 for a 137M code model over the entire three-head pipeline), and the second largest is the *combination rule*, not any stage it combines. So the second round decides a set of retrieval legs and the rule that fuses them, and it needs families declared before the runs that choose them. Declared **after** F1–F3 were published and **before** any F5–F9 arm was scored. The two binding rules are not decoration: a fusion weight is worth ~0.015, which is the scale at which choosing and reporting on the same queries *is* the result, and a 36-cell method sweep reports a maximum that no multiple-comparison correction can turn back into a test. |
 | 2026-08-05 | `map@20` is retained as `score.py`'s and excluded from the `ranx` migration | The metric arithmetic was cross-checked against `ranx` over seven archived runs on both corpora (`tests/test_ranx_equivalence.py`). nDCG@10, MRR@10 and recall@{1,5,10,20} agree **exactly**. `map@20` does not, on exactly one query in 1 475: `score.py` normalises AP by `min(\|gold\|, k)` and `ranx` — following trec_eval's `map_cut`, which unlike `ndcg_cut` does not cap its ideal — normalises by `\|gold\|`. The one query has 26 gold files against a cutoff of 20. `score.py`'s convention is the one argued for in its own docstring (a query with more gold than the cutoff must still be able to score 1.0, or the metric is measuring the query), so it stays and the divergence is pinned by a test rather than resolved. No published number changes. |
 | 2026-08-05 | **the measured task changed**: descriptive retrieval from project documentation replaces issue localization as the primary corpus (§1, §3) | The original §1 justified issue localization as "the task mindex is actually used for". That claim was wrong, and it was load-bearing — it chose the entire corpus. Localizing a bug from its symptoms requires **inference**; mindex performs **matching**, and the inference belongs to `/research`, a different endpoint. The consequence is not that the numbers were merely less relevant: family F2 asks whether ColBERT earns 99.6% of stored bytes, and answering it on a task the component does not perform can select the wrong configuration with a confidence interval attached. Ground truth for the replacement is each project's own Sphinx documentation — prose written by its maintainers describing its own code, with the link made explicit by directives and roles (django: 3 212 and 8 589 of them). Still not an exam we wrote. Issue localization is retained as a secondary tier and relabelled. Raised by the author of the request, not by the harness. |
+| 2026-08-06 | **family F10 declared** (§5.3) with the identifier query set (§3.4), its stratification requirement (§9.6) and its feasibility gate (§5.7) | §12.12 answered the second-leg question and stated its own limit in the same breath: both corpora are Python and **both query sets are documentation prose**, while CoIR measures BM25 varying 56× across datasets. That limit was left standing, and it is the one shape where the answer could differ — so it is now a family rather than a caveat. Two things make it a measurement rather than a demonstration: the gold set is inherited byte-identically from the frozen issue tier (only `query` changes), and the three routes to a negative result are declared in §9.6 before any run. Declared **before** the corpus was built and before any identifier retrieval was scored. |
+| 2026-08-06 | F10's feasibility gate: "10 × the `random` baseline" replaced by a significance test against it (§5.7) | The threshold was arithmetically impossible and would have withdrawn F10 unconditionally. `random`'s nDCG@10 is nowhere near zero on a corpus of a few hundred files — the ripgrep plumbing smoke measured **0.1475** — so ten times it exceeds the metric's maximum. What the threshold reached for was "this arm is off the floor", and a paired comparison against the same `random` run says that without a multiplier. Found by running the tier-0 smoke, which is a plumbing check and not a comparison; **no F10 arm has been scored on a confirmatory corpus**, so there is no result this could have been fitted to. The other half of the gate (A1 ≥ 0.5 × A0) is unchanged. |
+| 2026-08-06 | **family F6 withdrawn, unrun** (§5.3) | It was declared as "each candidate sparse retriever vs the BGE-M3 sparse head". F7 then removed the second leg entirely and the v3 migration removed BGE-M3, so the family's comparator cannot be constructed. Recorded as a withdrawal rather than deleted, because an unrun pre-registration that silently disappears is indistinguishable from one that was run and disliked. |
+| 2026-08-06 | **retraction**: `top_k = 100` is no longer justified by "a truncation, not a retrieval decision" (§4.3, and the 2026-08-04 row above) | That argument rested on the pipeline prefetching 200 dense + 200 sparse, fusing and reranking before cutting, so that any depth ≤ `fusion_limit` was a deeper slice of one ranking. Under v3 `/search` asks Qdrant for `top_k` directly — no prefetch, no fusion, no rerank — so the depth **is** a retrieval decision and a deeper cut is a different HNSW search. **No published number changes and no result is withdrawn**: every arm within a comparison is cut at the same depth, which is what those comparisons rest on. What is withdrawn is the reason the choice was safe; the value stays at 100. The comment carrying the false claim in `run.py` is annotated rather than silently corrected. Should F10 ship a lexical leg, the original argument becomes true again and this row is what says why. |
+| 2026-08-06 | `baselines/pipeline_ablation.py` deleted; `slicer_sweep.py --ablation` removed with it | The script queried Qdrant directly through BGE-M3's binary protocol (`MAGIC = b"BM3\x01"`) and its arms were `full` / `no-colbert` / `dense-only` / `sparse-only` — a pipeline v3 does not have. It could not run against the current server, and a benchmark script that produces nothing while *looking* runnable is worse than an absent one. F2 and F3 remain fully readable: their arms are frozen in `results/F2__*.json` and `results/F3__*.json`, and re-running a family whose incumbent no longer exists was never possible anyway. §12.7 and §12.10 keep their references to the script as the historical record of how those numbers were produced. |
+| 2026-08-06 | `run.py` reindexes on commit change alone, not on `single_snapshot and` commit change (§3.3) | The guard fired only for the descriptive tier, where every instance shares one commit. The condition it actually needs is the equality by itself: two instances naming the same sha cannot have different trees. This became load-bearing with §3.4, which emits four arms per source instance — on django the old conjunct would have bought 3 248 full reindexes where 812 are required. No published number changes: the skipped work was verifying a state that had not moved. `single_snapshot` still governs the equivalence sample and the GC cadence, which genuinely ask whether the corpus is one tree. |
 | 2026-08-06 | **equivalence sampling is 1 on a single-snapshot corpus**, and the periodic GC is skipped there (§3) | The check compares an incrementally-reached index against a cold build. The descriptive tier reaches its index in one step and never moves it, so nineteen of the twenty samples re-verified a state that could not have changed — `index=0ms` on every instance, `chunks_removed: 0` on every GC tick. Measured cost on django-docs-short: 20 x ~148 s of rebuild in a 55-minute run whose queries take 45 ms. No published number changes: the same index is measured by the same queries, and the one surviving check covers the one state that exists. |
 
 ---
@@ -1334,3 +1565,144 @@ so a corpus of identifier-heavy queries could restore the lexical leg's value;
 the `obvious` stratum here is the nearest thing to that and fusion is *negative*
 on it (−0.0072, sklearn). Prose retrieval remains unmeasured (F9), so no routing
 claim follows from any of this.
+
+### 12.13 The identifier query set (`build_ident_qrels.py`, 2026-08-06)
+
+A pre-measurement study in the §12.1 sense: it involves no comparison, so
+nothing here can have been fitted to a result. **No identifier retrieval has
+been scored at the time of writing.**
+
+`scikit-learn`'s issue tier was built today with `build_qrels.py` under the
+unchanged §3.2 rules — including §4.2's vector-limit exclusion, which is inert
+under v3 but is retained so both corpora are constructed alike (229 · 32 · 19
+published → **203 usable**, 45 excluded over limit).
+
+| corpus | sources | no idents | projected | ×4 arms | `ident_in_gold` |
+|---|---|---|---|---|---|
+| django | 812 | 30 | 782 | 3 128 | 636 (81.3%) |
+| scikit-learn | 203 | 3 | 200 | 800 | 190 (95.0%) |
+| ripgrep | 12 | 1 | 11 | 44 | 8 (72.7%) |
+
+An instance with no extractable identifier is skipped **whole** rather than
+dropped from the identifier arms alone: an empty query scores as an empty
+ranking, and keeping its prose arm would leave the arms measuring different
+instance sets.
+
+**This table is what freezes the corpus.** `bench/.data/` is gitignored, so
+§5.6's "frozen when its output is committed" has no committed artifact to point
+at on this tier or any other — the counts published here, before any comparison
+exists, are the record. A rebuild that disagrees with them is a different corpus
+however recent the file is. The build is deterministic given the source qrels:
+instances are read in their stored order and each mangle seed is
+`--seed + position`.
+
+**The projection did what it was built to do.** Median query length collapses
+from documentation-scale prose to a handful of names — django 864 → 97
+characters, scikit-learn 1 124 → 128, ripgrep 1 573 → 35 — and
+`lexical_overlap` moves the way §3.4 predicted: django's median rises 0.035 →
+0.083 and its `obvious` bucket from 0 to 129 instances, scikit-learn's 0.033 →
+0.167 with `obvious` 3 → 54. Arm A2 undoes it, as its premise requires: django's
+median overlap returns to **0.000** and its `obvious` bucket falls to 38.
+
+**Route 3 has range.** `ident_df_min` — the document frequency of the rarest
+identifier that occurs at all — has median 3 on both large corpora, p90 25
+(django) and 15 (scikit-learn), max **1 971** (django). So the corpus does
+contain queries whose every term matches most of the repository, which is the
+condition under which matching is free and ranking is the whole task. Of the
+identifiers probed, **77% (django, 4 186/5 458) and 85% (scikit-learn,
+1 466/1 718) occur in the tree at all**; 12 and 2 instances respectively have
+none, and carry no `df_min` rather than a zero.
+
+**Route 1 is evaluable on django and NOT on scikit-learn, and this bounds the
+decision rule.** The `ident_in_gold = false` stratum holds **146 instances on
+django** and **10 on scikit-learn**. Ten is below the n ≥ 20 floor `stats.py`
+applies before it will report any stratum at all, so the criterion "the effect must survive where the
+lexical leg has no string to match" can be tested on django only. That is
+recorded here, before any comparison, rather than discovered afterwards when it
+would look like a choice of which corpus to believe. Two consequences, both
+pre-registered in §5.7: the held-out direction that *reports* on django is the
+one carrying route 1, and a positive result reported only on scikit-learn is
+explicitly not a pass.
+
+The predicate is deliberately permissive — a literal case-sensitive substring
+of any of up to twelve identifiers in any gold file, which is what a trigram
+tokenizer would match — and its lopsidedness is a real property of the task,
+not a construction artifact: a bug report about scikit-learn usually does name
+something the fixed file contains. It is reported rather than tuned, because a
+threshold chosen to balance the strata would be chosen against the very
+comparison the strata exist to referee.
+
+**Audit.** The corpora were built, read and rebuilt twice before this section
+was written. Both defects were found by reading instances and neither would
+have failed a test — the §11 pattern, again. First, fenced blocks were exempt
+from the identifier-shape rule on the theory that a code fence marks a name; in
+bug reports it marks a dump, and one ripgrep instance contributed its version
+banner, a commit SHA, console output and a 45-character DNA sequence to what was
+meant to be an identifier query. Second, `ident_df_min` was taken over every
+identifier, which made it 0 for nearly every instance — a bug report reliably
+names one token the tree has never contained — so it was silently reporting
+route 1's statistic under route 3's name. Both rules are now pinned by
+`--self-test`.
+
+### 12.14 F10 — the feasibility gate, and the arm-level picture on scikit-learn (2026-08-06)
+
+**This is not F10's test.** F10 asks whether *fusing* a lexical leg into the
+dense one adds anything, held out across two corpora. django has not been run,
+so no confirmatory comparison exists yet and nothing below carries a claim. What
+is recorded here is the §5.7 gate — which is checked *before* the comparison by
+construction — and the single-corpus arm scores that came with it, written down
+now so they cannot later look chosen.
+
+Run: `v3-ident`, scikit-learn, 800 instances over 184 snapshots, 69.6 min.
+**Index-state equivalence passed** on all 20 sampled rebuilds. That is worth its
+own line: the descriptive tier is a single snapshot, so this is the first v3 run
+that walks history at all, and incremental indexing over 184 commits was never
+before compared against cold builds under this pipeline.
+
+**The gate passes, both halves.**
+
+| half | requirement | measured |
+|---|---|---|
+| (a) the projection reshaped rather than destroyed the query | A1 ≥ 0.5 × A0 | **0.5915 ≥ 0.2611** |
+| (b) the arm is off the floor | A1 beats `random`, CI lower bound > 0 | **Δ +0.5803, CI [+0.5268, +0.6303]** |
+
+Note for the record that the withdrawn "10 × random" threshold would also have
+passed here — `random` scores 0.0157 on a corpus of ~900 files, not the 0.1475
+it scored on ripgrep's 123. The §11 amendment corrected an arithmetic
+impossibility on small corpora; it did not change this outcome.
+
+**Arm scores, nDCG@10 (n = 200 per arm).**
+
+| arm | dense | BM25 unicode61 | BM25 trigram | `symbols` | random |
+|---|---|---|---|---|---|
+| A0 `prose` | 0.5222 | 0.2599 | 0.2548 | 0.2582 | 0.0202 |
+| A1 `ident` | **0.5915** | 0.2796 | 0.2481 | 0.2513 | 0.0157 |
+| A2 `ident-mangled` | 0.4581 | 0.0651 | 0.0622 | 0.0050 | 0.0073 |
+| A3 `ident-intent` | **0.6319** | 0.2904 | 0.2645 | 0.2512 | 0.0164 |
+
+Four observations, none of them a family verdict:
+
+1. **The identifier projection is the dense leg's best arm, not its worst.**
+   0.5915 against 0.5222 for the full bug report, and 0.6319 when the title is
+   added back. The corpus was built on the premise that identifier queries are
+   where a lexical leg would earn its slot; on these arms they are where the
+   *dense* leg does best.
+2. **A2 behaved exactly as §9.6 route 2 declared.** Perturb the literal string
+   and BM25 collapses to 0.0651 — near the random floor — while dense holds
+   0.4581. Whatever a lexical leg offers is conditional on the caller spelling
+   the name correctly.
+3. **`symbols` recovers nearly all of BM25's signal** (0.2513 against 0.2796 on
+   A1, and 0.2015 against 0.2294 on the `ident_in_gold = true` stratum). This is
+   the §5.7 criterion asking whether a positive result would argue for a leg or
+   for routing, and on this corpus the already-shipping tool is within a few
+   points of the challenger.
+4. **The `ident_in_gold = false` stratum is n = 40 across four arms — ten source
+   instances**, as §12.13 recorded in advance. It is reported (dense 0.2405,
+   BM25 0.1172, `symbols` 0.0000) and it decides nothing: four arms are not
+   independent observations of ten sources. django's 146 is where this stratum
+   is testable.
+
+**Still required before any F10 verdict**: the django run, the held-out fusion
+in both directions, and `noise_floor.py` against the v3 pipeline — §12.5 still
+carries the between-run SD as pending, and the decision rule's "Δ ≥ 2 × SD" term
+has no number until it exists.

@@ -342,6 +342,12 @@ def main() -> int:
                         "leaks_gold_basename": inst["leaks_gold_basename"],
                         "lexical_overlap": inst.get("lexical_overlap"),
                         "overlap_bucket": inst.get("overlap_bucket"),
+                        # PROTOCOL §3.4/§9.6 — absent on every other tier, and
+                        # carried here because `score.py` cuts F10's strata from
+                        # the result record, not from the qrels file.
+                        "projection": inst.get("projection"),
+                        "ident_in_gold": inst.get("ident_in_gold"),
+                        "ident_df_min": inst.get("ident_df_min"),
                         "doc_path": inst.get("doc_path"),
                         "results": results,
                         "n_results": len(results),

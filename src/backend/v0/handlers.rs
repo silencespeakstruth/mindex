@@ -12209,6 +12209,62 @@ mod tests {
         }
     }
 
+    /// The other three `llms_doc` guards check structure or provenance — that a
+    /// route exists, that an empty catalogue is not dressed up as a populated
+    /// one, that the register does not read as an attack. None of them can see
+    /// a sentence that is well-formed, well-mannered and false about how
+    /// retrieval works, and this document shipped two of those for the whole of
+    /// v3: that `/search` was "hybrid semantic + lexical retrieval" (it is one
+    /// dense vector and one nearest-neighbour query — no lexical leg exists),
+    /// and a "Measured retrieval property" about identifiers ranking
+    /// implementation first, which nothing in `bench/results/` measures.
+    ///
+    /// Both were harmless-looking prose and both misdirect the one reader this
+    /// endpoint has: an agent deciding which tool to reach for. A caller told
+    /// search is lexical does not reach for `symbols` or `grep`, which are the
+    /// tools that actually match a string.
+    ///
+    /// This is a lint and not a proof — it cannot know whether a *new* sentence
+    /// is true. What it does is make the vocabulary of a retrieval architecture
+    /// unusable by accident, so that describing one here is a deliberate act
+    /// that has to delete an entry from this list. When a lexical leg ships
+    /// (`bench/PROTOCOL.md` family F10 is the measurement that would justify
+    /// one), drop the terms it earns and leave the rest.
+    #[test]
+    fn llms_doc_makes_no_unmeasured_retrieval_claim() {
+        // Deliberately phrases, not bare words: the document legitimately says
+        // "measured p50/p90" of research costs it really does measure, and
+        // calls the *question* `grep` answers a lexical one.
+        const UNEARNED: &[&str] = &[
+            "hybrid",
+            "lexical retrieval",
+            "semantic + lexical",
+            "sparse",
+            "bm25",
+            "rerank",
+            "fusion",
+            "colbert",
+            "measured retrieval property",
+        ];
+
+        let doc = llms_document(&llms_test_config(
+            vec!["glm-4:9b".into()],
+            Some(1_700_000_000),
+            vec![],
+        ))
+        .to_lowercase();
+
+        for term in UNEARNED {
+            assert!(
+                !doc.contains(term),
+                "llms_doc.md contains {term:?} — retrieval-architecture vocabulary \
+                 this service has not earned. `/search` is dense-only; if that has \
+                 changed, the measurement justifying it belongs in bench/PROTOCOL.md \
+                 §12 and this term belongs out of UNEARNED"
+            );
+        }
+    }
+
     // ── the service descriptor ───────────────────────────────────────────────
 
     fn test_descriptor() -> MindexDescriptor {

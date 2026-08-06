@@ -78,6 +78,21 @@ class Instance:
     doc_path: str | None = None
     lexical_overlap: float | None = None
     overlap_bucket: str | None = None
+    # Identifier tier only (build_ident_qrels.py, PROTOCOL §3.4). That builder
+    # emits several *queries* per source instance, all sharing its gold set and
+    # its snapshot, so `source_instance_id` is what ties an arm back to the
+    # published row it inherited from — and what makes the byte-identical
+    # inheritance auditable after the fact rather than only at build time.
+    # Defaulted, because every field here is written into every qrels file and
+    # the two older tiers must keep loading unchanged.
+    projection: str | None = None
+    source_instance_id: str | None = None
+    n_idents: int | None = None
+    # §9.6's three routes to a negative result, measured per instance at build
+    # time so their sizes exist before any comparison could be fitted to them.
+    ident_in_gold: bool | None = None
+    ident_df_min: int | None = None
+    mangle_seed: int | None = None
 
 
 @dataclass

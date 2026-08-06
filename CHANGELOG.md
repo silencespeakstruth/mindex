@@ -107,6 +107,21 @@ ROCm) are in `deploy/embedder/README.md`.
   `STORABLE_TOKENS_CEILING` chain (a Qdrant multivector limit), the six v1 migrations,
   and `model_id` from seven tables.
 
+### Fixed
+
+- **`/llms.txt` described a retrieval pipeline this server does not have.** The
+  discovery document told every agent that reads it that `POST /v0/{guid}/search` is
+  "hybrid semantic + lexical retrieval", and carried a "Measured retrieval property"
+  claiming identifier queries rank implementation chunks first. The first has been
+  false since v3 removed the sparse leg — search is one dense vector and one Qdrant
+  query, with no lexical matching anywhere in it — and the second was never measured
+  by anything in `bench/results/`. Both misdirect the one reader this endpoint has:
+  an agent choosing a tool. A caller told search is lexical does not reach for
+  `symbols` or `grep`, which are what actually match a string. Replaced with what the
+  architecture entails, and guarded by `llms_doc_makes_no_unmeasured_retrieval_claim`
+  — the three existing `llms_doc` tests check routes, provenance and register, and
+  none of them can see a well-formed sentence that is simply untrue.
+
 ## [1.2.0] — 2026-08-04
 
 Gives the server **one credential that says what it may do and who holds it**, and

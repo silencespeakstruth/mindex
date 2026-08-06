@@ -99,9 +99,12 @@ def test_ranx_reproduces_score_py(name: str) -> None:
     for metric in SHARED_METRICS:
         theirs = float(ranx_scores[metric])
         mine = statistics.fmean(row[metric] for row in ours)
-        assert abs(theirs - mine) < TOLERANCE, (
-            f"{name} {metric}: ranx {theirs:.6f} vs score.py {mine:.6f}"
-        )
+        # The message is bound first because `ruff format` and `black` format a
+        # parenthesised assert-with-message in opposite directions and each
+        # reverts the other, so the repo cannot satisfy both checks at once on
+        # that shape. This one is formatted identically by both.
+        detail = f"{name} {metric}: ranx {theirs:.6f} vs score.py {mine:.6f}"
+        assert abs(theirs - mine) < TOLERANCE, detail
 
 
 @pytest.mark.parametrize("name", ARCHIVED)

@@ -73,11 +73,17 @@ BENCH_NAMESPACE = uuid.UUID("6f9b1f2c-4a1e-5d3b-9c8a-2e7d4f1a0b63")
 # the flat tail that produced looked like a finding about retrieval.
 #
 # 100 is the server's `[search].max_top_k` default and yields ~21.7 distinct
-# files here. It is safe to raise because top_k is a **truncation, not a
-# retrieval decision**: the pipeline prefetches 200 dense + 200 sparse, fuses,
-# reranks with ColBERT and then cuts, so any value at or below `fusion_limit`
-# (200) returns a deeper slice of the identical ranking. Every configuration and
-# baseline is cut at the same depth.
+# files here. Every configuration and baseline is cut at the same depth.
+#
+# RETRACTED 2026-08-06 (PROTOCOL §11): this comment used to justify raising
+# top_k by arguing it is "a truncation, not a retrieval decision", because "the
+# pipeline prefetches 200 dense + 200 sparse, fuses, reranks with ColBERT and
+# then cuts". That was true under v2 and is false under v3, which asks Qdrant
+# for `top_k` directly — there is no prefetch, no fusion and no rerank, so the
+# depth IS a retrieval decision and a deeper cut is a different HNSW search,
+# not a longer slice of one ranking. The value is unchanged and comparisons
+# stay valid (all arms share the depth); what is gone is the reason it was
+# safe. Should a lexical leg ship, the original argument becomes true again.
 TOP_K = 100
 
 # Indexing a large repository from cold is minutes of GPU work in one call.
@@ -767,10 +773,21 @@ def run_corpus(
             sha = inst["base_commit"]
             index_ms = 0
             pruned = 0
-            # With one snapshot for the whole corpus the tree and the index are
-            # moved once; every later query is asked of the same state, so the
-            # checkout, the reindex and the drift prune have nothing to do.
-            if not (single_snapshot and indexed_sha == sha):
+            # The tree and the index are moved only when the commit actually
+            # changes. Two instances naming the same sha cannot have different
+            # trees, so for the second the checkout, the reindex and the drift
+            # prune have nothing to do.
+            #
+            # This used to be conjoined with `single_snapshot`, which made it
+            # fire only for the descriptive tier — where every instance shares
+            # one commit. The condition it really needs is the equality alone,
+            # and that matters as soon as a corpus holds several *queries* per
+            # snapshot: the identifier projections (§3.4) emit four arms per
+            # source instance, so on django the conjunct would buy 3 248 full
+            # reindexes where 812 are required. `single_snapshot` still governs
+            # the equivalence sample and the GC cadence below, which genuinely
+            # ask whether the whole corpus is one tree.
+            if indexed_sha != sha:
                 clone.checkout(sha)
                 head = clone.head()
                 if head != sha:
@@ -889,6 +906,13 @@ def run_corpus(
                 "leaks_gold_basename": inst["leaks_gold_basename"],
                 "lexical_overlap": inst.get("lexical_overlap"),
                 "overlap_bucket": inst.get("overlap_bucket"),
+                # PROTOCOL §3.4/§9.6 — absent on every other tier. `score.py`
+                # cuts F10's strata from the result record rather than from the
+                # qrels file, so a run that dropped these would be unscoreable
+                # for the family it was made for.
+                "projection": inst.get("projection"),
+                "ident_in_gold": inst.get("ident_in_gold"),
+                "ident_df_min": inst.get("ident_df_min"),
                 "doc_path": inst.get("doc_path"),
                 "results": [
                     {

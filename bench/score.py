@@ -216,6 +216,13 @@ def score_all(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # the only effect dense and ColBERT retrieval are there to produce.
             "overlap_bucket": rec.get("overlap_bucket"),
             "lexical_overlap": rec.get("lexical_overlap"),
+            # PROTOCOL §3.4 / §9.6. `projection` names the arm a query belongs
+            # to; the other two are the strata that decide whether a lexical
+            # gain is retrieval or string matching. All three are absent on
+            # every other tier and simply stratify to None there.
+            "projection": rec.get("projection"),
+            "ident_in_gold": rec.get("ident_in_gold"),
+            "ident_df_min": rec.get("ident_df_min"),
             "n_results": rec["n_results"],
             "ranking_depth": len(ranked_files(rec["results"])),
             # A query the server could not serve scores zero like any other
@@ -257,7 +264,21 @@ def report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if row.get("refusal"):
             code = str(row["refusal"])
             out["refusals"][code] = out["refusals"].get(code, 0) + 1
-    for field in ("language", "category", "gold_size", "leakage", "overlap_bucket"):
+    for field in (
+        "language",
+        "category",
+        "gold_size",
+        "leakage",
+        "overlap_bucket",
+        "projection",
+        "ident_in_gold",
+    ):
+        # A field no tier in this run carries would otherwise report one
+        # stratum called "None" holding every query — a breakdown that looks
+        # like a result and says nothing. The identifier fields are absent from
+        # both older tiers by construction.
+        if all(row.get(field) is None for row in rows):
+            continue
         groups = stratify(rows, field)
         out["strata"][field] = {
             key: {"n": len(rs), **aggregate(rs, [PRIMARY, "recall@10"])}

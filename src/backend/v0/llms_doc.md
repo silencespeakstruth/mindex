@@ -304,17 +304,21 @@ corpus worth accumulating rather than a stream of one-off answers.
 
 ## Search and symbols
 
-`POST /v0/{project_guid}/search` is hybrid semantic + lexical retrieval over
-a project's indexed chunks. Body: `{"query": "...", "top_k": 5}` plus optional
+`POST /v0/{project_guid}/search` is dense semantic retrieval over a project's
+indexed chunks — one embedding of the query, one nearest-neighbour query, no
+lexical matching anywhere in it. Body: `{"query": "...", "top_k": 5}` plus optional
 `include`/`exclude` filters, each `{"paths": [globs], "programming_languages":
 [names]}`. Results come back scored, best first, with file path, line span and
 the chunk's code. A 404 with `search.no_match` is this endpoint's empty
 result, distinct from a missing project.
 
-Measured retrieval property: queries containing real identifiers rank
-implementation chunks first, while purely natural-language queries rank tests
-and documentation first. An identifier in the query text is what moves the
-ranking.
+One consequence of that shape is worth a caller's attention, and it follows
+from the architecture rather than from a measurement: an identifier in the
+query is embedded as text like any other word, and nothing scores a chunk for
+spelling it. So a rare, exact name is not necessarily found by asking for it
+here — the two tools that match on the string itself are `symbols`, for a
+definition by exact name, and `grep`, for a substring, and neither is a
+ranking. A question phrased as a question is what this endpoint is for.
 
 `POST /v0/{project_guid}/symbols` is exact-name lookup over **definitions**,
 returning ranked candidates plus full totals. Name collisions are part of the

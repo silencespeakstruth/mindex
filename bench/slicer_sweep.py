@@ -162,9 +162,9 @@ def main() -> int:
         help="max_chunk_tokens values to sweep",
     )
     ap.add_argument("--qrels-suffix", default="-docs-short")
-    ap.add_argument(
-        "--ablation", action="store_true", help="also run F2 arms per window"
-    )
+    # `--ablation` (F2 arms per window) is gone with `pipeline_ablation.py`: its
+    # arms were dense/sparse/ColBERT legs of a pipeline v3 does not have. The
+    # F3 windows themselves are unaffected — they are a property of the slicer.
     ap.add_argument("--keep", action="store_true", help="do not drop each project")
     ap.add_argument(
         "--db",
@@ -205,33 +205,6 @@ def main() -> int:
         # from it.
         for name in args.corpora:
             verify_window(args.db, project_guid(label, name), window)
-
-        if args.ablation:
-            for name in args.corpora:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(root / "bench" / "baselines" / "pipeline_ablation.py"),
-                        "--corpus",
-                        name,
-                        f"--qrels-suffix={args.qrels_suffix}",
-                        "--arm",
-                        "all",
-                        "--mindex-label",
-                        label,
-                    ],
-                    check=False,
-                )
-                # The ablation names its files by arm alone, so they would
-                # overwrite between windows. Stamp the window in.
-                results = root / "bench" / "results"
-                for arm in ("full", "no-colbert", "dense-only", "sparse-only"):
-                    src = results / f"F2-{arm}__{name}{args.qrels_suffix}.jsonl"
-                    if src.exists():
-                        src.rename(
-                            results
-                            / f"F3-{window}-{arm}__{name}{args.qrels_suffix}.jsonl"
-                        )
 
         chunks = {}
         for name in args.corpora:

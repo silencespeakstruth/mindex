@@ -49,11 +49,22 @@ def per_query(path: Path, metric: str) -> dict[str, float]:
     return {r["instance_id"]: r[metric] for r in score_all(records)}
 
 
-def strata(path: Path) -> dict[str, str]:
+def strata(path: Path, field: str = "overlap_bucket") -> dict[str, str]:
+    """The stratum each instance belongs to, for the per-stratum breakdown.
+
+    Parameterised because F10 (PROTOCOL §9.6) is decided on `ident_in_gold` and
+    reported per `projection`, and hardcoding the difficulty axis meant the two
+    strata that referee that family could not be reported at all. `False` is a
+    stratum, so the mapping is on `is None` rather than falsiness — read as a
+    boolean, every `ident_in_gold = false` instance would have collapsed into
+    "unbucketed" together with the tiers that carry no such field, which is the
+    one merge that would silently answer F10 in the affirmative.
+    """
     out = {}
     for line in path.open():
         r = json.loads(line)
-        out[r["instance_id"]] = r.get("overlap_bucket") or "unbucketed"
+        value = r.get(field)
+        out[r["instance_id"]] = "unbucketed" if value is None else str(value)
     return out
 
 
@@ -293,12 +304,18 @@ def main() -> int:
     ap.add_argument("baseline", type=Path)
     ap.add_argument("--metric", default="ndcg@10")
     ap.add_argument("--delta", type=float, default=None, help="TOST margin")
+    ap.add_argument(
+        "--stratum-field",
+        default="overlap_bucket",
+        help="per-query field to break the comparison down by "
+        "(F10 reports on ident_in_gold and projection)",
+    )
     ap.add_argument("--json", type=Path)
     args = ap.parse_args()
 
     a = per_query(args.system, args.metric)
     b = per_query(args.baseline, args.metric)
-    bucket = strata(args.system)
+    bucket = strata(args.system, args.stratum_field)
 
     shared = sorted(set(a) & set(b))
     if len(shared) != len(a) or len(shared) != len(b):
@@ -345,6 +362,11 @@ def main() -> int:
                     "system": args.system.name,
                     "baseline": args.baseline.name,
                     "metric": args.metric,
+                    # Which axis the per-stratum rows below are cut on. Two
+                    # archives that break the same comparison down differently
+                    # are otherwise indistinguishable once the console output
+                    # has scrolled away.
+                    "stratum_field": args.stratum_field,
                     "seed": SEED,
                     "b_permutation": B_PERM,
                     "b_bootstrap": B_BOOT,
