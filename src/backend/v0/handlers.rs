@@ -2599,7 +2599,7 @@ pub async fn post_search(
 }
 
 /// The `/search` core, shared by [`post_search`] and the research loop: embed the
-/// query → SQLite candidate set → Qdrant hybrid search → display rows for the
+/// query → SQLite candidate set → Qdrant dense search → display rows for the
 /// top-k winners, sorted by score descending. `Err(NoMatch)` = empty candidate
 /// set or no scored hits. Validation stays with the callers (the handler
 /// validates client input; the research loop constructs requests itself).

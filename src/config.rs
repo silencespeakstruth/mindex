@@ -13,8 +13,9 @@
 //!
 //! Structural invariants are deliberately **not** here — they would break the
 //! system if changed independently and live as documented `const`s next to the
-//! code that relies on them: the BGE-M3 vector width (`1024`), the `/encode` wire
-//! magic, `COLLECTION_SCHEMA_VERSION`, HTTP `499`, `PRAGMA foreign_keys = ON`, and
+//! code that relies on them: the registry's per-model width, context and
+//! collection slug (`models/registry.rs`), `COLLECTION_SCHEMA_VERSION`, HTTP
+//! `499`, `PRAGMA foreign_keys = ON`, and
 //! `PRAGMA journal_mode = WAL`.
 
 use std::net::SocketAddr;
@@ -1288,9 +1289,9 @@ impl Default for WorkerConfig {
     version,
     about = concat!(
         "mindex is a high-performance semantic search engine built in Rust. ",
-        "It leverages the BGE-M3 model for hybrid (dense/sparse) retrieval ",
-        "combined with advanced reranking techniques to deliver accurate, ",
-        "context-aware search results."
+        "It embeds tree-sitter chunks with a Qwen3-Embedding model served over an ",
+        "OpenAI-compatible API and searches them as dense vectors in Qdrant, to ",
+        "deliver accurate, context-aware search results."
     )
 )]
 pub struct Cli {
@@ -1317,11 +1318,12 @@ pub struct Cli {
     #[arg(long)]
     pub key_path: Option<PathBuf>,
 
-    /// Name of the model to use (default: BAAI/bge-m3).
+    /// Embedding model id, from the compiled registry (default:
+    /// qwen3-embedding-0.6b). Maps to [model].id.
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Model API server (default: http://localhost:11211).
+    /// Embedding server, OpenAI-compatible (default: http://localhost:11212).
     #[arg(long)]
     pub model_server: Option<Url>,
 

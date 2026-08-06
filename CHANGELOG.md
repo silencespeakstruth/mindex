@@ -9,6 +9,104 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
+## [Unreleased]
+
+**Retrieval v3.** Replaces the three-headed BGE-M3 pipeline with **one dense leg from a
+registry of Qwen3-Embedding models**, served by any OpenAI-compatible endpoint. This is
+the largest breaking change the project has made, and it is not a refactor: the vectors
+are from a different model, so **every index must be rebuilt from scratch**.
+
+The grounds are measured, not architectural. `bench/` (new in this cycle) scored the
+deployed pipeline against alternatives on this corpus, and RRF fusion of the dense and
+sparse legs came out **below the single dense leg it fused**; the late-interaction
+rerank was never shown to move a metric while costing 99.6% of Qdrant's storage
+(838 MB per segment against 2.6 MB dense). Swapping the model, by contrast, moved
+nDCG@10 from **0.3549 to 0.4540**. The embedder was the lever; the extra heads were
+not. Full record: `docs/claude/retrieval-v2.md`, `bench/FINDINGS.md`,
+`docs/claude/qdrant.md`.
+
+### Upgrading — REQUIRED, and it is a rebuild
+
+**1. The database lineage restarts.** The v1 schema carried `model_id` in seven primary
+keys; v3 removes it (a file, a chunk and a symbol are facts about the working tree —
+the *model* varies over the artifact instead). Rather than migrate rows whose vectors no
+longer exist, mindex **refuses to start** on a pre-v2 database, names the file and tells
+you to delete it. Fresh databases are unaffected. The Docker test stack needs
+`down -v` once.
+
+**2. The embedder changes process, and mindex stops shipping one.** `embedder/` — the
+vendored BGE-M3 server — is deleted; it existed only because no general server emitted
+three heads at once. What replaces it is a contract rather than a process:
+`deploy/embedder/` documents the three endpoints mindex needs, three recipes (a ~200-line
+torch reference server that ships with it, llama.cpp, and vLLM) with their measured
+throughput, and the three checks worth running. One of those checks is
+not optional: **pooling and normalisation cannot be verified over the wire**, and
+Qwen3-Embedding pools the *last* token — mean pooling returns 1024 plausible numbers and
+simply retrieves worse, with no error anywhere.
+
+**3. Config keys changed, and stale ones now fail at startup** (`deny_unknown_fields`,
+deliberately):
+
+| key | change |
+|---|---|
+| `[model].name` | **renamed** to `[model].id`; value is a registry id (`qwen3-embedding-0.6b` \| `-4b` \| `-8b`), not an HF repo |
+| `[model].served_name` | **new**, optional — for a server started with `--served-model-name` |
+| `[model].server_url` | default `:11211` → **`:12434`** |
+| `[model].max_429_retries` | unchanged, but now also covers **503** — the other spelling of "busy" |
+| `[qdrant].dense_prefetch_limit` | **removed** (no prefetch) |
+| `[qdrant].sparse_prefetch_limit` | **removed** (no sparse leg) |
+| `[qdrant].fusion_limit` | **removed** (no fusion) |
+| `[qdrant].search_hnsw_ef` | kept; the successor rule is `>= [search].max_top_k` |
+| `[indexing].sparse_min_weight` | **removed** (no sparse weights) |
+| `[slicer].max_chunk_tokens` | default 512 → **364** (measured; the only hard ceiling is now the model's own 32k context) |
+
+**4. Rebuild.** `mindex-index --force` per project, then drop the `_v1`/`_v2` Qdrant
+collections the startup log names. Runbook: `docs/claude/qdrant.md`.
+
+**Choose the serving stack by the indexing number, not by the protocol.** They differ by
+an order of magnitude for identical vectors: on the reference host this repository
+reindexes in **51 s** through `deploy/embedder/server.py` (torch) and **410 s** through
+llama.cpp, while *query* latency is 16 ms against 30 ms. No llama.cpp configuration
+recovers it — `-np` 1/8/32, three ubatch sizes, ROCm and Vulkan, and 1/4/8 concurrent
+clients were all measured. `[model].query_server_url` is the seam for serving the two
+paths from different processes. Numbers, method and the three traps that cost real
+debugging (bf16 vs fp16 NaN, token-budget batching, `empty_cache()` corrupting output on
+ROCm) are in `deploy/embedder/README.md`.
+
+### Added
+
+- **A model registry** (`src/models/registry.rs`): three canonical ids with their
+  width, context, collection slug, tokenizer and query prefix, cross-checked at startup
+  against an `embedding_models` table whose ids and dims are `CHECK`ed and append-only.
+  A rebuilt binary cannot silently reinterpret stored vectors.
+- **Per-model collections**: `{guid}_{slug}_v3`. Switching `[model].id` writes a new
+  collection and *holds* the old one — the stale worker reports it as `OtherModel`
+  (registered, not active) rather than orphaned, so switching back is instant reuse.
+  Deleting a project drops every model's collection.
+- **`mindex-index --vectors-only`** (body flag `vectors_only`): re-embed the stored
+  chunks into the active model's collection — no slicing, no symbols. This is what a
+  model *size* change costs, since all three Qwen3 sizes share one tokenizer. Refused
+  across a tokenizer change, and mutually exclusive with `--symbols-only`.
+- **A model-identity handshake.** `GET /v1/models` is checked at startup (a server that
+  answers and names a different model is a **refusal**; an unreachable one is only a
+  warning) and re-checked by `GET /health`, per instance when the query path is split.
+  Every embedding row is checked against the registry's dimension. Nothing checked
+  either before — a wrong embedder behind the right URL indexed in silence.
+- **Two new `project_files` columns**, `chunker_id` and `embedded_model_id`, folded into
+  the unchanged-file predicate beside the derivation versions: flipping the model
+  self-heals exactly like a version bump. `project_file_chunks` now stores each chunk's
+  `tokens`, so a future window can be checked against the corpus by SQL.
+- **`GET /config`** publishes `embedding_dim`, `min_chunk_tokens` and
+  `max_chunk_tokens`; `model_id` is the canonical registry id.
+
+### Removed
+
+- `embedder/` (the whole vendored server), `src/models/bge_m3.rs` and its binary wire
+  protocol, the sparse and ColBERT vectors, the RRF prefetch tree, the ColBERT rerank
+  and the fp16 / `on_disk` / `hnsw m=0` tuning that existed for it, the
+  `STORABLE_TOKENS_CEILING` chain (a Qdrant multivector limit), the six v1 migrations,
+  and `model_id` from seven tables.
+
 ## [1.2.0] — 2026-08-04
 
 Gives the server **one credential that says what it may do and who holds it**, and

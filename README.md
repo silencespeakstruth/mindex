@@ -5,16 +5,19 @@
 A frontier model's context is the expensive resource, and reading files burns it. mindex
 is a local-first code index built around that one economics problem. Everything below
 runs on your machine: vectors in a local Qdrant, metadata in a local SQLite file,
-embeddings from a local [BGE-M3](https://huggingface.co/BAAI/bge-m3) (~4–6 GB VRAM, or
-CPU-only). 21 programming languages, plus TOML, YAML and Markdown.
+embeddings from a local [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
+served by anything that speaks the OpenAI embeddings API — a ~200-line reference server
+ships in [`deploy/embedder/`](deploy/embedder/README.md), and llama.cpp or vLLM work
+equally (the 0.6B fits comfortably beside a research LLM; 4B and 8B are one config key
+away). 21 programming languages, plus TOML, YAML and Markdown.
 
 **Search and research are one pair, and the split is the product.**
 
 - **Search** is the paid-precision half: you spend a few chunks and get the byte-exact
-  text of one place. Retrieval is three-level and uses all of BGE-M3's heads as they
-  come — dense and SPLADE-style sparse run in parallel, RRF-fuse, and a ColBERT
-  multivector rerank orders what survives. No head is a fallback for another; each
-  catches what the others miss.
+  text of one place. Retrieval is one dense leg — deliberately, and after measuring the
+  alternative: a sparse leg fused in by RRF, plus a late-interaction rerank on top,
+  scored *below* the single leg it fused while costing 99.6% of the store. The
+  measurement, and the harness that produced it, are in [`bench/`](bench/README.md).
 - **Research** is the cheap-breadth half, and it costs the caller nothing. You ask a
   question; a **local** model runs the whole investigation — searching, reading code,
   looking up definitions, walking git history — and hands back a cited Markdown report.
@@ -35,10 +38,13 @@ re-derives every claim through the tools and returns `confirmed` / `disputed` /
 re-scoring its citations against the index as it stands now.
 
 **Reindexing is close to free.** A file is skipped by content hash *and* by the version
-of the code that derived its chunks and symbols, so an unchanged tree costs one round
-trip. When only the symbol extractor moves, `mindex-index --symbols-only` rebuilds the
-symbol table with no slicing, no GPU and no vector writes — measured at ~20× faster than
-a full pass on this repository.
+of the code that derived its chunks and symbols — and by *which model* embedded it — so
+an unchanged tree costs one round trip and a changed embedding model heals itself. When
+only the symbol extractor moves, `mindex-index --symbols-only` rebuilds the symbol table
+with no slicing, no GPU and no vector writes — measured at ~20× faster than a full pass
+on this repository. When only the model moves, `--vectors-only` re-embeds the stored
+chunks into that model's own collection: no re-slicing, and switching back is instant,
+because the previous model's vectors were never overwritten.
 
 **Exact lookup, honestly scoped.** `symbols` answers "where is X **defined**" from a
 tree-sitter symbol table built at index time, returning ranked candidates and full
@@ -96,8 +102,10 @@ file explicitly there with `--config` or `$MINDEX_CONFIG`.
 Bottom-up: embedder → Qdrant → mindex.
 
 ```sh
-# 1. Embedder — never in a container (torch is ~8 GB and wants the GPU directly).
-cd embedder && uv sync && uv run python -m bge_m3_api --port 11211
+# 1. Embedder — never in a container (it wants the GPU directly). deploy/embedder/
+#    has the venv, the systemd unit and two alternative stacks, with the numbers
+#    that tell them apart.
+cd deploy/embedder && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 11212
 
 # 2. Qdrant + mindex. No host ports by default; add the overlay to reach the API
 #    from the host (both loopback-only).
@@ -138,7 +146,8 @@ enabled = false                                   # the default; with it off, TL
                                                   # each caller reaches.
 
 [model]
-server_url = "http://localhost:11211"             # the BGE-M3 embedder
+server_url = "http://localhost:11212"             # any OpenAI-compatible embedder
+id         = "qwen3-embedding-0.6b"               # from the compiled registry
 
 [qdrant]
 server_url = "http://localhost:6334"
@@ -264,7 +273,12 @@ intersected — because a sync only drops what your refs no longer reach.
       --exit-code-from test-runner --abort-on-container-exit
   ```
 
-- **Why a custom embedder?** No off-the-shelf server (vLLM, Ollama, …) emits BGE-M3's
-  three heads together. [`embedder/`](embedder/README.md) exists solely to bridge that
-  and is meant to be deleted when one does.
+- **Why no bundled embedder?** There used to be one: BGE-M3's dense, sparse and
+  late-interaction heads came out of no general model server together, so mindex shipped
+  its own. Retrieval is dense-only now, that server was deleted, and the embedding side
+  is an ordinary OpenAI-compatible `/v1/embeddings` — any stack that serves one will do.
+  [`deploy/embedder/`](deploy/embedder/README.md) holds the contract, three recipes and
+  the checks worth running. Pick by the measured numbers, not the protocol: the same
+  model on the same card reindexes this repository in 51 s through the torch reference
+  server and 410 s through llama.cpp, while queries cost 16 ms against 30 ms.
 - **Licence:** [MIT](LICENSE).

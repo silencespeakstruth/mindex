@@ -149,7 +149,7 @@ pub struct PhaseLabels {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EmbedderLabels {
-    /// `index` or `query` — the two BGE-M3 instances, which may be one server.
+    /// `index` or `query` — the two embedder instances, which may be one server.
     pub embedder: &'static str,
 }
 
@@ -305,7 +305,7 @@ pub struct EmbedMetrics {
     pub duration: HistFamily<EmbedderLabels>,
     pub batch_size: HistFamily<EmbedderLabels>,
     pub texts: Family<EmbedderLabels, Counter>,
-    /// Incremented inside `BGEm3HttpClient::encode`: from outside the client,
+    /// Incremented inside `OpenAiEmbedClient::embed`: from outside the client,
     /// three retries then a success is indistinguishable from one success.
     pub retries: Family<EmbedderLabels, Counter>,
 }
@@ -798,12 +798,12 @@ impl Metrics {
         };
         registry.register(
             "embed_requests",
-            "Calls to a BGE-M3 /encode endpoint, by outcome",
+            "Calls to the embedder's /v1/embeddings endpoint, by outcome",
             embed.requests.clone(),
         );
         registry.register(
             "embed_duration_seconds",
-            "Latency of a BGE-M3 /encode call",
+            "Latency of an embedder /v1/embeddings call",
             embed.duration.clone(),
         );
         registry.register(

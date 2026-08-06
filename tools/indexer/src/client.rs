@@ -17,6 +17,9 @@ pub struct IndexRequest {
     pub force: bool,
     /// Rebuild only symbols: no slicing, no embedding, no Qdrant on the server side.
     pub symbols_only: bool,
+    /// Re-embed only the stored chunks into the active model's collection: no
+    /// slicing, no symbols — the cheap half of a model switch.
+    pub vectors_only: bool,
 }
 
 /// `files[language][relative_path] = chunk_count`

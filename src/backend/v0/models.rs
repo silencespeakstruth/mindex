@@ -514,7 +514,8 @@ pub struct SearchFilter {
 /// RRF fusion → ColBERT MaxSim rerank → top-k.
 #[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct SearchRequest {
-    /// Natural-language or code query; embedded with the same BGE-M3 model.
+    /// Natural-language or code query. Embedded by the same model the chunks
+    /// were, with the model's instruct prefix in front — queries only.
     pub query: String,
     /// Max results to return. Defaults to 5 when omitted.
     #[schema(default = 5, example = 5)]

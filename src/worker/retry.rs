@@ -250,7 +250,7 @@ pub async fn run(
 
 /// Re-indexes one stuck/failed file: `*→indexing → {indexed | failed}`. Extracted
 /// from the `run` loop so it can be unit-tested with a fake `VectorStore` +
-/// `BGEm3Model` (no live Qdrant or model server).
+/// `Embedder` (no live Qdrant or model server).
 ///
 /// Returns the outcome as a `&'static str`, which `run` records. Every branch is
 /// already a distinct decision with its own log line, so naming them costs

@@ -1,0 +1,12 @@
+# The embedding server's dependencies. torch is deliberately NOT pinned here:
+# the build must match the host's accelerator stack (ROCm / CUDA / XPU / CPU),
+# so install it first from the vendor's index, then this file.
+#
+#   python -m venv .venv
+#   .venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm7.0 torch
+#   .venv/bin/pip install -r requirements.txt
+sentence-transformers>=5.0
+transformers>=4.50
+fastapi>=0.115
+uvicorn>=0.30
+orjson>=3.10

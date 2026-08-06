@@ -50,7 +50,7 @@ const GAP_MIN_TOKENS: usize = 24;
 /// The single tokenizer capability the slicer needs: the byte-offset span of each
 /// token in `text`. Abstracted behind a trait so the AST-walk/selection logic can
 /// be tested with a cheap deterministic tokenizer instead of downloading the real
-/// BGE-M3 tokenizer. The production implementation is `tokenizers::Tokenizer`.
+/// registry tokenizer. The production implementation is `tokenizers::Tokenizer`.
 pub trait Tokenizing {
     fn token_offsets(&self, text: &str) -> Result<Vec<(usize, usize)>, SlicerError>;
 }
@@ -65,8 +65,8 @@ pub struct Slicer<'a> {
     pub tokenizer: &'a dyn Tokenizing,
     pub parser: Parser,
     /// Inclusive token window a node must fall in to be selected (from `[slicer]`
-    /// config). BGE-M3 performs best in this range; the window is measured, not
-    /// computed, because tokenization is context-dependent.
+    /// config). The window is measured, not computed, because tokenization is
+    /// context-dependent and token boundaries do not align with AST nodes.
     min_tokens: usize,
     max_tokens: usize,
     /// Whether to emit chunks for the lines the AST walk selected nothing for.
@@ -182,8 +182,9 @@ impl<'a> Slicer<'a> {
                 if start_token < end_token {
                     let len = end_token - start_token;
 
-                    /* In practice, BGE-M3 models perform best with input sequences
-                     * within this length range to balance context and semantic density.
+                    /* The measured retrieval window (`[slicer]` config): long
+                     * enough to carry context, short enough that one chunk is
+                     * about one thing. See bench/FINDINGS.md §2.5.
                      */
                     if (self.min_tokens..=self.max_tokens).contains(&len) {
                         let line_start = line_start_of(code, node.start_byte());

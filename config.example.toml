@@ -65,13 +65,17 @@ leeway_seconds = 60
 # stored chunks — rebuilds under the new model, into its own collection, and
 # switching back reuses the old one.
 id = "qwen3-embedding-0.6b"
-server_url = "http://localhost:11212" # the vLLM instance (OpenAI-compatible)
+server_url = "http://localhost:11212" # the embedding server (OpenAI-compatible).
+                                      # deploy/embedder/ measures the recipes: a
+                                      # torch server reindexes this repo in 51 s,
+                                      # llama.cpp in 410 s, queries alike
 health_timeout_ms = 2000             # /health ping + /v1/models handshake timeout
 max_429_retries = 3                  # retries when the server answers busy (429/503)
 backoff_base_ms = 200                # first backoff; doubles each retry
 encode_timeout_ms = 600000           # whole embed call incl. busy retries (ms); 10 min
 # What the serving side calls the model in /v1/models. Commented out = the
-# registry's HF repo id (what a plain `vllm serve Qwen/...` answers); set it only
+# registry's HF repo id (what a plain `vllm serve Qwen/...` answers); llama.cpp
+# under llama-swap answers with ITS model id, so set this to that; set it only
 # for a vLLM started with --served-model-name. The handshake at startup and in
 # /health refuses a server that answers with anything else — a wrong model behind
 # the right URL would otherwise poison every vector silently.

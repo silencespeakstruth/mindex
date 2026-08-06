@@ -12,8 +12,10 @@ that area.
 ## Overview
 
 `mindex` is an async RAG indexing + search engine in Rust. HTTPS API →
-`tree-sitter` AST chunking → `BGE-M3` multi-vector embeddings
-(dense/sparse/ColBERT) → `Qdrant` vectors + `SQLite3` metadata. TLS is the only
+`tree-sitter` AST chunking → dense embeddings from a registry model
+(`Qwen3-Embedding`, served over an OpenAI-compatible `/v1/embeddings`) →
+`Qdrant` vectors +
+`SQLite3` metadata. TLS is the only
 transport security; authorization is opt-in (`[auth]`, below) and off by
 default, so an unconfigured deployment is still an internal service that must
 not be exposed.
@@ -194,9 +196,9 @@ makes a typo a parse error). Keys carry unit suffixes
 (`*_ms/_seconds/_minutes/_days/_chunks/_tokens/_bytes/_points/_mib`).
 
 **Only genuine tuning knobs are configurable.** Structural invariants stay
-`const` next to their code with a "why not configurable" comment (`VECTOR_DIM`
-1024, `ENCODE_MAGIC`, `COLLECTION_SCHEMA_VERSION`, HTTP 499, the SQLite
-PRAGMAs). Config reaches code through constructors/params, **never globals**.
+`const` next to their code with a "why not configurable" comment (the registry's
+per-model `dim`/`max_seq`/`collection_slug`/`query_prefix`,
+`COLLECTION_SCHEMA_VERSION`, HTTP 499, the SQLite PRAGMAs). Config reaches code through constructors/params, **never globals**.
 New knob = key in the right `config.rs` section + `Default` + validation rule,
 threaded to the consumer. Request-shape limits are knobs too: `[limits]` and
 `[search].max_top_k`/`max_query_bytes` bound requests at the API edge (via
@@ -210,46 +212,43 @@ container means mounting a `config.toml`.
   path-depending on `tools/mindexfile` (the `.mindex` parser);
   `tools/mcp/{mindex,scout}` are Python/Poetry MCP stdio servers;
   `tools/search/mindex-search.sh` is the bash search frontend.
-- `embedder/` is the vendored BGE-M3 server (3 heads) — **host-run + GPU, NOT
-  in the Docker image** (`embedder/README.md`). On this host: a systemd
-  **template** `mindex-embedder@{egpu,igpu}` (example in `embedder/systemd/`,
-  installed to `/etc/systemd/system`), two torch backends (ROCm / Intel XPU) in
-  two venvs (`.venv-%i`), mutually exclusive via a symmetric `Conflicts=`+
-  `After=` naming both instances (systemd drops the self-reference). It is a
-  **system** unit, not a user one, and both reasons were things that read as
-  present and were not: the BPF-backed network directives that confine this
-  unauthenticated 0.0.0.0 listener to loopback are **inert in a user unit**, and
-  `Before=mindex.service` pointed across manager boundaries at nothing. The
-  migration has its own trap, worth stating because a leftover file is invisible:
-  **`Conflicts=` does not cross the scope boundary**, so while copies exist in
-  both `/etc/systemd/system` and `~/.config/systemd/user` the mutual exclusion is
-  void — a system `@egpu` will not stop a user `@igpu`, both race for port 11211,
-  and the winner is whoever started first. Keep exactly one copy. `@igpu` is the
-  default (leaves the discrete card to the research LLM); `@egpu` for bulk
-  reindexing (~17× faster per batch; query path ~28 ms either way). The backends
-  are not bit-identical and nothing checks it (the split-embedder warning under
-  **Retrieval pipeline**, across time), but measured interchangeable (dense
-  cosine 0.999996, sparse Jaccard 0.9968) **only with XPU off its default
-  attention kernel**, which returns NaN for padded fp16 rows and still answers
-  200 — `attention_backend()` in `__main__.py`; removing it silently corrupts
-  every batch of more than one text.
-- Migrations in `src/db/migrations/`. **Seven**: `v1.0.0_schema.sql` (version 1,
-  the whole 1.0.0 schema), `v1.1.0_git_history.sql` (2, adds `project_commits`
-  + `project_commit_paths`), `v1.1.0_toml_yaml_languages.sql` (3, rebuilds
-  `project_files` to widen its `programming_language` CHECK),
-  `v1.2.0_research_context.sql` (4, rebuilds `research_runs` for
-  `seq`/`expires_at`/`context_run_ids_json`, adds `research_run_files`),
-  `v1.3.0_research_verification.sql` (5, rebuilds `research_runs` for the
-  validation metadata + the challenge columns, adds `research_run_evidence` /
-  `research_run_citations` / `research_run_steps`),
-  `v1.4.0_symbol_definitions.sql` (6, rebuilds `project_file_symbols` to drop
-  `role` and its index — with references gone every value was `'definition'`;
-  the file carries surviving rows across verbatim and leaves the deletion to
-  `SYMBOLS_DERIVATION_VERSION`, so the rule lives in one place). The
-  applied set is the `MIGRATIONS` slice in `main.rs`, keyed by the integer in
-  `PRAGMA user_version`; the filename version is documentation. **v1.0.0 is
-  frozen** — the filter is `version > user_version`, so an in-place edit never
-  reaches a database stamped at 1 and is skipped in silence. Twelve tables:
+- **The embedder is a contract, and `deploy/embedder/` is where it is kept.**
+  `embedder/` was a vendored BGE-M3 server that existed for exactly one reason —
+  no general model server emitted its three heads together — and dense-only
+  retrieval retired it. What replaces it is `POST /v1/embeddings` +
+  `GET /v1/models` + `GET /health`, i.e. any OpenAI-compatible server, with
+  three recipes measured against each other in that directory's README. Four
+  things there are invisible from inside mindex and each cost a debugging
+  session to find:
+  **serving stacks differ by an order of magnitude** — the same model on the
+  same card reindexes this repo in **51 s** through a ~200-line torch server and
+  **410 s** through llama.cpp (measured across `-np` 1/8/32, three ubatch sizes,
+  ROCm and Vulkan, 1/4/8 clients; `llama-bench` says its own backend is 3×
+  faster than its server), while *query* latency is 16 ms against 30 ms, so the
+  trade is entirely about bulk indexing and `[model].query_server_url` is the
+  seam for splitting it; **pooling and normalisation are unverifiable over the
+  wire** (Qwen3-Embedding pools the LAST token; mean pooling returns 1024
+  plausible numbers and simply retrieves worse), so that README's cross-check
+  against `sentence-transformers` is the only test there is; **the dtype is
+  load-bearing** — Qwen3 in fp16 returns NaN for the longest chunks, which
+  mindex refuses as `null` rather than indexing, and which would otherwise
+  surface as `search_unscorable_winners`; and **`[model].id` names the model,
+  not the precision it is served at**, so switching quantization invalidates no
+  stored vector and triggers no re-embed (the same blind spot as a split
+  deployment whose two instances differ — see **Retrieval pipeline**).
+- Migrations in `src/db/migrations/`. **One**: `v2.0.0_schema.sql` (version 1,
+  the whole v2 schema as a single baseline). The six v1 files are deleted, and
+  the lineage **restarted** rather than continuing: v1 carried `model_id` in
+  seven tables' primary keys and its rows cannot be read under v3 retrieval
+  wrongly-but-plausibly, so an initialized pre-v2 database is **refused at
+  startup** (`refuse_old_lineage`, keyed on `PRAGMA application_id` = `MX03`,
+  stamped by the baseline) with a delete-and-reindex instruction. A fresh file
+  has both pragmas at 0 and passes. The applied set is the `MIGRATIONS` slice in
+  `main.rs`, keyed by the integer in `PRAGMA user_version`; the filename version
+  is documentation. **The baseline is frozen exactly as v1.0.0 was** — the filter
+  is `version > user_version`, so an in-place edit never reaches a database
+  stamped at 1 and is skipped in silence. Thirteen tables: `embedding_models`
+  (the registry's SQLite half — ids and dims `CHECK`ed, append-only by trigger),
   `projects`, `project_files`, `project_file_chunks`, `project_file_status_log`,
   `project_file_symbols`, `research_runs`, `research_run_files`,
   `research_run_evidence`, `research_run_citations`, `research_run_steps`,
@@ -265,8 +264,10 @@ container means mounting a `config.toml`.
 ## Core invariants (violating these causes bugs)
 
 **Project isolation = collection + has_id filter.** One Qdrant collection per
-project, `{guid_simple}_v2` (`COLLECTION_SCHEMA_VERSION`, `qdrant.rs`); always
-derive names via `collection_for(project_guid)`. The candidate set is a `has_id`
+project **and model**, `{guid_simple}_{slug}_v3` (the registry's
+`collection_slug` + `COLLECTION_SCHEMA_VERSION`, `qdrant.rs`); always derive
+names via `collection_for(project_guid, spec)`, never by formatting. The
+candidate set is a `has_id`
 filter built from SQLite (`qdrant_guid` for chunks matching project + filters +
 **`status='active'`**) — the *sole* isolation mechanism, also excluding
 soft-deleted vectors. It grows linearly with active-chunk count — fine at this
@@ -374,11 +375,16 @@ as `just_uploaded`/`indexing`. Anything else raises
   A read that fails leaves the file `indexing` for the next sweep
   (`a_database_error_never_passes_for_a_file_with_no_chunks`).
 
-**sha256 + derivation-version skip / empty 404.** Identical content is skipped
-by hash — but only if the *derivation versions* also match (a hash answers "did
-the file change", not "did the deriving code change"). `file_already_indexed`
-requires `project_files.chunks_version` and `symbols_version` to equal the
-current consts; both nullable, and NULL never matches. `post_search` returns
+**sha256 + derivation-version + model-identity skip / empty 404.** Identical
+content is skipped by hash — but only if the *derivation versions* also match
+(a hash answers "did the file change", not "did the deriving code change") and
+the *model identities* do (nor "is this the model whose vectors exist").
+`file_already_indexed` is a five-way predicate over an `indexed` row:
+`chunks_version`, `symbols_version`, `chunker_id` (the tokenizer that measured
+the boundaries) and `embedded_model_id` (whose vectors exist) must all equal
+the current consts and the active spec, and the stored `sha256` must equal the
+posted one. All four columns are nullable, and NULL never matches, which is what
+makes every backfill automatic. `post_search` returns
 404 immediately when the SQLite candidate set is empty, without calling Qdrant
 (avoids a 503 from a missing collection).
 
@@ -391,8 +397,10 @@ extracted, which is what removes the 23 810 stored ones), `PROMPT_VERSION`
 (`"2.7"` — 2.6 was the repo-map prelude and is **not** reverted to 2.5: nine
 journalled runs carry it, and a reused version would make them name a prompt
 that never existed). Deliberately outside it:
-`COLLECTION_SCHEMA_VERSION` (`"v2"`, a collection-*name* component) and the
-migration `i32` in `PRAGMA user_version`.
+`COLLECTION_SCHEMA_VERSION` (`"v3"`, a collection-*name* component), the model
+identities `chunker_id`/`embedded_model_id` (registry strings, not versions —
+they name *which* model, not which revision of an algorithm) and the migration
+`i32` in `PRAGMA user_version`.
 
 `COLLECTION_SCHEMA_VERSION` **is still not self-healing** — bump it and the new
 name names no collection while SQLite still reports every file `indexed`. The
@@ -416,31 +424,58 @@ Qdrant must not be able to spell it. Foreign collection names are classified and
 then never mentioned — Qdrant may be shared, and telling an operator to delete
 another service's data is worse than the problem being reported. Dropping the
 old collections is deliberately **not** automated: it is what makes a rollback
-impossible. `v1 → v2` (fp16 ColBERT, no ColBERT HNSW graph) is the first bump
-this covers; the runbook is in `docs/claude/qdrant.md`.
+impossible. The runbook is in `docs/claude/qdrant.md`; `v2 → v3` (one dense
+vector, per-model names) is the second bump it covers, and the one that could
+not be a migration — the vectors themselves are from another model.
 
-**Derivation versions** (two nullable columns on `project_files`), stamped by
-the same prepare-tx upsert that moves the file to `indexing` — the tx that
-writes the chunks/symbols they describe, so a row cannot claim a version whose
-rows were never produced:
+**A model switch is not a version bump, and the classifier says so.** Since
+the name carries the model slug, `classify_collection` has a third answer
+between `Current` and `Foreign`: **`OtherModel`** — a *registered* model at the
+current schema version, i.e. a collection this deployment wrote and may want
+back. It is reported as held (info), never as orphaned, because switching
+`[model].id` back is meant to be instant reuse; only `Previous` (a superseded
+`COLLECTION_SCHEMA_VERSION`) is genuinely dead. Both halves of every name
+component are checked, so a collection merely *ending* in `_v3` is still
+`Foreign`.
+
+**Derivation versions and model identities** (four nullable columns on
+`project_files`), all stamped by the same prepare-tx upsert that moves the file
+to `indexing` — the tx that writes the chunks/symbols they describe, so a row
+can never claim a version, a tokenizer or a model whose rows were not actually
+produced:
 
 - `CHUNKS_DERIVATION_VERSION` (`slicing/traits.rs`) — the AST walk, node
-  selection, left-extension rule, tokenizer. **Bump when a change would give
+  selection, left-extension rule. **Bump when a change would give
   different chunk boundaries for the same source.** Expensive (re-slice,
-  re-embed, re-upsert). The `[slicer]` token window is deliberately *not*
-  covered — it is config; retuning is the operator's call.
+  re-embed, re-upsert). Two axes are deliberately *not* covered: the `[slicer]`
+  token window (config; retuning is the operator's call) and the **tokenizer**,
+  which has its own column — a version cannot see a tokenizer change, and
+  pretending it could is how stale chunks hide behind a matching hash.
 - `SYMBOLS_DERIVATION_VERSION` (`slicing/symbols.rs`) — `queries_for`, the
   vendored `.scm` files, the extraction walk, the grammar crates. **Bump on any
   new/edited/vendored tags query, an `ALL` variant change, a `SymbolExtractor`
   change, or a `tree-sitter-<lang>` bump that alters tags output.** Cheap (pure
   CPU) — separate precisely so a tags fix doesn't cost a full reindex.
+- `chunker_id` — the registry `tokenizer_hf_id` the boundaries were measured
+  with. Not bumped by hand: it changes when `[model].id` moves to a model with
+  a *different* tokenizer, and that is what makes a re-slice mandatory rather
+  than optional.
+- `embedded_model_id` — the registry id whose vectors are in Qdrant. Changes
+  with `[model].id`, and is the one a **re-embed alone** repairs.
 
 Bumping is the *whole* action: the next ordinary `mindex-index` run rebuilds
-affected files by itself. After a symbols bump use `mindex-index
+affected files by itself. Two narrow passes exist for the two cheap cases, and
+each refuses what it cannot honestly do. After a symbols bump use `mindex-index
 --symbols-only` (body flag `symbols_only`): replaces symbol rows in one tx per
 file, no slicing/embed/Qdrant — ~20× faster (0.3 s vs 6.5 s on this repo). It
 skips files whose hash no longer matches (their chunks are stale too); run an
-ordinary pass for those. Not bumping is the motivating failure: the symbols
+ordinary pass for those. After a `[model].id` change **within one tokenizer**
+use `mindex-index --vectors-only` (body flag `vectors_only`): re-embed the
+stored chunks into the new model's collection and stamp `embedded_model_id`, no
+slicing and no symbols. It refuses a file whose `chunker_id` names a different
+tokenizer — those chunks are the wrong chunks, not merely the wrong vectors —
+and the two flags are mutually exclusive at validation. With one tokenizer
+across the Qwen3 sizes, changing size is exactly this pass. Not bumping is the motivating failure: the symbols
 feature shipped without one, hash-skipped files never gained symbols, and
 `/symbols` answered "no such symbol" (contractually *definitive*) for a third
 of the tree. Caveat the consts cannot see: a grammar-crate bump in `Cargo.lock`
@@ -1038,8 +1073,11 @@ is the `research_runs` table.) The hard invariants:
   the plan turn. **Prior reports are hearsay** — never seeded into `Evidence`
   (`a_prior_report_never_seeds_the_evidence`); truncated with a marker at
   `[research].max_context_chars`. Staleness is per-path via
-  `research_run_files` (a global counter was rejected): the join needs
-  **`model_id`**; `path` carries **no FK** (RESTRICT would brake GC, CASCADE
+  `research_run_files` (a global counter was rejected): the join is
+  `(project_guid, path)` against `project_files` — the run's baseline `sha256`
+  against the current one, and it no longer carries a `model_id` half, because
+  which model embedded a file says nothing about whether the file moved.
+  `path` carries **no FK** (RESTRICT would brake GC, CASCADE
   would fake freshness); list filters apply **inside** the cursor-bounded
   subquery, before `LIMIT`.
 - **Validity is derived, never stored**: `research_validity_ctes` — one
@@ -1447,69 +1485,109 @@ invariants:
 
 ## Retrieval pipeline
 
-Three named vectors per collection: `dense` (1024-d cosine), `sparse`
-(SPLADE-style), `colbert` (1024-d, multivector MaxSim). Search: prefetch
-top-200 dense + top-200 sparse → RRF fusion → ColBERT rerank → top-k.
-`post_search` runs **two** SQLite queries around Qdrant — candidate
-`qdrant_guid`s first, then `code`/metadata for *only* the top-k winners; never
-load `code` for the whole active set. Results are **sorted by score
-descending** before responding (don't rely on Qdrant's order). Sparse weights
-≤ 1e-5 are dropped before upsert. Batch sizes: `--embed-batch` chunks per
-`/encode` (default 256, the GPU-load lever), 256 points per Qdrant
-upsert/delete (`embed.rs`). Embed-response vectors are positionally aligned
-with the chunk list.
+**One dense vector, and the three-leg pipeline that preceded it was measured
+worse.** One named vector per collection — `dense`, the registry model's width
+(1024 for the 0.6B), cosine. Search is one Qdrant query at `top_k` with
+`[qdrant].search_hnsw_ef` as the beam; there is no prefetch tree, no fusion and
+no rerank. `post_search` still runs **two** SQLite queries around Qdrant —
+candidate `qdrant_guid`s first, then `code`/metadata for *only* the top-k
+winners; never load `code` for the whole active set — and results are still
+**sorted by score descending** before responding (`rank_by_score`, NaN last;
+don't rely on Qdrant's order). Batch sizes: `[indexing].embed_batch_chunks`
+per `/v1/embeddings` call (default 256, the GPU-load lever), 256 points per
+Qdrant upsert/delete (`embed.rs`); embed-response rows are positionally
+aligned with the chunk list and **counted** against it. Startup refuses
+`search_hnsw_ef < [search].max_top_k` — a beam narrower than the page asked
+for truncates it with no error anywhere. The measurement record (RRF fusion
+scoring *below* the single dense leg it fused, ColBERT never shown to help,
+and the ~99.6%-of-bytes ColBERT store that paid for it) is
+`docs/claude/retrieval-v2.md`, kept as evidence; the v3 grammar, the
+cross-collection GC note and the runbook are `docs/claude/qdrant.md`.
 
-**ColBERT is the collection; everything else is rounding error.** Measured on
-this repo's own index: `vector_storage-colbert` 838 MB per segment against
-2.6 MB dense and 0.5 MB sparse — **99.6% of the bytes**, ~1.85 MB per chunk
-(one 1024-wide row *per token*, ~450 of them), 322× dense. So the collection
-carries exactly three non-default options and all three are on that vector,
-as `const`s in `db/qdrant.rs` rather than config keys — each is part of the
-schema, and a TOML key would invite an operator to trigger a full reindex by
-accident. `datatype: Float16` halves the store and is not a quality trade the
-way quantization would be (fp16 carries ~3 decimal digits, and this vector only
-*orders* a pool dense and sparse already agreed on). `on_disk: true` is already
-true via mmap and is stated so a future Qdrant default cannot put gigabytes per
-project back in the heap. **`hnsw_config.m = 0` builds no graph at all**, which
-is correct only because ColBERT is always the *outer* query over a prefetch
-pool, never an entry point — Qdrant rescores an explicit candidate list and
-never traverses. The trap that sets: a query using `.using("colbert")` *without*
-a prefetch would not fail, it would silently brute-force the whole collection.
-The one **query**-side knob is `[qdrant].search_hnsw_ef` (256), applied to the
-dense prefetch alone (sparse is an inverted index, ColBERT has no graph);
-startup refuses it below `dense_prefetch_limit`, since a beam narrower than the
-pool it is asked for truncates it with no error anywhere. It changes nothing
-below Qdrant's `indexing_threshold`, where the prefetch is an exact scan — it is
-set so that crossing that threshold is not the day recall quietly drops.
-Measurement record, the rungs not climbed (binary quantization, token pooling,
-and whether ColBERT earns its place at all — none takeable without the
-retrieval-quality harness this repo does not have) and the `v1→v2` runbook:
-**`docs/claude/qdrant.md`**.
+**The model is a registry entry, and it varies over the artifact rather than
+the file.** `src/models/registry.rs` compiles in every model mindex can serve
+— three today (`qwen3-embedding-{0.6b,4b,8b}`, 1024/2560/4096-d, one shared
+tokenizer, `max_seq` 32768) — each with the `collection_slug` its collections
+are named by and the **instruct query prefix** its card specifies. The
+registry is one half of a two-sided contract: the `embedding_models` table
+pins the same ids and dims with a `CHECK` and is append-only by trigger, and
+`verify_model_registry` refuses to start when the two disagree, so a rebuilt
+binary can never silently reinterpret stored vectors. Adding a model is a
+registry entry **plus** a migration widening that `CHECK`, in one commit.
+
+**The prefix goes on queries and on nothing else.** Qwen3-Embedding is
+instruction-tuned and asymmetric: an `Instruct: …` / `Query:` preamble
+(trailing space included) in front of the query, documents bare. It is applied at exactly one site (`post_search`'s
+`query_text`) and the constant is byte-for-byte the bench's, because a drifted
+prefix degrades retrieval **silently** rather than failing — it is the first
+thing to check when a re-measured nDCG comes in low.
+
+**Collections are per (project, model)**: `{guid_simple}_{slug}_v3`, e.g.
+`2f1c…b6a_q3e06b_v3`. Switching `[model].id` therefore does not overwrite
+anything — the old model's collection is *held*, `worker::stale` classifies it
+`OtherModel` (registered, not active, reusable) apart from `Previous` (a
+superseded `COLLECTION_SCHEMA_VERSION`, genuinely orphaned), and switching back
+is instant reuse. `DELETE /projects/{guid}` drops **every** model's collection
+for that project, not just the active one.
+
+**A model switch is a re-embed, not a reindex.** `project_files` carries
+`chunker_id` (the tokenizer that measured the boundaries) and
+`embedded_model_id` (whose vectors exist); both join the `file_already_indexed`
+predicate beside the two derivation versions, so flipping `[model].id`
+self-heals exactly like a version bump. `mindex-index --vectors-only` (body
+flag `vectors_only`) is the cheap path: re-embed the **stored** chunks into the
+active model's collection, no slicing and no symbols — refused across a
+`chunker_id` mismatch, since different boundaries mean the chunks themselves
+are wrong. One tokenizer across the Qwen3 sizes is what makes changing size
+exactly this pass. The retry worker stamps `embedded_model_id` on the same
+grounds.
+
+**The client speaks OpenAI, and it checks who answered.**
+`src/models/embedder.rs` posts `/v1/embeddings` to whatever OpenAI-compatible
+server is configured — llama.cpp on this host, vLLM equally (the vendored BGE-M3
+server is deleted; it existed only because nothing general returned three heads
+at once). Two properties carried over verbatim: the **whole-call deadline**
+(`[model].encode_timeout_ms`, default 10 min — per-attempt bounds let a
+throttled server hold a search open for forty minutes), and the retry loop
+counting its own backoffs, so three-retries-then-success is distinguishable
+from one success. Busy is **429 *or* 503** — servers spell it both ways —
+retried `[model].max_429_retries` times (200/400/800 ms, cancellation-aware);
+then the file goes `failed` and the retry worker re-attempts later (layered
+backoff). Two properties are new and both close identity holes the old pipeline
+had: every response row is checked against the registry dim, and
+`GET /v1/models` is a **handshake** — startup **refuses** a server that answers
+and names a different model (a wrong model with a coincidental width would
+poison every vector in silence) while an *unreachable* one is only a warning (a
+down embedder is a state the retry worker already covers), and
+`embedder_probe` re-checks it on every `/health`, so a model swapped under a
+running mindex surfaces on the next read.
 
 **The query path may run on a second embedder instance.**
 `[model].query_server_url` (absent = one instance does both; `RouterState`
 holds the *same* `Arc` twice) puts `/search` and every research search on its
-own BGE-M3 — typically `--device cpu` (a query is one ~20-token text,
-latency-bound), freeing the ~6 GiB of VRAM the resident fp32 model otherwise
-holds. Both instances must be the same model at the same precision and
-**nothing checks that they are**: reduced precision on one side flips
-low-weight token ids in and out of the sparse set, presenting as "search
-sometimes can't find the obvious thing", not as an error. `GET /health` pings
-the second one separately (`checks.query_embedder`) — only when actually
-split, hence an `Option` compared by `Arc::ptr_eq`, not by URL.
-
-The embedder client (`bge_m3.rs`) retries HTTP **429** up to 3× (200/400/800
-ms, respecting the cancellation token in sleeps), then gives up — the file
-goes `failed` and the retry worker re-attempts later (layered backoff). Each
-`/encode` attempt has a whole-request timeout (`[model].encode_timeout_ms`,
-default 10 min) so a wedged embedder can't hang the retry worker.
+own server — typically the smaller card, or CPU (a query is one short text,
+latency-bound), freeing the indexing instance's VRAM. It is also the answer to a
+serving stack that is fast at one and slow at the other, which is a real shape
+and not a hypothetical: llama.cpp answers a query in ~30 ms while indexing 8×
+slower than a torch server (`deploy/embedder/README.md`). Both instances must
+serve the same model, and unlike v2 **something now checks**: the handshake
+runs per instance at startup and `GET /health` pings the second one separately
+(`checks.query_embedder`) — only when actually split, hence an `Option`
+compared by `Arc::ptr_eq`, not by URL. What is still unchecked is *precision*:
+two instances at different dtypes answer the handshake identically and present
+as "search sometimes can't find the obvious thing", not as an error.
 
 ## Slicer
 
 `Slicer` (`slicing/traits.rs`) walks the tree-sitter AST depth-first,
-selecting **named nodes** whose token span (HF tokenizer) is **128–512
-tokens** (BGE-M3's sweet spot; measured, not computed — token boundaries don't
-align with AST nodes and tokenization is context-dependent). `code` is
+selecting **named nodes** whose token span (HF tokenizer) falls in
+`[slicer].min_chunk_tokens..max_chunk_tokens` — **128–364** by default,
+measured, not computed (`bench/FINDINGS.md` §2.5: 364 beat 512 by +0.0108
+nDCG@10, p = 0.030, with the gain in the dense head; measured under the
+*previous* tokenizer and carried over as best-available, so the bench re-run is
+what confirms or moves it). The window's only hard ceiling is the active
+model's own `max_seq` (32k for the whole Qwen3 family), which startup
+validates. `code` is
 extended left to line start over pure indentation, then over the node's **doc
 comment and attributes** (`ABSORBED_KINDS`, matched as substrings — no
 per-language table). Not cosmetic: a doc comment is a *preceding sibling*,
@@ -1536,29 +1614,28 @@ definitions were inside any chunk, so `read_chunks` dead-ended on a coin flip
 
 `SlicedChunk.start_byte/end_byte` are `#[cfg(test)]`-gated (never persisted),
 as is `from_gap` — **the token window governs node selection, not gap chunks**
-(a gap chunk's floor is `GAP_MIN_TOKENS`). The window is counted over
-**whole-file** token offsets, so re-encoding a chunk alone is a different
-measurement (an edge token splits differently without its surroundings; 512
-can re-encode at 513). `chunks_satisfy_token_window` therefore asserts
-128–512 ±`WINDOW_SLACK` — without the slack the test is a tripwire on
-whichever file lands on a boundary (`src/research.rs` did).
+(a gap chunk's floor is `GAP_MIN_TOKENS`). `tokens` **is** persisted
+(`project_file_chunks.tokens`): a future model's window can then be checked
+against the corpus by SQL instead of a re-tokenization, which is what a
+blast-radius question needs. It is approximate by one edge token, because the
+window is counted over **whole-file** token offsets and re-encoding a chunk
+alone is a different measurement (an edge token splits differently without its
+surroundings; a 364 can re-encode at 365). `chunks_satisfy_token_window`
+therefore asserts the window ±`WINDOW_SLACK` — without the slack the test is a
+tripwire on whichever file lands on a boundary (`src/research.rs` did).
 
 **A line is not bounded by anything, so neither pass may cut only at line
 boundaries.** A minified file (or one paragraph of prose) is one line for its
-whole length — and what came out was an *unstorable* chunk: a Qdrant
-multivector point holds ≤ 1 048 576 elements, ColBERT emits one 1024-wide row
-per token, the embedder adds `[CLS]`/`[SEP]`, so anything above
-`STORABLE_TOKENS_CEILING` (1022 tokens) is **refused — failing the whole
-upsert batch** (a huge one first exhausts embedder GPU memory). Hence
-`token_boundary` (`slicing/traits.rs`), the last resort of both passes: cut on
-a boundary the tokenizer itself reported. Two easy mistakes: the ceiling is
-`min`-clamped **in both constructors**, not config-validated, because
-`[slicer].max_doc_chunk_tokens` **defaults to 1024** — over the ceiling before
-a single chunk is cut, and rejecting the default at startup would refuse a
-config the operator never chose; and a slicer must aim `RETOKENIZATION_SLACK`
-*under* the ceiling (a cut measured at 1022 re-encodes at 1023).
-Documentation blocks are truncated to the same ceiling before being embedded
-for the semantic term (a block is not a chunk and has no size bound).
+whole length, and a window is a window. Hence `token_boundary`
+(`slicing/traits.rs`), the last resort of both passes: cut on a boundary the
+tokenizer itself reported (ceiled to a `char` boundary — the text is sliced
+right after, and a fake tokenizer in tests owes UTF-8 nothing). The bound it
+cuts to is the slicer's **own** `max_tokens`, and that is the whole rule now:
+the `STORABLE_TOKENS_CEILING` (1022) / `RETOKENIZATION_SLACK` chain that used
+to sit above it was a **Qdrant multivector limit** — one 1024-wide ColBERT row
+per token against a 1 048 576-element point — and died with ColBERT along with
+the two mistakes it invited (a `min`-clamp in both constructors rather than
+config validation, and aiming under a ceiling a re-encode could cross).
 
 **Documentation is chunked by a second slicer, and every rule above
 inverts.** `MarkdownSlicer` (`slicing/markdown.rs`, `markdown` only) walks
@@ -1570,10 +1647,14 @@ term per chunk against a penalty for swallowing a level-3+ heading, `+∞` above
 to the cap" buries subsection headings to save chunks it did not need to
 save). Three inversions, each measured: **no lower bound** (a 40-token section
 is a complete claim), **chunks nest and merge**, and **the cap is 1024, not
-512** (512 answers 15/23 documentation questions vs 18/23 — it cuts
-explanations away from what they explain). `MODEL_MAX_TOKENS` (512) is the
-*code* window's quality ceiling, not the model's capacity (the embedder
-truncates at its `--maxlen`, default 8192).
+the code window** (512 answers 15/23 documentation questions vs 18/23 — it cuts
+explanations away from what they explain; past 1024 nothing improves while
+every hit costs proportionally more of a `/research` transcript). The code
+window (364) is a *quality* ceiling, never the model's capacity — Qwen3's
+`max_seq` is 32768, and both caps are validated against it at startup. Blocks
+are truncated to `max_doc_chunk_tokens` before being embedded for the semantic
+term, with the same number `segment` will cut to (a block is not a chunk and
+has no size bound of its own).
 
 **Boundaries come from two signals; the second refines the first.** Structure
 sets the hard rules; *semantic shift* (embedding distance between blocks,
@@ -1585,14 +1666,16 @@ headings are sparse and the packing would otherwise cut mid-topic. (A further
 model-driven boundary re-check pass measured *worse*; not shipped.) Separately
 real: block structure beats a line-based `#` splitter, MRR@10 0.3714 →
 0.3931, recall@10 18/23 → 20/23. Three consequences of the term being on: it
-costs **one `/encode` per document**, so block embedding happens *outside*
+costs **one embed call per document**, so block embedding happens *outside*
 the prepare transaction — hence the two-phase `plan` → `segment` API; an
 **unreachable embedder degrades to structure-only** with a WARN rather than
-failing the file (a refinement must never be a dependency); and chunk
-boundaries now depend on the **embedder's model and precision**, which
-`CHUNKS_DERIVATION_VERSION` cannot see — the same blind spot as a
-grammar-crate bump. Weight 0 restores pure structure and skips the
-round-trip.
+failing the file (a refinement must never be a dependency); and a documentation
+chunk's boundaries therefore depend on the **embedder's model and precision**,
+which nothing versions: `chunker_id` records the *tokenizer*, and every Qwen3
+size shares one — so `--vectors-only` across sizes keeps documentation
+boundaries that a different size's embeddings chose. Accepted (the term moves
+7-13% of boundaries at equal MRR here), and the same blind spot as a
+grammar-crate bump. Weight 0 restores pure structure and skips the round-trip.
 
 ## Concurrency & cancellation
 
@@ -1678,7 +1761,9 @@ fall-through.
 ## Mockable interfaces
 
 Three traits; production type is the sole real impl, fakes in `#[cfg(test)]`:
-**`BGEm3Model`** (embedder, `Arc<dyn>` in `RouterState` + retry worker),
+**`Embedder`** (`models/embedder.rs`; `Arc<dyn>` in `RouterState` + retry
+worker — three methods: `embed`, the liveness `health`, and `served_models`,
+which is the handshake half of model identity),
 **`VectorStore`** (all Qdrant ops; error is `VectorStoreError`, a rendered
 string — `QdrantError` isn't test-constructible), **`Tokenizing`** (the
 slicer's only tokenizer need; fakes avoid the HF download). New seam = minimal
@@ -1786,12 +1871,12 @@ counter reads as a process restart and permanently re-baselines every
 `rate()`. `StateMetrics` is written by that worker and nothing else.
 
 **Why decorators, and the four things that cannot be one.** `VectorStore`,
-`BGEm3Model`, `ResearchTools` and `ResearchJournal` are wrapped once in
+`Embedder`, `ResearchTools` and `ResearchJournal` are wrapped once in
 `main.rs`/`post_research`: a seam decorator cannot miss a caller;
 `MeteredJournal` alone yields nearly the whole research set (`RunRecord`
 already carries it). The exceptions, each structural: `SQLite3Pool` is not a
 trait, so it is instrumented in place at its single choke point; the
-embedder's 429 retry loop lives inside `encode` (invisible from outside);
+embedder's 429/503 retry loop lives inside `embed` (invisible from outside);
 Ollama's tool-call-parse retry and silent transcript truncation happen inside
 one `chat_stream` call; and the indexing-claim conflict is swallowed at
 `Err(ApiError::FileInFlight) => {}` while the request still 200s, so HTTP
@@ -1846,8 +1931,10 @@ such rather than as a mechanism.
 bug this closes is a default nobody chose: `[qdrant].timeout_ms`/`connect_timeout_ms`
 exist because the client's own default is 5 s and no knob reached it — a project
 whose fusion + ColBERT rerank ran past that failed **every** search with
-`qdrant.unavailable`, untunably. `[model].encode_timeout_ms` now bounds the whole
-`/encode` call rather than each attempt: per attempt the worst case was
+`qdrant.unavailable`, untunably (the pipeline that took that long is gone; the
+knob is not — a cold segment can still outlast a library default nobody chose).
+`[model].encode_timeout_ms` bounds the whole
+embed call rather than each attempt: per attempt the worst case was
 `(1 + max_429_retries)` timeouts plus backoffs — forty minutes at the defaults —
 while a throttled embedder held a search open or kept a file's indexing claim
 (`EncodeError::Timeout`, its own metric label, because "too busy for too long" is a
@@ -1868,13 +1955,15 @@ over h3 at all — the client saw nothing until the run ended (up to seventy min
 for a `high` run) and the server accumulated every event in memory, unbounded. Both
 endpoints exist *because* their output is worth watching arrive.
 
-**A number off the wire is not a capacity.** `Reader::checked_capacity` refuses a
-`Vec::with_capacity` the `/encode` body could not fill: reads were bounds-checked,
-capacities were not, and the count is a `u32` from the wire — a corrupt body asked
-for ~100 GB and aborted the process. Separately, `embed_and_upsert` now checks the
-row counts against the text count: `zip` silently truncated a short response,
-leaving a file marked `indexed` with vectors missing and no error anywhere, and a
-long one indexed `guids[i]` out of bounds.
+**A response is not trusted because it parsed.** The binary `/encode` reader
+that once had to refuse a `Vec::with_capacity` off the wire is gone with the
+protocol, but its lesson kept two successors on the JSON path: every embedding
+row is checked against the **registry's dimension** for the configured model
+(a server quietly serving something else is otherwise indistinguishable from a
+correct one until search degrades), and `embed_and_upsert` checks the **row
+count** against the text count — `zip` silently truncated a short response,
+leaving a file marked `indexed` with vectors missing and no error anywhere, and
+a long one indexed `guids[i]` out of bounds.
 
 **Ollama's two failure classes are two codes.** `ollama.unavailable` is unreachable
 or reachable-and-mute; `ollama.error` is Ollama answering *with* an error — nearly
@@ -1979,10 +2068,12 @@ reads as a decision.
 
 ## Performance conventions (hot paths)
 
-Build `ChunkAsVector` by **moving** `dense_vecs`/`colbert_vecs` (`into_iter`),
-not cloning; split the sparse `HashMap` into parallel index/value arrays in a
-**single pass** with the `>1e-5` threshold applied once. Lives in `embed.rs`
-(shared by `post_index` and the retry worker).
+Build `ChunkAsVector` by **moving** the response's dense rows (`into_iter`
++ `zip(guids)`), never cloning — a batch is `embed_batch_chunks` × the model's
+width of `f32`, and at 4096-d that is the largest allocation on the path. The
+row-count check precedes the `zip`, not the other way round. Lives in
+`embed.rs` (shared by `post_index`, the retry worker and the `vectors_only`
+pass).
 
 ## Languages
 
@@ -2096,11 +2187,15 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   `chunk_count == 0` = sliced to no chunks (<128 tokens), *not* unchanged —
   hash-unchanged files are absent entirely. `--check` runs `POST /drift`
   instead of uploading; non-zero exit on actionable drift (`--json` for
-  scripts). `--force` bypasses the unchanged-skip (hash *and* derivation
-  versions) — an escape hatch for what versioning can't see, not routine;
-  scope it with `--include`/`--exclude`. `--symbols-only` rebuilds just the
-  symbol table (no GPU, no Qdrant); its summary counts symbol rows, not
-  chunks. `--history` additionally reconciles the git channel (off by
+  scripts). `--force` bypasses the unchanged-skip (hash, derivation versions
+  *and* model identities) — an escape hatch for what versioning can't see, not
+  routine; scope it with `--include`/`--exclude`. `--symbols-only` rebuilds just
+  the symbol table (no GPU, no Qdrant); its summary counts symbol rows, not
+  chunks. `--vectors-only` re-embeds the stored chunks into the active model's
+  collection (no slicing, no symbols) — what a `[model].id` change costs when
+  the tokenizer is unchanged; it refuses files sliced by a different tokenizer,
+  and cannot be combined with `--symbols-only`. `--history` additionally
+  reconciles the git channel (off by
   default; `git_refs` in `.mindex` picks the refs, `--git-ref` replaces the
   list like every scope flag); `--history-only` restricts a run to that phase
   *without* switching the channel on. Watch the drop counts it prints.
@@ -2320,8 +2415,10 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
     host-side scripts in `perf/` driving this stack (`command:` flags read
     env; swap profiles via `--env-file perf/env/<f>.env`). **No host ports**;
     outbound-only `extra_hosts: host.docker.internal:host-gateway` reaches
-    the host-run embedder (`:11211`, deliberately not composed — ~8 GB torch
-    deps). TOML-only knobs require mounting a `config.toml`.
+    the host-run embedder (`:12434` by default, deliberately not composed —
+    a model server plus a GPU runtime is a multi-gigabyte image and a device
+    the compose stack has no business claiming). TOML-only knobs require
+    mounting a `config.toml`.
   - **Exposed overlay** (`docker-compose.exposed.yml`): opt-in via `-f`;
     publishes API (`11111`) + Qdrant dashboard (`6333`) on `127.0.0.1` only
     (neither has auth). The sanctioned way to open the stack.
@@ -2330,10 +2427,12 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
     --abort-on-container-exit`. Healthchecks use `/dev/tcp` / `urllib` (no
     curl in images). Mounts `tests/integration/mindex-test-config.toml`
     (small caps) so limit tests can exercise edge rejections. **Edit
-    `v1.0.0_schema.sql` and you must `down -v` before the next run**: a
+    `v2.0.0_schema.sql` and you must `down -v` before the next run**: a
     volume already stamped at 1 skips the edited schema in silence and every
     request touching a new column 500s with `no such column` — the price of
-    editing the schema in place, only paid pre-release.
+    editing the schema in place, only paid pre-release. A volume older than
+    the v2 baseline is a different failure and a louder one: mindex refuses
+    to start on the old lineage, which is `down -v` once, on purpose.
 
 ## Tests
 
@@ -2341,8 +2440,10 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
   Read the test files for coverage — highlights: the connection-leak and GC
   orphan-prevention regressions, the `codes_are_stable` snapshot,
   trigger-level illegal transitions, `sweep_candidates` selection rules. No
-  server/Docker; some slicer tests need the BGE-M3 tokenizer in the HF cache
-  (a fake-`Tokenizing` test avoids it).
+  server/Docker; some slicer tests need the registry tokenizer
+  (`Qwen/Qwen3-Embedding-0.6B`) in the HF cache — on an offline host, pre-cache
+  it, since the Rust side has no `HF_HUB_OFFLINE` equivalent (a
+  fake-`Tokenizing` test avoids it).
 - **Three seams exist only so an untestable thing became testable**, each
   because the code it guards had regressed *without failing anything*. Reach for
   them rather than inventing a fourth. `router_state()` (handlers tests) builds

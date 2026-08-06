@@ -173,6 +173,17 @@ struct Cli {
     #[arg(long)]
     symbols_only: bool,
 
+    /// Re-embed the STORED chunks into the active model's collection, leaving
+    /// slicing and symbols untouched.
+    ///
+    /// The cheap way to switch `[model].id`: the chunk text is already in the
+    /// server's database, so this is a pure GPU pass — no re-slice, no symbols,
+    /// and file contents are not even read here beyond the manifest. A file
+    /// whose chunks were sliced under a different tokenizer is skipped
+    /// (`needs_full_reindex`); run without this flag for those.
+    #[arg(long, conflicts_with = "symbols_only")]
+    vectors_only: bool,
+
     /// Also reconcile the project's git history (the second content channel).
     ///
     /// Walks the commits reachable from the tracked refs within the configured
@@ -463,6 +474,7 @@ async fn main() -> Result<()> {
                 files: HashMap::new(),
                 force: cli.force,
                 symbols_only: cli.symbols_only,
+                vectors_only: cli.vectors_only,
             },
             &cancel,
         )
@@ -497,7 +509,7 @@ async fn main() -> Result<()> {
         let project = scope.project.clone();
         let batch_size = cfg.batch_size_files;
         let verbose = cli.verbose;
-        let (force, symbols_only) = (cli.force, cli.symbols_only);
+        let (force, symbols_only, vectors_only) = (cli.force, cli.symbols_only, cli.vectors_only);
         handles.push(tokio::spawn(async move {
             run_worker(
                 shard,
@@ -510,6 +522,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 symbols_only,
+                vectors_only,
                 cancel,
                 shared,
             )
@@ -749,6 +762,7 @@ async fn run_worker(
     verbose: bool,
     force: bool,
     symbols_only: bool,
+    vectors_only: bool,
     cancel: CancellationToken,
     shared: Arc<Shared>,
 ) -> WorkerStats {
@@ -844,6 +858,7 @@ async fn run_worker(
                 files: req_files,
                 force,
                 symbols_only,
+                vectors_only,
             },
             &cancel,
             &mut on_event,

@@ -5,9 +5,16 @@
 # Assumes mindex + embedder + Qdrant are ALREADY RUNNING with whatever flags you are
 # testing — this script starts nothing and touches no hardware. It drives one k6 load
 # run per concurrency level, auto-detects the live config (mindex GET /config +
-# embedder GET /stats), and appends one self-describing row per run to a CSV.
+# embedder GET /stats — see the note below), and appends one self-describing row per
+# run to a CSV.
 #
-# To sweep process-level flags (embedder --batch / --max-inflight, mindex
+# NOTE (retrieval v3): the embedder-side columns came from the vendored server's
+# /stats endpoint, which is gone. vLLM does not serve it, so embedder_batch,
+# fwd_batch_mean, embedder_encode_s, queue_highwater and embedder_429 record NA.
+# The mindex-side columns — throughput, latency quantiles, error classes, pool
+# availability — are unaffected and are what this harness is for.
+#
+# To sweep process-level flags (vLLM's serving knobs, mindex
 # --embed-batch / --db-pool-size): change them, restart those services, rerun this
 # script. The CSV is append-only, so the matrix grows across reruns. Always use a
 # fresh corpus run against a fresh project GUID (handled here) so nothing is
@@ -20,7 +27,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mindex_url="https://127.0.0.1:11111"
-embedder_url="http://127.0.0.1:11211"
+embedder_url="http://127.0.0.1:11212"
 protocol="v0"
 corpus="$here/corpus/data/default"
 results_dir="$here/results"
@@ -34,8 +41,8 @@ usage() {
     cat <<'EOF'
 Usage: run.sh [options]
   --mindex-url URL     mindex base URL        (default: https://127.0.0.1:11111)
-  --embedder-url URL   embedder base URL      (default: http://127.0.0.1:11211)
-                       pass "" to skip /stats capture
+  --embedder-url URL   embedder base URL      (default: http://127.0.0.1:11212)
+                       pass "" to skip the reachability probe
   --protocol VER       API version segment    (default: v0)
   --corpus DIR         corpus dir (shards + manifest.json)
                        (default: perf/corpus/data/default)
@@ -123,8 +130,8 @@ curl -sk --max-time 5 "$mindex_url/health" >/dev/null 2>&1 || {
 if [ -n "$embedder_url" ]; then
     curl -s --max-time 5 "$embedder_url/health" >/dev/null 2>&1 || {
         echo "embedder unreachable at $embedder_url — start it, e.g.:" >&2
-        echo "    cd embedder && uv run python -m bge_m3_api --port 11211 --batch 512" >&2
-        echo "or pass --embedder-url \"\" to skip embedder /stats capture." >&2
+        echo "    systemctl start mindex-vllm@egpu   # see deploy/vllm/README.md" >&2
+        echo "or pass --embedder-url \"\" to skip the probe." >&2
         exit 1
     }
 fi

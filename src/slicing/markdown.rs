@@ -589,7 +589,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Deterministic stand-in for BGE-M3: blocks sharing a marker word get the
+    /// Deterministic stand-in for the real embedder: blocks sharing a marker word get the
     /// same direction, so "these two belong together" is expressible without a
     /// GPU. Dimension 4 is enough to place three distinct topics apart.
     fn topic_vectors(texts: &[&str]) -> Vec<Vec<f32>> {

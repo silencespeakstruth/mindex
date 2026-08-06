@@ -178,7 +178,7 @@ const CHECK_META: Record<string, { optional?: boolean; purpose: string; cost: st
         cost: "search and indexing stop until it answers",
     },
     embedder: {
-        purpose: "BGE-M3 — turns code and questions into vectors.",
+        purpose: "The embedding model server — turns code and questions into vectors.",
         cost: "search and indexing stop until it answers",
     },
     query_embedder: {

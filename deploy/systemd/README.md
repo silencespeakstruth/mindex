@@ -1,9 +1,13 @@
 # systemd units for a host-run mindex
 
-Reference units for the deployment described in `deploy/gate/` — mindex, Qdrant
-and the BGE-M3 embedder on one machine, reachable from outside only through the
-gateway. They are the units this project's own host runs, with its paths left in
-place: read them as a worked example, not as a drop-in.
+Reference units for the deployment described in `deploy/gate/` — mindex and
+Qdrant on one machine, reachable from outside only through the gateway. The
+embedding server's unit lives in `../vllm/` (a template with per-GPU env
+files), and everything below about network confinement, `IPAddressDeny=`
+drop-not-refuse and `PrivateDevices=` applies to it verbatim — the measured
+failures happened on its predecessor. They are the units this project's own
+host runs, with its paths left in place: read them as a worked example, not as
+a drop-in.
 
 The point of writing them down is not the boilerplate. It is the four things
 below, each of which was **measured** here, and each of which fails in a way that
@@ -34,11 +38,11 @@ mindex" was a race that lingering happened to win.
 
 ## `IPAddressDeny=` drops packets; libraries hang rather than fail
 
-Everything mindex speaks to is on loopback (embedder, Qdrant, Ollama), so
-`IPAddressAllow=localhost` costs nothing — except that both mindex and the
-embedder fetch BGE-M3 through a Hugging Face hub client that falls back to
-`huggingface.co`. Denied traffic is **dropped, not refused**, so that fallback
-does not fail: it waits out a TCP connect timeout and retries.
+Everything mindex speaks to is on loopback (the vLLM embedder, Qdrant,
+Ollama), so `IPAddressAllow=localhost` costs nothing — except that both mindex
+and the embedder fetch model files through a Hugging Face hub client that
+falls back to `huggingface.co`. Denied traffic is **dropped, not refused**, so
+that fallback does not fail: it waits out a TCP connect timeout and retries.
 
 Measured on the embedder's first boot under confinement: the model load sat at
 `Loading model …` for four minutes at 2% CPU with every thread in `futex_wait`,

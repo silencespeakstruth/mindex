@@ -7,6 +7,9 @@
 #
 # Migrations are additive (CREATE ... IF NOT EXISTS), so a re-run against the persisted
 # test_mindex_db volume needs no reset. Each test uses a fresh project GUID.
+# EXCEPTION: a volume created before the v2 schema baseline (retrieval v3) is an
+# old-lineage database and mindex now REFUSES it at startup — run `down -v` once
+# after pulling that change.
 services:
 
   qdrant:

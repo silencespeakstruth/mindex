@@ -4,6 +4,22 @@
 mindex. Every number below was measured on one machine and is offered as the shape of
 the problem, not as a specification — re-measure on yours.*
 
+> **Status after retrieval v3 (2026-08).** The harness still measures what it was
+> built to measure — the *mindex* side of indexing throughput — but its **embedder-side
+> columns are dead**. They came from `GET /stats` on the vendored BGE-M3 server, which
+> has been deleted; vLLM serves no equivalent, so `embedder_batch`,
+> `embedder_max_inflight`, `embedder_maxlen`, `fwd_batch_mean`, `fwd_batch_max`,
+> `embedder_encode_s`, `queue_highwater` and `embedder_429` now record `NA`. Everything
+> below that reasons about `fwd_batch_mean` is therefore **history**, kept because it
+> explains why the code looks the way it does, not because it is a procedure you can
+> run today. Reinstating an equivalent signal means reading vLLM's own `/metrics`, which
+> nothing here does yet.
+>
+> The four findings below are also about a pipeline that no longer exists (three heads,
+> ColBERT multivectors). They are retained as the record of *why* the embed path is
+> shaped the way it is; the retrieval-quality question they are sometimes mistaken for
+> belongs to [`bench/`](../bench/README.md).
+
 A hardware-agnostic load-test harness for tuning **indexing throughput** and GPU
 utilization. It simulates real indexing by POSTing source from real GitHub projects
 to `/index`, sweeps the tuning knobs, and writes a comparative CSV so the optimum
@@ -72,9 +88,10 @@ lever. This harness lets you find both knees on your hardware.
 | `plot.sh` | optional gnuplot views of the CSV |
 | `analyze.ipynb` | optional Jupyter explorer (set `RESULT_DIRS`, *Run All*) |
 
-The embedder exposes `GET /stats` + `POST /stats/reset` (added in `embedder/`) so the
-harness records the live embedder config and the **effective forward-pass batch
-size** — the direct "is the GPU being fed" signal — without touching hardware.
+The vendored embedder used to expose `GET /stats` + `POST /stats/reset`, which is how
+the harness recorded the live embedder config and the **effective forward-pass batch
+size** — the direct "is the GPU being fed" signal. That server is gone (see the status
+note above); those columns are `NA` until something reads vLLM's `/metrics` instead.
 
 Dependencies: `k6`, `jq`, `curl`, `awk`, `git` (and `gnuplot` for plots).
 
@@ -86,10 +103,12 @@ The axes split in two:
 
 - **Within a run (the harness varies this):** request **concurrency** — pass a list
   of VU levels, one CSV row each.
-- **Between runs (you change + restart, then rerun):** embedder `--batch` /
-  `--max-inflight`, mindex `--embed-batch` / `--db-pool-size`. The harness reads
-  these live from `GET /config` and `GET /stats`, so every CSV row records exactly
-  the config that produced it. The CSV is **append-only**, so the matrix accumulates
+- **Between runs (you change + restart, then rerun):** vLLM's serving knobs
+  (`--gpu-memory-utilization`, `--max-model-len`, in
+  `~/.config/mindex/vllm-<instance>.env`), mindex `--embed-batch` / `--db-pool-size`.
+  The harness reads the mindex half live from `GET /config`, so every CSV row records
+  the mindex config that produced it; the embedder half is no longer readable and is
+  what `--label` is for. The CSV is **append-only**, so the matrix accumulates
   across reruns.
 
 Each run uses a **fresh project GUID** and deletes it afterward, so nothing is
@@ -140,10 +159,11 @@ Ready profiles in `perf/env/`: `baseline.env`, `big-batch.env`,
 docker compose --env-file perf/env/big-batch.env config | grep -E 'embed-batch|db-pool-size'
 ```
 
-**The embedder is not in compose** (it runs on the host for GPU access), so its
-`--batch` / `--max-inflight` / `--maxlen` — the main GPU lever — are **not** set by
-these files. Change them on the embedder's launch command and restart it by hand;
-`.env` profiles cover only the mindex side of the matrix.
+**The embedder is not in compose** (it runs on the host for GPU access), so vLLM's own
+serving knobs are **not** set by these files. Change them in
+`~/.config/mindex/vllm-<instance>.env` and restart the unit
+(`systemctl restart mindex-vllm@egpu`); `.env` profiles cover only the mindex side of
+the matrix.
 
 ## Tuning method
 

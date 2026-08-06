@@ -30,8 +30,9 @@ const CONFIG: &str = "Config";
     info(
         title = "mindex",
         description = "\
-Async RAG indexing + search engine: tree-sitter AST chunking → BGE-M3 multi-vector \
-embeddings (dense / sparse / ColBERT) → Qdrant vectors + SQLite metadata.
+Async RAG indexing + search engine: tree-sitter AST chunking → dense embeddings from \
+a registry model (Qwen3-Embedding, served over an OpenAI-compatible `/v1/embeddings`) \
+→ Qdrant vectors + SQLite metadata.
 
 **Transport & auth.** TLS is the only transport security. Authorization is \
 **opt-in** (`[auth].enabled`): with it off — the default, and every deployment that \

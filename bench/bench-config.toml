@@ -28,8 +28,8 @@ key_path  = "/home/silencespeakstruth/.config/mindex/mindex-key.pem"
 max_body_mib = 512
 
 [model]
-name       = "BAAI/bge-m3"
-server_url = "http://localhost:11211"
+id         = "qwen3-embedding-0.6b"
+server_url = "http://localhost:11212"
 
 [qdrant]
 server_url = "http://localhost:6334"
@@ -39,19 +39,24 @@ path      = "/home/silencespeakstruth/.local/share/mindex-bench/mindex-bench.db"
 pool_size = 64
 
 [indexing]
-# 2048 was chosen from perf/'s throughput numbers, where the GPU is the
-# bottleneck — and it OOM'd this host. ColBERT stores one 1024-float row per
-# TOKEN, so an in-flight batch costs batch x tokens-per-chunk x 4 KiB: 2048
-# chunks of ~350 tokens is 2.9 GB, and mindex-index sends four such requests
-# concurrently, so ~11.6 GB of host RAM for one indexing pass. Nothing in the
-# flag, the config or the docs says that. 512 keeps the whole pass under 3 GB
-# and costs throughput this benchmark does not need.
+# 2048 was chosen from perf/'s throughput numbers and OOM'd this host under the
+# v2 pipeline, where ColBERT stored one 1024-float row per TOKEN and an
+# in-flight batch cost batch x tokens-per-chunk x 4 KiB (~11.6 GB for one
+# pass, with mindex-index sending four such requests concurrently). Dense-only
+# retrieval removes that entirely — a 512-chunk batch is now 512 x 1024 x 4 B
+# = 2 MiB of response. 512 is kept because it is what the archived runs were
+# measured at, and the benchmark's job is to compare like with like; raising it
+# is a throughput question, not a quality one.
 embed_batch_chunks  = 512
 stuck_grace_minutes = 30
 
 [slicer]
 min_chunk_tokens     = 128
-max_chunk_tokens     = 512
+# 364, the server's default since the sweep that measured it (FINDINGS.md
+# §2.5): +0.0108 nDCG@10 over 512, p = 0.030. Measured under the previous
+# tokenizer, so a re-sweep under Qwen3's is the open question this file is the
+# place to answer — override it from the command line, do not edit it silently.
+max_chunk_tokens     = 364
 fill_gaps            = true
 max_doc_chunk_tokens = 1024
 doc_semantic_weight  = 1.0
@@ -61,7 +66,7 @@ doc_semantic_weight  = 1.0
 # detectors mindex has for failures that a benchmark would otherwise publish as
 # a quality score:
 #
-#   search_unscorable_winners  — chunks the reranker could not score, i.e. NaN.
+#   search_unscorable_winners  — chunks that came back with a NaN score.
 #     Its documented producer is the embedder's XPU backend returning NaN for
 #     padded fp16 rows off its default attention kernel, and a split deployment
 #     whose two instances differ in precision. Both answer 200. From the

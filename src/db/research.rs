@@ -698,7 +698,7 @@ mod tests {
             top_p: Some(0.9),
             model_digest: Some("sha256:abc".into()),
             model_details_json: Some(r#"{"parameter_size":"32B"}"#.into()),
-            embedder_model_id: "BAAI/bge-m3".into(),
+            embedder_model_id: "qwen3-embedding-0.6b".into(),
             server_version: "0.0.0-test",
             started_at: 1_700_000_000,
             checkpoint_every_steps: 6,
@@ -953,7 +953,7 @@ mod tests {
         assert_eq!(first.2.as_deref(), Some("1. ANSWERED"));
         assert_eq!(first.3, Some(0.9));
         assert_eq!(first.4.as_deref(), Some("sha256:abc"));
-        assert_eq!(first.5.as_deref(), Some("BAAI/bge-m3"));
+        assert_eq!(first.5.as_deref(), Some("qwen3-embedding-0.6b"));
         assert_eq!(first.6.as_deref(), Some("0.0.0-test"));
         assert_eq!(first.7, Some(1_700_000_000));
         assert_eq!(first.8, Some(0.7));
