@@ -1,0 +1,19 @@
+# bench harness dependencies. Installed into bench/.venv:
+#
+#   python3 -m venv bench/.venv
+#   bench/.venv/bin/pip install -r bench/requirements.txt
+#
+# Deliberately small. Everything here is load-bearing:
+#   pyarrow  the ground-truth datasets ship as parquet
+#   numpy    per-query metric vectors
+#   scipy    the bootstrap and permutation machinery leans on its RNG and
+#            distributions; TOST needs the t distribution
+#   httpx    the mindex client, matching tests/integration
+#   tokenizers  counts a query in the units Qdrant constrains — one
+#            ColBERT row per BGE-M3 token. A bytes-per-token estimate is
+#            wrong on a stack trace, and issue reports contain both.
+pyarrow>=17
+numpy>=1.26
+scipy>=1.13
+httpx>=0.27
+tokenizers>=0.20

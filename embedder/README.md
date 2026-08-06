@@ -52,25 +52,60 @@ So it runs as a **systemd template**, `mindex-embedder@.service`, with two insta
 They are **mutually exclusive** — both bind port 11211 — and systemd enforces it
 rather than the port doing so by accident: the template carries a symmetric
 `Conflicts=` + `After=` naming both instances, and systemd drops the self-reference
-on each line (`systemd-analyze --user verify` prints "Dependency … is dropped").
-`Conflicts=` stops the other instance, `After=` orders that stop before this start
-so the port is free by the time we bind.
+on each line. `Conflicts=` stops the other instance, `After=` orders that stop
+before this start so the port is free by the time we bind.
 
-Install (the unit lives in the repo, `~/.config` gets symlinks):
+Verify it **by unit name, never by file path**:
 
 ```sh
-ln -sfn "$PWD/systemd/mindex-embedder@.service" ~/.config/systemd/user/
+systemd-analyze verify mindex-embedder@egpu.service   # clean
+systemd-analyze verify /etc/systemd/system/mindex-embedder@.service   # noisy, and correctly so
+```
+
+Both print four "Dependency … is dropped" lines — that is the self-reference
+being removed from each instance's symmetric list, i.e. the mechanism working,
+and it is the only expected output. The path form additionally reports
+`.venv-test_instance/bin/python` missing: handed a template, systemd instantiates
+a placeholder called `test_instance` and checks *that*, and this template's
+`ExecStart` names a venv per instance on purpose — one torch build per backend is
+the entire point of the split. There is no venv for a placeholder and there
+should not be one. The complaint is about the question, not the answer; ask about
+a real instance.
+
+**It is a system unit, not a user unit**, and that is not a preference. Two things
+were inert in the user manager and read as present: the network directives that
+confine this unauthenticated `0.0.0.0` listener to loopback — `IPAddressDeny=`,
+`SocketBind*=`, `RestrictNetworkInterfaces=` are BPF-backed and do nothing in a
+user unit on a stock host — and `Before=mindex.service`, which pointed across
+manager boundaries at a unit the system manager does not know.
+
+Install:
+
+```sh
+sudo install -Dm644 systemd/mindex-embedder@.service /etc/systemd/system/
+sudoedit /etc/systemd/system/mindex-embedder@.service   # the two paths and the user
 install -Dm644 systemd/embedder-egpu.env systemd/embedder-igpu.env -t ~/.config/mindex/
-systemctl --user daemon-reload
-systemctl --user enable --now mindex-embedder@igpu.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mindex-embedder@igpu.service
 ```
 
 Switching. Enable exactly **one** instance — two enabled instances race for the port
 on boot, which `Conflicts=` cannot prevent (it excludes, it does not choose):
 
 ```sh
-systemctl --user enable --now mindex-embedder@egpu.service   # Conflicts= stops @igpu
-systemctl --user disable      mindex-embedder@igpu.service   # so it doesn't return on boot
+sudo systemctl enable --now mindex-embedder@egpu.service   # Conflicts= stops @igpu
+sudo systemctl disable      mindex-embedder@igpu.service   # so it doesn't return on boot
+```
+
+**If you are migrating from the user-unit arrangement, delete the old copy.**
+`Conflicts=` does not cross the scope boundary: a system `@egpu` will not stop a
+user `@igpu`, both will race for 11211, and which one wins depends on start
+order. The exclusion reads as configured in both files and holds in neither.
+
+```sh
+systemctl --user disable --now mindex-embedder@igpu.service mindex-embedder@egpu.service
+rm ~/.config/systemd/user/mindex-embedder@.service
+systemctl --user daemon-reload
 ```
 
 The swap costs ~30–60 s of embedder downtime (model load). That is already covered by

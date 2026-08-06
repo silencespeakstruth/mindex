@@ -212,10 +212,19 @@ container means mounting a `config.toml`.
   `tools/search/mindex-search.sh` is the bash search frontend.
 - `embedder/` is the vendored BGE-M3 server (3 heads) — **host-run + GPU, NOT
   in the Docker image** (`embedder/README.md`). On this host: a systemd
-  **template** `mindex-embedder@{egpu,igpu}` (units in `embedder/systemd/`,
-  symlinked into `~/.config`), two torch backends (ROCm / Intel XPU) in two
-  venvs (`.venv-%i`), mutually exclusive via a symmetric `Conflicts=`+`After=`
-  naming both instances (systemd drops the self-reference). `@igpu` is the
+  **template** `mindex-embedder@{egpu,igpu}` (example in `embedder/systemd/`,
+  installed to `/etc/systemd/system`), two torch backends (ROCm / Intel XPU) in
+  two venvs (`.venv-%i`), mutually exclusive via a symmetric `Conflicts=`+
+  `After=` naming both instances (systemd drops the self-reference). It is a
+  **system** unit, not a user one, and both reasons were things that read as
+  present and were not: the BPF-backed network directives that confine this
+  unauthenticated 0.0.0.0 listener to loopback are **inert in a user unit**, and
+  `Before=mindex.service` pointed across manager boundaries at nothing. The
+  migration has its own trap, worth stating because a leftover file is invisible:
+  **`Conflicts=` does not cross the scope boundary**, so while copies exist in
+  both `/etc/systemd/system` and `~/.config/systemd/user` the mutual exclusion is
+  void — a system `@egpu` will not stop a user `@igpu`, both race for port 11211,
+  and the winner is whoever started first. Keep exactly one copy. `@igpu` is the
   default (leaves the discrete card to the research LLM); `@egpu` for bulk
   reindexing (~17× faster per batch; query path ~28 ms either way). The backends
   are not bit-identical and nothing checks it (the split-embedder warning under

@@ -1,0 +1,32 @@
+# Pins how ruff classifies this directory's imports.
+#
+# WHY IT EXISTS. The bench scripts reach their siblings through a
+# `sys.path.insert(...)` on the parent directory, so `bm25_fts5`, `build_qrels`,
+# `score`, `stats`, `ranx_bridge` and `run` are first-party modules that live
+# nowhere ruff can infer them from. Without this, ruff's isort splits them
+# across sections differently depending on which paths are passed on the command
+# line — `ruff check baselines/fusion.py` and `ruff check baselines/` disagreed,
+# and adding `bench/tests/` was enough to make it demand a blank line in a file
+# nobody had edited. A lint that reformats untouched files when a sibling
+# directory appears is noise indistinguishable from a real finding.
+#
+# THEY ARE PINNED AS THIRD-PARTY, WHICH LOOKS BACKWARDS AND IS NOT. Declaring
+# them first-party is what isort would call correct, and it puts them in their
+# own section — which every committed file in this directory would then fail,
+# because they were all written under ruff's default classification. The choice
+# is between one config line and reformatting the whole harness for no reader's
+# benefit, so this pins the classification the archive was written under.
+[lint.isort]
+known-third-party = [
+    "external_embedder",
+    "bm25_fts5",
+    "build_docs_qrels",
+    "build_qrels",
+    "fetch",
+    "noise_floor",
+    "ranx_bridge",
+    "run",
+    "score",
+    "sphinx_docs",
+    "stats",
+]

@@ -1,0 +1,80 @@
+# mindex config for the benchmark instance. NOT the live server's config.
+#
+# The benchmark runs against its own mindex process for three reasons, and only
+# the first is about tidiness:
+#
+#   1. Its own SQLite database and its own project GUIDs, so a benchmark pass
+#      cannot appear in the live index or be perturbed by it. Collection names
+#      derive from the GUID, so distinct GUIDs are what keep the two apart in
+#      Qdrant as well.
+#   2. Its own port, so the live server keeps serving the editor and the agents
+#      while a pass that takes hours is running.
+#   3. `[auth].enabled = false`, because the benchmark is a loopback client of
+#      a server that authorizes nothing — the one thing CLAUDE.md says that
+#      setting may mean. Minting a token would add a credential to the harness
+#      that measures nothing.
+#
+# Everything that could plausibly change a retrieval score is set to the live
+# server's value on purpose: the benchmark's external validity rests on
+# measuring the deployment people actually run, not a configuration invented
+# for it. Where a value differs, it is because it cannot affect retrieval
+# (bind, paths) or because the benchmark has no use for the subsystem
+# (research). Ablations override individual keys from the command line and
+# record the override in the result rows.
+
+[server]
+cert_path = "/home/silencespeakstruth/.config/mindex/mindex-cert.pem"
+key_path  = "/home/silencespeakstruth/.config/mindex/mindex-key.pem"
+max_body_mib = 512
+
+[model]
+name       = "BAAI/bge-m3"
+server_url = "http://localhost:11211"
+
+[qdrant]
+server_url = "http://localhost:6334"
+
+[database]
+path      = "/home/silencespeakstruth/.local/share/mindex-bench/mindex-bench.db"
+pool_size = 64
+
+[indexing]
+# 2048 was chosen from perf/'s throughput numbers, where the GPU is the
+# bottleneck — and it OOM'd this host. ColBERT stores one 1024-float row per
+# TOKEN, so an in-flight batch costs batch x tokens-per-chunk x 4 KiB: 2048
+# chunks of ~350 tokens is 2.9 GB, and mindex-index sends four such requests
+# concurrently, so ~11.6 GB of host RAM for one indexing pass. Nothing in the
+# flag, the config or the docs says that. 512 keeps the whole pass under 3 GB
+# and costs throughput this benchmark does not need.
+embed_batch_chunks  = 512
+stuck_grace_minutes = 30
+
+[slicer]
+min_chunk_tokens     = 128
+max_chunk_tokens     = 512
+fill_gaps            = true
+max_doc_chunk_tokens = 1024
+doc_semantic_weight  = 1.0
+
+[metrics]
+# ON, and this is not observability for its own sake. Two families are the only
+# detectors mindex has for failures that a benchmark would otherwise publish as
+# a quality score:
+#
+#   search_unscorable_winners  — chunks the reranker could not score, i.e. NaN.
+#     Its documented producer is the embedder's XPU backend returning NaN for
+#     padded fp16 rows off its default attention kernel, and a split deployment
+#     whose two instances differ in precision. Both answer 200. From the
+#     outside the symptom is "search sometimes ranks something irrelevant
+#     first", which reads as a ranking-quality finding and is not one.
+#   search_orphaned_winners    — Qdrant scored a chunk whose SQLite row is gone,
+#     i.e. the two stores disagree.
+#
+# Both are documented as expected to stay at zero. A benchmark is exactly the
+# consumer that must know when they do not, so run.py reads them per instance
+# and stops rather than scoring vectors it cannot trust. Nothing scrapes this
+# instance, so there is no series-collision with the live server's job.
+enabled = true
+
+[auth]
+enabled = false

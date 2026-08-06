@@ -1,0 +1,276 @@
+# bench corpora — repositories, ground-truth datasets, and run policy.
+#
+# Read by fetch.py, build_qrels.py and run.py. The selection rule and the
+# rationale for every choice here live in PROTOCOL.md; this file is the
+# machine-readable half and deliberately carries no argument of its own.
+#
+# Instance counts in comments were measured 2026-08-04 from the pinned dataset
+# revisions below, BEFORE the retention filter (PROTOCOL.md §3.3). They are
+# documentation; build_qrels.py recomputes and publishes the real ones.
+
+[run]
+# A dedicated mindex instance. Collection names derive from the project GUID,
+# so distinct GUIDs are what keep the benchmark off the live index.
+server_url = "https://127.0.0.1:11121"
+no_verify  = true
+
+# Working directories. Kept off the repo tree; both are gitignored.
+clone_dir  = "bench/.clones"
+data_dir   = "bench/.data"
+
+# mindex's indexing hot path is append-only: a reindex marks old chunks
+# deleted and orphans their vectors until GC. Measured on the live index:
+# ~764 KiB per chunk, ~22 chunks per file. A django pass is 850 checkouts, so
+# without this the orphans dwarf the index itself. See PROTOCOL.md §3.3.
+gc_every_instances = 25
+
+# Index-state equivalence check: this many random instances per corpus are
+# re-indexed from scratch and compared against the incrementally-reached
+# state. A divergence blocks the run.
+equivalence_sample = 20
+
+# Results are one JSONL record per (config, corpus, instance).
+results_dir = "bench/results"
+
+
+# ---------------------------------------------------------------------------
+# Ground-truth datasets, pinned by revision. A dataset that has moved is a
+# different experiment and gets a new archive, not a silent re-run.
+# ---------------------------------------------------------------------------
+
+[datasets.loc_bench]
+hf_id    = "czlll/Loc-Bench_V1"
+revision = "c44cf3b74e07ca642cec841b471a9939907c12a7"
+split    = "test"
+rows     = 560
+# file + function granularity; 242 bug / 150 feature / 139 performance /
+# 29 security. Spread over 165 repos — only the head is usable (PROTOCOL §2.1).
+kind     = "swebench_like"
+
+[datasets.swebench_full]
+hf_id    = "SWE-bench/SWE-bench"
+revision = "7074ef12ea2a6f70a228943c1336553333c22786"
+split    = "test"
+rows     = 2294
+kind     = "swebench_like"
+
+[datasets.swebench_verified]
+hf_id    = "SWE-bench/SWE-bench_Verified"
+revision = "91aa3ed51b709be6457e12d00300a6a596d4c6a3"
+split    = "test"
+rows     = 500
+kind     = "swebench_like"
+
+[datasets.multi_swebench]
+hf_id    = "ByteDance-Seed/Multi-SWE-bench"
+revision = "56ff018c04a38e27ada1e9d0a6d5839a51f88f0d"
+# One JSONL per repository, so only the selected repos are downloaded.
+path_template = "{lang}/{org}__{name}_dataset.jsonl"
+kind          = "multi_swebench"
+
+
+# ---------------------------------------------------------------------------
+# Corpora. Selected by instance density subject to language coverage
+# (PROTOCOL.md §2). `datasets` lists every ground truth scored against the
+# same index.
+# ---------------------------------------------------------------------------
+
+[[corpus]]
+name     = "django"
+repo     = "django/django"
+url      = "https://github.com/django/django.git"
+language = "python"
+datasets = ["swebench_full", "swebench_verified", "loc_bench"]  # 850 · 231 · 35
+# ~2905 indexable files; at ~22 chunks/file and ~764 KiB/chunk, ≈47 GiB.
+tier     = 1
+# ── descriptive tier (build_docs_qrels.py) ──────────────────────────────────
+# One pinned commit for the whole corpus: the documentation describes the code
+# beside it, so unlike the issue tier there is no "before the fix" to snapshot.
+docs_commit   = "7d75c0b9285f0e29cb796c647cc27f2076f9d49c"
+docs_dir      = "docs"
+docs_suffixes = [".txt"]
+package       = "django"
+# Release notes describe what CHANGED, not what IS — the same argument that
+# keeps CHANGELOG.md out of the issue tier's gold sets, and 28% of the first
+# build came from there. `internals/` documents how the project is run.
+docs_exclude  = ["docs/releases/**", "docs/internals/**", "docs/faq/**"]
+# Dropped from the RANKING, not from the index: the query text is lifted from
+# these files, so they would come back first by near-exact match.
+search_exclude_paths = ["docs/**"]
+
+[[corpus]]
+name     = "scikit-learn"
+repo     = "scikit-learn/scikit-learn"
+url      = "https://github.com/scikit-learn/scikit-learn.git"
+language = "python"
+datasets = ["swebench_full", "swebench_verified", "loc_bench"]  # 229 · 32 · 19
+tier     = 1
+# ── descriptive tier ────────────────────────────────────────────────────────
+docs_commit   = "7cb1868aac973906fe5293485133d873c0fe6c42"
+docs_dir      = "doc"
+docs_suffixes = [".rst"]
+package       = "sklearn"
+# The same rule as django's, and it removes more here: 95 of 186 .rst files are
+# release notes or contributor process. `whats_new/` describes what CHANGED;
+# `developers/`, the team pages, governance, roadmap, install and support
+# describe how the PROJECT is run. Neither is a description of the code.
+docs_exclude  = [
+    "doc/whats_new/**", "doc/whats_new.rst", "doc/developers/**",
+    "doc/*team*.rst", "doc/maintainers*.rst", "doc/governance.rst",
+    "doc/roadmap.rst", "doc/about.rst", "doc/support.rst", "doc/faq.rst",
+    "doc/install*.rst", "doc/related_projects.rst", "doc/presentations.rst",
+    "doc/testimonials/**", "doc/templates/**", "doc/sphinxext/**",
+]
+search_exclude_paths = ["doc/**"]
+
+[[corpus]]
+name        = "cli"
+repo        = "cli/cli"
+url         = "https://github.com/cli/cli.git"
+language    = "go"
+datasets    = ["multi_swebench"]  # 397 — densest non-Python repo available
+multi_lang  = "go"
+tier        = 1
+
+[[corpus]]
+name        = "clap"
+repo        = "clap-rs/clap"
+url         = "https://github.com/clap-rs/clap.git"
+language    = "rust"
+datasets    = ["multi_swebench"]  # 132
+multi_lang  = "rust"
+tier        = 1
+
+[[corpus]]
+name        = "vue-core"
+repo        = "vuejs/core"
+url         = "https://github.com/vuejs/core.git"
+language    = "typescript"
+datasets    = ["multi_swebench"]  # 48
+multi_lang  = "ts"
+tier        = 1
+
+[[corpus]]
+name        = "ripgrep"
+repo        = "BurntSushi/ripgrep"
+url         = "https://github.com/BurntSushi/ripgrep.git"
+language    = "rust"
+datasets    = ["multi_swebench"]  # 14
+multi_lang  = "rust"
+# The smoke corpus: 117 indexable files, ≈1.9 GiB. Backs the tier-0 fixture.
+tier        = 0
+
+
+# ---------------------------------------------------------------------------
+# Optional extensions. Admitted only by the same density rule, only if tier-1
+# wall-clock allows, and only as a whole — never cherry-picked after results.
+# ---------------------------------------------------------------------------
+
+[[corpus]]
+name     = "sympy"
+repo     = "sympy/sympy"
+url      = "https://github.com/sympy/sympy.git"
+language = "python"
+datasets = ["swebench_full", "swebench_verified", "loc_bench"]  # 386 · 75 · 7
+tier     = 2
+
+[[corpus]]
+name       = "svelte"
+repo       = "sveltejs/svelte"
+url        = "https://github.com/sveltejs/svelte.git"
+language   = "javascript"
+datasets   = ["multi_swebench"]  # 106
+multi_lang = "js"
+tier       = 2
+
+[[corpus]]
+name       = "nlohmann-json"
+repo       = "nlohmann/json"
+url        = "https://github.com/nlohmann/json.git"
+language   = "cpp"
+datasets   = ["multi_swebench"]  # 55
+multi_lang = "cpp"
+tier       = 2
+
+[[corpus]]
+name       = "jackson-databind"
+repo       = "FasterXML/jackson-databind"
+url        = "https://github.com/FasterXML/jackson-databind.git"
+language   = "java"
+datasets   = ["multi_swebench"]  # 42
+multi_lang = "java"
+tier       = 2
+
+
+# ---------------------------------------------------------------------------
+# Gold-set construction. PROTOCOL.md §3.2.
+# ---------------------------------------------------------------------------
+
+[qrels]
+# The query source differs by dataset family, and getting it wrong is the
+# easiest way to fake a good score:
+#
+#   swebench_like   `problem_statement` — the issue title and body.
+#                   `hints_text` is EXCLUDED: it holds pull-request review
+#                   comments written after the fix, which routinely name the
+#                   file to change.
+#
+#   multi_swebench  `resolved_issues[].title` + `.body` — the linked issue.
+#                   NOT the record's own `title`/`body`: those belong to the
+#                   pull request and describe the fix that was made. One
+#                   ripgrep PR title reads "replace clap with lexopt", which
+#                   would hand the answer to any retriever.
+query_field_swebench_like = "problem_statement"
+query_field_multi_swebench = "resolved_issues"
+
+# A test file is where a bug is demonstrated, not where it lives. Applied
+# uniformly to every system and baseline.
+exclude_test_paths = [
+    "**/test_*.py", "**/*_test.py", "**/tests/**", "**/test/**",
+    "**/*_test.go", "**/*_test.rs", "**/tests.rs",
+    "**/*.test.ts", "**/*.test.js", "**/*.spec.ts", "**/*.spec.js",
+    "**/__tests__/**", "**/spec/**",
+    "**/src/test/**", "**/*Test.java", "**/*Tests.java",
+]
+
+# A changelog entry is where a fix is ANNOUNCED, not where it lives — the same
+# argument that excludes tests. Measured on ripgrep: 3 of 14 instances carried
+# one, and a system ranking CHANGELOG.md first would have scored a hit for
+# "localizing" the bug. Deliberately narrow: it covers records of change, not
+# documentation. `doc/rg.1.md` stays gold, because a man page describing a flag
+# genuinely is part of the change surface.
+exclude_record_paths = [
+    "**/CHANGELOG*", "**/CHANGES*", "**/HISTORY*", "**/NEWS*",
+    "**/RELEASE*", "**/AUTHORS*", "**/CONTRIBUTORS*",
+    "**/COPYING*", "**/LICENSE*", "**/NOTICE*",
+]
+
+# NOTE for anyone editing the two lists above: they are matched with
+# PurePosixPath.full_match (Python 3.13+), NOT fnmatch. fnmatch is not
+# path-aware, so `**/tests/**` there fails to match a ROOT-level `tests/` —
+# which is exactly where django keeps its suite. See build_qrels.py
+# `path_matches` and `--self-test`.
+
+# Instances with an empty gold set after the exclusions are dropped; the count
+# is published rather than absorbed.
+drop_empty_gold = true
+
+# A query longer than this cannot be served AT ALL, and the bound belongs to the
+# vector store rather than to mindex: ColBERT emits one 1024-wide row per query
+# token, a Qdrant multivector holds at most 1 048 576 elements, so 1024 rows is
+# already one too many. Measured 2026-08-04 — such a query returns 503
+# `qdrant.unavailable` whatever its length, because the embedder's own --maxlen
+# truncation still leaves more rows than the store accepts. mindex derives
+# STORABLE_TOKENS_CEILING from the same constant and documents it as
+# "structural, not configurable, like VECTOR_DIM".
+#
+# 1023, not 1024: the store's check is `<`, so exactly 1024 rows fails.
+#
+# These instances are DROPPED from the corpus (PROTOCOL §4.2 and the amendment
+# in §11), counted, and published. The reason it is an exclusion rather than a
+# zero: the BM25/FTS5 floor in family F1 accepts a query of any length, so
+# scoring mindex zero here would charge it for a vector-store constraint no
+# baseline pays, in the one comparison that is meant to be about retrieval.
+# --keep-over-limit-queries builds the other corpus for anyone who disagrees.
+max_query_tokens = 1023
+tokenizer_model = "BAAI/bge-m3"
