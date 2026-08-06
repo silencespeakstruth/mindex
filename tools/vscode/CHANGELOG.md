@@ -1,5 +1,36 @@
 # Changelog
 
+Every component of mindex ships under one version, including this one — so a
+release with no extension changes of its own still gets an entry, and "which
+version am I running" has one answer.
+
+## 2.0.0
+
+**The server this extension talks to replaced its retrieval pipeline**, and the
+extension needed nothing to keep working: `/search`, `/research` and the SSE
+contract are unchanged, and `model_id` on `GET /config` was already read as an
+opaque string. What does change is what it is talking *to*.
+
+- **Point it at a v2.0.0 server or an older one, not both.** A v2 server refuses
+  to start on a pre-v2 database and its Qdrant collections are named per
+  `(project, model)`. Nothing in the extension notices either, which is the point
+  — but a workspace indexed by a 1.x server has no vectors a 2.0.0 server can
+  read, so the Drift view will report the whole tree as needing a reindex, and it
+  is right.
+- **Reindex is a real reindex this time.** `mindex-index --force` on the host is
+  what the upgrade costs; the extension's Sync all does the same work through the
+  same endpoint, and on a large repository that is minutes of GPU rather than the
+  usual hash-skipped seconds.
+- One string fix: the `mindex.batchSize` setting described its cost in terms of
+  `/encode`, an endpoint that no longer exists. It is `/v1/embeddings`.
+
+## 1.2.0
+
+No changes of its own. Released with the server's authorization work, which the
+extension had already shipped support for in 1.1.1 — the token indicator, the
+`SecretStorage` copy, the `aud` refusal and the mint command all predate the
+server-side `[auth]` section they were built against.
+
 ## 1.1.1
 
 Issuing a short-lived token for an agent was already here and effectively could not

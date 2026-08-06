@@ -67,7 +67,7 @@ no register to object to, so discovery still works where the prose does not. A t
 [VS Code extension](tools/vscode/README.md) drive the same API for humans; the extension
 ships as a `.vsix` on the
 [releases page](https://github.com/silencespeakstruth/mindex/releases), so
-`code --install-extension mindex-vscode-1.2.0.vsix` is the whole of installing it.
+`code --install-extension mindex-vscode-2.0.0.vsix` is the whole of installing it.
 
 ## Install
 
@@ -107,10 +107,16 @@ file explicitly there with `--config` or `$MINDEX_CONFIG`.
 Bottom-up: embedder → Qdrant → mindex.
 
 ```sh
-# 1. Embedder — never in a container (it wants the GPU directly). deploy/embedder/
-#    has the venv, the systemd unit and two alternative stacks, with the numbers
-#    that tell them apart.
-cd deploy/embedder && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 11211
+# 1. Embedder — never in a container (it wants the GPU directly). Install it
+#    OUTSIDE the checkout: it is a production dependency, and a working tree is
+#    not. deploy/embedder/ has the systemd unit and two alternative stacks, with
+#    the numbers that tell them apart.
+sudo mkdir -p /var/lib/mindex-embedder && cd /var/lib/mindex-embedder
+sudo python -m venv venv
+sudo venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm7.0 torch
+sudo venv/bin/pip install -r /path/to/mindex/deploy/embedder/requirements.txt
+sudo install -m0644 /path/to/mindex/deploy/embedder/server.py .
+venv/bin/uvicorn server:app --host 127.0.0.1 --port 11211
 
 # 2. Qdrant + mindex. No host ports by default; add the overlay to reach the API
 #    from the host (both loopback-only).

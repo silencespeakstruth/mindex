@@ -9,7 +9,7 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
-## [Unreleased]
+## [2.0.0] — 2026-08-07
 
 **Retrieval v3.** Replaces the three-headed BGE-M3 pipeline with **one dense leg from a
 registry of Qwen3-Embedding models**, served by any OpenAI-compatible endpoint. This is
@@ -52,6 +52,14 @@ queries and its one-tokenizer size ladder, neither of which is measured here —
 tokenizer. Full record, including the corrections made to it before this release:
 `bench/PROTOCOL.md` §11–§12, `bench/FINDINGS.md` §11, `docs/claude/retrieval-v2.md`,
 `docs/claude/qdrant.md`.
+
+**Three version numbers now read as one, and they are independent.** The product is
+**2.0.0**, the SQLite baseline is `v2.0.0_schema.sql`, and the Qdrant collection suffix
+is `_v3`. The coincidence is new and accidental: the schema filename was already v2 when
+the product was 1.2.0, and the collection layout was already v3. None of them predicts
+another — a future release can bump the product without touching either, and
+`GET /version` reports `db_schema_version` as the migration integer (`1`) rather than as
+any of these strings.
 
 ### Upgrading — REQUIRED, and it is a rebuild
 
@@ -126,6 +134,22 @@ ROCm) are in `deploy/embedder/README.md`.
   `tokens`, so a future window can be checked against the corpus by SQL.
 - **`GET /config`** publishes `embedding_dim`, `min_chunk_tokens` and
   `max_chunk_tokens`; `model_id` is the canonical registry id.
+- **`bench/` — a pre-registered retrieval-quality harness**, and the evidence for
+  everything above. `PROTOCOL.md` is the pre-registration: metrics, statistical
+  procedure, the non-inferiority margin, stopping rules and threats to validity,
+  committed before any number existed, with every later deviation recorded as a dated
+  amendment in §11. Ground truth is each project's own Sphinx documentation resolved by
+  AST against the source tree, so no model and no LLM touches the answer key.
+  `FINDINGS.md` is the working narrative, including a section of ten errors made while
+  building it. Neither claims more than it measured, and `FINDINGS.md` opens with the
+  list of what the harness does not establish.
+- **`bench/published/` — the artefacts behind every number quoted**, 132 KB of summary
+  and paired-comparison JSON plus a sha256 manifest of the query sets. The runs
+  themselves are 654 MB and are not committed, which for one release meant that nothing
+  a reader could check was: `PROTOCOL.md` §5.6's "a corpus is frozen when its output is
+  committed" pointed at no committed output. `bench/publish.py --check` fails on a
+  number whose artefact no longer produces it, on a citation with no artefact, and on an
+  artefact nothing cites.
 
 ### Removed
 
@@ -149,6 +173,49 @@ ROCm) are in `deploy/embedder/README.md`.
   architecture entails, and guarded by `llms_doc_makes_no_unmeasured_retrieval_claim`
   — the three existing `llms_doc` tests check routes, provenance and register, and
   none of them can see a well-formed sentence that is simply untrue.
+- **The reference embedder's non-finite recovery was a no-op.** On a NaN row,
+  `deploy/embedder/server.py` "recomputed in float32" by passing `precision="float32"`
+  to `SentenceTransformer.encode` — which selects the *output* quantization and is
+  already the default — inside a `torch.autocast(enabled=False)` that does nothing for
+  natively bf16 parameters. It recomputed at exactly the precision that had just failed,
+  so the deterministic outcome was a second NaN and a 500. It now casts the module and
+  restores it in a `finally`.
+- **That server also answered `/health` 200 while the model was loading**, for up to the
+  five minutes a cold load takes — so mindex's handshake passed and `checks.embedder`
+  read `"ok"` while every `/v1/embeddings` answered 503, and files burned their retry
+  budget against a server they had been told was healthy. It is 503 until the model is
+  in. Its startup hook is a lifespan handler for the same reason: the deprecated
+  `@app.on_event` would, on removal, leave `_model` None forever with nothing saying so.
+  Its `torch.cuda.*` calls are resolved per device, so `MINDEX_EMBED_DEVICE=xpu` and
+  `=cpu` no longer `AttributeError` on the OOM path.
+- **The published error-code catalogue was missing four codes.**
+  `openapi.rs`'s `info.description` is documented as the field clients localize against
+  and lists every code; `index.file_in_flight`, `auth.route_not_configured`,
+  `validation.index_modes_exclusive` and `research.invented` were absent, each added by a
+  change that updated `codes_are_stable` beside it and did not know the prose existed.
+  Guarded now by `the_published_error_catalogue_names_every_code`.
+- **The perf harness pointed at a port nothing serves** (`11212` in all three
+  `perf/env/*.env`, against `11211` everywhere else), recorded eight columns from the
+  deleted `/stats` endpoint as permanent `NA` while two plots charted them and the tuning
+  method taught a third, and sent no `Authorization` header at all — so against the
+  deployment shape this project calls mandatory behind a gateway, every run landed in
+  `err_other` with an empty CSV.
+- **The dashboard had no panel for `mindex_stale_collections` or
+  `mindex_orphaned_collections`** — the two gauges `README.md` names as worth an alert on
+  day one, and the only signal that a schema-version or model change has left a project's
+  search silently broken. Eight Overview panels and three contention-guard panels added,
+  plus `deploy/grafana/gen_alerts.py`, which generates eight provisioning rules (its
+  output is not committed: Grafana binds each rule to a per-installation datasource uid).
+- **Instructions that named deleted files**: `deploy/systemd/README.md`'s install block
+  enabled a template that is not a template and lives in another directory; the migration
+  precedents in `.claude/CLAUDE.md`, `docs/claude/vscode.md` and an assertion message in
+  `models.rs` told a contributor to copy v1 migrations that no longer exist;
+  `docs/claude/vscode.md` turned out to end in a truncated verbatim copy of CLAUDE.md's
+  lint matrix and all ten modification rules; `README.md` promised a `SHA256SUMS` where
+  the workflow emits `.sha256` sidecars.
+- **The release workflow published no Docker image**, although the README calls Docker
+  the supported way to run the server anywhere but Linux x86-64, and **no embedder**,
+  although mindex now ships none and cannot start without one. Both are jobs.
 
 ## [1.2.0] — 2026-08-04
 
@@ -1012,7 +1079,8 @@ server.
 - **Tools**: `mindex-index`, `mindex-watch`, `mindex-search.sh`, the `mindex` and
   `scout` MCP servers, and a VS Code extension.
 
-[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/silencespeakstruth/mindex/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/silencespeakstruth/mindex/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/silencespeakstruth/mindex/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/silencespeakstruth/mindex/compare/v1.0.0...v1.0.1
