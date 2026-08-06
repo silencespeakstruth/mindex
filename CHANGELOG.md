@@ -9,6 +9,224 @@ Every component ships under one version: the server, `mindex-index`, `mindex-wat
 the `.mindex` parser, both MCP servers and the VS Code extension. A component with no
 changes of its own is still released, so "which version am I running" has one answer.
 
+## [2.0.0] — 2026-08-07
+
+**Retrieval v3.** Replaces the three-headed BGE-M3 pipeline with **one dense leg from a
+registry of Qwen3-Embedding models**, served by any OpenAI-compatible endpoint. This is
+the largest breaking change the project has made, and it is not a refactor: the vectors
+are from a different model, so **every index must be rebuilt from scratch**.
+
+The grounds are measured, not architectural. `bench/` (new in this cycle) is a
+pre-registered retrieval-quality harness — ground truth built from each project's own
+Sphinx documentation and resolved by AST against the source tree, so no model and no LLM
+touches the answer key.
+
+**The headline is the two shipped systems against each other**, both driven through
+`POST /v0/{guid}/search`, same corpus, same queries, same cutoff:
+
+| | v3 | v2 | Δ | 95% CI | p |
+|---|---|---|---|---|---|
+| django docs, n = 1 115 | **0.4563** | 0.3549 | **+0.1014** | [+0.0832, +0.1190] | 0.0001 |
+
+Three qualifications, because the number is worth less without them. It is **one
+corpus** — Python, documentation prose, and there is no v3 run on the second one. It is
+a **system** comparison, so the embedder, the chunk window (512 → 364) and the tokenizer
+that measures it all move together and no part of the gain is attributable to one of
+them. And the gain is **not** confined to the easy stratum: `obvious` +0.1343, `mixed`
++0.0728 with an interval clear of zero, `non-obvious` +0.0375 with an interval through
+it at n = 148.
+
+What the extra heads were worth, separately: equal-weight RRF over the dense and sparse
+legs scored **below the single dense leg it fused** (0.4164 against 0.4448), and the
+sparse leg contributed +0.004 with both intervals through zero once the dense leg was a
+2026 encoder. The late-interaction rerank **significantly harmed** long queries (−0.016,
+p = 0.023) and was never established either way on short ones — a comparison the corpus
+is underpowered for by 3× — while costing 99.6% of Qdrant's storage (838 MB per segment
+against 2.6 MB dense). The embedder was the lever; the extra heads were not.
+
+Two things the harness does **not** establish, stated here rather than left to be found:
+the model that ships is not the one the model comparison selected — granite-r2 was
+statistically indistinguishable and cheaper, and Qwen3 was chosen for multilingual
+queries and its one-tokenizer size ladder, neither of which is measured here — and the
+364 chunk window comes from an exploratory sweep, on one corpus, under the *previous*
+tokenizer. Full record, including the corrections made to it before this release:
+`bench/PROTOCOL.md` §11–§12, `bench/FINDINGS.md` §11, `docs/claude/retrieval-v2.md`,
+`docs/claude/qdrant.md`.
+
+**Three version numbers now read as one, and they are independent.** The product is
+**2.0.0**, the SQLite baseline is `v2.0.0_schema.sql`, and the Qdrant collection suffix
+is `_v3`. The coincidence is new and accidental: the schema filename was already v2 when
+the product was 1.2.0, and the collection layout was already v3. None of them predicts
+another — a future release can bump the product without touching either, and
+`GET /version` reports `db_schema_version` as the migration integer (`1`) rather than as
+any of these strings.
+
+### Upgrading — REQUIRED, and it is a rebuild
+
+**1. The database lineage restarts.** The v1 schema carried `model_id` in seven primary
+keys; v3 removes it (a file, a chunk and a symbol are facts about the working tree —
+the *model* varies over the artifact instead). Rather than migrate rows whose vectors no
+longer exist, mindex **refuses to start** on a pre-v2 database, names the file and tells
+you to delete it. Fresh databases are unaffected. The Docker test stack needs
+`down -v` once.
+
+**2. The embedder changes process, and mindex stops shipping one.** `embedder/` — the
+vendored BGE-M3 server — is deleted; it existed only because no general server emitted
+three heads at once. What replaces it is a contract rather than a process:
+`deploy/embedder/` documents the three endpoints mindex needs, three recipes (a ~200-line
+torch reference server that ships with it, llama.cpp, and vLLM) with their measured
+throughput, and the three checks worth running. One of those checks is
+not optional: **pooling and normalisation cannot be verified over the wire**, and
+Qwen3-Embedding pools the *last* token — mean pooling returns 1024 plausible numbers and
+simply retrieves worse, with no error anywhere.
+
+**3. Config keys changed, and stale ones now fail at startup** (`deny_unknown_fields`,
+deliberately):
+
+| key | change |
+|---|---|
+| `[model].name` | **renamed** to `[model].id`; value is a registry id (`qwen3-embedding-0.6b` \| `-4b` \| `-8b`), not an HF repo |
+| `[model].served_name` | **new**, optional — for a server started with `--served-model-name` |
+| `[model].server_url` | port unchanged (`:11211`), but what answers it is not — an OpenAI-compatible server instead of the vendored one's binary `/encode` |
+| `[model].max_429_retries` | unchanged, but now also covers **503** — the other spelling of "busy" |
+| `[qdrant].dense_prefetch_limit` | **removed** (no prefetch) |
+| `[qdrant].sparse_prefetch_limit` | **removed** (no sparse leg) |
+| `[qdrant].fusion_limit` | **removed** (no fusion) |
+| `[qdrant].search_hnsw_ef` | kept; the successor rule is `>= [search].max_top_k` |
+| `[indexing].sparse_min_weight` | **removed** (no sparse weights) |
+| `[slicer].max_chunk_tokens` | default 512 → **364** (exploratory: +0.0108, p = 0.030, one corpus, measured under the *previous* tokenizer — `bench/PROTOCOL.md` §12.10. The only hard ceiling is now the model's own 32k context.) |
+
+**4. Rebuild.** `mindex-index --force` per project, then drop the `_v1`/`_v2` Qdrant
+collections the startup log names. Runbook: `docs/claude/qdrant.md`.
+
+**Choose the serving stack by the indexing number, not by the protocol.** They differ by
+an order of magnitude for identical vectors: on the reference host this repository
+reindexes in **51 s** through `deploy/embedder/server.py` (torch) and **410 s** through
+llama.cpp, while *query* latency is 16 ms against 30 ms. No llama.cpp configuration
+recovers it — `-np` 1/8/32, three ubatch sizes, ROCm and Vulkan, and 1/4/8 concurrent
+clients were all measured. `[model].query_server_url` is the seam for serving the two
+paths from different processes. Numbers, method and the three traps that cost real
+debugging (bf16 vs fp16 NaN, token-budget batching, `empty_cache()` corrupting output on
+ROCm) are in `deploy/embedder/README.md`.
+
+### Added
+
+- **A model registry** (`src/models/registry.rs`): three canonical ids with their
+  width, context, collection slug, tokenizer and query prefix, cross-checked at startup
+  against an `embedding_models` table whose ids and dims are `CHECK`ed and append-only.
+  A rebuilt binary cannot silently reinterpret stored vectors.
+- **Per-model collections**: `{guid}_{slug}_v3`. Switching `[model].id` writes a new
+  collection and *holds* the old one — the stale worker reports it as `OtherModel`
+  (registered, not active) rather than orphaned, so switching back is instant reuse.
+  Deleting a project drops every model's collection.
+- **`mindex-index --vectors-only`** (body flag `vectors_only`): re-embed the stored
+  chunks into the active model's collection — no slicing, no symbols. This is what a
+  model *size* change costs, since all three Qwen3 sizes share one tokenizer. Refused
+  across a tokenizer change, and mutually exclusive with `--symbols-only`.
+- **A model-identity handshake.** `GET /v1/models` is checked at startup (a server that
+  answers and names a different model is a **refusal**; an unreachable one is only a
+  warning) and re-checked by `GET /health`, per instance when the query path is split.
+  Every embedding row is checked against the registry's dimension. Nothing checked
+  either before — a wrong embedder behind the right URL indexed in silence.
+- **Two new `project_files` columns**, `chunker_id` and `embedded_model_id`, folded into
+  the unchanged-file predicate beside the derivation versions: flipping the model
+  self-heals exactly like a version bump. `project_file_chunks` now stores each chunk's
+  `tokens`, so a future window can be checked against the corpus by SQL.
+- **`GET /config`** publishes `embedding_dim`, `min_chunk_tokens` and
+  `max_chunk_tokens`; `model_id` is the canonical registry id.
+- **`bench/` — a pre-registered retrieval-quality harness**, and the evidence for
+  everything above. `PROTOCOL.md` is the pre-registration: metrics, statistical
+  procedure, the non-inferiority margin, stopping rules and threats to validity,
+  committed before any number existed, with every later deviation recorded as a dated
+  amendment in §11. Ground truth is each project's own Sphinx documentation resolved by
+  AST against the source tree, so no model and no LLM touches the answer key.
+  `FINDINGS.md` is the working narrative, including a section of ten errors made while
+  building it. Neither claims more than it measured, and `FINDINGS.md` opens with the
+  list of what the harness does not establish.
+- **`bench/published/` — the artefacts behind every number quoted**, 132 KB of summary
+  and paired-comparison JSON plus a sha256 manifest of the query sets. The runs
+  themselves are 654 MB and are not committed, which for one release meant that nothing
+  a reader could check was: `PROTOCOL.md` §5.6's "a corpus is frozen when its output is
+  committed" pointed at no committed output. `bench/publish.py --check` fails on a
+  number whose artefact no longer produces it, on a citation with no artefact, and on an
+  artefact nothing cites.
+
+### Removed
+
+- `embedder/` (the whole vendored server), `src/models/bge_m3.rs` and its binary wire
+  protocol, the sparse and ColBERT vectors, the RRF prefetch tree, the ColBERT rerank
+  and the fp16 / `on_disk` / `hnsw m=0` tuning that existed for it, the
+  `STORABLE_TOKENS_CEILING` chain (a Qdrant multivector limit), the six v1 migrations,
+  and `model_id` from seven tables.
+
+### Fixed
+
+- **`/llms.txt` described a retrieval pipeline this server does not have.** The
+  discovery document told every agent that reads it that `POST /v0/{guid}/search` is
+  "hybrid semantic + lexical retrieval", and carried a "Measured retrieval property"
+  claiming identifier queries rank implementation chunks first. The first has been
+  false since v3 removed the sparse leg — search is one dense vector and one Qdrant
+  query, with no lexical matching anywhere in it — and the second was never measured
+  by anything in `bench/results/`. Both misdirect the one reader this endpoint has:
+  an agent choosing a tool. A caller told search is lexical does not reach for
+  `symbols` or `grep`, which are what actually match a string. Replaced with what the
+  architecture entails, and guarded by `llms_doc_makes_no_unmeasured_retrieval_claim`
+  — the three existing `llms_doc` tests check routes, provenance and register, and
+  none of them can see a well-formed sentence that is simply untrue.
+- **The reference embedder's non-finite recovery was a no-op.** On a NaN row,
+  `deploy/embedder/server.py` "recomputed in float32" by passing `precision="float32"`
+  to `SentenceTransformer.encode` — which selects the *output* quantization and is
+  already the default — inside a `torch.autocast(enabled=False)` that does nothing for
+  natively bf16 parameters. It recomputed at exactly the precision that had just failed,
+  so the deterministic outcome was a second NaN and a 500. It now casts the module and
+  restores it in a `finally`.
+- **That server also answered `/health` 200 while the model was loading**, for up to the
+  five minutes a cold load takes — so mindex's handshake passed and `checks.embedder`
+  read `"ok"` while every `/v1/embeddings` answered 503, and files burned their retry
+  budget against a server they had been told was healthy. It is 503 until the model is
+  in. Its startup hook is a lifespan handler for the same reason: the deprecated
+  `@app.on_event` would, on removal, leave `_model` None forever with nothing saying so.
+  Its `torch.cuda.*` calls are resolved per device, so `MINDEX_EMBED_DEVICE=xpu` and
+  `=cpu` no longer `AttributeError` on the OOM path.
+- **The published error-code catalogue was missing four codes.**
+  `openapi.rs`'s `info.description` is documented as the field clients localize against
+  and lists every code; `index.file_in_flight`, `auth.route_not_configured`,
+  `validation.index_modes_exclusive` and `research.invented` were absent, each added by a
+  change that updated `codes_are_stable` beside it and did not know the prose existed.
+  Guarded now by `the_published_error_catalogue_names_every_code`.
+- **The perf harness pointed at a port nothing serves** (`11212` in all three
+  `perf/env/*.env`, against `11211` everywhere else), recorded eight columns from the
+  deleted `/stats` endpoint as permanent `NA` while two plots charted them and the tuning
+  method taught a third, and sent no `Authorization` header at all — so against the
+  deployment shape this project calls mandatory behind a gateway, every run landed in
+  `err_other` with an empty CSV.
+- **The dashboard had no panel for `mindex_stale_collections` or
+  `mindex_orphaned_collections`** — the two gauges `README.md` names as worth an alert on
+  day one, and the only signal that a schema-version or model change has left a project's
+  search silently broken. Eight Overview panels and three contention-guard panels added,
+  plus `deploy/grafana/gen_alerts.py`, which generates eight provisioning rules (its
+  output is not committed: Grafana binds each rule to a per-installation datasource uid).
+- **Instructions that named deleted files**: `deploy/systemd/README.md`'s install block
+  enabled a template that is not a template and lives in another directory; the migration
+  precedents in `.claude/CLAUDE.md`, `docs/claude/vscode.md` and an assertion message in
+  `models.rs` told a contributor to copy v1 migrations that no longer exist;
+  `docs/claude/vscode.md` turned out to end in a truncated verbatim copy of CLAUDE.md's
+  lint matrix and all ten modification rules; `README.md` promised a `SHA256SUMS` where
+  the workflow emits `.sha256` sidecars.
+- **The release workflow published no Docker image**, although the README calls Docker
+  the supported way to run the server anywhere but Linux x86-64, and **no embedder**,
+  although mindex now ships none and cannot start without one. Both are jobs.
+- **`mindex-cli-x86_64-apple-darwin` was missing from 1.1.0 and 1.2.0**, while the README
+  promised "macOS (Intel and Apple silicon)". Its `macos-13` runner is retired, so the job
+  was never picked up, queued for GitHub's 24-hour maximum and was auto-cancelled — and
+  because the other five jobs succeeded and uploaded, the only symptom was the run's
+  overall conclusion reading `cancelled` a day after anyone was looking. Both macOS
+  targets now build on `macos-14`, the Intel one as a cross-compile, which is safe for
+  two pure-Rust binaries and fails in minutes rather than queueing for a day if it ever
+  is not. `--target` is passed on every target besides: without it cargo built for the
+  host and the archive named `mindex-cli-<triple>` carried whatever the runner happened
+  to be — a label rather than a fact, correct only by coincidence.
+
 ## [1.2.0] — 2026-08-04
 
 Gives the server **one credential that says what it may do and who holds it**, and
@@ -871,7 +1089,8 @@ server.
 - **Tools**: `mindex-index`, `mindex-watch`, `mindex-search.sh`, the `mindex` and
   `scout` MCP servers, and a VS Code extension.
 
-[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/silencespeakstruth/mindex/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/silencespeakstruth/mindex/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/silencespeakstruth/mindex/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/silencespeakstruth/mindex/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/silencespeakstruth/mindex/compare/v1.0.0...v1.0.1

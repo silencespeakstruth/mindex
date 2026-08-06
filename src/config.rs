@@ -13,8 +13,9 @@
 //!
 //! Structural invariants are deliberately **not** here — they would break the
 //! system if changed independently and live as documented `const`s next to the
-//! code that relies on them: the BGE-M3 vector width (`1024`), the `/encode` wire
-//! magic, `COLLECTION_SCHEMA_VERSION`, HTTP `499`, `PRAGMA foreign_keys = ON`, and
+//! code that relies on them: the registry's per-model width, context and
+//! collection slug (`models/registry.rs`), `COLLECTION_SCHEMA_VERSION`, HTTP
+//! `499`, `PRAGMA foreign_keys = ON`, and
 //! `PRAGMA journal_mode = WAL`.
 
 use std::net::SocketAddr;
@@ -32,7 +33,16 @@ const DEFAULT_CERT_PATH: &str = "cert.pem";
 const DEFAULT_KEY_PATH: &str = "key.pem";
 const DEFAULT_MAX_BODY_MIB: usize = 256;
 
-const DEFAULT_MODEL_NAME: &str = "BAAI/bge-m3";
+/// The smallest Qwen3-Embedding: the one the retrieval harness measured
+/// (+0.12 nDCG@10 over the old pipeline on django-short) and the one whose
+/// VRAM cost is negligible beside the research LLM. The other registry entries
+/// are one config line away.
+const DEFAULT_MODEL_ID: &str = "qwen3-embedding-0.6b";
+/// The port the embedder has always answered on here. v3 changed what speaks it
+/// — an OpenAI-compatible `/v1/embeddings` rather than the vendored server's
+/// binary `/encode` — but not where, so an existing deployment's `server_url`
+/// keeps pointing at the right process. (It is also memcached's registered
+/// port; nothing else claims it on a host running mindex's embedder.)
 const DEFAULT_MODEL_SERVER: &str = "http://localhost:11211";
 const DEFAULT_HEALTH_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_MAX_429_RETRIES: u32 = 3;
@@ -41,28 +51,26 @@ const DEFAULT_ENCODE_TIMEOUT_MS: u64 = 600_000;
 
 const DEFAULT_QDRANT_SERVER: &str = "http://localhost:6334";
 const DEFAULT_UPSERT_BATCH_POINTS: usize = 256;
-const DEFAULT_DENSE_PREFETCH_LIMIT: u32 = 200;
-const DEFAULT_SPARSE_PREFETCH_LIMIT: u32 = 200;
-const DEFAULT_FUSION_LIMIT: u32 = 200;
-/// HNSW `ef` for the **dense** prefetch — how wide Qdrant's graph search keeps its
+/// HNSW `ef` for the dense query — how wide Qdrant's graph search keeps its
 /// candidate beam.
 ///
 /// A genuine tuning knob (recall against latency), unlike the collection's own HNSW
 /// settings, which are structural consts beside the code that writes them: `ef` is a
 /// *query* parameter and changing it needs no reindex.
 ///
-/// 256 rather than the client's implicit default of 128, because the beam must not be
-/// narrower than the pool the query asks for: `dense_prefetch_limit` is 200, and an
-/// `ef` under that returns fewer good candidates than were requested with no error.
+/// 256 rather than the client's implicit default of 128, so the beam is never
+/// narrower than any `top_k` a request may ask for (`max_top_k` defaults to 100)
+/// — an `ef` under the requested pool returns fewer good candidates than were
+/// asked for with no error.
 ///
 /// Honest caveat: on a collection under `optimizers_config.indexing_threshold`
-/// (10 000 points by Qdrant's default) no HNSW index exists yet, the prefetch is an
+/// (10 000 points by Qdrant's default) no HNSW index exists yet, the query is an
 /// exact scan and this value changes nothing. It is set now so that a project growing
 /// past that threshold does not walk off a silent recall cliff on the day it does.
 const DEFAULT_SEARCH_HNSW_EF: u64 = 256;
 /// Whole-request ceiling for one Qdrant call. The client's own default is **5 s**,
-/// which nothing in this repo set or could override: a project whose candidate set is
-/// large enough that fusion + ColBERT rerank exceeds it failed *every* search with
+/// which nothing in this repo set or could override: a project whose candidate set
+/// was large enough that a search exceeded it failed *every* one with
 /// `qdrant.unavailable` 503, untunably. 30 s is generous for a query and still short
 /// enough to fail a wedged connection rather than hold a request open.
 const DEFAULT_QDRANT_TIMEOUT_MS: u64 = 30_000;
@@ -78,25 +86,16 @@ const DEFAULT_SYNCHRONOUS: &str = "normal";
 const DEFAULT_EMBED_BATCH_CHUNKS: usize = 256;
 const DEFAULT_STUCK_GRACE_MINUTES: i64 = 30;
 const DEFAULT_PATH_BATCH_SIZE: usize = 500;
-const DEFAULT_SPARSE_MIN_WEIGHT: f32 = 1e-5;
 
 const DEFAULT_MIN_CHUNK_TOKENS: usize = 128;
-const DEFAULT_MAX_CHUNK_TOKENS: usize = 512;
-/// Validation ceiling for the *code* chunk window: 512 is the top of the range
-/// BGE-M3 was measured to work best in, and the window is measured, not computed.
-///
-/// It is **not** the model's input limit, which this comment used to claim. The
-/// embedder truncates at its `--maxlen`, default 8192 (`embedder/src/bge_m3_api`);
-/// verified against the running server, where a ~1600-token text returns 2514
-/// ColBERT vectors rather than 512. That distinction is what lets documentation
-/// use a wider window — see [`MODEL_INPUT_LIMIT_TOKENS`].
-const MODEL_MAX_TOKENS: usize = 512;
-
-/// The point past which the embedder really does drop text on the floor.
-/// Chunks above this are silently truncated, so it is a hard ceiling for any
-/// window. Kept separate from [`MODEL_MAX_TOKENS`], which is a quality choice
-/// for code rather than a capacity limit.
-const MODEL_INPUT_LIMIT_TOKENS: usize = 8192;
+/// The code chunk window's cap: 364, measured, not computed (bench/FINDINGS.md
+/// §2.5: +0.0108 nDCG@10 over 512, p = 0.030, with the gain in the dense head).
+/// Measured under the previous model's tokenizer and carried over as the best
+/// available default; the bench re-run is what confirms or moves it. The only
+/// hard ceiling on any window now is the model's own `max_seq` (32k for the
+/// whole Qwen3-Embedding family), validated below — the old 1020-token clamp
+/// was a Qdrant multivector limit and died with ColBERT.
+const DEFAULT_MAX_CHUNK_TOKENS: usize = 364;
 
 /// Cap on a documentation chunk, measured rather than argued: at 512 the answer
 /// is repeatedly cut away from the text that explains it (18/23 documentation
@@ -118,7 +117,7 @@ const DEFAULT_FILL_GAPS: bool = true;
 /// already marked every topic change; it earns its keep on documents with sparse
 /// or absent headings, where structure alone degenerates to packing blindly up to
 /// the cap. On by default for that reason, and free to turn off: 0 disables the
-/// per-document `/encode` entirely. Above ~4 it outvotes chunk cost and the
+/// per-document embed call entirely. Above ~4 it outvotes chunk cost and the
 /// segmentation collapses toward one block per chunk.
 const DEFAULT_DOC_SEMANTIC_WEIGHT: f64 = 1.0;
 /// Past this the term stops refining and starts shredding, so a larger value is
@@ -400,33 +399,44 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ModelConfig {
-    pub name: String,
+    /// The **canonical id** of the embedding model this deployment serves —
+    /// one of `src/models/registry.rs`'s entries, validated at startup with the
+    /// full list in the error. It decides the dense width, the collection
+    /// names, the slicer's tokenizer and the query instruct prefix all at once;
+    /// switching it self-heals through the prepare-phase skip (the next
+    /// ordinary run — or the cheap `mindex-index --vectors-only` — re-embeds).
+    pub id: String,
+    /// The vLLM instance embedding for the index path (OpenAI-compatible).
     pub server_url: Url,
+    /// What the serving side calls the model in `GET /v1/models` and expects in
+    /// the request's `model` field. Absent = the registry's HF repo id, which
+    /// is what a plain `vllm serve Qwen/...` answers; set it only for a vLLM
+    /// started with `--served-model-name`.
+    pub served_name: Option<String>,
     /// Optional **second** embedder instance serving only the *query* path
     /// (`/search`, and every `search` a `/research` run makes). Absent = one
-    /// instance does both, which is today's behaviour and stays the default.
+    /// instance does both, which stays the default.
     ///
-    /// The two workloads have opposite profiles and only one of them needs the
-    /// GPU. Indexing sends batches of hundreds and is throughput-bound; a query is
-    /// one text of ~20 tokens and is latency-bound, so serving it costs a few
-    /// hundred milliseconds on a CPU instance — against a research turn of tens of
-    /// seconds, irrelevant. What it buys is the ~6 GiB of VRAM the resident fp32
-    /// model otherwise holds permanently, which on a 32 GiB card is the difference
-    /// between a 23 GB model running on the GPU and running half on the CPU.
+    /// The two workloads have opposite profiles: indexing sends batches of
+    /// hundreds and is throughput-bound; a query is one short text and is
+    /// latency-bound. A second instance on the other GPU (or CPU) keeps queries
+    /// answering while a bulk reindex saturates the first.
     ///
-    /// Point it at another instance of the *same* server started with
-    /// `--device cpu`: identical code, identical fp32 numerics, so index-side and
-    /// query-side vectors still agree — which they must, or sparse set membership
-    /// diverges and lexical recall degrades in a way that looks like a bad model.
+    /// It must serve the **same model** — the startup and `/health` handshakes
+    /// verify the served name, and the client refuses any response row whose
+    /// width is not the registry's. What no handshake can check is numerics: a
+    /// different precision on one side degrades ranking silently, so keep the
+    /// two instances on the same dtype.
     pub query_server_url: Option<Url>,
-    /// Liveness-ping timeout for the embedder's `/health`.
+    /// Liveness-ping timeout for the embedder's `/health` (also bounds the
+    /// `/v1/models` handshake).
     pub health_timeout_ms: u64,
-    /// 429-backoff retries before giving up on an `/encode` call.
+    /// Busy-backoff retries (HTTP 429 or 503) before giving up on one call.
     pub max_429_retries: u32,
-    /// First 429 backoff; doubles each retry.
+    /// First backoff; doubles each retry.
     pub backoff_base_ms: u64,
-    /// Ceiling on one `/encode` call, its 429 retries and their backoffs included —
-    /// not per attempt. See `BGEm3Tuning::encode_timeout_ms`.
+    /// Ceiling on one embed call, its busy retries and their backoffs included —
+    /// not per attempt. See `EmbedderTuning::encode_timeout_ms`.
     pub encode_timeout_ms: u64,
 }
 
@@ -435,10 +445,7 @@ pub struct ModelConfig {
 pub struct QdrantConfig {
     pub server_url: Url,
     pub upsert_batch_points: usize,
-    pub dense_prefetch_limit: u32,
-    pub sparse_prefetch_limit: u32,
-    pub fusion_limit: u32,
-    /// HNSW `ef` for the dense prefetch stage.
+    /// HNSW `ef` for the dense query.
     pub search_hnsw_ef: u64,
     /// Whole-request timeout for one Qdrant call.
     pub timeout_ms: u64,
@@ -459,15 +466,13 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IndexingConfig {
-    /// Chunks per `/encode` call (the GPU batch lever).
+    /// Chunks per `/v1/embeddings` call (the GPU batch lever).
     pub embed_batch_chunks: usize,
     /// Minutes a file may sit in `indexing` before the retry worker treats it as
     /// crash-orphaned. Must exceed the longest legitimate in-flight request.
     pub stuck_grace_minutes: i64,
     /// Paths per batch on soft-delete / cancel (bounded by SQLite bind-var limit).
     pub path_batch_size: usize,
-    /// Sparse weights at or below this magnitude are dropped before upsert.
-    pub sparse_min_weight: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -481,7 +486,7 @@ pub struct SlicerConfig {
     /// section is a complete claim, and the code slicer's floor would drop it.
     pub max_doc_chunk_tokens: usize,
     /// How much embedding distance influences where documentation is cut.
-    /// 0 turns the term off, and with it the per-document `/encode`.
+    /// 0 turns the term off, and with it the per-document embed call.
     pub doc_semantic_weight: f64,
 }
 
@@ -1045,10 +1050,12 @@ impl Default for ServerConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            name: DEFAULT_MODEL_NAME.to_string(),
+            id: DEFAULT_MODEL_ID.to_string(),
             server_url: DEFAULT_MODEL_SERVER
                 .parse()
                 .expect("valid default model url"),
+            // The registry's HF repo id unless the operator renamed the serving.
+            served_name: None,
             // One instance serves both paths unless an operator splits them.
             query_server_url: None,
             health_timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
@@ -1066,9 +1073,6 @@ impl Default for QdrantConfig {
                 .parse()
                 .expect("valid default qdrant url"),
             upsert_batch_points: DEFAULT_UPSERT_BATCH_POINTS,
-            dense_prefetch_limit: DEFAULT_DENSE_PREFETCH_LIMIT,
-            sparse_prefetch_limit: DEFAULT_SPARSE_PREFETCH_LIMIT,
-            fusion_limit: DEFAULT_FUSION_LIMIT,
             search_hnsw_ef: DEFAULT_SEARCH_HNSW_EF,
             timeout_ms: DEFAULT_QDRANT_TIMEOUT_MS,
             connect_timeout_ms: DEFAULT_QDRANT_CONNECT_TIMEOUT_MS,
@@ -1093,7 +1097,6 @@ impl Default for IndexingConfig {
             embed_batch_chunks: DEFAULT_EMBED_BATCH_CHUNKS,
             stuck_grace_minutes: DEFAULT_STUCK_GRACE_MINUTES,
             path_batch_size: DEFAULT_PATH_BATCH_SIZE,
-            sparse_min_weight: DEFAULT_SPARSE_MIN_WEIGHT,
         }
     }
 }
@@ -1291,9 +1294,9 @@ impl Default for WorkerConfig {
     version,
     about = concat!(
         "mindex is a high-performance semantic search engine built in Rust. ",
-        "It leverages the BGE-M3 model for hybrid (dense/sparse) retrieval ",
-        "combined with advanced reranking techniques to deliver accurate, ",
-        "context-aware search results."
+        "It embeds tree-sitter chunks with a Qwen3-Embedding model served over an ",
+        "OpenAI-compatible API and searches them as dense vectors in Qdrant, to ",
+        "deliver accurate, context-aware search results."
     )
 )]
 pub struct Cli {
@@ -1320,11 +1323,12 @@ pub struct Cli {
     #[arg(long)]
     pub key_path: Option<PathBuf>,
 
-    /// Name of the model to use (default: BAAI/bge-m3).
+    /// Embedding model id, from the compiled registry (default:
+    /// qwen3-embedding-0.6b). Maps to [model].id.
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Model API server (default: http://localhost:11211).
+    /// Embedding server, OpenAI-compatible (default: http://localhost:11211).
     #[arg(long)]
     pub model_server: Option<Url>,
 
@@ -1340,7 +1344,7 @@ pub struct Cli {
     #[arg(long)]
     pub db_pool_size: Option<usize>,
 
-    /// Chunks sent to the model server per /encode call during indexing (default: 256).
+    /// Chunks sent to the model server per /v1/embeddings call during indexing (default: 256).
     #[arg(long)]
     pub embed_batch: Option<usize>,
 
@@ -1660,7 +1664,7 @@ fn apply_cli_overrides(cfg: &mut Config, cli: &Cli) {
         cfg.server.max_body_mib,
         "server.max_body_mib"
     );
-    over!(cli.model, cfg.model.name, "model.name");
+    over!(cli.model, cfg.model.id, "model.id");
     over!(cli.model_server, cfg.model.server_url, "model.server_url");
     over!(
         cli.qdrant_server,
@@ -1710,6 +1714,15 @@ impl Config {
             ));
         }
 
+        if crate::models::registry::model_by_id(&self.model.id).is_none() {
+            e.push(format!(
+                "[model].id = {:?} is not a registered embedding model. Fix: use one \
+                 of {} (src/models/registry.rs is the authority; adding a model is a \
+                 registry entry plus a migration).",
+                self.model.id,
+                crate::models::registry::known_ids().join(" / ")
+            ));
+        }
         if self.model.max_429_retries > 20 {
             e.push(format!(
                 "[model].max_429_retries = {} is implausibly high. Fix: use a small count (e.g. 3).",
@@ -1732,19 +1745,6 @@ impl Config {
         if self.qdrant.upsert_batch_points < 1 {
             e.push("[qdrant].upsert_batch_points = 0 would never upsert. Fix: use at least 1 (e.g. 256).".to_string());
         }
-        // Checked against `max_top_k`, not `default_top_k`: the default is only what a
-        // request gets when it asks for nothing, while the maximum is what a request is
-        // *permitted* to ask for. With the looser check a caller asking for the
-        // documented maximum got a silently short result set — no warning at startup,
-        // none at query time, and a correct-looking response.
-        if self.qdrant.fusion_limit < self.search.max_top_k as u32 {
-            e.push(format!(
-                "[qdrant].fusion_limit = {} is below [search].max_top_k = {}; a request \
-                 asking for max_top_k results would be silently truncated by the reranker. \
-                 Fix: set fusion_limit >= max_top_k.",
-                self.qdrant.fusion_limit, self.search.max_top_k
-            ));
-        }
         if self.qdrant.timeout_ms < 1 {
             e.push(
                 "[qdrant].timeout_ms = 0 would time out every call immediately. \
@@ -1759,31 +1759,16 @@ impl Config {
                     .to_string(),
             );
         }
-        if self.qdrant.dense_prefetch_limit < self.qdrant.fusion_limit {
+        // Checked against `max_top_k`, not `default_top_k`: the maximum is what a
+        // request is *permitted* to ask for, and a beam narrower than the requested
+        // pool returns fewer good candidates than were asked for with no error —
+        // a short result set that looks like a genuinely thin index.
+        if self.qdrant.search_hnsw_ef < self.search.max_top_k {
             e.push(format!(
-                "[qdrant].dense_prefetch_limit = {} is below fusion_limit = {}; fusion starves. \
-                 Fix: set dense_prefetch_limit >= fusion_limit.",
-                self.qdrant.dense_prefetch_limit, self.qdrant.fusion_limit
-            ));
-        }
-        if self.qdrant.sparse_prefetch_limit < self.qdrant.fusion_limit {
-            e.push(format!(
-                "[qdrant].sparse_prefetch_limit = {} is below fusion_limit = {}; fusion starves. \
-                 Fix: set sparse_prefetch_limit >= fusion_limit.",
-                self.qdrant.sparse_prefetch_limit, self.qdrant.fusion_limit
-            ));
-        }
-        // Checked against the pool the prefetch is *asked* for, not against
-        // `dense_prefetch_limit` alone: a beam narrower than the requested pool returns
-        // fewer candidates than were asked for, silently, and the shortfall then
-        // propagates through fusion into a short result set that looks like a genuinely
-        // thin index.
-        if self.qdrant.search_hnsw_ef < self.qdrant.dense_prefetch_limit as u64 {
-            e.push(format!(
-                "[qdrant].search_hnsw_ef = {} is below dense_prefetch_limit = {}; the graph \
-                 search would return fewer candidates than the prefetch asks for, with no \
-                 error. Fix: set search_hnsw_ef >= dense_prefetch_limit.",
-                self.qdrant.search_hnsw_ef, self.qdrant.dense_prefetch_limit
+                "[qdrant].search_hnsw_ef = {} is below [search].max_top_k = {}; the graph \
+                 search would return fewer candidates than a request may ask for, with no \
+                 error. Fix: set search_hnsw_ef >= max_top_k.",
+                self.qdrant.search_hnsw_ef, self.search.max_top_k
             ));
         }
 
@@ -1830,15 +1815,6 @@ impl Config {
                  in-flight indexing request or the retry worker can race a live batch. Default is 30."
             );
         }
-        if !(self.indexing.sparse_min_weight.is_finite() && self.indexing.sparse_min_weight >= 0.0)
-        {
-            e.push(format!(
-                "[indexing].sparse_min_weight = {} must be a finite, non-negative threshold. \
-                 Fix: use a small positive value (e.g. 0.00001).",
-                self.indexing.sparse_min_weight
-            ));
-        }
-
         if self.slicer.min_chunk_tokens < 1 {
             e.push(
                 "[slicer].min_chunk_tokens = 0 is invalid. Fix: use at least 1 (default 128)."
@@ -1851,12 +1827,28 @@ impl Config {
                 self.slicer.min_chunk_tokens, self.slicer.max_chunk_tokens
             ));
         }
-        if self.slicer.max_chunk_tokens > MODEL_MAX_TOKENS {
-            e.push(format!(
-                "[slicer].max_chunk_tokens = {} exceeds the BGE-M3 limit of {MODEL_MAX_TOKENS}; \
-                 longer chunks are silently truncated. Fix: set max_chunk_tokens <= {MODEL_MAX_TOKENS}.",
-                self.slicer.max_chunk_tokens
-            ));
+        // Both windows are bounded by the model's own context, and by nothing
+        // else: the old 1020-token clamp was a Qdrant multivector limit that died
+        // with ColBERT. `max_seq` comes from the registry entry `[model].id`
+        // names; when the id itself is invalid that error is already queued
+        // above, so this check simply skips.
+        if let Some(spec) = crate::models::registry::model_by_id(&self.model.id) {
+            if self.slicer.max_chunk_tokens > spec.max_seq {
+                e.push(format!(
+                    "[slicer].max_chunk_tokens = {} exceeds {}'s context of {}; longer \
+                     chunks are silently truncated by the embedder. Fix: set \
+                     max_chunk_tokens <= {}.",
+                    self.slicer.max_chunk_tokens, spec.id, spec.max_seq, spec.max_seq
+                ));
+            }
+            if self.slicer.max_doc_chunk_tokens > spec.max_seq {
+                e.push(format!(
+                    "[slicer].max_doc_chunk_tokens = {} exceeds {}'s context of {}; longer \
+                     chunks are silently truncated by the embedder. Fix: set \
+                     max_doc_chunk_tokens <= {}.",
+                    self.slicer.max_doc_chunk_tokens, spec.id, spec.max_seq, spec.max_seq
+                ));
+            }
         }
         if self.slicer.max_doc_chunk_tokens < 1 {
             e.push(
@@ -1864,14 +1856,6 @@ impl Config {
                  Fix: use at least 1 (default 1024)."
                     .to_string(),
             );
-        }
-        if self.slicer.max_doc_chunk_tokens > MODEL_INPUT_LIMIT_TOKENS {
-            e.push(format!(
-                "[slicer].max_doc_chunk_tokens = {} exceeds the embedder's input limit of \
-                 {MODEL_INPUT_LIMIT_TOKENS}; longer chunks are silently truncated. \
-                 Fix: set max_doc_chunk_tokens <= {MODEL_INPUT_LIMIT_TOKENS}.",
-                self.slicer.max_doc_chunk_tokens
-            ));
         }
         if !(0.0..=MAX_DOC_SEMANTIC_WEIGHT).contains(&self.slicer.doc_semantic_weight) {
             e.push(format!(
@@ -2740,67 +2724,32 @@ mod tests {
     }
 
     /// The realistic mis-set: an operator raises `[search].max_top_k` and touches
-    /// nothing else. The reranker only ever sees `fusion_limit` candidates, so a
-    /// request asking for the documented maximum comes back silently short — no
-    /// warning at startup, none at query time, and a correct-looking 200. The check
-    /// was against `default_top_k`, which a raised maximum does not move, so this
-    /// whole configuration passed validation.
+    /// nothing else. The graph search only keeps a `search_hnsw_ef`-wide beam, so
+    /// a request asking for the documented maximum comes back silently short — no
+    /// warning at startup, none at query time, and a correct-looking 200.
     #[test]
-    fn raising_max_top_k_past_the_fusion_limit_is_refused_at_startup() {
+    fn raising_max_top_k_past_the_beam_is_refused_at_startup() {
         let cfg = parse("[search]\nmax_top_k = 500\n").expect("parses");
         let err = cfg.validate().expect_err("must be rejected");
         assert!(
             err.iter()
-                .any(|m| m.contains("fusion_limit") && m.contains("max_top_k")),
+                .any(|m| m.contains("search_hnsw_ef") && m.contains("max_top_k")),
             "{err:?}"
         );
 
-        // Raising the whole chain together is the correct fix, and must be accepted.
-        // `search_hnsw_ef` is part of that chain: a beam narrower than the prefetch
-        // pool truncates it just as silently as a fusion limit below `max_top_k`.
-        let cfg = parse(
-            "[search]\nmax_top_k = 500\n\n[qdrant]\nfusion_limit = 500\n\
-             dense_prefetch_limit = 500\nsparse_prefetch_limit = 500\nsearch_hnsw_ef = 500\n",
-        )
-        .expect("parses");
-        cfg.validate().expect("a consistently raised set is valid");
+        // Raising both together is the correct fix, and must be accepted.
+        let cfg =
+            parse("[search]\nmax_top_k = 500\n\n[qdrant]\nsearch_hnsw_ef = 500\n").expect("parses");
+        cfg.validate().expect("a consistently raised pair is valid");
     }
 
-    /// `max_top_k` exactly equal to `fusion_limit` is the boundary the rule is
-    /// written on, and the one an operator sizing the two together will land on.
+    /// `max_top_k` exactly equal to the beam is the boundary the rule is written
+    /// on, and the one an operator sizing the two together will land on.
     #[test]
-    fn max_top_k_equal_to_the_fusion_limit_is_accepted() {
-        let cfg = parse("[search]\nmax_top_k = 200\n").expect("parses");
+    fn max_top_k_equal_to_the_beam_is_accepted() {
+        let cfg = parse("[search]\nmax_top_k = 256\n").expect("parses");
         cfg.validate()
-            .expect("max_top_k == the default fusion_limit must be valid");
-    }
-
-    /// The prefetch → fusion → top_k chain has to hold end to end. A prefetch below
-    /// fusion starves the reranker in exactly the same silent way, and the three rules
-    /// must all fire rather than the first one masking the rest — `validate` collects
-    /// every problem precisely so one startup tells the operator the whole story.
-    #[test]
-    fn every_broken_link_in_the_retrieval_chain_is_named_at_once() {
-        let cfg = parse(
-            "[search]\nmax_top_k = 300\n\n\
-             [qdrant]\nfusion_limit = 200\ndense_prefetch_limit = 10\nsparse_prefetch_limit = 10\n",
-        )
-        .expect("parses");
-        let err = cfg.validate().expect_err("must be rejected");
-
-        assert!(
-            err.iter().any(|m| m.contains("fusion_limit = 200")
-                && m.contains("[search].max_top_k = 300")),
-            "the top_k link was not reported: {err:?}"
-        );
-        assert!(
-            err.iter().any(|m| m.contains("dense_prefetch_limit = 10")),
-            "the dense prefetch link was not reported: {err:?}"
-        );
-        assert!(
-            err.iter().any(|m| m.contains("sparse_prefetch_limit = 10")),
-            "the sparse prefetch link was not reported: {err:?}"
-        );
+            .expect("max_top_k == the default search_hnsw_ef must be valid");
     }
 
     /// The Qdrant client's own default is 5 s and no key reached it, so a project
@@ -2855,7 +2804,7 @@ mod tests {
             cfg.indexing.embed_batch_chunks,
             def.indexing.embed_batch_chunks
         );
-        assert_eq!(cfg.slicer.max_chunk_tokens, 512);
+        assert_eq!(cfg.slicer.max_chunk_tokens, 364);
         assert_eq!(cfg.workers.gc_interval_seconds, 3600);
         assert!(cfg.metrics.enabled);
         assert_eq!(cfg.metrics.refresh_interval_seconds, 60);
@@ -2897,7 +2846,7 @@ mod tests {
         let cfg = parse("[slicer]\nmin_chunk_tokens = 64\n").expect("valid");
         assert_eq!(cfg.slicer.min_chunk_tokens, 64);
         // Untouched key in the present section still defaults.
-        assert_eq!(cfg.slicer.max_chunk_tokens, 512);
+        assert_eq!(cfg.slicer.max_chunk_tokens, 364);
         // Absent section entirely defaults.
         assert_eq!(cfg.database.pool_size, 4);
     }
@@ -2936,9 +2885,9 @@ mod tests {
     fn validation_collects_multiple_errors() {
         let mut cfg = Config::default();
         cfg.database.pool_size = 0;
-        cfg.slicer.max_chunk_tokens = 9000;
+        cfg.slicer.max_chunk_tokens = 99_000; // above every registry max_seq
         cfg.database.synchronous = "sometimes".into();
-        cfg.qdrant.fusion_limit = 1; // below default_top_k=5
+        cfg.qdrant.search_hnsw_ef = 1; // below max_top_k
         let errs = cfg.validate().expect_err("should be invalid");
         assert!(
             errs.len() >= 4,
@@ -2951,7 +2900,7 @@ mod tests {
         );
         assert!(errs.iter().any(|m| m.contains("max_chunk_tokens")));
         assert!(errs.iter().any(|m| m.contains("synchronous")));
-        assert!(errs.iter().any(|m| m.contains("fusion_limit")));
+        assert!(errs.iter().any(|m| m.contains("search_hnsw_ef")));
     }
 
     /// Each broken glob gets its own collected error naming index and pattern —

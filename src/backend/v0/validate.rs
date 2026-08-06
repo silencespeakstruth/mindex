@@ -298,6 +298,12 @@ pub fn validate_index_request(
     max_files: usize,
     max_code_bytes: usize,
 ) -> Result<(), ApiError> {
+    // Two "rebuild only this half" modes at once is a contradiction, not a
+    // union: symbols_only touches no vectors and vectors_only touches no
+    // symbols, so honouring both would honour neither.
+    if req.symbols_only && req.vectors_only {
+        return Err(ApiError::IndexModesExclusive);
+    }
     let total: usize = req.files.values().map(HashMap::len).sum();
     if total > max_files {
         return Err(ApiError::TooManyFiles {
@@ -781,6 +787,7 @@ mod tests {
             files,
             force: false,
             symbols_only: false,
+            vectors_only: false,
         };
 
         assert!(validate_index_request(&req, 10, 100).is_ok());

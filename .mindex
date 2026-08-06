@@ -13,7 +13,8 @@
 # Scope policy for this repo: index everything that is written, exclude only what
 # is generated, fetched or secret. That deliberately includes the tooling — the
 # indexer, watcher, mindexfile, both MCP servers, the VS Code extension, the
-# embedder, the shell scripts, the SQL migrations and the documentation — because
+# reference embedder server, the shell scripts, the SQL migrations and the
+# documentation — because
 # all of it is code someone has to answer questions about.
 
 guid: c2d7e2c1-3165-42f5-9366-0ff1492b4bab
@@ -43,8 +44,8 @@ exclude_paths:
   # stays in; the dashboard is its output, and answers no question the generator
   # does not answer better.
   - deploy/grafana/mindex-service.json
-  # Python environments and tool caches. The embedder's venvs are per-backend
-  # (.venv-egpu / .venv-igpu), so the plain `.venv` glob does not reach them.
+  # Python environments and tool caches. The `-*` variant catches the ones that
+  # are not plainly `.venv` (a per-backend `.venv-egpu`, a per-tool `.venv-lint`).
   - "**/.venv/**"
   - "**/.venv-*/**"
   - "**/__pycache__/**"
@@ -66,6 +67,18 @@ exclude_paths:
   # Benchmark output: one CSV per run, plus generated plots.
   - perf/results/**
   - perf/plots/**
+  # The retrieval-quality harness, ALL of it — unlike perf/, whose scripts are
+  # indexed. Two reasons, and the second is why the whole tree goes rather than
+  # just its data. First, bench/.clones holds django, scikit-learn and the rest
+  # at whatever commit a run left checked out, so indexing it would put a moving
+  # snapshot of four foreign repositories into this project; .data is downloaded
+  # ground truth, results/ is one JSONL per run, fixtures/ a frozen SQLite +
+  # Qdrant snapshot. Second, the harness itself is ~8 700 lines of Python that
+  # measures mindex without being part of it, and it lives on a branch while it
+  # is in flux — retrieving it would answer "how is search evaluated" to every
+  # question about how search WORKS. Its findings are prose in PROTOCOL.md and
+  # FINDINGS.md, and those are what a reader should be pointed at.
+  - bench/**
   # CI and deployment YAML. Now that mindex indexes .yml/.yaml these would be
   # retrieved as project content, and they are neither: a workflow describes how
   # the repository is built elsewhere, and a scrape config describes a host this

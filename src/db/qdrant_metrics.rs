@@ -121,34 +121,15 @@ impl VectorStore for MeteredVectorStore {
         r
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "mirrors the trait method, whose inputs are the irreducible parts \
-                  of one hybrid query"
-    )]
     async fn search(
         &self,
         collection: &str,
         chunk_ids: Vec<UUIDv4>,
         dense: Vec<f32>,
-        sparse_indices: Vec<u32>,
-        sparse_values: Vec<f32>,
-        colbert: Vec<Vec<f32>>,
         top_k: u64,
     ) -> Result<Vec<SearchHit>, VectorStoreError> {
         let t = Instant::now();
-        let r = self
-            .inner
-            .search(
-                collection,
-                chunk_ids,
-                dense,
-                sparse_indices,
-                sparse_values,
-                colbert,
-                top_k,
-            )
-            .await;
+        let r = self.inner.search(collection, chunk_ids, dense, top_k).await;
         self.record("search", t, &r);
         r
     }
@@ -186,9 +167,6 @@ mod tests {
             _: &str,
             _: Vec<UUIDv4>,
             _: Vec<f32>,
-            _: Vec<u32>,
-            _: Vec<f32>,
-            _: Vec<Vec<f32>>,
             _: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             Ok(vec![])
@@ -252,9 +230,6 @@ mod tests {
             _: &str,
             _: Vec<UUIDv4>,
             _: Vec<f32>,
-            _: Vec<u32>,
-            _: Vec<f32>,
-            _: Vec<Vec<f32>>,
             _: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             Ok(vec![])
@@ -318,10 +293,7 @@ mod tests {
         store.health().await.expect("ok");
         store.count_points("c").await.expect("ok");
         store.list_collections().await.expect("ok");
-        store
-            .search("c", vec![], vec![], vec![], vec![], vec![], 5)
-            .await
-            .expect("ok");
+        store.search("c", vec![], vec![], 5).await.expect("ok");
 
         let text = metrics.render().expect("renders");
         for op in [

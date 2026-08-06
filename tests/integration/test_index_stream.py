@@ -51,7 +51,10 @@ def test_streaming_index_reports_the_full_pipeline(
 
     assert names[0] == "started", names
     started = json.loads(events[0][1])
-    assert started == {"files": 1, "symbols_only": False}
+    # Exact, not a subset: `started` reports the shape of the request, and a
+    # field appearing there is a wire change every consumer has to be told
+    # about. `vectors_only` joined `symbols_only` with retrieval v3.
+    assert started == {"files": 1, "symbols_only": False, "vectors_only": False}
 
     prepared = [json.loads(d) for e, d in events if e == "prepared"]
     assert len(prepared) == 1, events

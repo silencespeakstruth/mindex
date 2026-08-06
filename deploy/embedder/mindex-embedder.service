@@ -1,0 +1,166 @@
+# The embedding server for mindex (deploy/embedder/server.py).
+#
+# EXAMPLE UNIT. Edit the user name and, if you install elsewhere, the paths.
+# Nothing here can be relative or expanded: systemd requires the first token of
+# ExecStart= literal, and a system unit has no %h.
+#
+# THE PATHS BELOW POINT AT /var/lib/mindex-embedder, NOT AT THE CHECKOUT, and
+# that is the one thing worth not "simplifying" back. The venv and server.py
+# lived inside `deploy/embedder/` on the reference host for a release, which
+# made a production service a dependency of a working tree: a branch switch, a
+# `git clean -xfd` or moving the directory stops the embedder, and mindex's only
+# symptom is every file going `failed` while the retry worker re-attempts
+# forever. Deploy is a copy, not a checkout:
+#
+#     sudo mkdir -p /var/lib/mindex-embedder
+#     sudo python -m venv /var/lib/mindex-embedder/venv
+#     sudo /var/lib/mindex-embedder/venv/bin/pip install \
+#         --index-url https://download.pytorch.org/whl/rocm7.0 torch
+#     sudo /var/lib/mindex-embedder/venv/bin/pip install -r deploy/embedder/requirements.txt
+#     sudo install -m0644 deploy/embedder/server.py /var/lib/mindex-embedder/
+#
+# Re-run the last line after pulling a change to server.py; nothing does it for
+# you, and that is the price of the isolation.
+#
+# This is the old BGE-M3 unit with its subject replaced. Every hardening
+# paragraph below was written against a failure that had already happened on
+# this host, and none of them is about which model is served — so they carry
+# over verbatim, and the reasons are kept with them rather than trimmed to a
+# clean file that would invite re-learning them.
+#
+# WHY THIS IS A SYSTEM UNIT AND NOT A USER UNIT
+#
+# It was a user unit first, and two things broke quietly there.
+#
+#   * The BPF-backed network directives below (IPAddressDeny=, SocketBind*=,
+#     RestrictNetworkInterfaces=) are inert in a user unit on a stock host. They
+#     load, they show up in `systemctl --user show`, and they confine nothing.
+#     A confinement that reads as present and is not is worse than none.
+#   * A system unit cannot order itself after a user manager's unit, so
+#     `Before=mindex.service` pointed at a unit in another manager and silently
+#     did nothing.
+#
+# WHAT THE NETWORK CONFINEMENT IS FOR
+#
+# This server authenticates nothing. It binds loopback by the ExecStart flag,
+# and the kernel is made to enforce that independently: an edit to --host, or a
+# future default, cannot open it to the LAN, where anything could drive the GPU.
+
+[Unit]
+Description=Embedding server for mindex (Qwen3-Embedding)
+Documentation=https://github.com/silencespeakstruth/mindex/blob/master/deploy/embedder/README.md
+After=network-online.target
+Wants=network-online.target
+# mindex degrades gracefully when the embedder is down (files go `failed`, the
+# retry worker re-attempts), so this is not a hard dependency — but starting it
+# first avoids a burst of failures on boot. This ordering is only enforced
+# because both are system units; see the header.
+Before=mindex.service
+
+[Service]
+Type=exec
+User=YOUR_USER
+Group=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+WorkingDirectory=/var/lib/mindex-embedder
+# EnvironmentFile is read by the manager before the namespace exists, so this
+# path needs no bind below. It carries MINDEX_EMBED_* (see server.py's header):
+# the model, the device, the dtype, the GPU batch and the truncation length.
+EnvironmentFile=/home/YOUR_USER/.config/mindex/embedder.env
+ExecStart=/var/lib/mindex-embedder/venv/bin/uvicorn server:app \
+    --host 127.0.0.1 --port 11211
+Restart=on-failure
+RestartSec=5
+# Model load is slow on a cold page cache; don't let systemd call it a failure.
+TimeoutStartSec=300
+
+# ── network ──────────────────────────────────────────────────────────────────
+IPAddressDeny=any
+IPAddressAllow=localhost
+SocketBindDeny=any
+SocketBindAllow=tcp:11211
+RestrictNetworkInterfaces=lo
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# CONSEQUENCE, and it must be spelled to the library or it hangs instead of
+# failing. IPAddressDeny= DROPS packets rather than refusing them, so a client
+# that still tries huggingface.co waits out a TCP connect timeout and then
+# retries. Measured on the first boot of the predecessor unit: the model load
+# sat at "Loading model …" for four minutes at 2% CPU with every thread in
+# futex_wait, while /health answered ok throughout.
+#
+# The offline flags turn that into what it should be: the cache below is the
+# whole truth, a miss is an immediate error naming the missing file, and no
+# request leaves the machine. Populate it once, outside the unit.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+
+# ── GPU ──────────────────────────────────────────────────────────────────────
+#
+# PrivateDevices=true IS WRONG HERE, and it fails quietly — which is the only
+# reason it gets a paragraph. It replaces /dev with a minimal private instance,
+# and DeviceAllow= does not populate that: it grants cgroup permission for a
+# node that is then not present. Measured on the attempt to enable it: /dev/dri
+# did not exist inside the namespace, torch logged "device count is zero!" as a
+# UserWarning, and the server started, answered /health "ok" and would have run
+# the whole index on CPU. Nothing failed; it just got ~17x slower and no line
+# anywhere said why.
+#
+# So /dev stays real and the restriction is done by the cgroup device policy
+# instead. Renumber these for your hardware (`ls -l /dev/dri`). /dev/kfd is
+# AMD's compute node; an unused device costs nothing, a missing one is an
+# import-time crash inside torch.
+#
+# The check that the GPU is actually in use is not /health, which cannot tell:
+# it is the throughput line this server logs per request ("embedded N texts in
+# …"). On this host a CPU fallback reads ~0.3 chunks/s against ~119 on the GPU.
+DevicePolicy=closed
+DeviceAllow=/dev/dri/renderD128 rw
+DeviceAllow=/dev/dri/renderD129 rw
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri/card1 rw
+DeviceAllow=/dev/dri/card2 rw
+SupplementaryGroups=render video
+
+# ── filesystem ───────────────────────────────────────────────────────────────
+#
+# Deliberately NOT the empty-tmpfs treatment mindex and qdrant get. This process
+# is a torch stack with a vendor runtime underneath it; ProtectSystem=strict
+# already denies every write outside the paths below, and replacing the home
+# with a tmpfs buys confidentiality against a service that is now unreachable
+# from anywhere but loopback. The cost — a driver cache found by a rule nobody
+# wrote down — lands as a GPU that silently falls back to CPU.
+#
+#   huggingface        — the weights
+#   miopen             — ROCm kernel perf DB
+#   neo_compiler_cache — intel-compute-runtime's compiled-kernel cache
+#
+# ⚠️ IF ANY OF THESE IS A SYMLINK, NAME BOTH SPELLINGS. ProtectSystem=strict
+# applies to the path the process actually opens after resolution, so on a host
+# where ~/.cache points at another filesystem (this one: /data), the /home
+# spelling alone leaves every write denied and the /data spelling alone leaves
+# the symlink dangling inside the namespace. Add the resolved path beside each
+# one — `readlink -f` says which. mindex.service's own sandbox drop-in carries
+# the same pair for the same reason, and the failure is silent both ways: a
+# model that cannot write its cache recompiles kernels on every start.
+ProtectSystem=strict
+ReadWritePaths=/home/YOUR_USER/.cache/huggingface
+ReadWritePaths=/home/YOUR_USER/.config/miopen
+ReadWritePaths=/home/YOUR_USER/.cache/neo_compiler_cache
+PrivateTmp=true
+
+NoNewPrivileges=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

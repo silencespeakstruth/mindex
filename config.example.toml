@@ -54,55 +54,59 @@ max_token_days = 90
 leeway_seconds = 60
 
 [model]
-name = "BAAI/bge-m3"                 # embedding model id (one model supported today)
-server_url = "http://localhost:11211" # the BGE-M3 embedder
-health_timeout_ms = 2000             # /health ping timeout
-max_429_retries = 3                  # retries when the embedder returns 429 (busy)
-backoff_base_ms = 200                # first 429 backoff; doubles each retry
-encode_timeout_ms = 600000           # whole /encode call incl. 429 retries (ms); 10 min
+# The CANONICAL id of the embedding model this deployment serves — one of the
+# compiled registry's entries (src/models/registry.rs):
+#   qwen3-embedding-0.6b   1024-d  (default; the size the retrieval harness measured)
+#   qwen3-embedding-4b     2560-d
+#   qwen3-embedding-8b     4096-d
+# It decides the dense width, the collection names, the slicer's tokenizer and the
+# query instruct prefix all at once. Switching it self-heals: the next ordinary
+# indexer run — or the cheap `mindex-index --vectors-only`, a pure re-embed of the
+# stored chunks — rebuilds under the new model, into its own collection, and
+# switching back reuses the old one.
+id = "qwen3-embedding-0.6b"
+server_url = "http://localhost:11211" # the embedding server (OpenAI-compatible).
+                                      # deploy/embedder/ measures the recipes: a
+                                      # torch server reindexes this repo in 51 s,
+                                      # llama.cpp in 410 s, queries alike
+health_timeout_ms = 2000             # /health ping + /v1/models handshake timeout
+max_429_retries = 3                  # retries when the server answers busy (429/503)
+backoff_base_ms = 200                # first backoff; doubles each retry
+encode_timeout_ms = 600000           # whole embed call incl. busy retries (ms); 10 min
+# What the serving side calls the model in /v1/models. Commented out = the
+# registry's HF repo id (what a plain `vllm serve Qwen/...` answers); llama.cpp
+# under llama-swap answers with ITS model id, so set this to that; set it only
+# for a vLLM started with --served-model-name. The handshake at startup and in
+# /health refuses a server that answers with anything else — a wrong model behind
+# the right URL would otherwise poison every vector silently.
+# served_name = "Qwen/Qwen3-Embedding-0.6B"
 
 # OPTIONAL second embedder instance serving only the QUERY path (/search, and every
 # search a /research run makes). Commented out = one instance does both, which is
-# the default.
-#
-# Why split: the two workloads have opposite profiles and only one needs the GPU.
-# Indexing sends batches of hundreds and is throughput-bound. A query is one text
-# of ~20 tokens and is latency-bound — a few hundred ms on CPU, against a research
-# turn of tens of seconds. What the split buys is the ~6 GiB of VRAM the resident
-# fp32 model otherwise holds permanently; on a 32 GiB card that is the difference
-# between a 23 GB local LLM running on the GPU and running half on the CPU.
-#
-# Start it as another instance of the SAME server with `--device cpu`: identical
-# code, identical fp32 numerics. That matters — reduced precision on one side flips
-# low-weight token ids in and out of the sparse set, and a query-side sparse head
-# that disagrees with the index-side one degrades lexical recall in a way that
-# presents as "search sometimes can't find the obvious thing".
-# query_server_url = "http://localhost:11212"
+# the default. A second instance on the other GPU keeps queries answering while a
+# bulk reindex saturates the first. It must serve the SAME model — the handshake
+# checks the name and the client refuses wrong-width vectors, but numerics it
+# cannot check: keep both instances on the same dtype, or ranking degrades in a
+# way that presents as "search sometimes can't find the obvious thing".
+# query_server_url = "http://localhost:11213"
 
 [qdrant]
 server_url = "http://localhost:6334" # Qdrant gRPC endpoint
 upsert_batch_points = 256            # points per Qdrant upsert
-dense_prefetch_limit = 200           # dense candidates before RRF fusion
-sparse_prefetch_limit = 200          # sparse candidates before RRF fusion
-fusion_limit = 200                   # candidates after fusion, before ColBERT rerank
-search_hnsw_ef = 256                 # HNSW beam width for the dense prefetch
+search_hnsw_ef = 256                 # HNSW beam width for the dense query
 timeout_ms = 30000                   # ceiling on one Qdrant call
 connect_timeout_ms = 5000            # ceiling on establishing the connection
-# Invariant: search_hnsw_ef >= dense_prefetch_limit, and
-# dense/sparse_prefetch_limit >= fusion_limit >= search.max_top_k. Every rung is a
-# silent truncation if it is not held: a beam narrower than the pool it is asked for,
-# or a pool smaller than the top_k a caller may request, comes back short with no
-# error at startup and none at query time.
-# search_hnsw_ef is the recall/latency knob, and it is the only *query*-side Qdrant
-# setting there is — the collection's own index and storage options are structural
-# consts in src/db/qdrant.rs, because changing one is a reindex. Note that on a
-# collection under Qdrant's `indexing_threshold` (10000 points) there is no HNSW
-# index yet and the prefetch is an exact scan, so this changes nothing until a
-# project grows past it. That is exactly when it would otherwise start silently
-# under-recalling.
+# Invariant: search_hnsw_ef >= search.max_top_k — a beam narrower than the pool a
+# request may ask for comes back short with no error at startup and none at query
+# time. It is the one *query*-side Qdrant knob; the collection's own index and
+# storage options are structural consts in src/db/qdrant.rs, because changing one
+# is a reindex. On a collection under Qdrant's `indexing_threshold` (10000 points)
+# there is no HNSW index yet and the query is an exact scan, so this changes
+# nothing until a project grows past it — which is exactly when it would otherwise
+# start silently under-recalling.
 # The two timeouts exist because the client's own default is 5s for each and nothing
-# could override it: a project whose candidate set made fusion + ColBERT rerank run
-# past five seconds failed every search with `qdrant.unavailable`, untunably.
+# could override it: a project whose candidate set made a search run past five
+# seconds failed every one with `qdrant.unavailable`, untunably.
 
 [database]
 path = "mindex.db"      # SQLite file (use ":memory:" for ephemeral)
@@ -112,24 +116,26 @@ synchronous = "normal"  # SQLite synchronous mode: off / normal / full / extra
 # Note: journal_mode=WAL and foreign_keys=ON are fixed (correctness invariants).
 
 [indexing]
-embed_batch_chunks = 256   # chunks per /encode call — the GPU batch lever
+embed_batch_chunks = 256   # chunks per /v1/embeddings call — the GPU batch lever
 stuck_grace_minutes = 30   # how long a file may sit in 'indexing' before the retry
                            # worker treats it as crash-orphaned; MUST exceed the
                            # longest legitimate in-flight indexing request
 path_batch_size = 500      # paths per batch on soft-delete/cancel (SQLite bind limit; 1..=999)
-sparse_min_weight = 0.00001 # sparse weights at or below this are dropped before upsert
 
 [slicer]
 min_chunk_tokens = 128  # smallest node token-span that becomes a chunk
-max_chunk_tokens = 512  # largest; must be <= 512 (top of BGE-M3's measured sweet spot)
+max_chunk_tokens = 364  # largest — measured (bench/FINDINGS.md §2.5: +0.011 nDCG@10
+                        # over 512, p=0.03); the only hard ceiling is the model's
+                        # own context (32768 for the Qwen3-Embedding family)
 # Documentation is chunked by block structure, not by the AST walk, and has no
 # minimum — a short section is a complete claim. 512 measurably cuts explanations
 # away from what they explain; past 1024 nothing improves and each hit costs more
-# of a /research transcript. Hard ceiling is the embedder's --maxlen (8192).
+# of a /research transcript. Bounded only by the model's context now — the old
+# silent 1020-token clamp was a Qdrant multivector limit that died with ColBERT.
 max_doc_chunk_tokens = 1024
 # How much embedding distance refines where documentation is cut, against the
 # heading structure (which always wins outright at heading levels 1-2). 0 turns
-# it off along with the one /encode per document; 1 is the default; above ~4 the
+# it off along with the one embed call per document; 1 is the default; above ~4 the
 # segmentation collapses toward one block per chunk. On a densely-headed corpus
 # this measurably changes nothing — it earns its keep on documents whose headings
 # are sparse or absent, where structure alone can only pack up to the cap.

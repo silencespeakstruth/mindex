@@ -149,7 +149,7 @@ pub struct PhaseLabels {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EmbedderLabels {
-    /// `index` or `query` — the two BGE-M3 instances, which may be one server.
+    /// `index` or `query` — the two embedder instances, which may be one server.
     pub embedder: &'static str,
 }
 
@@ -305,7 +305,7 @@ pub struct EmbedMetrics {
     pub duration: HistFamily<EmbedderLabels>,
     pub batch_size: HistFamily<EmbedderLabels>,
     pub texts: Family<EmbedderLabels, Counter>,
-    /// Incremented inside `BGEm3HttpClient::encode`: from outside the client,
+    /// Incremented inside `OpenAiEmbedClient::embed`: from outside the client,
     /// three retries then a success is indistinguishable from one success.
     pub retries: Family<EmbedderLabels, Counter>,
 }
@@ -798,17 +798,17 @@ impl Metrics {
         };
         registry.register(
             "embed_requests",
-            "Calls to a BGE-M3 /encode endpoint, by outcome",
+            "Calls to the embedder's /v1/embeddings endpoint, by outcome",
             embed.requests.clone(),
         );
         registry.register(
             "embed_duration_seconds",
-            "Latency of a BGE-M3 /encode call",
+            "Latency of an embedder /v1/embeddings call",
             embed.duration.clone(),
         );
         registry.register(
             "embed_batch_texts",
-            "Texts per /encode call",
+            "Texts per /v1/embeddings call",
             embed.batch_size.clone(),
         );
         registry.register("embed_texts", "Texts embedded", embed.texts.clone());
@@ -1698,7 +1698,7 @@ mod tests {
             .get_or_create(&BuildLabels {
                 version: "1.0.0",
                 db_schema_version: "1".into(),
-                model_id: "BAAI/bge-m3".into(),
+                model_id: "qwen3-embedding-0.6b".into(),
             })
             .set(1);
         s.start_time.set(1);
@@ -1913,7 +1913,7 @@ mod tests {
                 refresh_interval_seconds: 60,
                 probe_dependencies: false,
                 max_retries: 3,
-                model_id: "BAAI/bge-m3".to_string(),
+                model_id: "qwen3-embedding-0.6b".to_string(),
             },
             &tokio_util::sync::CancellationToken::new(),
         )

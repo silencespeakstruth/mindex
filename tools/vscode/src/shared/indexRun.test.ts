@@ -269,7 +269,7 @@ describe("IndexRun file list", () => {
         assert.deepStrictEqual(
             rows.map((f) => f.state),
             ["embedding", "embedding", "embedding"],
-            "one /encode call holds all three"
+            "one embed call holds all three"
         );
         assert.deepStrictEqual(
             rows.map((f) => f.path),

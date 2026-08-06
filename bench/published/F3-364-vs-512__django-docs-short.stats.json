@@ -1,0 +1,59 @@
+{
+  "system": "F2-full__django-364-docs-short.jsonl",
+  "baseline": "F2-full__django-docs-short.jsonl",
+  "metric": "ndcg@10",
+  "stratum_field": "overlap_bucket",
+  "seed": 20260805,
+  "b_permutation": 10000,
+  "b_bootstrap": 10000,
+  "rows": [
+    {
+      "stratum": "ALL",
+      "n": 1115,
+      "mean_delta": 0.0108,
+      "ci95": [
+        0.0012,
+        0.0208
+      ],
+      "p_permutation": 0.0304,
+      "non_inferior": true,
+      "margin": 0.01
+    },
+    {
+      "stratum": "mixed",
+      "n": 363,
+      "mean_delta": 0.015,
+      "ci95": [
+        -0.0017,
+        0.0333
+      ],
+      "p_permutation": 0.09749,
+      "non_inferior": true,
+      "margin": 0.01
+    },
+    {
+      "stratum": "non-obvious",
+      "n": 148,
+      "mean_delta": 0.0056,
+      "ci95": [
+        -0.0189,
+        0.0388
+      ],
+      "p_permutation": 0.71633,
+      "non_inferior": false,
+      "margin": 0.01
+    },
+    {
+      "stratum": "obvious",
+      "n": 604,
+      "mean_delta": 0.0095,
+      "ci95": [
+        -0.0037,
+        0.0226
+      ],
+      "p_permutation": 0.15438,
+      "non_inferior": true,
+      "margin": 0.01
+    }
+  ]
+}

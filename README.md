@@ -5,16 +5,22 @@
 A frontier model's context is the expensive resource, and reading files burns it. mindex
 is a local-first code index built around that one economics problem. Everything below
 runs on your machine: vectors in a local Qdrant, metadata in a local SQLite file,
-embeddings from a local [BGE-M3](https://huggingface.co/BAAI/bge-m3) (~4–6 GB VRAM, or
-CPU-only). 21 programming languages, plus TOML, YAML and Markdown.
+embeddings from a local [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
+served by anything that speaks the OpenAI embeddings API — a ~200-line reference server
+ships in [`deploy/embedder/`](deploy/embedder/README.md), and llama.cpp or vLLM work
+equally (the 0.6B fits comfortably beside a research LLM; 4B and 8B are one config key
+away). 21 programming languages, plus TOML, YAML and Markdown.
 
 **Search and research are one pair, and the split is the product.**
 
 - **Search** is the paid-precision half: you spend a few chunks and get the byte-exact
-  text of one place. Retrieval is three-level and uses all of BGE-M3's heads as they
-  come — dense and SPLADE-style sparse run in parallel, RRF-fuse, and a ColBERT
-  multivector rerank orders what survives. No head is a fallback for another; each
-  catches what the others miss.
+  text of one place. Retrieval is one dense leg — deliberately, and after measuring the
+  alternative: a sparse leg fused in by RRF, plus a late-interaction rerank on top,
+  scored *below* the single leg it fused while costing 99.6% of the store. Replacing all
+  three with one modern encoder moved nDCG@10 from **0.3549 to 0.4563** on 1 115 queries
+  (Δ +0.1014, 95% CI [+0.0832, +0.1190]) — one corpus, and the harness says so itself.
+  The measurement, its limits, and the pre-registration it was run under are in
+  [`bench/`](bench/README.md).
 - **Research** is the cheap-breadth half, and it costs the caller nothing. You ask a
   question; a **local** model runs the whole investigation — searching, reading code,
   looking up definitions, walking git history — and hands back a cited Markdown report.
@@ -35,10 +41,13 @@ re-derives every claim through the tools and returns `confirmed` / `disputed` /
 re-scoring its citations against the index as it stands now.
 
 **Reindexing is close to free.** A file is skipped by content hash *and* by the version
-of the code that derived its chunks and symbols, so an unchanged tree costs one round
-trip. When only the symbol extractor moves, `mindex-index --symbols-only` rebuilds the
-symbol table with no slicing, no GPU and no vector writes — measured at ~20× faster than
-a full pass on this repository.
+of the code that derived its chunks and symbols — and by *which model* embedded it — so
+an unchanged tree costs one round trip and a changed embedding model heals itself. When
+only the symbol extractor moves, `mindex-index --symbols-only` rebuilds the symbol table
+with no slicing, no GPU and no vector writes — measured at ~20× faster than a full pass
+on this repository. When only the model moves, `--vectors-only` re-embeds the stored
+chunks into that model's own collection: no re-slicing, and switching back is instant,
+because the previous model's vectors were never overwritten.
 
 **Exact lookup, honestly scoped.** `symbols` answers "where is X **defined**" from a
 tree-sitter symbol table built at index time, returning ranked candidates and full
@@ -58,14 +67,16 @@ no register to object to, so discovery still works where the prose does not. A t
 [VS Code extension](tools/vscode/README.md) drive the same API for humans; the extension
 ships as a `.vsix` on the
 [releases page](https://github.com/silencespeakstruth/mindex/releases), so
-`code --install-extension mindex-vscode-1.2.0.vsix` is the whole of installing it.
+`code --install-extension mindex-vscode-2.0.0.vsix` is the whole of installing it.
 
 ## Install
 
 **Prebuilt**, from the [releases page](https://github.com/silencespeakstruth/mindex/releases):
 `mindex-index` and `mindex-watch` for Linux, Windows and macOS (Intel and Apple
 silicon), the `mindex` server for Linux x86-64, and the VS Code `.vsix`. Unpack and put
-the binaries on `PATH`; each archive carries a `SHA256SUMS`.
+the binaries on `PATH`. Each archive is published with a `.sha256` sidecar beside
+it (`mindex-cli-x86_64-unknown-linux-gnu.tar.gz.sha256`), so
+`sha256sum -c <file>.sha256` verifies a download without a second tool.
 
 **From source:**
 
@@ -96,8 +107,16 @@ file explicitly there with `--config` or `$MINDEX_CONFIG`.
 Bottom-up: embedder → Qdrant → mindex.
 
 ```sh
-# 1. Embedder — never in a container (torch is ~8 GB and wants the GPU directly).
-cd embedder && uv sync && uv run python -m bge_m3_api --port 11211
+# 1. Embedder — never in a container (it wants the GPU directly). Install it
+#    OUTSIDE the checkout: it is a production dependency, and a working tree is
+#    not. deploy/embedder/ has the systemd unit and two alternative stacks, with
+#    the numbers that tell them apart.
+sudo mkdir -p /var/lib/mindex-embedder && cd /var/lib/mindex-embedder
+sudo python -m venv venv
+sudo venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm7.0 torch
+sudo venv/bin/pip install -r /path/to/mindex/deploy/embedder/requirements.txt
+sudo install -m0644 /path/to/mindex/deploy/embedder/server.py .
+venv/bin/uvicorn server:app --host 127.0.0.1 --port 11211
 
 # 2. Qdrant + mindex. No host ports by default; add the overlay to reach the API
 #    from the host (both loopback-only).
@@ -138,7 +157,8 @@ enabled = false                                   # the default; with it off, TL
                                                   # each caller reaches.
 
 [model]
-server_url = "http://localhost:11211"             # the BGE-M3 embedder
+server_url = "http://localhost:11211"             # any OpenAI-compatible embedder
+id         = "qwen3-embedding-0.6b"               # from the compiled registry
 
 [qdrant]
 server_url = "http://localhost:6334"
@@ -264,7 +284,12 @@ intersected — because a sync only drops what your refs no longer reach.
       --exit-code-from test-runner --abort-on-container-exit
   ```
 
-- **Why a custom embedder?** No off-the-shelf server (vLLM, Ollama, …) emits BGE-M3's
-  three heads together. [`embedder/`](embedder/README.md) exists solely to bridge that
-  and is meant to be deleted when one does.
+- **Why no bundled embedder?** There used to be one: BGE-M3's dense, sparse and
+  late-interaction heads came out of no general model server together, so mindex shipped
+  its own. Retrieval is dense-only now, that server was deleted, and the embedding side
+  is an ordinary OpenAI-compatible `/v1/embeddings` — any stack that serves one will do.
+  [`deploy/embedder/`](deploy/embedder/README.md) holds the contract, three recipes and
+  the checks worth running. Pick by the measured numbers, not the protocol: the same
+  model on the same card reindexes this repository in 51 s through the torch reference
+  server and 410 s through llama.cpp, while queries cost 16 ms against 30 ms.
 - **Licence:** [MIT](LICENSE).

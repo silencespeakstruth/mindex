@@ -1,5 +1,29 @@
 # mindex — semantic code index/search server.
 #
+# THIS IS ONE REAL HOST'S UNIT, NOT A TEMPLATE, and it is committed that way on
+# purpose. Its sibling `deploy/embedder/mindex-embedder.service` is parameterized
+# with YOUR_USER because nothing in it depends on where anything lives; this one
+# is the opposite. Half its lines exist because *this* machine splits a home
+# across two filesystems (/home is a btrfs subvolume, .cargo/.cache/.local are
+# symlinks into /data), and the BindReadOnlyPaths= pairs below are the shape that
+# fact forces — source on /data, destination where the process actually looks.
+# Substituting a placeholder would produce a file that reads as portable, is not,
+# and no longer explains itself.
+#
+# SO EDIT IT, and here is the whole list:
+#
+#   * `silencespeakstruth` -> your user, everywhere (User=, Group=, HOME=,
+#     HF_HOME=, ExecStart=, WorkingDirectory=, every Bind*Paths=)
+#   * the `/data/...:/home/...` bind pairs -> if your home is on ONE filesystem,
+#     collapse each pair to its single real path. Read the comment above them
+#     first; getting this wrong yields a dangling symlink inside the sandbox,
+#     and the symptom is "no such file" for a path that plainly exists.
+#   * `Documentation=` -> wherever you cloned the repository
+#
+# Verify with `systemd-analyze security mindex.service`, and then by actually
+# indexing a file and searching for it — every sandbox failure recorded in
+# `deploy/systemd/README.md` passed a start-and-check-health test.
+#
 # WHY THIS IS A SYSTEM UNIT AND NOT A USER UNIT
 #
 # It ran as a --user unit until 2026-08-04 and the filesystem sandbox worked
@@ -24,7 +48,7 @@
 #
 # ORDERING
 #
-# Qdrant and the BGE-M3 embedder moved to system units in the same change, and
+# Qdrant and the embedding server moved to system units in the same change, and
 # that is what makes the ordering real rather than lucky. While they were user
 # units this could only say After=user@1000.service, which waits for the manager
 # and not for what it starts: all three happened to come up in the same second
@@ -54,24 +78,25 @@ Environment=HOME=/home/silencespeakstruth
 
 # THE TOKENIZER IS A DEPENDENCY, NOT A CACHE, AND NOW LIVES LIKE ONE.
 #
-# The slicer counts tokens with BGE-M3's tokenizer, loaded by
-# Tokenizer::from_pretrained("BAAI/bge-m3") — which reads $HF_HOME and falls back
-# to huggingface.co on a miss. That fallback is refused by IPAddressDeny= below,
-# so the miss would be a start failure; and the default location was the shared
-# ~/.cache/huggingface, which is a *cache*: 48 GB that a disk cleanup or
+# The slicer counts tokens with the active model's tokenizer — the registry's
+# tokenizer_hf_id, "Qwen/Qwen3-Embedding-0.6B" for the whole Qwen3-Embedding
+# family — loaded by Tokenizer::from_pretrained, which reads $HF_HOME and falls
+# back to huggingface.co on a miss. That fallback is refused by IPAddressDeny=
+# below, so the miss would be a start failure; and the default location was the
+# shared ~/.cache/huggingface, which is a *cache* that a disk cleanup or
 # `huggingface-cli delete-cache` is entitled to evict, taking the server with it.
 #
-# So mindex owns its copy — 22 MB, five files, inside its own data directory,
-# beside the database it already treats as durable. Nothing else writes there and
+# So mindex owns its copy — a few files, inside its own data directory, beside
+# the database it already treats as durable. Nothing else writes there and
 # nothing sweeps it.
 #
-# Refreshing it (only needed if the upstream tokenizer ever changes, which would
-# be a CHUNKS_DERIVATION_VERSION event of its own):
-#   SRC=~/.cache/huggingface/hub/models--BAAI--bge-m3; SHA=$(cat $SRC/refs/main)
-#   DST=~/.local/share/mindex/hf/hub/models--BAAI--bge-m3
+# Refreshing it (needed on a registry tokenizer change, which is a chunker_id
+# event of its own — every file re-slices):
+#   SRC=~/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B
+#   SHA=$(cat $SRC/refs/main)
+#   DST=~/.local/share/mindex/hf/hub/models--Qwen--Qwen3-Embedding-0.6B
 #   mkdir -p $DST/snapshots/$SHA $DST/refs
-#   cp -L $SRC/snapshots/$SHA/{tokenizer.json,tokenizer_config.json,\
-#         special_tokens_map.json,config.json,sentencepiece.bpe.model} \
+#   cp -L $SRC/snapshots/$SHA/{tokenizer.json,tokenizer_config.json,config.json} \
 #         $DST/snapshots/$SHA/
 #   printf %s "$SHA" > $DST/refs/main
 Environment=HF_HOME=/home/silencespeakstruth/.local/share/mindex/hf
@@ -83,8 +108,8 @@ RestartSec=5
 
 # ── network ──────────────────────────────────────────────────────────────────
 #
-# Everything mindex speaks to is on loopback: the embedder (11211), Qdrant
-# (6334) and Ollama (11434). So the whole of its legitimate traffic fits inside
+# Everything mindex speaks to is on loopback: the embedder (11211),
+# Qdrant (6334) and Ollama (11434). So the whole of its legitimate traffic fits inside
 # `localhost`, and a compromised process gets no route off this machine — which
 # is the point, since the service is reachable from the internet through the
 # gate.

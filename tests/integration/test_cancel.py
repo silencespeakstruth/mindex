@@ -35,16 +35,26 @@ def cancel(
 
 
 def _wait_for_indexing(
-    client: httpx.Client, project: str, timeout: float = 10.0
+    client: httpx.Client, project: str, files: int = 1, timeout: float = 10.0
 ) -> None:
-    """Block until at least one file in the project is reported `indexing`."""
+    """Block until `files` files in the project are reported `indexing`.
+
+    The count is the whole point and must match what the caller is about to
+    select. `post_index` prepares file by file, so a test that waits for one and
+    then cancels a *different* one races the prepare loop: the cancel matches
+    only `status='indexing'` rows, finds none, and answers 204. That is a
+    passing-looking 204 against an assertion of 200 — the precondition never
+    held, so the test measured nothing about the selector it exists to pin.
+    Observed under a loaded suite, and not in isolation, which is the shape that
+    makes it read as a server regression.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         resp = stats(client, project)
-        if resp.status_code == 200 and resp.json()["files"]["indexing"] >= 1:
+        if resp.status_code == 200 and resp.json()["files"]["indexing"] >= files:
             return
         time.sleep(0.05)
-    raise AssertionError("no file entered 'indexing' within the timeout")
+    raise AssertionError(f"fewer than {files} file(s) entered 'indexing' in time")
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +91,7 @@ def test_cancel_indexed_file_is_noop(client: httpx.Client, project: str) -> None
 def test_cancel_live_indexing_file(
     client: httpx.Client, project: str, embed_delay: Callable[[float], None]
 ) -> None:
-    embed_delay(3.0)  # hold each /encode for 3s so the file lingers in 'indexing'
+    embed_delay(3.0)  # hold each embed call for 3s so the file lingers in 'indexing'
 
     def do_index() -> None:
         with httpx.Client(verify=False, timeout=30.0) as c:
@@ -130,7 +140,7 @@ def test_cancel_live_respects_selector(
     worker = threading.Thread(target=do_index)
     worker.start()
     try:
-        _wait_for_indexing(client, project)
+        _wait_for_indexing(client, project, files=2)
         resp = cancel(client, project, include={"paths": ["drop/**"]})
         assert resp.status_code == 200, resp.text
         assert resp.json()["cancelled_files"] == 1

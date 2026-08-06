@@ -1,0 +1,36 @@
+# The embedding server's dependencies.
+#
+#   python -m venv /var/lib/mindex-embedder/venv     # NOT inside the checkout
+#   .../bin/pip install --index-url https://download.pytorch.org/whl/rocm7.0 torch
+#   .../bin/pip install -r requirements.txt
+#
+# THE VENV MUST NOT LIVE IN THE REPOSITORY. It is a production dependency of a
+# systemd unit, and a checkout is a working tree: a branch switch, a `git clean
+# -xfd` or moving the directory takes the embedder down, and mindex's only
+# symptom is files going `failed` while the retry worker patiently re-attempts.
+# `README.md` beside this file has the unit paths.
+#
+# torch is deliberately NOT pinned and not listed: the build must match the
+# host's accelerator stack (ROCm / CUDA / XPU / CPU), so install it first from
+# the vendor's index. Pinning it here would pin the wrong wheel for most hosts.
+#
+# Everything else carries an UPPER bound as well as a lower one. The lower bound
+# is what the code needs; the upper is what stops an unattended `pip install -U`
+# from swapping a major version under a service that answers a contract. One of
+# these is not hypothetical — `@app.on_event("startup")` was deprecated in
+# FastAPI, and its removal would have left this server answering every
+# `/v1/embeddings` 503 with no model loaded. server.py now uses a lifespan
+# handler and `/health` returns 503 while `_model is None`, so the same removal
+# would be loud instead; the bound is the belt to that pair of braces.
+#
+# numpy and pydantic are listed although sentence-transformers and FastAPI pull
+# them in: server.py imports both directly, and a dependency you import is one
+# you declare — otherwise a transitive that drops them is an ImportError with no
+# obvious cause.
+sentence-transformers>=5.0,<6
+transformers>=4.50,<6
+numpy>=1.26,<3
+fastapi>=0.115,<1
+pydantic>=2.7,<3
+uvicorn>=0.30,<1
+orjson>=3.10,<4

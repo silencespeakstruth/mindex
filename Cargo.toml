@@ -1,12 +1,12 @@
 [package]
 name        = "mindex"
-version     = "1.2.0"
+version     = "2.0.0"
 edition     = "2024"
 authors     = ["Сергей Боголюбов"]
 license     = "MIT"
 repository  = "https://github.com/silencespeakstruth/mindex"
 readme      = "README.md"
-description = "Local-first semantic code search: hybrid BGE-M3 retrieval, tree-sitter symbols and agent research over your own repositories."
+description = "Local-first semantic code search: dense Qwen3-Embedding retrieval, tree-sitter symbols and agent research over your own repositories."
 keywords    = ["code-search", "rag", "embeddings", "tree-sitter", "mcp"]
 categories  = ["development-tools"]
 

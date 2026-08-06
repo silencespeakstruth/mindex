@@ -1,0 +1,55 @@
+# bench harness dependencies. Installed into bench/.venv:
+#
+#   python3 -m venv bench/.venv
+#   bench/.venv/bin/pip install -r bench/requirements.txt
+#
+# Every bound is an upper bound as well as a lower one, and that is the point:
+# this file exists so a number in PROTOCOL.md can be recomputed, and a floor-only
+# pin makes "the same harness" mean whatever PyPI served that week. The upper
+# bounds are the next major of each package — wide enough not to be maintenance,
+# narrow enough that a breaking release cannot silently change a metric. The
+# versions the published results were produced under are named in the comments.
+#
+# ── the harness itself ───────────────────────────────────────────────────────
+#   pyarrow  the ground-truth datasets ship as parquet
+#   numpy    per-query metric vectors
+#   httpx    the mindex client, matching tests/integration
+#   tokenizers  counts a query in the units the store constrains. Under v2 that
+#            was one ColBERT row per BGE-M3 token against Qdrant's multivector
+#            limit; under v3 nothing constrains query length that way, and it is
+#            kept because §4.2's exclusion is part of the frozen corpora.
+#   scipy    the bootstrap and permutation machinery leans on its RNG and
+#            distributions. NOTE: stats.py imports none of it — the permutation
+#            test and the BCa interval are written out against `random` and
+#            `statistics`, and the non-inferiority check is the interval, not a
+#            t-test (PROTOCOL §11, 2026-08-06). Kept because ranx pulls it in
+#            anyway and the metric cross-check needs it.
+pyarrow>=17,<26        # results produced under 25.0.0
+numpy>=1.26,<3         # 2.4.6
+scipy>=1.13,<2         # 1.18.0
+httpx>=0.27,<1         # 0.28.1
+tokenizers>=0.20,<1    # 0.23.1
+
+# ── the metric cross-check (tests/test_ranx_equivalence.py) ──────────────────
+# ranx is the independent implementation score.py is checked against, and the
+# test reaches into its internals (`ranx.metrics`), so an unpinned major is a
+# test that breaks for a reason unrelated to anything measured. numba is ranx's
+# JIT and is named explicitly because pip will otherwise resolve it to whatever
+# matches the numpy above, and that pair is the usual source of an import error
+# with no obvious cause.
+ranx>=0.3.20,<0.4      # 0.3.21
+numba>=0.60,<1         # 0.66.0
+pytest>=8,<10          # 9.1.1
+
+# ── baselines that load a model (optional; install only to re-run F5/F8) ─────
+# Not imported by run.py, score.py or stats.py, so the harness runs without
+# them; baselines/external_embedder.py and baselines/cross_encoder.py do not.
+# They are commented out because torch is ~3 GB and its build must match the
+# host accelerator — install the wheel your GPU wants first, then uncomment.
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/rocm7.0
+#   pip install 'sentence-transformers>=5,<6' 'transformers>=4.44,<6'
+#
+# torch>=2.5,<3
+# sentence-transformers>=5,<6
+# transformers>=4.44,<6

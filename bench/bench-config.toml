@@ -1,0 +1,97 @@
+# mindex config for the benchmark instance. NOT the live server's config.
+#
+# The benchmark runs against its own mindex process for three reasons, and only
+# the first is about tidiness:
+#
+#   1. Its own SQLite database and its own project GUIDs, so a benchmark pass
+#      cannot appear in the live index or be perturbed by it. Collection names
+#      derive from the GUID, so distinct GUIDs are what keep the two apart in
+#      Qdrant as well.
+#   2. Its own port, so the live server keeps serving the editor and the agents
+#      while a pass that takes hours is running.
+#   3. `[auth].enabled = false`, because the benchmark is a loopback client of
+#      a server that authorizes nothing — the one thing CLAUDE.md says that
+#      setting may mean. Minting a token would add a credential to the harness
+#      that measures nothing.
+#
+# Everything that could plausibly change a retrieval score is set to the live
+# server's value on purpose: the benchmark's external validity rests on
+# measuring the deployment people actually run, not a configuration invented
+# for it. Where a value differs, it is because it cannot affect retrieval
+# (bind, paths) or because the benchmark has no use for the subsystem
+# (research). Ablations override individual keys from the command line and
+# record the override in the result rows.
+
+# THREE PATHS ARE NOT IN THIS FILE, AND THAT IS DELIBERATE. The TLS certificate,
+# its key and the database file are per-machine, and a committed absolute path
+# under one author's home directory is the first thing that breaks for everybody
+# else. mindex takes all three as CLI flags, and a flag beats the TOML, so the
+# start command carries them:
+#
+#     mindex --config bench/bench-config.toml \
+#            --cert-path "$MINDEX_BENCH_CERT" \
+#            --key-path  "$MINDEX_BENCH_KEY" \
+#            --db-path   "$MINDEX_BENCH_DB"
+#
+# bench/README.md §Setup has the mkcert invocation that produces the first two.
+# `run.py` needs the database path as well — to read index state out of band —
+# and takes it from `--db-path`, defaulting to `$MINDEX_BENCH_DB`.
+
+[server]
+max_body_mib = 512
+
+[model]
+id         = "qwen3-embedding-0.6b"
+server_url = "http://localhost:11211"
+
+[qdrant]
+server_url = "http://localhost:6334"
+
+[database]
+pool_size = 64
+
+[indexing]
+# 2048 was chosen from perf/'s throughput numbers and OOM'd this host under the
+# v2 pipeline, where ColBERT stored one 1024-float row per TOKEN and an
+# in-flight batch cost batch x tokens-per-chunk x 4 KiB (~11.6 GB for one
+# pass, with mindex-index sending four such requests concurrently). Dense-only
+# retrieval removes that entirely — a 512-chunk batch is now 512 x 1024 x 4 B
+# = 2 MiB of response. 512 is kept because it is what the archived runs were
+# measured at, and the benchmark's job is to compare like with like; raising it
+# is a throughput question, not a quality one.
+embed_batch_chunks  = 512
+stuck_grace_minutes = 30
+
+[slicer]
+min_chunk_tokens     = 128
+# 364, the server's default since the sweep that measured it (FINDINGS.md
+# §2.5): +0.0108 nDCG@10 over 512, p = 0.030. Measured under the previous
+# tokenizer, so a re-sweep under Qwen3's is the open question this file is the
+# place to answer — override it from the command line, do not edit it silently.
+max_chunk_tokens     = 364
+fill_gaps            = true
+max_doc_chunk_tokens = 1024
+doc_semantic_weight  = 1.0
+
+[metrics]
+# ON, and this is not observability for its own sake. Two families are the only
+# detectors mindex has for failures that a benchmark would otherwise publish as
+# a quality score:
+#
+#   search_unscorable_winners  — chunks that came back with a NaN score.
+#     Its documented producer is the embedder's XPU backend returning NaN for
+#     padded fp16 rows off its default attention kernel, and a split deployment
+#     whose two instances differ in precision. Both answer 200. From the
+#     outside the symptom is "search sometimes ranks something irrelevant
+#     first", which reads as a ranking-quality finding and is not one.
+#   search_orphaned_winners    — Qdrant scored a chunk whose SQLite row is gone,
+#     i.e. the two stores disagree.
+#
+# Both are documented as expected to stay at zero. A benchmark is exactly the
+# consumer that must know when they do not, so run.py reads them per instance
+# and stops rather than scoring vectors it cannot trust. Nothing scrapes this
+# instance, so there is no series-collision with the live server's job.
+enabled = true
+
+[auth]
+enabled = false

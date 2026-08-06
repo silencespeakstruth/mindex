@@ -40,8 +40,9 @@ use crate::backend::metrics::{
 use crate::backend::v0::models::ProgrammingLanguage;
 use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
-use crate::models::bge_m3::BGEm3Model;
+use crate::models::embedder::Embedder;
 use crate::models::ollama::OllamaModel;
+use crate::models::registry::model_by_id;
 
 /// Collector settings (`[metrics]` config plus `[workers].max_retries`, which
 /// defines "permanently failed").
@@ -55,9 +56,8 @@ pub struct MetricsTuning {
     pub refresh_interval_seconds: u64,
     pub probe_dependencies: bool,
     pub max_retries: i64,
-    /// The embedding model whose rows this collector describes. `project_files` is
-    /// keyed `(project_guid, model_id, path)`, so the research staleness join would
-    /// otherwise match a run's baseline across every model the database has held.
+    /// The active embedding model's canonical id — what names the collections
+    /// the vector-count probe counts.
     pub model_id: String,
 }
 
@@ -68,8 +68,8 @@ pub struct MetricsTuning {
 /// call one instance two things.
 pub struct ProbeTargets {
     pub store: Arc<dyn VectorStore>,
-    pub embedder: Arc<dyn BGEm3Model>,
-    pub query_embedder: Option<Arc<dyn BGEm3Model>>,
+    pub embedder: Arc<dyn Embedder>,
+    pub query_embedder: Option<Arc<dyn Embedder>>,
     pub ollama: Arc<dyn OllamaModel>,
 }
 
@@ -139,7 +139,7 @@ pub async fn run(
 
         if let Some(p) = &probes {
             probe_dependencies(p, &metrics).await;
-            probe_vector_counts(&p.store, &db_pool, &metrics, &token).await;
+            probe_vector_counts(&p.store, &db_pool, &tuning.model_id, &metrics, &token).await;
         }
     }
 }
@@ -155,12 +155,9 @@ pub(crate) async fn collect_once(
     // One transaction for all seven aggregates: holding one of the pool's
     // connections for a few milliseconds a minute is nothing, while seven
     // transactions would be seven `spawn_blocking` round-trips.
-    let model_id = tuning.model_id.clone();
     let max_retries = tuning.max_retries;
     let snapshot = match db_pool
-        .transaction(token.clone(), move |tx| {
-            read_snapshot(tx, max_retries, &model_id)
-        })
+        .transaction(token.clone(), move |tx| read_snapshot(tx, max_retries))
         .with_cancellation_token(token)
         .await
     {
@@ -182,7 +179,6 @@ pub(crate) async fn collect_once(
 fn read_snapshot(
     tx: &rusqlite::Transaction,
     max_retries: i64,
-    model_id: &str,
 ) -> Result<Snapshot, SQLite3PoolError> {
     let mut s = Snapshot::default();
 
@@ -212,7 +208,6 @@ fn read_snapshot(
              FROM project_file_chunks c
              JOIN project_files f
                ON f.project_guid = c.project_guid
-              AND f.model_id     = c.model_id
               AND f.path         = c.file_path
              WHERE c.status = 'active'
              GROUP BY 1, 2",
@@ -278,10 +273,6 @@ fn read_snapshot(
     // to drop. It is still nothing like the `SUM(LENGTH(code))` scan the
     // "deliberately not measured" rule refused: that one evicts the page cache the
     // search candidate query depends on, this one touches an index.
-    //
-    // `model_id` is bound because project_files is keyed (project_guid, model_id,
-    // path); joining on the path alone would match a baseline against every embedding
-    // model the database has ever held.
     s.research_stale = tx
         .prepare(
             "SELECT r.project_guid, COUNT(*) FROM research_runs r
@@ -289,14 +280,13 @@ fn read_snapshot(
                     SELECT 1 FROM research_run_files rf
                     LEFT JOIN project_files pf
                            ON pf.project_guid = r.project_guid
-                          AND pf.model_id     = ?1
                           AND pf.path         = rf.path
                           AND pf.status      != 'deleted'
                      WHERE rf.run_id = r.id
                        AND (pf.sha256 IS NULL OR pf.sha256 <> rf.sha256))
               GROUP BY 1",
         )?
-        .query_map([model_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
 
     let pages: i64 = tx.pragma_query_value(None, "page_count", |r| r.get(0))?;
@@ -419,9 +409,20 @@ fn apply(metrics: &Metrics, snapshot: &Snapshot) {
 async fn probe_vector_counts(
     store: &Arc<dyn VectorStore>,
     db_pool: &SQLite3Pool,
+    model_id: &str,
     metrics: &Metrics,
     token: &CancellationToken,
 ) {
+    // The active model's collections are the ones search serves, so they are
+    // the ones whose emptiness is the lost-volume signal. Resolved per call so
+    // a bad id degrades to a no-op probe rather than a panic in a worker.
+    let Some(spec) = model_by_id(model_id) else {
+        warn!(
+            model_id,
+            "Metrics collector: unknown model id; skipping the vector-count probe."
+        );
+        return;
+    };
     let projects = match db_pool
         .transaction(token.clone(), |tx| {
             tx.prepare("SELECT guid FROM projects")?
@@ -446,7 +447,10 @@ async fn probe_vector_counts(
 
     let mut counted: Vec<(String, u64)> = Vec::with_capacity(projects.len());
     for guid in projects {
-        match store.count_points(&collection_name(&guid)).await {
+        match store
+            .count_points(&collection_name(&guid, spec.collection_slug))
+            .await
+        {
             Ok(Some(n)) => counted.push((guid, n)),
             // The store declines to answer (every test fake takes the trait's provided
             // impl, by design). Not an error, and not a zero — but also not a reason to
@@ -520,7 +524,7 @@ mod tests {
     use crate::backend::v0::models::UUIDv4;
     use crate::db::qdrant::{ChunkAsVector, SearchHit, VectorStoreError};
 
-    const MODEL: &str = "BAAI/bge-m3";
+    const MODEL: &str = "qwen3-embedding-0.6b";
 
     /// A store that answers the vector-count probe from a script keyed by collection
     /// name: `Some(Ok(n))` counts, `Some(Err)` fails, and a name absent from the map
@@ -536,7 +540,17 @@ mod tests {
             Self {
                 counts: pairs
                     .iter()
-                    .map(|(g, r)| (collection_name(g), *r))
+                    .map(|(g, r)| {
+                        (
+                            collection_name(
+                                g,
+                                model_by_id("qwen3-embedding-0.6b")
+                                    .expect("registered")
+                                    .collection_slug,
+                            ),
+                            *r,
+                        )
+                    })
                     .collect(),
                 declines: false,
             }
@@ -584,9 +598,6 @@ mod tests {
             _collection: &str,
             _chunk_ids: Vec<UUIDv4>,
             _dense: Vec<f32>,
-            _sparse_indices: Vec<u32>,
-            _sparse_values: Vec<f32>,
-            _colbert: Vec<Vec<f32>>,
             _top_k: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             unreachable!()
@@ -617,14 +628,14 @@ mod tests {
     async fn seed_project(pool: &SQLite3Pool, guid: &'static str) {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                rusqlite::params![guid, MODEL],
+                "INSERT INTO projects (guid) VALUES (?1)",
+                rusqlite::params![guid],
             )?;
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, ?2, 'src/a.rs', ?3, 'rust', 'indexing')",
-                rusqlite::params![guid, MODEL, "a".repeat(64)],
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'src/a.rs', ?2, 'rust', 'indexing')",
+                rusqlite::params![guid, "a".repeat(64)],
             )?;
             tx.execute(
                 "UPDATE project_files SET status = 'indexed'
@@ -719,7 +730,7 @@ mod tests {
         let metrics = Metrics::new();
         let token = CancellationToken::new();
 
-        probe_vector_counts(&store, &pool, &metrics, &token).await;
+        probe_vector_counts(&store, &pool, "qwen3-embedding-0.6b", &metrics, &token).await;
 
         let text = metrics.render().expect("renders");
         assert!(
@@ -748,7 +759,14 @@ mod tests {
         ]));
         let metrics = Metrics::new();
 
-        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+        probe_vector_counts(
+            &store,
+            &pool,
+            "qwen3-embedding-0.6b",
+            &metrics,
+            &CancellationToken::new(),
+        )
+        .await;
 
         let text = metrics.render().expect("renders");
         assert!(
@@ -781,7 +799,7 @@ mod tests {
         let metrics = Metrics::new();
         let token = CancellationToken::new();
 
-        probe_vector_counts(&store, &pool, &metrics, &token).await;
+        probe_vector_counts(&store, &pool, "qwen3-embedding-0.6b", &metrics, &token).await;
         assert!(metrics.render().expect("renders").contains(&format!(
             r#"mindex_project_vectors{{project_guid="{b}"}} 22"#
         )));
@@ -794,7 +812,7 @@ mod tests {
         .await
         .expect("delete");
 
-        probe_vector_counts(&store, &pool, &metrics, &token).await;
+        probe_vector_counts(&store, &pool, "qwen3-embedding-0.6b", &metrics, &token).await;
 
         let text = metrics.render().expect("renders");
         assert!(
@@ -824,7 +842,14 @@ mod tests {
         });
         let metrics = Metrics::new();
 
-        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+        probe_vector_counts(
+            &store,
+            &pool,
+            "qwen3-embedding-0.6b",
+            &metrics,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(
             !metrics
@@ -853,7 +878,14 @@ mod tests {
         let store: Arc<dyn VectorStore> = Arc::new(CountingStore::with(&[(counted, Ok(5))]));
         let metrics = Metrics::new();
 
-        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+        probe_vector_counts(
+            &store,
+            &pool,
+            "qwen3-embedding-0.6b",
+            &metrics,
+            &CancellationToken::new(),
+        )
+        .await;
 
         let text = metrics.render().expect("renders");
         assert!(
@@ -881,14 +913,21 @@ mod tests {
         let store: Arc<dyn VectorStore> = Arc::new(CountingStore::with(&[(a, Ok(9))]));
         let metrics = Metrics::new();
 
-        probe_vector_counts(&store, &pool, &metrics, &CancellationToken::new()).await;
+        probe_vector_counts(
+            &store,
+            &pool,
+            "qwen3-embedding-0.6b",
+            &metrics,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(metrics.render().expect("renders").contains(&format!(
             r#"mindex_project_vectors{{project_guid="{a}"}} 9"#
         )));
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        probe_vector_counts(&store, &pool, &metrics, &cancelled).await;
+        probe_vector_counts(&store, &pool, "qwen3-embedding-0.6b", &metrics, &cancelled).await;
 
         assert!(
             metrics.render().expect("renders").contains(&format!(

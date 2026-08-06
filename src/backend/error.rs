@@ -119,6 +119,10 @@ pub enum ApiError {
     /// has, or it sends the caller looking for one that does not exist.
     SelectorEmpty { field: &'static str },
 
+    /// `/index` was asked for `symbols_only` and `vectors_only` at once — two
+    /// disjoint "rebuild only this half" modes whose conjunction is empty.
+    IndexModesExclusive,
+
     // ── Validation (each carries the data its detail/meta interpolate) ──────────
     /// A repo-relative path violated the path rules (absolute / `..` / backslash / empty). 400.
     PathInvalid { path: String },
@@ -282,6 +286,7 @@ impl ApiError {
             ApiError::MalformedPath(_) => "request.malformed_path",
             ApiError::BodyTooLarge => "request.body_too_large",
             ApiError::SelectorEmpty { .. } => "selector.empty",
+            ApiError::IndexModesExclusive => "validation.index_modes_exclusive",
             ApiError::PathInvalid { .. } => "validation.path_invalid",
             ApiError::Sha256Invalid { .. } => "validation.sha256_invalid",
             ApiError::TopKOutOfRange { .. } => "validation.top_k_out_of_range",
@@ -377,6 +382,7 @@ impl ApiError {
             ApiError::MalformedPath(_) => "Malformed path parameter",
             ApiError::BodyTooLarge => "Request body too large",
             ApiError::SelectorEmpty { .. } => "Empty selector",
+            ApiError::IndexModesExclusive => "Exclusive index modes",
             ApiError::PathInvalid { .. } => "Invalid file path",
             ApiError::Sha256Invalid { .. } => "Invalid sha256",
             ApiError::TopKOutOfRange { .. } => "Invalid top_k",
@@ -502,6 +508,12 @@ impl ApiError {
                 "This endpoint refuses an empty selector, so that a destructive request \
                  cannot match everything by omission. Name what it applies to in `{field}`."
             ),
+            ApiError::IndexModesExclusive => {
+                "`symbols_only` and `vectors_only` are mutually exclusive: one rebuilds \
+                 only the symbol table, the other re-embeds only the stored chunks, and \
+                 a request asking for both asks for nothing."
+                    .into()
+            }
             ApiError::PathInvalid { path } => format!(
                 "Path {path:?} is invalid: paths must be non-empty, repo-relative (no leading '/'), \
                  free of '..' traversal, and use '/' (no backslash)."
@@ -1065,6 +1077,46 @@ mod tests {
         assert_eq!(
             codes, expected,
             "error-code contract changed — update intentionally"
+        );
+    }
+
+    /// **The catalogue in the OpenAPI description is the published contract, and
+    /// nothing checked it.** `openapi.rs`'s `info.description` calls the `code`
+    /// "the field a client localizes against" and then lists them — which makes
+    /// that list the one a client author reads, and an omission a code they
+    /// never write a message for. Four had accumulated
+    /// (`index.file_in_flight`, `auth.route_not_configured`,
+    /// `validation.index_modes_exclusive`, `research.invented`), each shipped by
+    /// a change that correctly updated `codes_are_stable` next door and did not
+    /// know the prose existed.
+    ///
+    /// Asserted in one direction only, deliberately. Every real code must be
+    /// listed; the reverse would forbid the description from ever mentioning a
+    /// retired code in a sentence about its retirement, which is the one thing a
+    /// contract document should be free to do.
+    #[test]
+    fn the_published_error_catalogue_names_every_code() {
+        let doc = crate::backend::openapi::api_doc();
+        let description = doc
+            .info
+            .description
+            .expect("the spec's description carries the code catalogue");
+
+        let missing: Vec<&str> = every_variant()
+            .iter()
+            .map(ApiError::code)
+            // Backticked, so a code cannot be matched by a substring of a longer
+            // one — `research.no_report` would otherwise satisfy nothing and
+            // `ollama.error` would be found inside `internal.error` if the
+            // delimiters were dropped.
+            .filter(|code| !description.contains(&format!("`{code}`")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these codes exist and are absent from the catalogue in \
+             openapi.rs's info.description, which clients are told to key on: \
+             {missing:?}"
         );
     }
 

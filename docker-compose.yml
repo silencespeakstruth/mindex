@@ -5,8 +5,9 @@
 #
 # No host ports are published: the whole stack lives on the internal compose network and
 # talks to itself there. The only host boundary it crosses is OUTBOUND — reaching the
-# embedder on the host (host.docker.internal:11211, via extra_hosts below). Integration
-# tests use docker-compose.test.yml instead (not this file).
+# embedder on the host (host.docker.internal:11211 by default — see deploy/embedder/,
+# via extra_hosts below). Integration tests use docker-compose.test.yml instead (not
+# this file).
 services:
 
   qdrant:
@@ -37,9 +38,10 @@ services:
       - "host.docker.internal:host-gateway"
     # The perf-tunable flags read from the environment (see .env.example and
     # perf/env/*.env). Swap a profile with:  docker compose --env-file <file> up -d
-    # NOTE: the embedder runs on the HOST (not in compose), so its --batch /
-    # --max-inflight / --maxlen are NOT set here — restart the host embedder to change
-    # them. .env only covers the mindex side of the matrix.
+    # NOTE: the embedder runs on the HOST (not in compose), so ITS serving knobs
+    # (llama.cpp's -np/--ubatch-size, vLLM's --gpu-memory-utilization) are NOT set
+    # here — they live wherever that server is configured and need it restarted.
+    # .env only covers the mindex side of the matrix.
     command:
       - --bind=0.0.0.0:11111
       - --db-path=/data/mindex.db
@@ -47,7 +49,7 @@ services:
       - --key-path=/certs/key.pem
       - --qdrant-server=http://qdrant:6334
       - --model-server=${MINDEX_MODEL_SERVER:-http://host.docker.internal:11211}
-      # Chunks per /encode call — the GPU-batch lever; keep >= the embedder's --batch.
+      # Chunks per /v1/embeddings call — the GPU-batch lever.
       - --embed-batch=${MINDEX_EMBED_BATCH:-1024}
       # Connection pool: the indexer's --concurrency must stay <= this (the pool
       # errors when exhausted, it doesn't block).

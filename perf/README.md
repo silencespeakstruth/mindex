@@ -4,6 +4,29 @@
 mindex. Every number below was measured on one machine and is offered as the shape of
 the problem, not as a specification — re-measure on yours.*
 
+> **Status after retrieval v3 (2026-08).** The harness measures what it was built to
+> measure — the *mindex* side of indexing throughput — and it now measures **only**
+> that. The eight embedder-side columns came from `GET /stats` on the vendored BGE-M3
+> server, which is deleted; the OpenAI-compatible contract that replaced it has no
+> equivalent, and no general server extends it with one. Those columns
+> (`embedder_batch`, `embedder_max_inflight`, `embedder_maxlen`, `fwd_batch_mean`,
+> `fwd_batch_max`, `embedder_encode_s`, `queue_highwater`, `embedder_429`) have been
+> **removed** rather than left recording `NA`, along with the two plots that charted
+> them and the `POST /stats/reset` call that warned on every level of every run. A
+> column that is always `NA` reads as a measurement that failed rather than one that
+> was never taken.
+>
+> If you want that signal back, scrape the embedder's own metrics endpoint beside
+> mindex — see [`deploy/victoriametrics/`](../deploy/victoriametrics/) — rather than
+> sampling it from here. Sampling per run was always the weaker design; it just took
+> the removal of one server's private API to make that obvious.
+>
+> The four findings below are about a pipeline that no longer exists (three heads,
+> ColBERT multivectors) and about a signal this harness no longer reads. They are
+> retained as the record of *why* the embed path is shaped the way it is, and each
+> is marked. The retrieval-quality question they are sometimes mistaken for belongs
+> to [`bench/`](../bench/README.md).
+
 A hardware-agnostic load-test harness for tuning **indexing throughput** and GPU
 utilization. It simulates real indexing by POSTing source from real GitHub projects
 to `/index`, sweeps the tuning knobs, and writes a comparative CSV so the optimum
@@ -29,8 +52,11 @@ are **illustrative of the shape**, not a spec — re-measure on yours.
    ~70% of each request, all on the GPU worker thread (so the GPU sat idle during
    serialization). The "GPU encode share" looked high only because that CPU time was
    being timed as encode. **Fix:** a compact length-prefixed **binary `/encode` wire
-   format** (see `embedder/README.md` and `src/models/bge_m3.rs`). This alone took the
-   single-stream rate from ~24-25 to the point where the GPU was the next limit.
+   format**. *(History: both that server and the wire format are deleted — the
+   finding survives as the reason mindex batches at all. Under v3 the response is
+   one dense vector per chunk, ~4 KiB, and JSON costs nothing worth measuring.)*
+   This alone took the single-stream rate from ~24-25 to the point where the GPU
+   was the next limit.
 
 2. **The GPU forward batch is capped by SHARD SIZE, not by `--batch`.** Each `/index`
    request embeds in one shot, so the forward-pass batch equals *chunks-per-request*.
@@ -56,10 +82,17 @@ are **illustrative of the shape**, not a spec — re-measure on yours.
 
 **Takeaway / lever order:** the binary protocol and single-forward fixes are baked into
 the code. What's left for *you* to tune per machine: **(a)** shard size until the GPU
-fills (`fwd_batch_mean`), **(b)** request concurrency until throughput plateaus or the
-latency knee / `err_*` appear. `--embed-batch` and the embedder `--batch` only need to
-be ≥ chunks-per-request so they don't *re-split* a shard; past that they're not the
+fills, **(b)** request concurrency until throughput plateaus or the latency knee /
+`err_*` appear. `--embed-batch` and the embedder's own batch flag only need to be
+≥ chunks-per-request so they don't *re-split* a shard; past that they're not the
 lever. This harness lets you find both knees on your hardware.
+
+**How to see (a) now that `fwd_batch_mean` is gone.** The forward batch is still what
+matters and it is no longer readable from the client, so read it off the outcome
+instead: sweep `--shard-files` and watch `chunks_per_s` at fixed concurrency. It rises
+while the GPU is being under-fed and flattens when it is not, which is the same knee
+the column used to name directly — one plot instead of one number, and it needs no
+cooperation from the embedder.
 
 ## Pieces
 
@@ -72,9 +105,11 @@ lever. This harness lets you find both knees on your hardware.
 | `plot.sh` | optional gnuplot views of the CSV |
 | `analyze.ipynb` | optional Jupyter explorer (set `RESULT_DIRS`, *Run All*) |
 
-The embedder exposes `GET /stats` + `POST /stats/reset` (added in `embedder/`) so the
-harness records the live embedder config and the **effective forward-pass batch
-size** — the direct "is the GPU being fed" signal — without touching hardware.
+The vendored embedder used to expose `GET /stats` + `POST /stats/reset`, which is how
+the harness recorded the live embedder config and the **effective forward-pass batch
+size** — the direct "is the GPU being fed" signal. That server is gone, and with it any
+way for a client to ask an embedder what it is doing; the columns are removed rather
+than left `NA`, and the knee is now read off `chunks_per_s` (see above).
 
 Dependencies: `k6`, `jq`, `curl`, `awk`, `git` (and `gnuplot` for plots).
 
@@ -86,10 +121,14 @@ The axes split in two:
 
 - **Within a run (the harness varies this):** request **concurrency** — pass a list
   of VU levels, one CSV row each.
-- **Between runs (you change + restart, then rerun):** embedder `--batch` /
-  `--max-inflight`, mindex `--embed-batch` / `--db-pool-size`. The harness reads
-  these live from `GET /config` and `GET /stats`, so every CSV row records exactly
-  the config that produced it. The CSV is **append-only**, so the matrix accumulates
+- **Between runs (you change + restart, then rerun):** the embedder's own serving
+  knobs (device, dtype, batch and token budget — `MINDEX_EMBED_*` in
+  `~/.config/mindex/embedder.env`, see
+  [`deploy/embedder/`](../deploy/embedder/README.md)), and mindex's
+  `--embed-batch` / `--db-pool-size` / `[model].id`.
+  The harness reads the mindex half live from `GET /config`, so every CSV row records
+  the mindex config that produced it; the embedder half is no longer readable and is
+  what `--label` is for. The CSV is **append-only**, so the matrix accumulates
   across reruns.
 
 Each run uses a **fresh project GUID** and deletes it afterward, so nothing is
@@ -105,12 +144,14 @@ perf/corpus/fetch.sh                       # → perf/corpus/data/default/
 # 2. Make sure mindex + embedder + Qdrant are up with the flags you want to test.
 
 # 3. Benchmark across concurrency levels. Each run writes ITS OWN file:
-#    perf/results/<UTC-stamp>_eb<embed_batch>_pool<db_pool>_xb<embedder_batch>[_<label>].csv
-#    (auto-named from the live config; runs never overwrite each other).
-perf/run.sh --concurrency "1 2 4 8" --label "embedder_batch=16"
+#    perf/results/<UTC-stamp>_<model_id>_eb<embed_batch>_pool<db_pool>[_<label>].csv
+#    (auto-named from GET /config; runs never overwrite each other).
+#    The embedder's own settings are NOT readable over the OpenAI-compatible
+#    contract, so put them in --label if you are sweeping them.
+perf/run.sh --concurrency "1 2 4 8" --label "embed_batch=256"
 
-# 4. Change embedder --batch (e.g. 64), restart the embedder, rerun — new file:
-perf/run.sh --concurrency "1 2 4 8" --label "embedder_batch=64"
+# 4. Change something on the embedder (batch, dtype, device), restart it, rerun:
+perf/run.sh --concurrency "1 2 4 8" --label "embed_batch=256 dtype=bf16"
 
 # 5. Plot — reads ALL per-run files in perf/results/ and compares them (optional).
 perf/plot.sh                               # → perf/plots/
@@ -118,8 +159,9 @@ perf/plot.sh                               # → perf/plots/
 
 k6's native progress bar and end-of-test summary are shown live during each run.
 Results files live in `perf/results/` (gitignored — kept for comparison, never
-committed). Key `run.sh` flags: `--mindex-url`, `--embedder-url` (pass `""` to skip
-`/stats`), `--corpus`, `--out` (override the auto name), `--concurrency`, `--label`.
+committed). Key `run.sh` flags: `--mindex-url`, `--embedder-url` (pass `""` to skip the
+reachability probe), `--corpus`, `--out` (override the auto name), `--concurrency`,
+`--label`.
 See `--help` on each script.
 
 ## Changing mindex config via docker compose (.env profiles)
@@ -140,30 +182,37 @@ Ready profiles in `perf/env/`: `baseline.env`, `big-batch.env`,
 docker compose --env-file perf/env/big-batch.env config | grep -E 'embed-batch|db-pool-size'
 ```
 
-**The embedder is not in compose** (it runs on the host for GPU access), so its
-`--batch` / `--max-inflight` / `--maxlen` — the main GPU lever — are **not** set by
-these files. Change them on the embedder's launch command and restart it by hand;
-`.env` profiles cover only the mindex side of the matrix.
+**The embedder is not in compose** (it runs on the host for GPU access), so its own
+serving knobs are **not** set by these files. Change them in
+`~/.config/mindex/embedder.env` (`MINDEX_EMBED_DEVICE`, `_DTYPE`, `_MAX_ROWS`,
+`_TOKEN_BUDGET`, `_MAX_SEQ` — see
+[`deploy/embedder/embedder.env.example`](../deploy/embedder/embedder.env.example)) and
+restart the unit (`systemctl restart mindex-embedder`); `.env` profiles cover only the
+mindex side of the matrix.
 
 ## Tuning method
 
 The two code-level taxes (JSON serialization, double forward) are already fixed, so
 tuning is about **feeding** the GPU and then **keeping it fed**:
 
-1. **Baseline** at current defaults (`perf/env/baseline.env`). Note `fwd_batch_mean`,
-   `chunks_per_s`, and the `embedder_encode_s / wall_clock_s` ratio.
+1. **Baseline** at current defaults (`perf/env/baseline.env`). Note `chunks_per_s` and
+   `req_dur_p95` at each concurrency level.
 2. **Grow shard size** to enlarge the GPU forward batch — this is the primary lever.
    Rebuild the corpus with bigger shards and rerun:
    `corpus/fetch.sh --name shard64 --shard-files 64` then `run.sh --corpus
-   corpus/data/shard64 …`. Watch `fwd_batch_mean` climb and `chunks_per_s` with it.
-   The bare backbone **saturates around batch ~64-128**, so stop once `fwd_batch_mean`
-   is in that range — bigger shards past that add latency, not throughput.
-3. **Keep `--embed-batch` and the embedder `--batch` ≥ chunks-per-request** so a shard
-   isn't re-split into several smaller forwards. They are guardrails, not the lever.
+   corpus/data/shard64 …`, and watch `chunks_per_s`. It rises while the forward pass
+   is under-filled and flattens once it is not; that flattening is the same knee the
+   retired `fwd_batch_mean` column used to name directly. Saturation was measured
+   around 64-128 sequences per forward on this hardware — past it, bigger shards add
+   latency and not throughput.
+3. **Keep `--embed-batch` and the embedder's own batch ≥ chunks-per-request** so a
+   shard isn't re-split into several smaller forwards. They are guardrails, not the
+   lever.
 4. **Push concurrency + `--db-pool-size`** (`perf/env/high-concurrency.env`) to overlap
    slicing / Qdrant upsert with GPU encode. Raise until `chunks_per_s` plateaus, the
    latency knee appears, or `err_500` (pool exhaustion: concurrency > `--db-pool-size`)
-   / `err_429`/`embedder_429` (backpressure) show up.
+   / `err_429` and `err_503` (backpressure — the embedder spells "busy" both ways, and
+   mindex retries both) show up.
 5. Watch VRAM with *your own* tool (`rocm-smi`/`nvidia-smi`) out of band. Pick the
    config at the **latency knee** with an acceptable error rate — the optimum is
    machine-specific.
@@ -173,17 +222,19 @@ tuning is about **feeding** the GPU and then **keeping it fed**:
 One file per run, one row per concurrency level. Headline columns:
 
 - `chunks_per_s` — primary throughput metric.
-- `fwd_batch_mean` / `fwd_batch_max` — sequences per GPU forward pass. If this stays
-  small while you raise `--embed-batch`/`--batch`, the cap is **shard size**, not the
-  batch flags — fatten shards (`--shard-files`). Aim to fill the GPU (~64-128), no more.
-- `embedder_encode_s` vs `wall_clock_s` — how much of the wall time is actual GPU
-  encoding vs overhead (slicing / Qdrant upsert / transport). `encode_s ≈ wall_s` ⇒
-  GPU-bound; much lower ⇒ the GPU is idle waiting on the rest of the pipeline.
+- `model_id` — which embedder produced the row. Two runs at different models are not
+  comparable on throughput *or* on anything else; it is in the filename for that reason.
+- `min_pool_available` — the low-water mark of the SQLite pool over the run. Approaching
+  0 while `err_500` climbs is pool exhaustion, not embedder backpressure, and the fix is
+  `--db-pool-size` rather than shard size.
 - `req_dur_p95` — per-request latency (= per-shard with the default sharding); the
   knee against `chunks_per_s` marks the optimum. (With a single-shard corpus this is
   just the whole-corpus time, not a meaningful percentile — keep shards small.)
-- `err_429`/`embedder_429` — backpressure (embedder saturated). `err_500` — SQLite
-  pool exhaustion (concurrency > `--db-pool-size`). `err_503` — embedder unreachable.
+- `err_429` / `err_503` — backpressure. The embedder spells "busy" both ways and
+  mindex retries both (`[model].max_429_retries`), so a row carrying either is one
+  where indexing was throttled rather than one where it failed. Sustained `err_503`
+  with no `err_429` is the embedder being *unreachable* instead of saturated.
+  `err_500` — SQLite pool exhaustion (concurrency > `--db-pool-size`).
 - `min_pool_available` — lowest SQLite pool headroom seen during the run (0 ⇒
   saturated; sampled by `run.sh` polling `GET /status`).
 
@@ -194,12 +245,16 @@ or load it into a spreadsheet — the CSV is the source of truth.
 
 `analyze.ipynb` is a richer interactive alternative: set `RESULT_DIRS` (one or more
 folders of `*.csv`) in the first cell and *Run All*. It concatenates every CSV under
-those folders, groups rows into a **config signature** (embed_batch / db_pool_size /
-embedder_batch / max_inflight + `label`) with concurrency as the x-axis, and renders a
-summary table plus throughput, latency-knee, latency-percentile, GPU-encode-share
-(`embedder_encode_s / wall_clock_s`), forward-pass-batch (vs `chunks_per_req` and the
-configured `--batch`), and error/pool-headroom views — closing with a few
-auto-generated takeaways. Deps: `pandas`, `matplotlib` (+ a Jupyter kernel).
+those folders, groups rows into a **config signature** (model_id / embed_batch /
+db_pool_size + `label`) with concurrency as the x-axis, and renders a summary table
+plus throughput, latency-knee, latency-percentile and error/pool-headroom views —
+closing with a few auto-generated takeaways. Deps: `pandas`, `matplotlib` (+ a Jupyter
+kernel).
+
+**It has not been re-run since the column removal**, and its config signature still
+names `embedder_batch`/`max_inflight`; the GPU-encode-share and forward-pass-batch
+cells will KeyError on a v3 CSV. Fix the signature and drop those two cells before
+trusting it, or use `plot.sh`, which was updated.
 
 ## Notes
 
@@ -207,6 +262,7 @@ auto-generated takeaways. Deps: `pandas`, `matplotlib` (+ a Jupyter kernel).
   and deletes its project, but it shares the Qdrant/SQLite instance you point it at.
 - Keep the corpus large enough to keep the GPU busy for the whole run (tens of
   thousands of chunks); a too-small corpus finishes before steady state.
-- The embedder `/stats` numbers are **logical** (derived from request shape and
-  `--batch`, matching how the embedder sub-batches a call) — not GPU telemetry. Correlate
-  them with your own VRAM/utilization tool for the hardware view.
+- **Nothing here is GPU telemetry.** Every column is measured from the client or read
+  from mindex; the embedder is a black box behind `/v1/embeddings`. Correlate with your
+  own VRAM/utilization tool (`rocm-smi`, `nvidia-smi`, `intel_gpu_top`) for the hardware
+  view, or scrape the embedder's own metrics if it has them.

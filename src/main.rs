@@ -1,10 +1,10 @@
-use crate::backend::http3::{EmbeddingModel, RouterState};
+use crate::backend::http3::{ActiveModel, RouterState};
 use crate::config::Cli;
 use crate::db::qdrant::{QdrantStore, VectorStore};
 use crate::db::qdrant_metrics::MeteredVectorStore;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::embed::EmbedTuning;
-use crate::models::bge_m3::{BGEm3HttpClient, BGEm3Model, BGEm3Tuning, MeteredEmbedder};
+use crate::models::embedder::{Embedder, EmbedderTuning, MeteredEmbedder, OpenAiEmbedClient};
 use crate::models::ollama::{OllamaHttpClient, OllamaModel, OllamaTuning};
 use crate::worker::retry::RetryTuning;
 use clap::Parser;
@@ -95,23 +95,105 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
 // Applied in order on startup: only migrations whose version exceeds the
 // current `PRAGMA user_version` are run, inside one transaction. `pub(crate)`
 // so test modules build a schema-identical `:memory:` pool from the same source.
-pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
-    (1, include_str!("db/migrations/v1.0.0_schema.sql")),
-    (2, include_str!("db/migrations/v1.1.0_git_history.sql")),
-    (
-        3,
-        include_str!("db/migrations/v1.1.0_toml_yaml_languages.sql"),
-    ),
-    (4, include_str!("db/migrations/v1.2.0_research_context.sql")),
-    (
-        5,
-        include_str!("db/migrations/v1.3.0_research_verification.sql"),
-    ),
-    (
-        6,
-        include_str!("db/migrations/v1.4.0_symbol_definitions.sql"),
-    ),
-];
+//
+// The lineage restarted at 1 with the v2 baseline: the v1 lineage (model_id in
+// seven primary keys, no embedding-model registry) is refused by
+// `refuse_old_lineage` below rather than migrated — see the header of
+// v2.0.0_schema.sql.
+pub(crate) const MIGRATIONS: &[(i32, &str)] =
+    &[(1, include_str!("db/migrations/v2.0.0_schema.sql"))];
+
+/// 'MX03'. Stamped by the baseline's `PRAGMA application_id`; read by
+/// `refuse_old_lineage` before any migration runs.
+pub(crate) const APPLICATION_ID: i32 = 0x4D58_3033;
+
+/// Refuse an initialized database of the pre-v2 lineage.
+///
+/// The v1 schema is not migratable (the model registry rebuild touches every
+/// table), and reading it wrongly is worse than refusing it: `user_version` 1..6
+/// would read as "no pending migrations beyond 1" and the first query against a
+/// missing column would 500. A database that was never initialized has both
+/// pragmas at 0 and passes; the baseline then stamps `application_id`.
+pub(crate) fn refuse_old_lineage(
+    tx: &rusqlite::Transaction,
+    db_path: &str,
+) -> Result<(), db::sqlite3::SQLite3PoolError> {
+    let app_id: i32 = tx.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let user_version: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if app_id != APPLICATION_ID && user_version > 0 {
+        return Err(db::sqlite3::SQLite3PoolError::Sql(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                Some(format!(
+                    "this database predates the v2 retrieval schema \
+                     (application_id {app_id:#010x}, schema version {user_version}) and \
+                     cannot be migrated. Delete it — {db_path} plus its -wal/-shm \
+                     companions — and the old Qdrant collections, restart, and reindex \
+                     every project (mindex-index --force). See docs/claude/retrieval-v3.md."
+                )),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to run when the compiled model registry and the database's
+/// `embedding_models` table disagree.
+///
+/// The table is the schema's half of model identity (its CHECK is what stops a
+/// hand-edited row); this is the binary's half. A mismatch means this binary
+/// would reinterpret vectors some other binary produced — the one failure that
+/// surfaces as "search sometimes can't find the obvious thing" and never as an
+/// error, so it is refused at startup while it still has a name.
+pub(crate) fn verify_model_registry(
+    tx: &rusqlite::Transaction,
+) -> Result<(), db::sqlite3::SQLite3PoolError> {
+    use crate::models::registry::{EMBEDDING_MODELS, model_by_id};
+
+    let mismatch = |msg: String| {
+        db::sqlite3::SQLite3PoolError::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+            Some(msg),
+        ))
+    };
+
+    let mut stmt = tx.prepare("SELECT id, dim FROM embedding_models")?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    for (id, dim) in &rows {
+        match model_by_id(id) {
+            None => {
+                return Err(mismatch(format!(
+                    "the database's embedding_models table names {id:?}, which this \
+                     binary's registry does not know — the binary is older than the \
+                     database. Deploy the binary that introduced {id:?}."
+                )));
+            }
+            Some(spec) if spec.dim as i64 != *dim => {
+                return Err(mismatch(format!(
+                    "the registry says {id} is {}-d, the database says {dim} — one \
+                     of the two would reinterpret stored vectors. Refusing to run.",
+                    spec.dim
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    for spec in EMBEDDING_MODELS {
+        if !rows.iter().any(|(id, _)| id == spec.id) {
+            return Err(mismatch(format!(
+                "the registry knows {:?} but the database's embedding_models table \
+                 does not — the migration that seeds it did not run. The database \
+                 predates this binary; apply its migrations (a plain restart does) \
+                 or restore the matching binary.",
+                spec.id
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Applies every migration whose version exceeds the DB's `PRAGMA user_version`,
 /// then stamps `user_version` to the highest applied version. Returns the resulting
@@ -418,8 +500,17 @@ async fn main() -> Result<(), BoxError> {
         .with_metrics(&metrics),
     );
 
+    // One transaction: lineage refusal first (an old-lineage database must not be
+    // read at all), migrations, then the registry cross-check (which needs the
+    // `embedding_models` table the baseline just seeded).
+    let db_path_for_refusal = cfg.database.path.display().to_string();
     let db_schema_version = match db_pool
-        .migration_transaction(token, apply_pending_migrations)
+        .migration_transaction(token, move |tx| {
+            refuse_old_lineage(tx, &db_path_for_refusal)?;
+            let applied = apply_pending_migrations(tx)?;
+            verify_model_registry(tx)?;
+            Ok(applied)
+        })
         .await
     {
         Ok((v, true)) => {
@@ -442,7 +533,15 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
-    let model_id = cfg.model.name.as_str(); // For now, only one model is supported.
+    // The active embedding model. Config validation already guaranteed the id
+    // resolves; this is the one place the spec is looked up for the process.
+    let spec = models::registry::model_by_id(&cfg.model.id)
+        .expect("config validation guarantees [model].id resolves in the registry");
+    let served_name = cfg
+        .model
+        .served_name
+        .clone()
+        .unwrap_or_else(|| spec.hf_repo.to_string());
 
     // Identity is only knowable now: the schema version is whatever the startup
     // migration left behind.
@@ -452,7 +551,7 @@ async fn main() -> Result<(), BoxError> {
         .get_or_create(&backend::metrics::BuildLabels {
             version: env!("CARGO_PKG_VERSION"),
             db_schema_version: db_schema_version.to_string(),
-            model_id: model_id.to_string(),
+            model_id: spec.id.to_string(),
         })
         .set(1);
     metrics
@@ -464,7 +563,6 @@ async fn main() -> Result<(), BoxError> {
     let embed_tuning = EmbedTuning {
         embed_batch: cfg.indexing.embed_batch_chunks,
         upsert_batch: cfg.qdrant.upsert_batch_points,
-        sparse_min_weight: cfg.indexing.sparse_min_weight,
     };
 
     // Surface files that have exhausted their retries — the retry worker stops
@@ -495,34 +593,36 @@ async fn main() -> Result<(), BoxError> {
         Arc::new(QdrantStore::new(
             // Both timeouts set explicitly. The client's own defaults are 5 s for
             // each, and nothing here could override them: a project big enough that
-            // fusion + ColBERT rerank ran past five seconds failed every single search
-            // with `qdrant.unavailable`, with no knob to reach for.
+            // a search ran past five seconds failed every single one with
+            // `qdrant.unavailable`, with no knob to reach for.
             Qdrant::from_url(cfg.qdrant.server_url.as_str())
                 .timeout(Duration::from_millis(cfg.qdrant.timeout_ms))
                 .connect_timeout(Duration::from_millis(cfg.qdrant.connect_timeout_ms))
                 .build()?,
-            cfg.qdrant.dense_prefetch_limit,
-            cfg.qdrant.sparse_prefetch_limit,
-            cfg.qdrant.fusion_limit,
+            spec.dim as u64,
             cfg.qdrant.search_hnsw_ef,
         )),
         metrics.clone(),
     ));
 
+    let embed_tuning_http = EmbedderTuning {
+        max_429_retries: cfg.model.max_429_retries,
+        backoff_base_ms: cfg.model.backoff_base_ms,
+        health_timeout_ms: cfg.model.health_timeout_ms,
+        encode_timeout_ms: cfg.model.encode_timeout_ms,
+    };
+
     // One embedding client, shared (as a trait object) by the retry worker and the
     // HTTP handlers — built once rather than per consumer.
-    let embed_client: Arc<dyn BGEm3Model> = Arc::new(MeteredEmbedder::new(
+    let embed_client: Arc<dyn Embedder> = Arc::new(MeteredEmbedder::new(
         Arc::new(
-            BGEm3HttpClient::new(
+            OpenAiEmbedClient::new(
                 cfg.model.server_url.clone(),
-                BGEm3Tuning {
-                    max_429_retries: cfg.model.max_429_retries,
-                    backoff_base_ms: cfg.model.backoff_base_ms,
-                    health_timeout_ms: cfg.model.health_timeout_ms,
-                    encode_timeout_ms: cfg.model.encode_timeout_ms,
-                },
+                served_name.clone(),
+                spec.dim,
+                embed_tuning_http,
             )
-            // The 429 retry loop is inside `encode`, so the decorator outside it
+            // The busy-retry loop is inside `embed`, so the decorator outside it
             // cannot see a retry — only the client can count them.
             .with_metrics(&metrics, "index"),
         ),
@@ -533,25 +633,22 @@ async fn main() -> Result<(), BoxError> {
     // The query path: a second instance when the operator split the workloads,
     // otherwise literally the same `Arc`. Same tuning — the retry/backoff and
     // timeout semantics do not change with the device.
-    let query_embed_client: Arc<dyn BGEm3Model> = match &cfg.model.query_server_url {
+    let query_embed_client: Arc<dyn Embedder> = match &cfg.model.query_server_url {
         Some(url) => {
             info!(
                 index_server = %cfg.model.server_url,
                 query_server = %url,
-                "Serving the query path from a separate embedder instance. It must run \
-                 the same model at the same precision as the indexing instance, or \
-                 query and index vectors disagree."
+                "Serving the query path from a separate embedder instance. It must \
+                 serve the same model at the same precision as the indexing instance, \
+                 or query and index vectors disagree."
             );
             Arc::new(MeteredEmbedder::new(
                 Arc::new(
-                    BGEm3HttpClient::new(
+                    OpenAiEmbedClient::new(
                         url.clone(),
-                        BGEm3Tuning {
-                            max_429_retries: cfg.model.max_429_retries,
-                            backoff_base_ms: cfg.model.backoff_base_ms,
-                            health_timeout_ms: cfg.model.health_timeout_ms,
-                            encode_timeout_ms: cfg.model.encode_timeout_ms,
-                        },
+                        served_name.clone(),
+                        spec.dim,
+                        embed_tuning_http,
                     )
                     .with_metrics(&metrics, "query"),
                 ),
@@ -564,6 +661,50 @@ async fn main() -> Result<(), BoxError> {
         // the honest answer — there is one server doing both.
         None => embed_client.clone(),
     };
+
+    // The startup half of the model-identity handshake, per instance. An
+    // unreachable server is a warning and nothing more — a down embedder at
+    // startup is a legitimate state the retry worker already covers. A server
+    // that ANSWERS and names a different model is a refusal: the dim check
+    // catches a wrong family, but a wrong model with a coincidental width would
+    // poison every vector silently, and a server that can be interrogated and
+    // answers wrong is a misconfiguration, not an outage.
+    for (role, client) in [("index", &embed_client), ("query", &query_embed_client)] {
+        if role == "query" && Arc::ptr_eq(&embed_client, &query_embed_client) {
+            continue; // one instance, already checked
+        }
+        match client.served_models().await {
+            Ok(models) if models.iter().any(|m| m == &served_name) => {
+                info!(role, model = %served_name, "Embedder handshake ok.");
+            }
+            Ok(models) => {
+                error!(
+                    role,
+                    expected = %served_name,
+                    served = ?models,
+                    "The embedder answers but serves a different model than \
+                     [model].id names; refusing to start. Sysadmin: point \
+                     [model].server_url at the server hosting this model, or fix \
+                     [model].id / [model].served_name (deploy/embedder/)."
+                );
+                return Err(format!(
+                    "embedder model mismatch on the {role} instance: expected \
+                     {served_name:?}, server offers {models:?}"
+                )
+                .into());
+            }
+            Err(e) => {
+                warn!(
+                    role,
+                    error = ?e,
+                    model = %served_name,
+                    "Embedder unreachable at startup; identity unverified. Files \
+                     will fail and retry until it is up — /health re-checks the \
+                     handshake."
+                );
+            }
+        }
+    }
 
     // Dedicated small runtime for /research jobs: research is rare but long-lived
     // (minutes of local-LLM turns), so it gets its own threads instead of tying up
@@ -620,6 +761,7 @@ async fn main() -> Result<(), BoxError> {
     worker::stale::check_and_publish(
         &db_pool,
         &qdrant_client,
+        spec,
         &metrics,
         &sigterm_token.child_token(),
     )
@@ -634,6 +776,7 @@ async fn main() -> Result<(), BoxError> {
         worker::stale::run(
             db_pool.clone(),
             qdrant_client.clone(),
+            spec,
             metrics.clone(),
             sigterm_token.child_token(),
         ),
@@ -645,6 +788,7 @@ async fn main() -> Result<(), BoxError> {
         worker::gc::run(
             db_pool.clone(),
             qdrant_client.clone(),
+            spec,
             gc_flag.clone(),
             cfg.workers.gc_interval_seconds,
             cfg.workers.status_log_retention_days,
@@ -660,7 +804,7 @@ async fn main() -> Result<(), BoxError> {
             db_pool.clone(),
             qdrant_client.clone(),
             embed_client.clone(),
-            model_id.to_string(),
+            spec,
             RetryTuning {
                 embed: embed_tuning,
                 retry_interval_seconds: cfg.workers.retry_interval_seconds,
@@ -685,7 +829,7 @@ async fn main() -> Result<(), BoxError> {
                     refresh_interval_seconds: cfg.metrics.refresh_interval_seconds,
                     probe_dependencies: cfg.metrics.probe_dependencies,
                     max_retries: cfg.workers.max_retries,
-                    model_id: cfg.model.name.clone(),
+                    model_id: spec.id.to_string(),
                 },
                 cfg.metrics.probe_dependencies.then(|| {
                     worker::metrics::ProbeTargets {
@@ -797,11 +941,15 @@ async fn main() -> Result<(), BoxError> {
             cfg.server.key_path.as_path(),
         ),
         RouterState {
-            tokenizer: Arc::new(Tokenizer::from_pretrained(model_id, None)?),
+            // The slicer's tokenizer follows the registry, not the model size:
+            // every Qwen3-Embedding size shares one tokenizer, which is what
+            // makes a size switch a re-embed instead of a re-slice.
+            tokenizer: Arc::new(Tokenizer::from_pretrained(spec.tokenizer_hf_id, None)?),
             db_pool: db_pool.clone(),
             qdrant: qdrant_client.clone(),
-            model: EmbeddingModel::BGEm3 {
-                model_id: model_id.to_string(),
+            model: ActiveModel {
+                spec,
+                served_name: served_name.clone(),
                 client: embed_client.clone(),
             },
             query_model: query_embed_client.clone(),
@@ -1114,7 +1262,7 @@ mod tests {
                 refresh_interval_seconds: 60,
                 probe_dependencies: false,
                 max_retries: 3,
-                model_id: "BAAI/bge-m3".to_string(),
+                model_id: "qwen3-embedding-0.6b".to_string(),
             },
             &CancellationToken::new(),
         )

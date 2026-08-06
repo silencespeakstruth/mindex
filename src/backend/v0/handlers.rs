@@ -11,7 +11,6 @@ use crate::backend::extract::{
     ListProjectsScope, MintScope, ResearchScope, SearchScope,
 };
 use crate::backend::http3;
-use crate::backend::http3::EmbeddingModel;
 use crate::backend::http3::RouterState;
 use crate::backend::v0::models::ActiveResearchResponse;
 use crate::backend::v0::models::ActiveResearchRun;
@@ -105,10 +104,9 @@ use crate::db::sqlite3::SQLite3PoolError;
 use crate::embed::EmbedProgress;
 use crate::embed::EmbedUpsertError;
 use crate::embed::embed_and_upsert;
-use crate::models::bge_m3::BGEm3EmbedRequest;
-use crate::models::bge_m3::BGEm3EmbedResponse;
-use crate::models::bge_m3::BGEm3Model;
-use crate::models::bge_m3::EncodeError;
+use crate::models::embedder::Embedder;
+use crate::models::embedder::EncodeError;
+use crate::models::registry::EmbeddingModelSpec;
 use crate::slicing::markdown::MarkdownSlicer;
 use crate::slicing::symbols::SYMBOLS_DERIVATION_VERSION;
 use crate::slicing::symbols::SymbolError;
@@ -281,7 +279,6 @@ fn build_search_query(project_guid: UUIDv4, req: &SearchRequest) -> (String, Vec
     FROM project_file_chunks c
     JOIN project_files f
         ON c.project_guid = f.project_guid
-        AND c.model_id = f.model_id
         AND c.file_path = f.path
     WHERE {}",
         meta_where.join(" AND ")
@@ -326,7 +323,7 @@ pub(crate) fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
     }
 }
 
-/// In-process mutual exclusion for indexing a single `(project, model, path)`.
+/// In-process mutual exclusion for indexing a single `(project, path)`.
 ///
 /// `post_index`'s pipeline is several independent transactions (hash-check →
 /// mark `indexing` → slice+insert → embed → `mark_indexed`), not one atomic unit.
@@ -338,14 +335,14 @@ pub(crate) fn tree_sitter_language(pl: ProgrammingLanguage) -> Language {
 /// hash-skip). This claim serializes the whole per-file pipeline within one process
 /// (mindex is single-instance). A multi-instance deployment would need a DB-level
 /// CAS claim instead.
-/// The per-file mutual-exclusion key: `{guid_simple}\0{model_id}\0{path}`. The NUL
-/// separators can't appear in any component, so the join is unambiguous. Built
+/// The per-file mutual-exclusion key: `{guid_simple}\0{path}`. The NUL separator
+/// can't appear in either component, so the join is unambiguous. Built
 /// identically by the indexing handler and the retry worker so a claim taken by a
 /// live `/index` is visible to the worker (and vice versa) — they share one lock
 /// table. `guid_simple` must be the 32-char hyphen-less form (`Uuid::simple`), which
 /// is exactly how the guid is stored in SQLite (see `UUIDv4`'s `ToSql`).
-pub(crate) fn indexing_lock_key(guid_simple: &str, model_id: &str, path: &str) -> String {
-    format!("{guid_simple}\u{0}{model_id}\u{0}{path}")
+pub(crate) fn indexing_lock_key(guid_simple: &str, path: &str) -> String {
+    format!("{guid_simple}\u{0}{path}")
 }
 
 pub(crate) struct IndexClaim {
@@ -392,6 +389,19 @@ struct Prepared {
     _claim: IndexClaim,
 }
 
+/// What [`FileIndexer::prepare_stored`] decided about one file.
+enum StoredPrep {
+    /// Claimed, marked `indexing`, stored chunks read — ready for the embed pass.
+    Ready(Prepared),
+    /// Already embedded under the active model; nothing to do.
+    Current,
+    /// Not `indexed` (or never indexed): there is nothing safe to re-embed —
+    /// an ordinary pass or the retry worker owns it.
+    NotEligible,
+    /// Sliced under a different tokenizer; re-embedding would be wrong.
+    ForeignChunker,
+}
+
 /// Borrowed view of everything indexing needs. `post_index` drives it in two
 /// phases — `prepare` every file, then one batched `embed_all` across all of them —
 /// so the GPU sees `embed_batch`-sized batches instead of one file's chunks at a time.
@@ -399,11 +409,13 @@ struct FileIndexer<'a> {
     db_pool: &'a SQLite3Pool,
     store: &'a dyn VectorStore,
     tokenizer: &'a Arc<Tokenizer>,
-    embedder: &'a dyn BGEm3Model,
-    model_id: &'a str,
+    embedder: &'a dyn Embedder,
+    /// The active embedding model: identity for `embedded_model_id`, tokenizer
+    /// identity for `chunker_id`, slug for the collection name.
+    spec: &'static EmbeddingModelSpec,
     project_guid: UUIDv4,
     collection: &'a str,
-    /// Embed/upsert batch sizing + sparse threshold (from config).
+    /// Embed and upsert batch sizing (from config).
     embed_tuning: crate::embed::EmbedTuning,
     /// Slicer token window (from config).
     min_chunk_tokens: usize,
@@ -413,7 +425,7 @@ struct FileIndexer<'a> {
     /// Documentation chunk cap (from config). Documentation has no minimum.
     max_doc_chunk_tokens: usize,
     /// Weight of the semantic-shift term when cutting documentation; 0 turns it
-    /// off, along with the per-document `/encode`.
+    /// off, along with the per-document embed call.
     doc_semantic_weight: f64,
     /// Request-scoped cancellation token (the handler's `CancellationGuard`).
     token: &'a CancellationToken,
@@ -434,9 +446,12 @@ struct FileIndexer<'a> {
 /// The hash alone is not enough: it says the *file* is unchanged, not that the code
 /// which derives chunks and symbols from it is. So the skip also requires the stored
 /// derivation versions to match the current ones — a slicer or tags-query change
-/// bumps its const, stops matching, and the next ordinary run rebuilds the file.
-/// `NULL` (written before versioning existed) never matches, which is what makes the
-/// backfill automatic.
+/// bumps its const, stops matching, and the next ordinary run rebuilds the file —
+/// **and** the stored model identities to match the active spec: `chunker_id` (the
+/// tokenizer that measured the chunk boundaries) and `embedded_model_id` (whose
+/// vectors exist). Flipping `[model].id` therefore self-heals through this exact
+/// check, like a derivation-version bump. `NULL` never matches, which is what makes
+/// every backfill automatic.
 ///
 /// Only an `indexed` row counts for the skip, because a
 /// non-`indexed` row has no (complete) vectors: a file sliced but never embedded
@@ -447,21 +462,23 @@ fn file_already_indexed(
     tx: &rusqlite::Transaction,
     project_guid: UUIDv4,
     path: &str,
-    model_id: &str,
+    spec: &EmbeddingModelSpec,
     sha256: &str,
 ) -> Result<bool, SQLite3PoolError> {
     let existing: Option<String> = tx
         .query_row(
             "SELECT sha256 FROM project_files
-             WHERE project_guid = ?1 AND path = ?2 AND model_id = ?3
+             WHERE project_guid = ?1 AND path = ?2
                AND status = 'indexed'
-               AND chunks_version = ?4 AND symbols_version = ?5",
+               AND chunks_version = ?3 AND symbols_version = ?4
+               AND chunker_id = ?5 AND embedded_model_id = ?6",
             params![
                 project_guid,
                 path,
-                model_id,
                 CHUNKS_DERIVATION_VERSION,
-                SYMBOLS_DERIVATION_VERSION
+                SYMBOLS_DERIVATION_VERSION,
+                spec.tokenizer_hf_id,
+                spec.id
             ],
             |r| r.get(0),
         )
@@ -471,21 +488,25 @@ fn file_already_indexed(
 
 /// The prepare-phase upsert that moves a file into `indexing`. Extracted as a const
 /// so the sha256-refresh regression test executes the exact production statement
-/// (binds: ?1 project_guid, ?2 path, ?3 sha256, ?4 programming_language, ?5 model_id,
-/// ?6 chunks_version, ?7 symbols_version).
+/// (binds: ?1 project_guid, ?2 path, ?3 sha256, ?4 programming_language,
+/// ?5 chunks_version, ?6 symbols_version, ?7 chunker_id, ?8 embedded_model_id).
 ///
-/// It stamps the derivation versions in the same statement, which is the same
-/// transaction as the chunk and symbol inserts downstream — so a row can never claim
-/// a version whose rows were not actually produced.
+/// It stamps the derivation versions and both model identities in the same
+/// statement, which is the same transaction as the chunk and symbol inserts
+/// downstream — so a row can never claim a version, a tokenizer or a model whose
+/// rows were not actually produced.
 const MARK_INDEXING_UPSERT_SQL: &str = "INSERT INTO project_files
-         (project_guid, path, sha256, programming_language, model_id,
-          status, status_updated_at, chunks_version, symbols_version)
-     VALUES (?1, ?2, ?3, ?4, ?5, 'indexing', unixepoch(), ?6, ?7)
-     ON CONFLICT (project_guid, model_id, path)
+         (project_guid, path, sha256, programming_language,
+          status, status_updated_at, chunks_version, symbols_version,
+          chunker_id, embedded_model_id)
+     VALUES (?1, ?2, ?3, ?4, 'indexing', unixepoch(), ?5, ?6, ?7, ?8)
+     ON CONFLICT (project_guid, path)
      DO UPDATE SET status = 'indexing', sha256 = excluded.sha256,
                    status_updated_at = unixepoch(),
                    chunks_version  = excluded.chunks_version,
-                   symbols_version = excluded.symbols_version";
+                   symbols_version = excluded.symbols_version,
+                   chunker_id        = excluded.chunker_id,
+                   embedded_model_id = excluded.embedded_model_id";
 
 /// Extracts a file's symbols and inserts them, returning how many rows were written.
 /// Shared by the full index path and the `symbols_only` rebuild so the two can never
@@ -498,7 +519,6 @@ const MARK_INDEXING_UPSERT_SQL: &str = "INSERT INTO project_files
 fn extract_and_insert_symbols(
     tx: &rusqlite::Transaction,
     project_guid: UUIDv4,
-    model_id: &str,
     path: &str,
     pl: ProgrammingLanguage,
     code: &str,
@@ -532,13 +552,12 @@ fn extract_and_insert_symbols(
     for s in &symbols {
         tx.execute(
             "INSERT INTO project_file_symbols
-                 (project_guid, model_id, file_path, name, kind,
+                 (project_guid, file_path, name, kind,
                   start_line, end_line, start_column,
                   end_column, parent_name, parent_kind, doc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 project_guid,
-                model_id,
                 path,
                 s.name,
                 s.kind,
@@ -559,7 +578,7 @@ impl FileIndexer<'_> {
     /// Slices a document, refining its boundaries with block embeddings.
     ///
     /// Runs outside the prepare transaction because the middle step is an
-    /// `/encode` round-trip. The two CPU halves go to `spawn_blocking`: parsing
+    /// `/v1/embeddings` round-trip. The two CPU halves go to `spawn_blocking`: parsing
     /// and the packing DP are cheap, but "cheap" on a 40 KB document is still
     /// milliseconds of tokenizer work, which does not belong on a runtime
     /// thread.
@@ -592,7 +611,7 @@ impl FileIndexer<'_> {
         .map_err(slicer_err_to_pool_err)
         .map_err(ApiError::from)?;
 
-        // One `/encode` for the whole document's blocks. Skipped entirely when
+        // One `/v1/embeddings` call for the whole document's blocks. Skipped entirely when
         // the term is off, so `doc_semantic_weight = 0` costs no round-trip.
         let vectors = if weight > 0.0 && !plan.is_empty() {
             let texts: Vec<String> = plan
@@ -600,12 +619,8 @@ impl FileIndexer<'_> {
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            match self
-                .embedder
-                .encode(BGEm3EmbedRequest { texts }, self.token.clone())
-                .await
-            {
-                Ok(resp) => Some(resp.dense_vecs),
+            match self.embedder.embed(texts, self.token.clone()).await {
+                Ok(dense_vecs) => Some(dense_vecs),
                 Err(err) => {
                     warn!(
                         error = ?err,
@@ -654,11 +669,7 @@ impl FileIndexer<'_> {
             // Held across the whole pipeline via `Prepared._claim`; released on any
             // early return below (unchanged / error) when this local drops.
             let claim = {
-                let key = indexing_lock_key(
-                    &project_guid.0.as_simple().to_string(),
-                    self.model_id,
-                    path,
-                );
+                let key = indexing_lock_key(&project_guid.0.as_simple().to_string(), path);
                 match IndexClaim::try_acquire(self.indexing_locks, key) {
                     Some(c) => c,
                     None => {
@@ -676,8 +687,8 @@ impl FileIndexer<'_> {
 
             // ── hash check ───────────────────────────────────────────────
             {
-                let (sha256_c, path_c, model_id_c) =
-                    (sha256.clone(), path.to_string(), self.model_id.to_string());
+                let (sha256_c, path_c) = (sha256.clone(), path.to_string());
+                let spec = self.spec;
                 let force = self.force;
                 let unchanged = self
                     .db_pool
@@ -685,7 +696,7 @@ impl FileIndexer<'_> {
                         if force {
                             return Ok(false);
                         }
-                        file_already_indexed(tx, project_guid, &path_c, &model_id_c, &sha256_c)
+                        file_already_indexed(tx, project_guid, &path_c, spec, &sha256_c)
                     })
                     .with_cancellation_token(self.token)
                     .await
@@ -705,8 +716,8 @@ impl FileIndexer<'_> {
 
             // ── status = 'indexing' (committed before heavy work) ────────
             {
-                let (sha256_u, path_u, model_id_u) =
-                    (sha256.clone(), path.to_string(), self.model_id.to_string());
+                let (sha256_u, path_u) = (sha256.clone(), path.to_string());
+                let spec = self.spec;
                 self.db_pool
                     .transaction(self.token.child_token(), move |tx| {
                         tx.execute(
@@ -716,9 +727,10 @@ impl FileIndexer<'_> {
                                 path_u,
                                 sha256_u,
                                 pl,
-                                model_id_u,
                                 CHUNKS_DERIVATION_VERSION,
-                                SYMBOLS_DERIVATION_VERSION
+                                SYMBOLS_DERIVATION_VERSION,
+                                spec.tokenizer_hf_id,
+                                spec.id
                             ],
                         )?;
                         Ok(())
@@ -734,8 +746,7 @@ impl FileIndexer<'_> {
 
             // ── mark old chunks deleted + slice + insert new chunks ───────
             let tokenizer = self.tokenizer.clone();
-            let (path_m, model_id_m, code_m) =
-                (path.to_string(), self.model_id.to_string(), code.to_string());
+            let (path_m, code_m) = (path.to_string(), code.to_string());
             let (min_chunk_tokens, max_chunk_tokens, max_doc_chunk_tokens, fill_gaps) = (
                 self.min_chunk_tokens,
                 self.max_chunk_tokens,
@@ -763,16 +774,16 @@ impl FileIndexer<'_> {
                     tx.execute(
                         "UPDATE project_file_chunks
                          SET status = 'deleted'
-                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
+                         WHERE project_guid = ?1 AND file_path = ?2
                            AND status = 'active'",
-                        params![project_guid, path_m, model_id_m],
+                        params![project_guid, path_m],
                     )?;
                     // Symbols parallel the chunk set: replaced (hard-delete, no
                     // Qdrant counterpart → no GC cycle) in the same transaction.
                     tx.execute(
                         "DELETE FROM project_file_symbols
-                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3",
-                        params![project_guid, path_m, model_id_m],
+                         WHERE project_guid = ?1 AND file_path = ?2",
+                        params![project_guid, path_m],
                     )?;
 
                     // Documentation arrives already sliced (see above); every
@@ -800,7 +811,6 @@ impl FileIndexer<'_> {
                     let symbols = extract_and_insert_symbols(
                         tx,
                         project_guid,
-                        &model_id_m,
                         &path_m,
                         pl,
                         &code_m,
@@ -810,6 +820,7 @@ impl FileIndexer<'_> {
                     let mut out: Vec<(UUIDv4, String)> = Vec::with_capacity(chunks.len());
                     for SlicedChunk {
                         code,
+                        tokens,
                         start_line,
                         end_line,
                         start_column,
@@ -820,15 +831,15 @@ impl FileIndexer<'_> {
                         let qdrant_guid = UUIDv4(Uuid::new_v4());
                         tx.execute(
                             "INSERT INTO project_file_chunks
-                                 (project_guid, file_path, code, model_id, qdrant_guid,
+                                 (project_guid, file_path, code, qdrant_guid, tokens,
                                   start_line, end_line, start_column, end_column, status)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
                             params![
                                 project_guid,
                                 path_m,
                                 code,
-                                model_id_m,
                                 qdrant_guid,
+                                *tokens as i64,
                                 *start_line as i64,
                                 *end_line as i64,
                                 *start_column as i64,
@@ -876,7 +887,7 @@ impl FileIndexer<'_> {
     }
 
     /// Phase 2: embed + upsert every chunk across all prepared files in one batched
-    /// pass (`embed_batch` chunks per `/encode`). `progress` is invoked per completed
+    /// pass (`embed_batch` chunks per `/v1/embeddings` call). `progress` is invoked per completed
     /// batch — `None` outside a streaming (`?stream=yes`) request.
     async fn embed_all(
         &self,
@@ -908,20 +919,16 @@ impl FileIndexer<'_> {
     /// because a 0-row `UPDATE` is `Ok(())`.
     async fn mark_indexed(&self, path: &str, sha256: &str) -> Result<bool, ApiError> {
         let project_guid = self.project_guid;
-        let (sha256_f, path_f, model_id_f) = (
-            sha256.to_string(),
-            path.to_string(),
-            self.model_id.to_string(),
-        );
+        let (sha256_f, path_f) = (sha256.to_string(), path.to_string());
         self.db_pool
             .transaction(self.token.child_token(), move |tx| {
                 tx.execute(
                     "UPDATE project_files
                      SET status = 'indexed', sha256 = ?1, retry_count = 0,
                          status_updated_at = unixepoch()
-                     WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4
+                     WHERE project_guid = ?2 AND path = ?3
                        AND status = 'indexing'",
-                    params![sha256_f, project_guid, path_f, model_id_f],
+                    params![sha256_f, project_guid, path_f],
                 )
                 .map_err(SQLite3PoolError::from)
             })
@@ -955,7 +962,6 @@ impl FileIndexer<'_> {
             self.db_pool,
             &self.project_guid.0.as_simple().to_string(),
             path,
-            self.model_id,
             status,
             increment_retry,
             CancellationToken::new(),
@@ -1007,8 +1013,7 @@ impl FileIndexer<'_> {
             // Same claim as the full path: a concurrent /index for this file would
             // otherwise race our DELETE + INSERT against its own.
             let _claim = {
-                let key =
-                    indexing_lock_key(&project_guid.0.as_simple().to_string(), self.model_id, path);
+                let key = indexing_lock_key(&project_guid.0.as_simple().to_string(), path);
                 match IndexClaim::try_acquire(self.indexing_locks, key) {
                     Some(c) => c,
                     None => {
@@ -1021,11 +1026,7 @@ impl FileIndexer<'_> {
             hasher.update(code.as_bytes());
             let sha256 = hex::encode(hasher.finalize_fixed_reset());
 
-            let (path_m, model_id_m, code_m) = (
-                path.to_string(),
-                self.model_id.to_string(),
-                code.to_string(),
-            );
+            let (path_m, code_m) = (path.to_string(), code.to_string());
             let force = self.force;
             let token = self.token.clone();
 
@@ -1036,8 +1037,8 @@ impl FileIndexer<'_> {
                         .query_row(
                             "SELECT sha256, symbols_version FROM project_files
                               WHERE project_guid = ?1 AND path = ?2
-                                AND model_id = ?3 AND status = 'indexed'",
-                            params![project_guid, path_m, model_id_m],
+                                AND status = 'indexed'",
+                            params![project_guid, path_m],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
                         .optional()?;
@@ -1054,18 +1055,11 @@ impl FileIndexer<'_> {
 
                     tx.execute(
                         "DELETE FROM project_file_symbols
-                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3",
-                        params![project_guid, path_m, model_id_m],
+                         WHERE project_guid = ?1 AND file_path = ?2",
+                        params![project_guid, path_m],
                     )?;
-                    let n = extract_and_insert_symbols(
-                        tx,
-                        project_guid,
-                        &model_id_m,
-                        &path_m,
-                        pl,
-                        &code_m,
-                        &token,
-                    )?;
+                    let n =
+                        extract_and_insert_symbols(tx, project_guid, &path_m, pl, &code_m, &token)?;
 
                     // `chunks_version` is COALESCEd, not assigned: this pass did not
                     // re-slice, so an already-versioned file keeps whatever produced
@@ -1076,13 +1070,12 @@ impl FileIndexer<'_> {
                     // nothing.
                     tx.execute(
                         "UPDATE project_files
-                            SET symbols_version = ?4,
-                                chunks_version  = COALESCE(chunks_version, ?5)
-                          WHERE project_guid = ?1 AND path = ?2 AND model_id = ?3",
+                            SET symbols_version = ?3,
+                                chunks_version  = COALESCE(chunks_version, ?4)
+                          WHERE project_guid = ?1 AND path = ?2",
                         params![
                             project_guid,
                             path_m,
-                            model_id_m,
                             SYMBOLS_DERIVATION_VERSION,
                             CHUNKS_DERIVATION_VERSION
                         ],
@@ -1103,6 +1096,160 @@ impl FileIndexer<'_> {
         .await
     }
 
+    /// The `vectors_only` Phase 1 for one file: claim it, decide whether its
+    /// stored chunks can and should be re-embedded under the active model, and
+    /// if so read them out and mark the file `indexing`.
+    ///
+    /// The retry worker's mechanism, promoted to a request: the chunk text is
+    /// already in `project_file_chunks.code`, so a model swap is a pure GPU
+    /// pass — no client bytes, no tree walk, no symbols. Legal only when
+    /// `chunker_id` matches the active spec's tokenizer: chunk boundaries are
+    /// measured in tokens, and a different tokenizer means different units.
+    async fn prepare_stored(&self, path: &str) -> Result<StoredPrep, ApiError> {
+        let project_guid = self.project_guid;
+        let claim = {
+            let key = indexing_lock_key(&project_guid.0.as_simple().to_string(), path);
+            match IndexClaim::try_acquire(self.indexing_locks, key) {
+                Some(c) => c,
+                None => return Err(ApiError::FileInFlight),
+            }
+        };
+
+        let (path_r, spec) = (path.to_string(), self.spec);
+        let row = self
+            .db_pool
+            .transaction(self.token.child_token(), move |tx| {
+                tx.query_row(
+                    "SELECT status, sha256, chunker_id, embedded_model_id
+                       FROM project_files
+                      WHERE project_guid = ?1 AND path = ?2",
+                    params![project_guid, path_r],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(SQLite3PoolError::from)
+            })
+            .with_cancellation_token(self.token)
+            .await
+            .from_cancelled()
+            .map_err(|err| {
+                error!(error = ?err, "Failed to read the file row for a vectors-only pass.");
+                ApiError::from(err)
+            })?;
+
+        let Some((status, sha256, chunker_id, embedded_model_id)) = row else {
+            // Never indexed: there are no stored chunks to re-embed. An
+            // ordinary pass is the answer, and `unchanged` is how the
+            // symbols_only path already spells "nothing for this mode to do".
+            return Ok(StoredPrep::NotEligible);
+        };
+        if status != "indexed" {
+            // failed/indexing/deleted rows belong to the retry worker and GC.
+            return Ok(StoredPrep::NotEligible);
+        }
+        if chunker_id.as_deref() != Some(spec.tokenizer_hf_id) {
+            // Different tokenizer, different units: re-embedding these chunks
+            // would be wrong, not merely stale.
+            return Ok(StoredPrep::ForeignChunker);
+        }
+        if !self.force && embedded_model_id.as_deref() == Some(spec.id) {
+            return Ok(StoredPrep::Current);
+        }
+
+        // Mark `indexing` (any → indexing is legal) so a crash mid-embed hands
+        // the file to the retry worker, exactly like the full path.
+        let moved = set_file_status(
+            self.db_pool,
+            &project_guid.0.as_simple().to_string(),
+            path,
+            "indexing",
+            false,
+            self.token.child_token(),
+        )
+        .await;
+        if !moved {
+            error!(%path, "Could not mark the file 'indexing' for a vectors-only pass.");
+            return Err(ApiError::Internal);
+        }
+
+        let path_c = path.to_string();
+        let chunks = self
+            .db_pool
+            .transaction(self.token.child_token(), move |tx| {
+                tx.prepare(
+                    "SELECT qdrant_guid, code FROM project_file_chunks
+                      WHERE project_guid = ?1 AND file_path = ?2 AND status = 'active'",
+                )?
+                .query_map(params![project_guid, path_c], |r| {
+                    Ok((r.get::<_, UUIDv4>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SQLite3PoolError::from)
+            })
+            .with_cancellation_token(self.token)
+            .await
+            .from_cancelled()
+            .map_err(|err| {
+                error!(error = ?err, "Failed to read stored chunks for a vectors-only pass.");
+                ApiError::from(err)
+            });
+        let chunks = match chunks {
+            Ok(c) => c,
+            Err(e) => {
+                // The row is `indexing` now; hand it to the retry worker rather
+                // than leaving the failure to the stuck-grace sweep.
+                self.recover(path, "failed", true).await;
+                return Err(e);
+            }
+        };
+
+        Ok(StoredPrep::Ready(Prepared {
+            pl: ProgrammingLanguage::Rust, // overwritten by the caller, which knows it
+            path: path.to_string(),
+            sha256,
+            chunks,
+            symbols: 0,
+            _claim: claim,
+        }))
+    }
+
+    /// The `vectors_only` Phase 3: confirm the re-embed by moving the file back
+    /// to `indexed` **and stamping `embedded_model_id`** — the write that makes
+    /// the model switch durable. Same `AND status = 'indexing'` cancel guard as
+    /// [`Self::mark_indexed`]; sha256 and the derivation versions are untouched,
+    /// because nothing was re-derived.
+    async fn mark_vectors_done(&self, path: &str) -> Result<bool, ApiError> {
+        let project_guid = self.project_guid;
+        let (path_f, spec) = (path.to_string(), self.spec);
+        self.db_pool
+            .transaction(self.token.child_token(), move |tx| {
+                tx.execute(
+                    "UPDATE project_files
+                     SET status = 'indexed', embedded_model_id = ?1, retry_count = 0,
+                         status_updated_at = unixepoch()
+                     WHERE project_guid = ?2 AND path = ?3
+                       AND status = 'indexing'",
+                    params![spec.id, project_guid, path_f],
+                )
+                .map_err(SQLite3PoolError::from)
+            })
+            .with_cancellation_token(self.token)
+            .await
+            .from_cancelled()
+            .map_err(|err| {
+                error!(error = ?err, "Failed to confirm a vectors-only re-embed in SQLite.");
+                ApiError::from(err)
+            })
+            .map(|rows| rows > 0)
+    }
+
     /// Reconciliation between Phase 1 and Phase 2: drop any prepared file that a
     /// concurrent `POST /cancel` (or `DELETE /files`) flipped out of `indexing`
     /// since it was prepared. `/cancel` deliberately does not take the per-file
@@ -1121,22 +1268,20 @@ impl FileIndexer<'_> {
         }
         let project_guid = self.project_guid;
         let paths: Vec<String> = prepared.iter().map(|p| p.path.clone()).collect();
-        let model_id = self.model_id.to_string();
 
         let cancelled: HashSet<String> = self
             .db_pool
             .transaction(self.token.child_token(), move |tx| {
-                let placeholders = (3..3 + paths.len())
+                let placeholders = (2..2 + paths.len())
                     .map(|i| format!("?{i}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let mut binds: Vec<Bind> = Vec::with_capacity(paths.len() + 2);
+                let mut binds: Vec<Bind> = Vec::with_capacity(paths.len() + 1);
                 binds.push(Bind::Guid(project_guid));
-                binds.push(Bind::Path(model_id));
                 binds.extend(paths.into_iter().map(Bind::Path));
                 tx.prepare(&format!(
                     "SELECT path FROM project_files
-                     WHERE project_guid = ?1 AND model_id = ?2 AND status != 'indexing'
+                     WHERE project_guid = ?1 AND status != 'indexing'
                        AND path IN ({placeholders})"
                 ))?
                 .query_map(params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
@@ -1169,7 +1314,7 @@ impl FileIndexer<'_> {
         }
 
         for path in &cancelled {
-            let (pg, p, m) = (project_guid, path.clone(), self.model_id.to_string());
+            let (pg, p) = (project_guid, path.clone());
             // Not `self.token`: this is the cleanup half of a cancellation, so the
             // token that brought us here is routinely already cancelled — see
             // `recover`. Leaving the chunks `active` would let a cancelled file keep
@@ -1179,14 +1324,14 @@ impl FileIndexer<'_> {
                 .transaction(CancellationToken::new(), move |tx| {
                     tx.execute(
                         "UPDATE project_file_chunks SET status = 'deleted'
-                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3
+                         WHERE project_guid = ?1 AND file_path = ?2
                            AND status = 'active'",
-                        params![pg, p, m],
+                        params![pg, p],
                     )?;
                     tx.execute(
                         "DELETE FROM project_file_symbols
-                         WHERE project_guid = ?1 AND file_path = ?2 AND model_id = ?3",
-                        params![pg, p, m],
+                         WHERE project_guid = ?1 AND file_path = ?2",
+                        params![pg, p],
                     )?;
                     Ok(())
                 })
@@ -1394,31 +1539,32 @@ async fn run_index_job(
         emit(IndexEvent::Started {
             files: payload.files.values().map(HashMap::len).sum(),
             symbols_only: payload.symbols_only,
+            vectors_only: payload.vectors_only,
         });
 
         let db_pool = s.db_pool;
         let qdrant = s.qdrant;
         let tokenizer = s.tokenizer;
         let indexing_locks = s.indexing_locks;
-        let EmbeddingModel::BGEm3 { model_id, client } = s.model;
+        let spec = s.model.spec;
+        let client = s.model.client;
 
-        let collection = collection_for(project_guid);
+        let collection = collection_for(project_guid, spec);
 
         // ── ensure project row ────────────────────────────────────────────────
         {
-            let model_id = model_id.clone();
             db_pool
                 .transaction(token.child_token(), move |tx| {
                     // Idempotent and concurrency-safe: two parallel first-time /index
                     // calls for the same new project both reach here. A SELECT-then-
                     // INSERT would let both pass the check and the second trip the
-                    // (guid, model_id) PK, failing an otherwise-valid request with 500.
+                    // guid PK, failing an otherwise-valid request with 500.
                     // ON CONFLICT DO NOTHING makes the loser a no-op instead. This is
                     // *before* the per-file claim, so the claim can't cover it.
                     let inserted = tx.execute(
-                        "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)
-                         ON CONFLICT (guid, model_id) DO NOTHING",
-                        params![project_guid, model_id],
+                        "INSERT INTO projects (guid) VALUES (?1)
+                         ON CONFLICT (guid) DO NOTHING",
+                        params![project_guid],
                     )?;
                     if inserted > 0 {
                         info!("Created a new project.");
@@ -1460,7 +1606,7 @@ async fn run_index_job(
             store: &*qdrant,
             tokenizer: &tokenizer,
             embedder: &*client,
-            model_id: &model_id,
+            spec,
             project_guid,
             collection: &collection,
             embed_tuning: s.embed_tuning,
@@ -1527,6 +1673,133 @@ async fn run_index_job(
                 })
                 .inc();
         };
+
+        // ── vectors_only: the cheap model-switch path. Stored chunks are
+        //    re-embedded into the ACTIVE model's collection; nothing is sliced,
+        //    no symbols move, and the posted `code` is never read — eligibility
+        //    is decided from the stored row alone.
+        if payload.vectors_only {
+            info!(force = payload.force, "Re-embedding stored chunks only.");
+            let mut prepared: Vec<Prepared> = Vec::new();
+            for (pl, files) in payload.files.iter() {
+                let pl = *pl;
+                res.files.entry(pl).or_default();
+                for path in files.keys() {
+                    let skip = |reason: SkipReason, outcome: &'static str| {
+                        emit(IndexEvent::Skipped {
+                            path: path.clone(),
+                            language: pl,
+                            reason,
+                        });
+                        file_outcome(pl, outcome);
+                    };
+                    match indexer.prepare_stored(path).await {
+                        Ok(StoredPrep::Ready(mut p)) => {
+                            p.pl = pl;
+                            emit(IndexEvent::Prepared {
+                                path: path.clone(),
+                                language: pl,
+                                chunks: p.chunks.len(),
+                                symbols: 0,
+                            });
+                            prepared.push(p);
+                        }
+                        Ok(StoredPrep::Current) | Ok(StoredPrep::NotEligible) => {
+                            skip(SkipReason::Unchanged, "skipped_unchanged");
+                        }
+                        Ok(StoredPrep::ForeignChunker) => {
+                            skip(SkipReason::NeedsFullReindex, "needs_full_reindex");
+                        }
+                        Err(ApiError::FileInFlight) => {
+                            m.index.claim_conflicts.inc();
+                            skip(SkipReason::InFlight, "in_flight");
+                        }
+                        Err(e) => {
+                            for p in &prepared {
+                                file_outcome(p.pl, "failed");
+                            }
+                            indexer.recover_all(&prepared, "failed", true).await;
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+
+            let counts: Vec<u64> = prepared.iter().map(|p| p.chunks.len() as u64).collect();
+            let all_chunks: Vec<(UUIDv4, String)> = prepared
+                .iter_mut()
+                .flat_map(|p| std::mem::take(&mut p.chunks))
+                .collect();
+            info!(
+                files = prepared.len(),
+                chunks = all_chunks.len(),
+                "Re-embedding stored chunks in batches."
+            );
+            let embed_events = events.clone();
+            let embed_progress = move |p: EmbedProgress| {
+                if let Some(tx) = &embed_events {
+                    let _ = tx.send(IndexEvent::Embedded {
+                        batch_chunks: p.batch_chunks,
+                        chunks_done: p.chunks_done,
+                        chunks_total: p.chunks_total,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+            };
+            if let Err(e) = indexer.embed_all(&all_chunks, Some(&embed_progress)).await {
+                let (status, increment, api): (&'static str, bool, ApiError) = match e {
+                    EmbedUpsertError::Cancelled => ("cancelled", false, ApiError::Cancelled),
+                    EmbedUpsertError::Store(err) => {
+                        error!(error = ?err, "Qdrant upsert failed during a vectors-only pass.");
+                        ("failed", true, ApiError::Internal)
+                    }
+                    err => {
+                        error!(
+                            error = ?err,
+                            "Embedding failed during a vectors-only pass; marking the \
+                             batch 'failed' for the retry worker."
+                        );
+                        ("failed", true, ApiError::EmbedderUnavailable)
+                    }
+                };
+                for p in &prepared {
+                    file_outcome(
+                        p.pl,
+                        if status == "cancelled" {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        },
+                    );
+                }
+                indexer.recover_all(&prepared, status, increment).await;
+                return Err(api);
+            }
+            for (p, count) in prepared.iter().zip(counts) {
+                if !indexer.mark_vectors_done(&p.path).await? {
+                    file_outcome(p.pl, "cancelled");
+                    emit(IndexEvent::Skipped {
+                        path: p.path.clone(),
+                        language: p.pl,
+                        reason: SkipReason::Cancelled,
+                    });
+                    continue;
+                }
+                file_outcome(p.pl, "indexed");
+                emit(IndexEvent::Indexed {
+                    path: p.path.clone(),
+                    language: p.pl,
+                    count,
+                });
+                *res.files
+                    .entry(p.pl)
+                    .or_default()
+                    .entry(p.path.clone())
+                    .or_insert(0) += count;
+            }
+            info!("All files processed (vectors only).");
+            return Ok(res);
+        }
 
         let prepare_started = std::time::Instant::now();
         let mut prepared: Vec<Prepared> = Vec::new();
@@ -1985,12 +2258,9 @@ async fn history_core(
     payload: HistoryRequest,
     token: &CancellationToken,
 ) -> Result<HistoryResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
-
     s.db_pool
         .transaction(token.child_token(), move |tx| {
-            reconcile_history(tx, project_guid, &model_id, &payload)
+            reconcile_history(tx, project_guid, &payload)
         })
         .with_cancellation_token(token)
         .await
@@ -2012,7 +2282,6 @@ async fn history_core(
 fn reconcile_history(
     tx: &rusqlite::Transaction,
     project_guid: UUIDv4,
-    model_id: &str,
     payload: &HistoryRequest,
 ) -> Result<HistoryResponse, SQLite3PoolError> {
     // History may arrive before any file has been indexed — the git walk does
@@ -2020,25 +2289,25 @@ fn reconcile_history(
     // exist. Same ON CONFLICT DO NOTHING as `post_index`, and for the same
     // reason: two concurrent creators must not 500.
     tx.execute(
-        "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)
-         ON CONFLICT (guid, model_id) DO NOTHING",
-        params![project_guid, model_id],
+        "INSERT INTO projects (guid) VALUES (?1)
+         ON CONFLICT (guid) DO NOTHING",
+        params![project_guid],
     )?;
 
     let mut indexed = 0usize;
     {
         let mut insert_commit = tx.prepare(
             "INSERT INTO project_commits
-                 (project_guid, model_id, sha, author_name, author_email,
+                 (project_guid, sha, author_name, author_email,
                   authored_at, committed_at, parent_count, subject, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT (project_guid, model_id, sha) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (project_guid, sha) DO NOTHING",
         )?;
         let mut insert_path = tx.prepare(
             "INSERT INTO project_commit_paths
-                 (project_guid, model_id, sha, path, change_type, old_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (project_guid, model_id, sha, path) DO NOTHING",
+                 (project_guid, sha, path, change_type, old_path)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project_guid, sha, path) DO NOTHING",
         )?;
         for c in &payload.commits {
             // A commit's content is immutable, so a row that already exists is
@@ -2046,7 +2315,6 @@ fn reconcile_history(
             // count a real "new", not a euphemism for "attempted".
             indexed += insert_commit.execute(params![
                 project_guid,
-                model_id,
                 c.sha,
                 c.author_name,
                 c.author_email,
@@ -2059,7 +2327,6 @@ fn reconcile_history(
             for p in &c.paths {
                 insert_path.execute(params![
                     project_guid,
-                    model_id,
                     c.sha,
                     p.path,
                     p.change_type,
@@ -2092,10 +2359,9 @@ fn reconcile_history(
     let removed = tx.execute(
         "DELETE FROM project_commits
          WHERE project_guid = ?1
-           AND model_id = ?2
-           AND (?3 IS NULL OR committed_at >= ?3)
+           AND (?2 IS NULL OR committed_at >= ?2)
            AND sha NOT IN (SELECT sha FROM temp.posted_shas)",
-        params![project_guid, model_id, payload.since],
+        params![project_guid, payload.since],
     )?;
     tx.execute_batch("DROP TABLE IF EXISTS temp.posted_shas;")?;
 
@@ -2181,34 +2447,27 @@ pub async fn post_history(
 fn prune_history(
     tx: &rusqlite::Transaction,
     project_guid: UUIDv4,
-    model_id: &str,
     q: &HistoryPruneQuery,
 ) -> Result<HistoryPruneResponse, SQLite3PoolError> {
     let removed = tx.execute(
         "DELETE FROM project_commits
          WHERE project_guid = ?1
-           AND model_id = ?2
-           AND (?3 IS NULL OR committed_at < ?3)
+           AND (?2 IS NULL OR committed_at < ?2)
            AND sha NOT IN (
                SELECT sha FROM project_commits
-               WHERE project_guid = ?1 AND model_id = ?2
+               WHERE project_guid = ?1
                -- `sha` breaks the tie so a run is reproducible: same-second
                -- commits are common (a rebase stamps a whole branch at once),
                -- and an unordered LIMIT would keep an arbitrary one of them.
                ORDER BY committed_at DESC, sha DESC
-               LIMIT ?4
+               LIMIT ?3
            )",
-        params![
-            project_guid,
-            model_id,
-            q.older_than,
-            q.keep_last.unwrap_or(0) as i64,
-        ],
+        params![project_guid, q.older_than, q.keep_last.unwrap_or(0) as i64],
     )?;
 
     let remaining: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM project_commits WHERE project_guid = ?1 AND model_id = ?2",
-        params![project_guid, model_id],
+        "SELECT COUNT(*) FROM project_commits WHERE project_guid = ?1",
+        params![project_guid],
         |row| row.get(0),
     )?;
 
@@ -2260,13 +2519,11 @@ pub async fn delete_history(
 ) -> Result<Json<HistoryPruneResponse>, ApiError> {
     validate::validate_history_prune(&q)?;
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
 
     let res = s
         .db_pool
         .transaction(guard.0.child_token(), move |tx| {
-            prune_history(tx, project_guid, &model_id, &q)
+            prune_history(tx, project_guid, &q)
         })
         .with_cancellation_token(&guard.0)
         .await
@@ -2290,13 +2547,14 @@ pub async fn delete_history(
     Ok(Json(res))
 }
 
-/// Hybrid semantic + lexical code search within one project.
+/// Dense semantic code search within one project.
 ///
-/// The query is embedded with BGE-M3 (dense + sparse + ColBERT). Candidate chunks are
-/// the project's `active` chunks matching the optional `include`/`exclude` selector
-/// (project isolation + soft-delete exclusion happen here, in SQLite). Qdrant then
-/// prefetches top-200 dense + top-200 sparse, fuses with RRF, reranks with ColBERT
-/// MaxSim, and returns the top-k. Results are sorted by score descending.
+/// The query — prefixed with the active model's instruct string, which documents
+/// never get — is embedded by the model `[model].id` names. Candidate chunks are
+/// the project's `active` chunks matching the optional `include`/`exclude`
+/// selector (project isolation + soft-delete exclusion happen here, in SQLite);
+/// Qdrant scores the candidates by cosine and returns the top-k. Results are
+/// sorted by score descending.
 ///
 /// An empty candidate set (nothing indexed, or filtered to nothing) returns **404**
 /// immediately without touching Qdrant.
@@ -2341,7 +2599,7 @@ pub async fn post_search(
 }
 
 /// The `/search` core, shared by [`post_search`] and the research loop: embed the
-/// query → SQLite candidate set → Qdrant hybrid search → display rows for the
+/// query → SQLite candidate set → Qdrant dense search → display rows for the
 /// top-k winners, sorted by score descending. `Err(NoMatch)` = empty candidate
 /// set or no scored hits. Validation stays with the callers (the handler
 /// validates client input; the research loop constructs requests itself).
@@ -2391,22 +2649,17 @@ async fn search_core_inner(
     let embed_started = std::time::Instant::now();
     // The query path deliberately uses `query_model`, not the indexing client:
     // when an operator has split the two, this is the instance that is not holding
-    // the GPU. Same server, same fp32 numerics, so the vectors still agree with
-    // the index side.
+    // the GPU. Both must serve the same model, or the vectors disagree with the
+    // index side — the handshake at startup and in /health checks exactly that.
+    //
+    // **The one place the query prefix is applied.** The model is
+    // instruction-tuned: queries carry the instruct string, documents never do,
+    // and the asymmetry is what the retrieval quality was measured with —
+    // omitting it degrades silently. Research inherits this through
+    // `search_core`, the single query-embedding call site.
     let client = &state.query_model;
-    let BGEm3EmbedResponse {
-        dense_vecs,
-        sparse_vecs,
-        colbert_vecs,
-    } = match client
-        .encode(
-            BGEm3EmbedRequest {
-                texts: vec![payload.query.clone()],
-            },
-            token.clone(),
-        )
-        .await
-    {
+    let query_text = format!("{}{}", state.model.spec.query_prefix, payload.query);
+    let dense_vecs = match client.embed(vec![query_text], token.clone()).await {
         Ok(val) => Ok(val),
         Err(EncodeError::Cancelled) => Err(ApiError::Cancelled),
         Err(EncodeError::Timeout(budget)) => {
@@ -2422,7 +2675,8 @@ async fn search_core_inner(
             error!(
                 error = ?request_err,
                 "Failed to embed the search query. \
-                 Check the model server at --model-server is up and reachable."
+                 Check the vLLM instance at [model].query_server_url (or server_url) \
+                 is up and reachable."
             );
             Err(ApiError::EmbedderUnavailable)
         }
@@ -2430,8 +2684,8 @@ async fn search_core_inner(
             error!(
                 error = %decode_err,
                 "Failed to decode the embedder's response for the search query. \
-                 The embedder and mindex binary wire formats disagree — \
-                 redeploy them from the same revision."
+                 The server is not answering the OpenAI embeddings shape, or serves \
+                 a different model than [model].id names."
             );
             Err(ApiError::EmbedderUnavailable)
         }
@@ -2473,17 +2727,9 @@ async fn search_core_inner(
         return Err(ApiError::NoMatch);
     }
 
-    // The embedder must return exactly one vector per head for the single query; an
+    // The embedder must return exactly one vector for the single query; an
     // empty list is an embedder contract violation, not a client error.
     let dense = dense_vecs
-        .into_iter()
-        .next()
-        .ok_or(ApiError::EmbedderUnavailable)?;
-    let sparse = sparse_vecs
-        .into_iter()
-        .next()
-        .ok_or(ApiError::EmbedderUnavailable)?;
-    let colbert = colbert_vecs
         .into_iter()
         .next()
         .ok_or(ApiError::EmbedderUnavailable)?;
@@ -2492,12 +2738,9 @@ async fn search_core_inner(
     let search_hits = state
         .qdrant
         .search(
-            &collection_for(project_guid),
+            &collection_for(project_guid, state.model.spec),
             candidate_ids,
             dense,
-            sparse.keys().copied().collect(),
-            sparse.values().copied().collect(),
-            colbert,
             payload
                 .top_k
                 .map(|k| k as u64)
@@ -2626,11 +2869,10 @@ async fn search_core_inner(
         warn!(
             unscorable,
             winners = results.len(),
-            "The reranker scored chunks NaN; ranking them last rather than first. \
-             Sysadmin: this is what a mismatched embedder produces — check both \
-             instances are the same model at the same precision, and that the XPU \
-             backend is off its default attention kernel (it returns NaN for padded \
-             fp16 rows and still answers 200)."
+            "Qdrant scored chunks NaN; ranking them last rather than first. \
+             Sysadmin: this is what a mismatched embedder produces — check the \
+             index and query instances serve the same model at the same precision \
+             (the /health handshake names what each serves)."
         );
     }
 
@@ -2642,11 +2884,11 @@ async fn search_core_inner(
 ///
 /// **NaN must sort last, and this is not a theoretical concern.** `total_cmp` orders
 /// `+NaN` above every finite value, so a plain descending sort by it hands the
-/// *first* result slot to a chunk the reranker could not score — the top hit, the one
-/// an agent reads and a human trusts. And NaN scores have a documented producer on
-/// this hardware: the XPU backend's default attention kernel returns NaN for padded
-/// fp16 rows and still answers 200 (`attention_backend()` in the embedder), as does
-/// any split deployment whose two instances disagree about precision. The symptom
+/// *first* result slot to a chunk that could not be scored — the top hit, the one
+/// an agent reads and a human trusts. The documented producer class survives the
+/// dense-only pipeline unchanged: a split deployment whose index and query
+/// instances disagree about model or precision emits vectors whose cosine against
+/// the stored ones is garbage or NaN, and answers 200 while doing it. The symptom
 /// would be "search sometimes puts something irrelevant first", which reads as a
 /// ranking-quality complaint rather than a broken embedder.
 ///
@@ -2682,7 +2924,6 @@ const DEFAULT_SYMBOL_LIMIT: usize = 20;
 /// caller can reason about bind positions without reading the selector's own SQL.
 fn build_symbols_query(
     project_guid: UUIDv4,
-    model_id: &str,
     req: &SymbolsRequest,
     limit: usize,
 ) -> (String, Vec<Bind>) {
@@ -2690,14 +2931,10 @@ fn build_symbols_query(
         "SELECT file_path, kind, start_line, end_line, start_column, end_column,
                 parent_name, parent_kind, doc, COUNT(*) OVER () AS total
          FROM project_file_symbols
-         WHERE project_guid = ?1 AND model_id = ?2 AND name = ?3",
+         WHERE project_guid = ?1 AND name = ?2",
     );
-    let mut binds: Vec<Bind> = vec![
-        Bind::Guid(project_guid),
-        Bind::Path(model_id.to_string()),
-        Bind::Path(req.name.clone()),
-    ];
-    let mut next = 4;
+    let mut binds: Vec<Bind> = vec![Bind::Guid(project_guid), Bind::Path(req.name.clone())];
+    let mut next = 3;
     if let Some(kind) = &req.kind {
         sql.push_str(&format!(" AND kind = ?{next}"));
         binds.push(Bind::Path(kind.clone()));
@@ -2809,10 +3046,9 @@ pub(crate) async fn symbols_core(
     req: &SymbolsRequest,
     token: &CancellationToken,
 ) -> Result<SymbolsResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
     let limit = req.limit.unwrap_or(DEFAULT_SYMBOL_LIMIT);
 
-    let (sql, binds) = build_symbols_query(project_guid, model_id, req, limit);
+    let (sql, binds) = build_symbols_query(project_guid, req, limit);
 
     // What the selector hid. Only when there *is* a selector, and asked unscoped on
     // purpose: the point is the difference, and a scoped total cannot report what it
@@ -2833,7 +3069,7 @@ pub(crate) async fn symbols_core(
         // Only the totals matter here, and `COUNT(*) OVER ()` already carries them
         // past the LIMIT — so the same builder answers this with no second SQL to
         // keep in step.
-        build_symbols_query(project_guid, model_id, &unscoped_req, limit)
+        build_symbols_query(project_guid, &unscoped_req, limit)
     });
 
     let (definitions, total_definitions, out_of_scope_definitions) = s
@@ -2966,8 +3202,6 @@ pub(crate) async fn outline_core(
     scope: &crate::research::ToolScope,
     token: &CancellationToken,
 ) -> Result<OutlineResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
     let owned_path = path.to_string();
 
     // A third read when the caller scoped the run, for the same reason there are
@@ -2995,9 +3229,9 @@ pub(crate) async fn outline_core(
             let language: Option<ProgrammingLanguage> = tx
                 .query_row(
                     "SELECT programming_language FROM project_files
-                     WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3
+                     WHERE project_guid = ?1 AND path = ?2
                        AND status != 'deleted'",
-                    (&project_guid, &model_id, &owned_path),
+                    (&project_guid, &owned_path),
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -3006,12 +3240,12 @@ pub(crate) async fn outline_core(
                 "SELECT name, kind, start_line, end_line, parent_name, parent_kind, doc,
                         COUNT(*) OVER () AS total
                  FROM project_file_symbols
-                 WHERE project_guid = ?1 AND model_id = ?2 AND file_path = ?3
+                 WHERE project_guid = ?1 AND file_path = ?2
                  ORDER BY start_line ASC, name ASC
                  LIMIT {OUTLINE_LIMIT}"
             ))?;
             let rows = stmt
-                .query_map((&project_guid, &model_id, &owned_path), |r| {
+                .query_map((&project_guid, &owned_path), |r| {
                     Ok((
                         OutlineSymbol {
                             name: r.get(0)?,
@@ -3086,8 +3320,6 @@ pub(crate) async fn read_chunks_core(
     limit: usize,
     token: &CancellationToken,
 ) -> Result<ReadChunksResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
     let owned_path = path.to_string();
 
     // See `outline_core`: a refusal must not read as an empty range.
@@ -3108,9 +3340,9 @@ pub(crate) async fn read_chunks_core(
             let indexed: Option<i64> = tx
                 .query_row(
                     "SELECT 1 FROM project_files
-                     WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3
+                     WHERE project_guid = ?1 AND path = ?2
                        AND status != 'deleted'",
-                    (&project_guid, &model_id, &owned_path),
+                    (&project_guid, &owned_path),
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -3118,9 +3350,9 @@ pub(crate) async fn read_chunks_core(
             let mut stmt = tx.prepare(&format!(
                 "SELECT start_line, end_line, code
                  FROM project_file_chunks
-                 WHERE project_guid = ?1 AND model_id = ?2 AND file_path = ?3
+                 WHERE project_guid = ?1 AND file_path = ?2
                    AND status = 'active'
-                   AND start_line <= ?5 AND end_line >= ?4
+                   AND start_line <= ?4 AND end_line >= ?3
                  ORDER BY start_line ASC
                  LIMIT {limit}"
             ))?;
@@ -3128,7 +3360,6 @@ pub(crate) async fn read_chunks_core(
                 .query_map(
                     rusqlite::params![
                         &project_guid,
-                        &model_id,
                         &owned_path,
                         start_line as i64,
                         end_line as i64
@@ -3201,8 +3432,6 @@ pub(crate) async fn file_history_core(
     limit: usize,
     token: &CancellationToken,
 ) -> Result<FileHistoryResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
     let owned_path = path.to_string();
 
     // Path-keyed, so an out-of-scope path is refused rather than silently
@@ -3222,7 +3451,7 @@ pub(crate) async fn file_history_core(
     let (history_indexed, path_indexed, total, commits) = s
         .db_pool
         .transaction(token.child_token(), move |tx| {
-            read_file_history(tx, project_guid, &model_id, &owned_path, limit)
+            read_file_history(tx, project_guid, &owned_path, limit)
         })
         .with_cancellation_token(token)
         .await
@@ -3254,7 +3483,6 @@ pub(crate) async fn file_history_core(
 fn read_file_history(
     tx: &rusqlite::Transaction,
     project_guid: UUIDv4,
-    model_id: &str,
     owned_path: &str,
     limit: usize,
 ) -> Result<(bool, bool, usize, Vec<CommitSummary>), SQLite3PoolError> {
@@ -3265,8 +3493,8 @@ fn read_file_history(
     let history_indexed: bool = tx
         .query_row(
             "SELECT 1 FROM project_commits
-                     WHERE project_guid = ?1 AND model_id = ?2 LIMIT 1",
-            params![project_guid, model_id],
+                     WHERE project_guid = ?1 LIMIT 1",
+            params![project_guid],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
@@ -3277,9 +3505,9 @@ fn read_file_history(
     let path_indexed: bool = tx
         .query_row(
             "SELECT 1 FROM project_files
-                     WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3
+                     WHERE project_guid = ?1 AND path = ?2
                        AND status != 'deleted' LIMIT 1",
-            params![project_guid, model_id, owned_path],
+            params![project_guid, owned_path],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
@@ -3289,8 +3517,8 @@ fn read_file_history(
     // implied by a list that happens to be exactly as long as the cap.
     let total: usize = tx.query_row(
         "SELECT COUNT(*) FROM project_commit_paths
-                 WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-        params![project_guid, model_id, owned_path],
+                 WHERE project_guid = ?1 AND path = ?2",
+        params![project_guid, owned_path],
         |r| r.get::<_, i64>(0),
     )? as usize;
 
@@ -3300,29 +3528,25 @@ fn read_file_history(
                  FROM project_commit_paths p
                  JOIN project_commits c
                    ON c.project_guid = p.project_guid
-                  AND c.model_id = p.model_id
                   AND c.sha = p.sha
-                 WHERE p.project_guid = ?1 AND p.model_id = ?2 AND p.path = ?3
+                 WHERE p.project_guid = ?1 AND p.path = ?2
                  ORDER BY c.committed_at DESC
-                 LIMIT ?4",
+                 LIMIT ?3",
     )?;
     let commits = stmt
-        .query_map(
-            params![project_guid, model_id, owned_path, limit as i64],
-            |r| {
-                let sha: String = r.get(0)?;
-                Ok(CommitSummary {
-                    short_sha: sha.chars().take(8).collect(),
-                    sha,
-                    authored_at: r.get(1)?,
-                    author_name: r.get(2)?,
-                    subject: r.get(3)?,
-                    body: r.get(4)?,
-                    change_type: r.get(5)?,
-                    old_path: r.get(6)?,
-                })
-            },
-        )?
+        .query_map(params![project_guid, owned_path, limit as i64], |r| {
+            let sha: String = r.get(0)?;
+            Ok(CommitSummary {
+                short_sha: sha.chars().take(8).collect(),
+                sha,
+                authored_at: r.get(1)?,
+                author_name: r.get(2)?,
+                subject: r.get(3)?,
+                body: r.get(4)?,
+                change_type: r.get(5)?,
+                old_path: r.get(6)?,
+            })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok((history_indexed, path_indexed, total, commits))
@@ -3447,17 +3671,13 @@ pub(crate) async fn grep_core(
     limit: usize,
     token: &CancellationToken,
 ) -> Result<GrepResponse, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
-
     // The scope goes first so its placeholders are `?1..`, leaving the chunk-level
     // binds to be numbered after it — see `scope_subquery`.
     let (scope_sql, mut binds) = scope_subquery(project_guid, scope, 1);
     let mut n = binds.len() + 1;
-    let (p_guid, p_model, p_pattern) = (n, n + 1, n + 2);
-    n += 3;
+    let (p_guid, p_pattern) = (n, n + 1);
+    n += 2;
     binds.push(Bind::Guid(project_guid));
-    binds.push(Bind::Path(model_id.clone()));
     binds.push(Bind::Path(format!("%{}%", like_escape(pattern))));
     let glob_clause = match glob {
         Some(g) => {
@@ -3469,7 +3689,7 @@ pub(crate) async fn grep_core(
     let sql = format!(
         "SELECT c.file_path, c.start_line, c.end_line, c.code, COUNT(*) OVER () AS total
          FROM project_file_chunks c
-         WHERE c.project_guid = ?{p_guid} AND c.model_id = ?{p_model}
+         WHERE c.project_guid = ?{p_guid}
            AND c.status = 'active'
            AND c.code LIKE ?{p_pattern} ESCAPE '\\'
            AND c.file_path IN ({scope_sql}){glob_clause}
@@ -3482,12 +3702,11 @@ pub(crate) async fn grep_core(
     // a string that simply occurs less often.
     let out_of_scope_sql = scope.is_scoped().then_some(
         "SELECT COUNT(*) FROM project_file_chunks c
-             WHERE c.project_guid = ?1 AND c.model_id = ?2 AND c.status = 'active'
-               AND c.code LIKE ?3 ESCAPE '\\'",
+             WHERE c.project_guid = ?1 AND c.status = 'active'
+               AND c.code LIKE ?2 ESCAPE '\\'",
     );
     let unscoped_binds = [
         Bind::Guid(project_guid),
-        Bind::Path(model_id.clone()),
         Bind::Path(format!("%{}%", like_escape(pattern))),
     ];
 
@@ -3503,10 +3722,9 @@ pub(crate) async fn grep_core(
     // run report 0 occurrences of a string another run finds five times.
     let (cov_scope_sql, mut cov_binds) = scope_subquery(project_guid, scope, 1);
     let mut cn = cov_binds.len() + 1;
-    let (c_guid, c_model) = (cn, cn + 1);
-    cn += 2;
+    let c_guid = cn;
+    cn += 1;
     cov_binds.push(Bind::Guid(project_guid));
-    cov_binds.push(Bind::Path(model_id));
     let cov_glob_clause = match glob {
         Some(g) => {
             cov_binds.push(Bind::Path(g.to_string()));
@@ -3517,7 +3735,7 @@ pub(crate) async fn grep_core(
     let coverage_sql = format!(
         "SELECT COUNT(*), COUNT(DISTINCT c.file_path)
          FROM project_file_chunks c
-         WHERE c.project_guid = ?{c_guid} AND c.model_id = ?{c_model}
+         WHERE c.project_guid = ?{c_guid}
            AND c.status = 'active'
            AND c.file_path IN ({cov_scope_sql}){cov_glob_clause}"
     );
@@ -3648,8 +3866,6 @@ pub(crate) async fn file_versions_core(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.clone();
     let asked = paths.len();
 
     let rows: Vec<crate::research::FileVersion> = s
@@ -3657,20 +3873,19 @@ pub(crate) async fn file_versions_core(
         .transaction(token.child_token(), move |tx| {
             let mut out = Vec::with_capacity(paths.len());
             for chunk in paths.chunks(FILE_VERSIONS_CHUNK) {
-                // `?1`/`?2` pin the project; the paths follow, numbered from 3.
+                // `?1` pins the project; the paths follow, numbered from 2.
                 let placeholders = (0..chunk.len())
-                    .map(|i| format!("?{}", i + 3))
+                    .map(|i| format!("?{}", i + 2))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
                     "SELECT path, sha256, status FROM project_files
-                     WHERE project_guid = ?1 AND model_id = ?2
+                     WHERE project_guid = ?1
                        AND status != 'deleted'
                        AND path IN ({placeholders})"
                 );
-                let mut binds: Vec<Bind> = Vec::with_capacity(chunk.len() + 2);
+                let mut binds: Vec<Bind> = Vec::with_capacity(chunk.len() + 1);
                 binds.push(Bind::Guid(project_guid));
-                binds.push(Bind::Path(model_id.clone()));
                 binds.extend(chunk.iter().map(|p| Bind::Path(p.clone())));
 
                 let mut stmt = tx.prepare(&sql)?;
@@ -3723,8 +3938,6 @@ pub(crate) async fn list_research_core(
     query: Option<String>,
     token: &CancellationToken,
 ) -> Result<Vec<crate::research::ResearchListing>, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid.0.simple().to_string();
 
     let rows = s
@@ -3745,9 +3958,9 @@ pub(crate) async fn list_research_core(
                     {q_clause}
                   ORDER BY r.seq DESC
                   LIMIT {limit}",
-                ctes = research_validity_ctes("?1", "?2"),
+                ctes = research_validity_ctes("?1"),
                 q_clause = if filter.is_some() {
-                    "AND (r.title LIKE ?3 ESCAPE '\\' OR r.question LIKE ?3 ESCAPE '\\')"
+                    "AND (r.title LIKE ?2 ESCAPE '\\' OR r.question LIKE ?2 ESCAPE '\\')"
                 } else {
                     ""
                 },
@@ -3755,7 +3968,7 @@ pub(crate) async fn list_research_core(
                 trust = research_trust_column(),
             );
             let mut stmt = tx.prepare(&sql)?;
-            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg];
             if let Some(f) = &filter {
                 binds.push(f);
             }
@@ -3797,8 +4010,6 @@ pub(crate) async fn read_research_core(
     seq: i64,
     token: &CancellationToken,
 ) -> Result<crate::research::StoredReport, ApiError> {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid.0.simple().to_string();
 
     let found = s
@@ -3810,12 +4021,12 @@ pub(crate) async fn read_research_core(
                         EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id),
                         {trust}
                    FROM research_runs r
-                  WHERE r.project_guid = ?1 AND r.seq = ?3",
-                ctes = research_validity_ctes("?1", "?2"),
+                  WHERE r.project_guid = ?1 AND r.seq = ?2",
+                ctes = research_validity_ctes("?1"),
                 trust = research_trust_column(),
             );
             let row = tx
-                .query_row(&sql, rusqlite::params![pg, model_id, seq], |row| {
+                .query_row(&sql, rusqlite::params![pg, seq], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -3914,25 +4125,17 @@ pub(crate) fn research_title(question: &str) -> String {
 /// they are one fact, that what it describes no longer holds, which is exactly what
 /// `Evidence::is_stale` means by `changed || removed`.
 ///
-/// The `model_id` bind is load-bearing and easy to omit: `project_files` is keyed
-/// `(project_guid, model_id, path)`, so joining on the path alone would match a run's
-/// baseline against every embedding model the database has ever held.
-/// `model_bind` is the positional placeholder (`"?2"`) the caller has bound the
-/// embedding model id to; the two readers number their parameters differently, and a
-/// hardcoded index here would silently mis-bind one of them.
-fn research_staleness_columns(model_bind: &str) -> String {
-    format!(
-        "(SELECT COUNT(*) FROM research_run_files rf WHERE rf.run_id = r.id) AS files_total,
-         (SELECT COUNT(*)
-            FROM research_run_files rf
-            LEFT JOIN project_files pf
-                   ON pf.project_guid = r.project_guid
-                  AND pf.model_id     = {model_bind}
-                  AND pf.path         = rf.path
-                  AND pf.status      != 'deleted'
-           WHERE rf.run_id = r.id
-             AND (pf.sha256 IS NULL OR pf.sha256 <> rf.sha256)) AS files_moved"
-    )
+fn research_staleness_columns() -> String {
+    "(SELECT COUNT(*) FROM research_run_files rf WHERE rf.run_id = r.id) AS files_total,
+     (SELECT COUNT(*)
+        FROM research_run_files rf
+        LEFT JOIN project_files pf
+               ON pf.project_guid = r.project_guid
+              AND pf.path         = rf.path
+              AND pf.status      != 'deleted'
+       WHERE rf.run_id = r.id
+         AND (pf.sha256 IS NULL OR pf.sha256 <> rf.sha256)) AS files_moved"
+        .to_string()
 }
 
 /// The `WITH` block computing per-run *validity* for one project's stored research.
@@ -3951,12 +4154,12 @@ fn research_staleness_columns(model_bind: &str) -> String {
 /// on": the corpus is one project's retained runs, two orders of magnitude smaller
 /// than anything the search path touches.
 ///
-/// `guid_bind`/`model_bind` are the caller's positional placeholders for the
-/// project guid (simple form) and the EMBEDDING model id — `"?1"`/`"?2"` for every
-/// reader today, parameterised for the reason `research_staleness_columns` is.
-/// Ids are compared exactly as stored (hyphenated `Uuid::to_string()` on both
-/// sides); do not normalise them here.
-fn research_validity_ctes(guid_bind: &str, model_bind: &str) -> String {
+/// `guid_bind` is the caller's positional placeholder for the project guid
+/// (simple form) — `"?1"` for every reader today, parameterised so the readers'
+/// own bind numbering cannot silently mis-bind it. Ids are compared exactly as
+/// stored (hyphenated `Uuid::to_string()` on both sides); do not normalise them
+/// here.
+fn research_validity_ctes(guid_bind: &str) -> String {
     format!(
         "WITH moved AS (
              SELECT r.id AS run_id,
@@ -3964,7 +4167,6 @@ fn research_validity_ctes(guid_bind: &str, model_bind: &str) -> String {
                        FROM research_run_files rf
                        LEFT JOIN project_files pf
                               ON pf.project_guid = r.project_guid
-                             AND pf.model_id     = {model_bind}
                              AND pf.path         = rf.path
                              AND pf.status      != 'deleted'
                       WHERE rf.run_id = r.id
@@ -4006,7 +4208,6 @@ fn research_validity_ctes(guid_bind: &str, model_bind: &str) -> String {
 fn research_dependencies(
     tx: &rusqlite::Transaction<'_>,
     pg: &str,
-    model_id: &str,
     run_ids: &[String],
 ) -> rusqlite::Result<std::collections::HashMap<String, Vec<ResearchRunDependency>>> {
     let mut out: std::collections::HashMap<String, Vec<ResearchRunDependency>> =
@@ -4015,7 +4216,7 @@ fn research_dependencies(
         return Ok(out);
     }
     let placeholders = (0..run_ids.len())
-        .map(|i| format!("?{}", i + 3))
+        .map(|i| format!("?{}", i + 2))
         .collect::<Vec<_>>()
         .join(", ");
     // One WITH list: `ancestors` joins the validity CTEs rather than opening a
@@ -4036,10 +4237,10 @@ fn research_dependencies(
            LEFT JOIN research_runs p
                   ON p.id = a.anc_id AND p.project_guid = ?1
           ORDER BY a.root_id, (p.seq IS NULL), p.seq",
-        ctes = research_validity_ctes("?1", "?2"),
+        ctes = research_validity_ctes("?1"),
     );
     let mut stmt = tx.prepare(&sql)?;
-    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg];
     for id in run_ids {
         binds.push(id);
     }
@@ -4118,8 +4319,6 @@ async fn load_prior_reports(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     // The 32-char simple form, matching `UUIDv4`'s own `ToSql` and every other table
     // in the schema. `Uuid::to_string()` is hyphenated and would match nothing.
     let pg = project_guid.0.simple().to_string();
@@ -4129,7 +4328,7 @@ async fn load_prior_reports(
         .db_pool
         .transaction(token.child_token(), move |tx| {
             let placeholders = (0..wanted.len())
-                .map(|i| format!("?{}", i + 3))
+                .map(|i| format!("?{}", i + 2))
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
@@ -4145,11 +4344,11 @@ async fn load_prior_reports(
                             AS dangling_parent
                    FROM research_runs r
                   WHERE r.project_guid = ?1 AND r.id IN ({placeholders})",
-                ctes = research_validity_ctes("?1", "?2"),
-                cols = research_staleness_columns("?2"),
+                ctes = research_validity_ctes("?1"),
+                cols = research_staleness_columns(),
             );
             let mut stmt = tx.prepare(&sql)?;
-            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg, &model_id];
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pg];
             for id in &wanted {
                 binds.push(id);
             }
@@ -4970,8 +5169,6 @@ pub async fn post_research_challenge(
 
     // The subject, loaded before any slot is taken (the prior-reports rule).
     let load_guard = http3::CancellationGuard(CancellationToken::new());
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid;
     let rid = run_id.clone();
     let subject_row = s
@@ -4982,10 +5179,10 @@ pub async fn post_research_challenge(
                  SELECT r.seq, r.question, r.report, r.kind, r.scoped, r.scope_spec_json,
                         EXISTS (SELECT 1 FROM invalid i WHERE i.run_id = r.id) AS invalid_flag
                    FROM research_runs r
-                  WHERE r.project_guid = ?1 AND r.id = ?3",
-                ctes = research_validity_ctes("?1", "?2"),
+                  WHERE r.project_guid = ?1 AND r.id = ?2",
+                ctes = research_validity_ctes("?1"),
             );
-            tx.query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+            tx.query_row(&sql, rusqlite::params![pg, rid], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -5228,10 +5425,7 @@ async fn launch_research_job(
                     top_p: params.sampling.top_p,
                     model_digest,
                     model_details_json,
-                    embedder_model_id: {
-                        let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-                        model_id.clone()
-                    },
+                    embedder_model_id: { s.model.spec.id.to_string() },
                     server_version: env!("CARGO_PKG_VERSION"),
                     started_at: crate::unix_now(),
                     checkpoint_every_steps: params.checkpoint_every_steps,
@@ -5605,7 +5799,6 @@ pub async fn get_project_stats(
                      FROM project_file_chunks c
                      JOIN project_files f
                          ON c.project_guid = f.project_guid
-                         AND c.model_id = f.model_id
                          AND c.file_path = f.path
                      WHERE c.project_guid = ?1
                      GROUP BY f.programming_language, c.status",
@@ -5673,7 +5866,6 @@ pub async fn delete_project(
     State(s): State<RouterState>,
 ) -> Result<StatusCode, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let collection = collection_for(project_guid);
     let pg = project_guid;
 
     s.db_pool
@@ -5693,14 +5885,43 @@ pub async fn delete_project(
             ApiError::from(e)
         })?;
 
-    s.qdrant.delete_collection(&collection).await.map_err(|e| {
-        error!(
-            error = %e,
-            collection = %collection,
-            "Failed to delete the Qdrant collection. Check Qdrant is reachable at --qdrant-server."
-        );
-        ApiError::Internal
-    })?;
+    // The project is gone, so EVERY collection carrying its guid goes — all
+    // models, all layout versions — not just the active model's. The listing
+    // is the only way to see them (SQLite records no layout); when it declines
+    // or fails, fall back to the active collection so the common case still
+    // cleans up, and say what was left behind.
+    let guid_prefix = format!("{}_", project_guid.0.as_simple());
+    let to_drop: Vec<String> = match s.qdrant.list_collections().await {
+        Ok(Some(names)) => names
+            .into_iter()
+            .filter(|n| {
+                n.starts_with(&guid_prefix)
+                    && crate::db::qdrant::classify_collection(n, s.model.spec.collection_slug)
+                        != crate::db::qdrant::CollectionAge::Foreign
+            })
+            .collect(),
+        Ok(None) => vec![collection_for(project_guid, s.model.spec)],
+        Err(e) => {
+            warn!(
+                error = %e,
+                project_guid = %pg.0,
+                "Could not enumerate collections while deleting a project; dropping \
+                 only the active model's. Other models' collections for this project \
+                 remain until the stale check names them or they are dropped by hand."
+            );
+            vec![collection_for(project_guid, s.model.spec)]
+        }
+    };
+    for collection in &to_drop {
+        s.qdrant.delete_collection(collection).await.map_err(|e| {
+            error!(
+                error = %e,
+                collection = %collection,
+                "Failed to delete the Qdrant collection. Check Qdrant is reachable at --qdrant-server."
+            );
+            ApiError::Internal
+        })?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -6146,7 +6367,6 @@ pub async fn get_files(
                         f.retry_count, f.status_updated_at,
                         (SELECT COUNT(*) FROM project_file_chunks c
                           WHERE c.project_guid = f.project_guid
-                            AND c.model_id = f.model_id
                             AND c.file_path = f.path
                             AND c.status = 'active') AS chunk_count
                  FROM project_files f
@@ -6352,7 +6572,6 @@ pub async fn get_config(State(s): State<RouterState>) -> Json<ConfigResponse> {
 /// so the numbers the bootstrap document quotes can never disagree with what
 /// `/config` serves — one assembly, two renderings.
 async fn config_snapshot(s: &RouterState) -> ConfigResponse {
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
     // Cloned out and the guard dropped before anything else: the writer is a worker
     // on a tick, and this handler never holds the lock across an `.await`.
     let catalog = s.research_models.read().await.clone();
@@ -6361,7 +6580,10 @@ async fn config_snapshot(s: &RouterState) -> ConfigResponse {
     let stats = s.research_stats.read().await.clone();
     ConfigResponse {
         version: env!("CARGO_PKG_VERSION"),
-        model_id: model_id.clone(),
+        model_id: s.model.spec.id.to_string(),
+        embedding_dim: s.model.spec.dim,
+        min_chunk_tokens: s.min_chunk_tokens,
+        max_chunk_tokens: s.max_chunk_tokens,
         languages: ProgrammingLanguage::ALL.iter().map(|l| l.name()).collect(),
         embed_batch: s.embed_tuning.embed_batch,
         db_pool_size: s.db_pool_size,
@@ -6858,12 +7080,12 @@ fn research_summary_columns() -> String {
              AS challenged_title,
          (SELECT s.question FROM research_runs s WHERE s.id = r.challenged_run_id)
              AS challenged_question",
-        research_staleness_columns("?2"),
+        research_staleness_columns(),
         trust = research_trust_column(),
     )
 }
 
-/// The corpus totals for one project: `?1` the guid, `?2` the embedding model id.
+/// The corpus totals for one project: `?1` the guid.
 ///
 /// **No filter from the request is applied here, ever** — see
 /// [`ResearchCorpusTotals`]. They are a fixed denominator; a count that shrank as
@@ -6902,7 +7124,7 @@ fn research_totals_sql() -> String {
                 WHERE r.project_guid = ?1
            ) r
            JOIN moved m ON m.run_id = r.id",
-        ctes = research_validity_ctes("?1", "?2"),
+        ctes = research_validity_ctes("?1"),
     )
 }
 
@@ -7036,8 +7258,6 @@ pub async fn get_research_runs(
     validate::research_list_limit(q.limit, s.research_list_page_limit)?;
     let limit = q.limit.unwrap_or(s.research_list_page_limit);
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid;
     let pg_simple = project_guid.0.simple().to_string();
 
@@ -7057,8 +7277,8 @@ pub async fn get_research_runs(
             }
 
             let mut where_parts = vec!["r.project_guid = ?1".to_string()];
-            let mut binds: Vec<Bind> = vec![Bind::Guid(pg), Bind::Path(model_id.clone())];
-            let mut n = 3usize;
+            let mut binds: Vec<Bind> = vec![Bind::Guid(pg)];
+            let mut n = 2usize;
             if let Some(pattern) = q.q.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
                 // NULL title in the OR is harmless: `NULL LIKE x` is NULL, and the
                 // question clause still decides.
@@ -7141,7 +7361,7 @@ pub async fn get_research_runs(
                  ) {outer_where}
                  ORDER BY seq DESC
                  LIMIT ?{n}",
-                ctes = research_validity_ctes("?1", "?2"),
+                ctes = research_validity_ctes("?1"),
                 cols = research_summary_columns(),
                 where_clause = where_parts.join(" AND "),
             );
@@ -7157,7 +7377,7 @@ pub async fn get_research_runs(
 
             // The ancestry, once for the whole page rather than per row.
             let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
-            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &ids)?;
+            let mut deps = research_dependencies(tx, &pg_simple, &ids)?;
             for run in &mut runs {
                 fill_validity(run, deps.remove(&run.id).unwrap_or_default());
             }
@@ -7174,7 +7394,7 @@ pub async fn get_research_runs(
             // the pass then proposes.
             let totals = tx.query_row(
                 &research_totals_sql(),
-                rusqlite::params![pg, model_id],
+                rusqlite::params![pg],
                 research_totals_from_row,
             )?;
 
@@ -7230,8 +7450,6 @@ pub async fn get_research_run(
     State(s): State<RouterState>,
 ) -> Result<Json<ResearchRunDetail>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid;
     let pg_simple = project_guid.0.simple().to_string();
     let rid = run_id.clone();
@@ -7243,12 +7461,12 @@ pub async fn get_research_run(
                 "{ctes}
                  SELECT {cols}, r.report, r.prompt_version, r.context_run_ids_json, r.scope_json
                    FROM research_runs r
-                  WHERE r.project_guid = ?1 AND r.id = ?3",
-                ctes = research_validity_ctes("?1", "?2"),
+                  WHERE r.project_guid = ?1 AND r.id = ?2",
+                ctes = research_validity_ctes("?1"),
                 cols = research_summary_columns(),
             );
             let row = tx
-                .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                .query_row(&sql, rusqlite::params![pg, rid], |row| {
                     let summary = research_summary_from_row(row)?;
                     // The four detail-only columns, appended after the summary's —
                     // indexed from the boundary rather than from a literal, so a
@@ -7267,7 +7485,7 @@ pub async fn get_research_run(
             let Some((mut summary, report, prompt_version, context_json, scope)) = row else {
                 return Ok(None);
             };
-            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &[summary.id.clone()])?;
+            let mut deps = research_dependencies(tx, &pg_simple, &[summary.id.clone()])?;
             let own_deps = deps.remove(&summary.id).unwrap_or_default();
             fill_validity(&mut summary, own_deps);
 
@@ -7278,17 +7496,13 @@ pub async fn get_research_run(
                    FROM research_run_files rf
                    LEFT JOIN project_files pf
                           ON pf.project_guid = ?1
-                         AND pf.model_id     = ?2
                          AND pf.path         = rf.path
                          AND pf.status      != 'deleted'
-                  WHERE rf.run_id = ?3
+                  WHERE rf.run_id = ?2
                   ORDER BY rf.path",
             )?;
-            // `model_id` is the EMBEDDING model, which is what project_files is keyed
-            // by. `summary.model` is the Ollama model that drove the run — a different
-            // thing entirely, and binding it here made every file read as `removed`.
             let files = stmt
-                .query_map(rusqlite::params![pg, &model_id, &summary.id], |row| {
+                .query_map(rusqlite::params![pg, &summary.id], |row| {
                     let sha256: String = row.get(1)?;
                     let current: Option<String> = row.get(2)?;
                     let state = match &current {
@@ -7377,8 +7591,6 @@ pub async fn get_research_verification(
     State(s): State<RouterState>,
 ) -> Result<Json<ResearchVerification>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid;
     let pg_simple = project_guid.0.simple().to_string();
     let rid = run_id.clone();
@@ -7392,12 +7604,12 @@ pub async fn get_research_verification(
                  SELECT {cols}, r.report, r.citations_path_only, r.stale_citations,
                         r.started_at
                    FROM research_runs r
-                  WHERE r.project_guid = ?1 AND r.id = ?3",
-                ctes = research_validity_ctes("?1", "?2"),
+                  WHERE r.project_guid = ?1 AND r.id = ?2",
+                ctes = research_validity_ctes("?1"),
                 cols = research_summary_columns(),
             );
             let row = tx
-                .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                .query_row(&sql, rusqlite::params![pg, rid], |row| {
                     let summary = research_summary_from_row(row)?;
                     // Indexed from the summary boundary, like the detail query —
                     // a new summary column must not quietly redirect these.
@@ -7415,7 +7627,7 @@ pub async fn get_research_verification(
             else {
                 return Ok(None);
             };
-            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &[summary.id.clone()])?;
+            let mut deps = research_dependencies(tx, &pg_simple, &[summary.id.clone()])?;
             let own_deps = deps.remove(&summary.id).unwrap_or_default();
             fill_validity(&mut summary, own_deps);
 
@@ -7427,13 +7639,12 @@ pub async fn get_research_verification(
                    FROM research_run_files rf
                    LEFT JOIN project_files pf
                           ON pf.project_guid = ?1
-                         AND pf.model_id     = ?2
                          AND pf.path         = rf.path
                          AND pf.status      != 'deleted'
-                  WHERE rf.run_id = ?3",
+                  WHERE rf.run_id = ?2",
             )?;
             let states: FileStates = stmt
-                .query_map(rusqlite::params![pg, &model_id, &summary.id], |row| {
+                .query_map(rusqlite::params![pg, &summary.id], |row| {
                     let path: String = row.get(0)?;
                     let baseline: String = row.get(1)?;
                     let current: Option<String> = row.get(2)?;
@@ -7623,8 +7834,6 @@ pub async fn post_research_pin(
     ApiJson(req): ApiJson<ResearchPinRequest>,
 ) -> Result<Json<ResearchRunSummary>, ApiError> {
     let guard = http3::CancellationGuard(CancellationToken::new());
-    let EmbeddingModel::BGEm3 { model_id, .. } = &s.model;
-    let model_id = model_id.to_string();
     let pg = project_guid;
     let pg_simple = project_guid.0.simple().to_string();
     let rid = run_id.clone();
@@ -7644,19 +7853,19 @@ pub async fn post_research_pin(
             }
             let sql = format!(
                 "{ctes}
-                 SELECT {cols} FROM research_runs r WHERE r.project_guid = ?1 AND r.id = ?3",
-                ctes = research_validity_ctes("?1", "?2"),
+                 SELECT {cols} FROM research_runs r WHERE r.project_guid = ?1 AND r.id = ?2",
+                ctes = research_validity_ctes("?1"),
                 cols = research_summary_columns(),
             );
             let summary = tx
-                .query_row(&sql, rusqlite::params![pg, model_id, rid], |row| {
+                .query_row(&sql, rusqlite::params![pg, rid], |row| {
                     research_summary_from_row(row)
                 })
                 .optional()?;
             let Some(mut summary) = summary else {
                 return Ok(None);
             };
-            let mut deps = research_dependencies(tx, &pg_simple, &model_id, &[summary.id.clone()])?;
+            let mut deps = research_dependencies(tx, &pg_simple, &[summary.id.clone()])?;
             let own_deps = deps.remove(&summary.id).unwrap_or_default();
             fill_validity(&mut summary, own_deps);
             Ok(Some(summary))
@@ -7872,6 +8081,7 @@ pub async fn post_gc(
     let out = crate::worker::gc::collect(
         &s.db_pool,
         &*s.qdrant,
+        s.model.spec,
         s.status_log_retention_days,
         &s.metrics,
         "manual",
@@ -8146,6 +8356,30 @@ enum ProbeFailure<E> {
     TimedOut(Duration),
 }
 
+/// Liveness **and identity** in one embedder probe: the instance must answer,
+/// and it must serve the model `[model].id` names. A server answering with a
+/// different model is exactly as broken for this deployment as one that is
+/// down — every vector it produced would be poison — and reporting it `ok`
+/// would leave "search finds nothing obvious" with no failing check anywhere.
+/// This is the recurring half of the startup handshake, so a model swapped
+/// under a running mindex surfaces on the next `/health` read.
+async fn embedder_probe(
+    client: &Arc<dyn Embedder>,
+    model: &crate::backend::http3::ActiveModel,
+) -> Result<(), EncodeError> {
+    client.health().await?;
+    let served = client.served_models().await?;
+    if served.iter().any(|m| m == &model.served_name) {
+        Ok(())
+    } else {
+        Err(EncodeError::Decode(format!(
+            "the embedder answers but serves {served:?}, not {:?} — [model].id \
+             names a model this instance does not host",
+            model.served_name
+        )))
+    }
+}
+
 /// One dependency probe: the verdict for the wire, the reason for the log.
 ///
 /// The raw error deliberately does not travel — see [`CheckState`]. Every probe
@@ -8223,19 +8457,15 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
             .await
         },
         bounded(health_deadline, s.qdrant.health()),
-        bounded(health_deadline, {
-            let EmbeddingModel::BGEm3 { client, .. } = &s.model;
-            client.health()
-        }),
+        bounded(health_deadline, embedder_probe(&s.model.client, &s.model)),
         async {
             // Pinged separately only when it *is* separate: a split deployment can have
             // a healthy indexer and a dead query instance, which would otherwise show as
             // a green health check and every search failing.
-            let EmbeddingModel::BGEm3 { client, .. } = &s.model;
-            if Arc::ptr_eq(client, &s.query_model) {
+            if Arc::ptr_eq(&s.model.client, &s.query_model) {
                 None
             } else {
-                Some(bounded(health_deadline, s.query_model.health()).await)
+                Some(bounded(health_deadline, embedder_probe(&s.query_model, &s.model)).await)
             }
         },
         bounded(health_deadline, s.research_ollama.health()),
@@ -8260,8 +8490,9 @@ pub async fn get_health(State(s): State<RouterState>) -> Json<HealthResponse> {
 
     let (embedder, _) = probe(
         "embedder",
-        "check the BGE-M3 server is up and reachable from here — a 0.0.0.0 bind \
-         there is not 127.0.0.1 from this process.",
+        "check the vLLM instance at [model].server_url is up, reachable from \
+         here (a 0.0.0.0 bind there is not 127.0.0.1 from this process), and \
+         serving the model [model].id names.",
         embedder_res,
     );
     let query_embedder = query_res.map(|r| {
@@ -8672,6 +8903,7 @@ mod tests {
         tx.send(IndexEvent::Started {
             files: 1,
             symbols_only: false,
+            vectors_only: false,
         })
         .unwrap();
         drop(tx); // the job died here: no `done`, no `error`.
@@ -8908,8 +9140,8 @@ mod tests {
     async fn trust_aggregates_valid_challenges_and_drops_stale_ones() {
         let pool = SQLite3Pool::new(FsPath::new(":memory:"), 1, 16384, "NORMAL");
         let trust_sql = format!(
-            "{ctes} SELECT {trust} FROM research_runs r WHERE r.id = ?3",
-            ctes = research_validity_ctes("?1", "?2"),
+            "{ctes} SELECT {trust} FROM research_runs r WHERE r.id = ?2",
+            ctes = research_validity_ctes("?1"),
             trust = research_trust_column(),
         );
         pool.transaction(CancellationToken::new(), move |tx| {
@@ -8954,9 +9186,7 @@ mod tests {
             };
             insert_run("subj", 1, "research", None, None)?;
             let trust = |tx: &rusqlite::Transaction| -> rusqlite::Result<String> {
-                tx.query_row(&trust_sql, params!["p1", "BAAI/bge-m3", "subj"], |r| {
-                    r.get(0)
-                })
+                tx.query_row(&trust_sql, params!["p1", "subj"], |r| r.get(0))
             };
             assert_eq!(trust(tx)?, "unchallenged");
 
@@ -9057,13 +9287,13 @@ mod tests {
                      )
                      ORDER BY seq DESC
                      LIMIT 10",
-                    ctes = research_validity_ctes("?1", "?2"),
+                    ctes = research_validity_ctes("?1"),
                     cols = research_summary_columns(),
                     where_clause = where_parts.join(" AND "),
                 );
                 let mut stmt = tx.prepare(&sql)?;
                 let seqs = stmt
-                    .query_map(params!["p1", "BAAI/bge-m3"], |row| {
+                    .query_map(params!["p1"], |row| {
                         research_summary_from_row(row).map(|r| r.seq)
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -9139,13 +9369,13 @@ mod tests {
              )
              ORDER BY seq DESC
              LIMIT 100",
-            ctes = research_validity_ctes("?1", "?2"),
+            ctes = research_validity_ctes("?1"),
             cols = research_summary_columns(),
             where_clause = where_parts.join(" AND "),
         );
         let mut stmt = tx.prepare(&sql)?;
         let rows = stmt
-            .query_map(params!["p1", "BAAI/bge-m3"], research_summary_from_row)?
+            .query_map(params!["p1"], research_summary_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -9326,7 +9556,7 @@ mod tests {
 
             let t = tx.query_row(
                 &research_totals_sql(),
-                params!["p1", "BAAI/bge-m3"],
+                params!["p1"],
                 research_totals_from_row,
             )?;
 
@@ -9536,29 +9766,35 @@ mod tests {
         p.transaction(CancellationToken::new(), move |tx| {
             tx.execute_batch(
                 "CREATE TABLE project_files (
-                     project_guid    TEXT NOT NULL,
-                     path            TEXT NOT NULL,
-                     model_id        TEXT NOT NULL,
-                     sha256          TEXT NOT NULL,
-                     status          TEXT NOT NULL,
-                     chunks_version  TEXT,
-                     symbols_version TEXT
+                     project_guid      TEXT NOT NULL,
+                     path              TEXT NOT NULL,
+                     sha256            TEXT NOT NULL,
+                     status            TEXT NOT NULL,
+                     chunks_version    TEXT,
+                     chunker_id        TEXT,
+                     embedded_model_id TEXT,
+                     symbols_version   TEXT
                  );",
             )?;
             // `None` binds as SQL NULL and models a file derived by an unknown
             // version: the skip compares for equality, and nothing equals NULL.
+            // The two identity columns are stamped as current whenever the
+            // versions are, so these tests keep exercising the version axes.
+            let spec =
+                crate::models::registry::model_by_id("qwen3-embedding-0.6b").expect("registered");
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, path, model_id, sha256, status,
-                      chunks_version, symbols_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (project_guid, path, sha256, status,
+                      chunks_version, chunker_id, embedded_model_id, symbols_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     guid(),
                     "src/a.py",
-                    "m",
                     sha,
                     status,
                     chunks_version,
+                    chunks_version.map(|_| spec.tokenizer_hf_id),
+                    chunks_version.map(|_| spec.id),
                     symbols_version
                 ],
             )?;
@@ -9571,7 +9807,13 @@ mod tests {
 
     async fn already_indexed(p: &SQLite3Pool, sha: &'static str) -> bool {
         p.transaction(CancellationToken::new(), move |tx| {
-            file_already_indexed(tx, guid(), "src/a.py", "m", sha)
+            file_already_indexed(
+                tx,
+                guid(),
+                "src/a.py",
+                crate::models::registry::model_by_id("qwen3-embedding-0.6b").expect("registered"),
+                sha,
+            )
         })
         .await
         .unwrap()
@@ -9801,21 +10043,20 @@ mod tests {
                 (p2, "tests/x.rs", gx, "active"),
             ] {
                 tx.execute(
-                    "INSERT OR IGNORE INTO projects (guid, model_id)
-                     VALUES (?1, 'BAAI/bge-m3')",
+                    "INSERT OR IGNORE INTO projects (guid) VALUES (?1)",
                     params![pg],
                 )?;
                 tx.execute(
                     "INSERT INTO project_files
-                         (project_guid, model_id, path, sha256, programming_language, status)
-                     VALUES (?1, 'BAAI/bge-m3', ?2, ?3, 'rust', 'indexing')",
+                         (project_guid, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, 'rust', 'indexing')",
                     params![pg, path, "0".repeat(64)],
                 )?;
                 tx.execute(
                     "INSERT INTO project_file_chunks
-                         (project_guid, file_path, model_id, code, qdrant_guid,
+                         (project_guid, file_path, code, qdrant_guid, tokens,
                           start_line, end_line, start_column, end_column, status)
-                     VALUES (?1, ?2, 'BAAI/bge-m3', 'code', ?3, 1, 2, 0, 1, ?4)",
+                     VALUES (?1, ?2, 'code', ?3, 3, 1, 2, 0, 1, ?4)",
                     params![pg, path, chunk_guid, chunk_status],
                 )?;
             }
@@ -9859,14 +10100,11 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
-                params![guid()],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![guid()])?;
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'src/a.py', ?2, 'python', 'indexing')",
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'src/a.py', ?2, 'python', 'indexing')",
                 params![guid(), SHA_OLD],
             )?;
             // indexing → indexed: the state a previously indexed file sits in.
@@ -9881,6 +10119,8 @@ mod tests {
 
         // Reindex with changed content: the exact production prepare upsert.
         pool.transaction(CancellationToken::new(), |tx| {
+            let spec =
+                crate::models::registry::model_by_id("qwen3-embedding-0.6b").expect("registered");
             tx.execute(
                 MARK_INDEXING_UPSERT_SQL,
                 params![
@@ -9888,9 +10128,10 @@ mod tests {
                     "src/a.py",
                     SHA_NEW,
                     ProgrammingLanguage::Python,
-                    "BAAI/bge-m3",
                     CHUNKS_DERIVATION_VERSION,
-                    SYMBOLS_DERIVATION_VERSION
+                    SYMBOLS_DERIVATION_VERSION,
+                    spec.tokenizer_hf_id,
+                    spec.id
                 ],
             )?;
             Ok(())
@@ -10050,7 +10291,7 @@ mod tests {
         // "req1 releases → req3 reindexes → req1's late `failed` lands" impossible:
         // req1 never releases mid-pipeline.
         let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let key = indexing_lock_key("guid", "model", "f.rs");
+        let key = indexing_lock_key("guid", "f.rs");
 
         let claim = IndexClaim::try_acquire(&locks, key.clone()).expect("first acquires");
         let prepared = Prepared {
@@ -10093,7 +10334,6 @@ mod tests {
     #[tokio::test]
     async fn the_handler_and_the_retry_worker_spell_the_same_lock_key() {
         let guid = UUIDv4(Uuid::new_v4());
-        const MODEL_ID: &str = "BAAI/bge-m3";
         const PATH: &str = "src/a.rs";
 
         // What the worker gets: whatever SQLite hands back for a stored `UUIDv4`.
@@ -10103,8 +10343,8 @@ mod tests {
                 tx.execute_batch(m)?;
             }
             tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                rusqlite::params![guid, MODEL_ID],
+                "INSERT INTO projects (guid) VALUES (?1)",
+                rusqlite::params![guid],
             )?;
             Ok(())
         })
@@ -10119,8 +10359,8 @@ mod tests {
             .await
             .expect("read the guid back");
 
-        let handler_key = indexing_lock_key(&guid.0.as_simple().to_string(), MODEL_ID, PATH);
-        let worker_key = indexing_lock_key(&from_db, MODEL_ID, PATH);
+        let handler_key = indexing_lock_key(&guid.0.as_simple().to_string(), PATH);
+        let worker_key = indexing_lock_key(&from_db, PATH);
 
         assert_eq!(
             handler_key, worker_key,
@@ -10137,29 +10377,29 @@ mod tests {
         );
     }
 
-    /// The NUL separators are what make the three components unambiguous: no guid,
-    /// model id or path can contain one, so two different files can never collide on
-    /// one key and one file can never produce two. A separator that *can* appear in a
-    /// component (a `/`, say) would let `a/b` + `c` and `a` + `b/c` share a claim.
+    /// The NUL separator is what makes the two components unambiguous: no guid
+    /// or path can contain one, so two different files can never collide on one
+    /// key and one file can never produce two. A separator that *can* appear in
+    /// a component (a `/`, say) would let `a/b` + `c` and `a` + `b/c` share a
+    /// claim.
     #[test]
     fn distinct_files_never_share_a_lock_key() {
         let keys = [
-            indexing_lock_key("g", "m", "a/b.rs"),
-            indexing_lock_key("g", "m", "a/c.rs"),
-            indexing_lock_key("g", "m2", "a/b.rs"),
-            indexing_lock_key("g2", "m", "a/b.rs"),
+            indexing_lock_key("g", "a/b.rs"),
+            indexing_lock_key("g", "a/c.rs"),
+            indexing_lock_key("g2", "a/b.rs"),
             // The classic ambiguity: components that would run together under a
-            // separator any of them could contain.
-            indexing_lock_key("g", "m/x", "b.rs"),
-            indexing_lock_key("g", "m", "x/b.rs"),
+            // separator either of them could contain.
+            indexing_lock_key("gx", "b.rs"),
+            indexing_lock_key("g", "x/b.rs"),
         ];
         let unique: HashSet<&String> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len(), "two distinct files share a claim");
 
         // ...and the same file always produces the same key.
         assert_eq!(
-            indexing_lock_key("g", "m", "a/b.rs"),
-            indexing_lock_key("g", "m", "a/b.rs")
+            indexing_lock_key("g", "a/b.rs"),
+            indexing_lock_key("g", "a/b.rs")
         );
     }
 
@@ -10170,7 +10410,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn only_one_of_many_racing_claimants_wins_and_the_slot_frees_afterwards() {
         let locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let key = indexing_lock_key("g", "m", "hot.rs");
+        let key = indexing_lock_key("g", "hot.rs");
         let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let gate = Arc::new(tokio::sync::Notify::new());
 
@@ -10222,15 +10462,12 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![guid(), "BAAI/bge-m3"],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![guid()])?;
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, ?2, 'a.rs', ?3, 'rust', 'indexing')",
-                params![guid(), "BAAI/bge-m3", "0".repeat(64)],
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'a.rs', ?2, 'rust', 'indexing')",
+                params![guid(), "0".repeat(64)],
             )?;
             Ok(())
         })
@@ -10241,16 +10478,7 @@ mod tests {
         // an old status_updated_at directly — both are plain column writes, not status
         // transitions, so no trigger fires.
         let pg = guid().0.as_simple().to_string();
-        let _ = set_file_status(
-            &pool,
-            &pg,
-            "a.rs",
-            "BAAI/bge-m3",
-            "failed",
-            true,
-            CancellationToken::new(),
-        )
-        .await;
+        let _ = set_file_status(&pool, &pg, "a.rs", "failed", true, CancellationToken::new()).await;
         pool.transaction(CancellationToken::new(), |tx| {
             tx.execute(
                 "UPDATE project_files SET retry_count = 9, status_updated_at = 1000
@@ -10313,13 +10541,13 @@ mod tests {
 
     use crate::db::files::set_file_status;
     use crate::db::qdrant::{ChunkAsVector, SearchHit, VectorStoreError};
-    use crate::models::bge_m3::{BGEm3EmbedRequest, BGEm3EmbedResponse, EncodeError};
+    use crate::models::embedder::EncodeError;
     use async_trait::async_trait;
     use sha2::Digest;
     use std::collections::HashSet;
     use std::sync::Mutex;
 
-    const MODEL: &str = "BAAI/bge-m3";
+    const MODEL: &str = "qwen3-embedding-0.6b";
 
     /// Neither seam may be touched by `drop_cancelled`/`recover_all` — they are
     /// SQLite-only paths. Any call is a test failure.
@@ -10350,9 +10578,6 @@ mod tests {
             _c: &str,
             _i: Vec<UUIDv4>,
             _d: Vec<f32>,
-            _si: Vec<u32>,
-            _sv: Vec<f32>,
-            _cb: Vec<Vec<f32>>,
             _k: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             unreachable!()
@@ -10361,15 +10586,18 @@ mod tests {
 
     struct NoEmbedder;
     #[async_trait]
-    impl crate::models::bge_m3::BGEm3Model for NoEmbedder {
-        async fn encode(
+    impl crate::models::embedder::Embedder for NoEmbedder {
+        async fn embed(
             &self,
-            _req: BGEm3EmbedRequest,
+            _texts: Vec<String>,
             _token: CancellationToken,
-        ) -> Result<BGEm3EmbedResponse, EncodeError> {
+        ) -> Result<Vec<Vec<f32>>, EncodeError> {
             unreachable!("drop_cancelled/recover_all must not call the embedder")
         }
         async fn health(&self) -> Result<(), EncodeError> {
+            unreachable!()
+        }
+        async fn served_models(&self) -> Result<Vec<String>, EncodeError> {
             unreachable!()
         }
     }
@@ -10385,24 +10613,21 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![guid(), MODEL],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![guid()])?;
             for path in paths {
                 tx.execute(
                     "INSERT INTO project_files
-                         (project_guid, model_id, path, sha256, programming_language, status)
-                     VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing')",
-                    params![guid(), MODEL, path, "0".repeat(64)],
+                         (project_guid, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, 'rust', 'indexing')",
+                    params![guid(), path, "0".repeat(64)],
                 )?;
                 for _ in 0..n_chunks {
                     tx.execute(
                         "INSERT INTO project_file_chunks
-                             (project_guid, file_path, model_id, code, qdrant_guid,
+                             (project_guid, file_path, code, qdrant_guid, tokens,
                               start_line, end_line, start_column, end_column, status)
-                         VALUES (?1, ?2, ?3, 'code', ?4, 1, 2, 0, 1, 'active')",
-                        params![guid(), path, MODEL, Uuid::new_v4().simple().to_string()],
+                         VALUES (?1, ?2, 'code', ?3, 3, 1, 2, 0, 1, 'active')",
+                        params![guid(), path, Uuid::new_v4().simple().to_string()],
                     )?;
                 }
             }
@@ -10416,7 +10641,7 @@ mod tests {
     /// Builds a `Prepared` for `path` the way `prepare` would: claim held, chunks
     /// carried. The chunk list content is irrelevant to the paths under test.
     fn prepared_for(locks: &Arc<Mutex<HashSet<String>>>, path: &str) -> Prepared {
-        let key = indexing_lock_key(&guid().0.as_simple().to_string(), MODEL, path);
+        let key = indexing_lock_key(&guid().0.as_simple().to_string(), path);
         Prepared {
             pl: ProgrammingLanguage::Rust,
             path: path.to_string(),
@@ -10434,13 +10659,13 @@ mod tests {
                 "SELECT f.status,
                         (SELECT COUNT(*) FROM project_file_chunks c
                          WHERE c.project_guid = f.project_guid AND c.file_path = f.path
-                           AND c.model_id = f.model_id AND c.status = 'active'),
+                           AND c.status = 'active'),
                         (SELECT COUNT(*) FROM project_file_chunks c
                          WHERE c.project_guid = f.project_guid AND c.file_path = f.path
-                           AND c.model_id = f.model_id AND c.status = 'deleted')
+                           AND c.status = 'deleted')
                  FROM project_files f
-                 WHERE f.project_guid = ?1 AND f.path = ?2 AND f.model_id = ?3",
-                params![guid(), path, MODEL],
+                 WHERE f.project_guid = ?1 AND f.path = ?2",
+                params![guid(), path],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .map_err(SQLite3PoolError::from)
@@ -10493,21 +10718,22 @@ mod tests {
             .unk_token("[UNK]".to_string())
             .build()
             .expect("static vocab");
-        let embedder: Arc<dyn crate::models::bge_m3::BGEm3Model> = Arc::new(NoEmbedder);
+        let embedder: Arc<dyn crate::models::embedder::Embedder> = Arc::new(NoEmbedder);
+        let spec = crate::models::registry::model_by_id(MODEL).expect("registered");
 
         RouterState {
             tokenizer: Arc::new(Tokenizer::new(word_level)),
             db_pool: Arc::new(pool),
             qdrant: Arc::new(NoStore),
-            model: EmbeddingModel::BGEm3 {
-                model_id: MODEL.to_string(),
+            model: crate::backend::http3::ActiveModel {
+                spec,
+                served_name: spec.hf_repo.to_string(),
                 client: Arc::clone(&embedder),
             },
             query_model: embedder,
             embed_tuning: crate::embed::EmbedTuning {
                 embed_batch: cfg.indexing.embed_batch_chunks,
                 upsert_batch: cfg.qdrant.upsert_batch_points,
-                sparse_min_weight: cfg.indexing.sparse_min_weight,
             },
             min_chunk_tokens: cfg.slicer.min_chunk_tokens,
             max_chunk_tokens: cfg.slicer.max_chunk_tokens,
@@ -10607,13 +10833,12 @@ mod tests {
             store: &NoStore,
             tokenizer: &fx.tokenizer,
             embedder: &NoEmbedder,
-            model_id: MODEL,
+            spec: crate::models::registry::model_by_id(MODEL).expect("registered"),
             project_guid: guid(),
             collection: "unused",
             embed_tuning: crate::embed::EmbedTuning {
                 embed_batch: 64,
                 upsert_batch: 256,
-                sparse_min_weight: 1e-5,
             },
             min_chunk_tokens: 128,
             max_chunk_tokens: 512,
@@ -10642,31 +10867,28 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![guid(), MODEL],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![guid()])?;
             // A row may only enter as `just_uploaded`/`indexing` (status-machine
             // trigger), so
             // reach `indexed` the legal way rather than inserting it directly.
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing')",
-                params![guid(), MODEL, path, sha],
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, ?3, 'rust', 'indexing')",
+                params![guid(), path, sha],
             )?;
             tx.execute(
                 "UPDATE project_files SET status = 'indexed'
-                 WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-                params![guid(), MODEL, path],
+                 WHERE project_guid = ?1 AND path = ?2",
+                params![guid(), path],
             )?;
             // `None` leaves both columns NULL — the unversioned shape.
             if let Some(v) = symbols_version {
                 tx.execute(
                     "UPDATE project_files
-                        SET chunks_version = ?4, symbols_version = ?5
-                      WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-                    params![guid(), MODEL, path, CHUNKS_DERIVATION_VERSION, v],
+                        SET chunks_version = ?3, symbols_version = ?4
+                      WHERE project_guid = ?1 AND path = ?2",
+                    params![guid(), path, CHUNKS_DERIVATION_VERSION, v],
                 )?;
             }
             Ok(())
@@ -10864,7 +11086,6 @@ mod tests {
             &pool,
             &pg,
             "a.rs",
-            MODEL,
             "cancelled",
             false,
             CancellationToken::new(),
@@ -10959,10 +11180,10 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO project_file_symbols
-                     (project_guid, model_id, file_path, name, kind,
+                     (project_guid, file_path, name, kind,
                       start_line, end_line, start_column, end_column)
-                 VALUES (?1, ?2, ?3, ?4, 'function', 1, 1, 0, 1)",
-                params![guid(), MODEL, path, name],
+                 VALUES (?1, ?2, ?3, 'function', 1, 1, 0, 1)",
+                params![guid(), path, name],
             )?;
             Ok(())
         })
@@ -10974,10 +11195,10 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.prepare(
                 "SELECT name FROM project_file_symbols
-                 WHERE project_guid = ?1 AND model_id = ?2 AND file_path = ?3
+                 WHERE project_guid = ?1 AND file_path = ?2
                  ORDER BY name",
             )?
-            .query_map(params![guid(), MODEL, path], |r| r.get::<_, String>(0))?
+            .query_map(params![guid(), path], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(SQLite3PoolError::from)
         })
@@ -11033,7 +11254,6 @@ mod tests {
             &pool,
             &pg,
             "a.rs",
-            MODEL,
             "cancelled",
             false,
             CancellationToken::new(),
@@ -11067,7 +11287,6 @@ mod tests {
             &pool,
             &pg,
             "a.rs",
-            MODEL,
             "deleted",
             false,
             CancellationToken::new(),
@@ -11106,7 +11325,7 @@ mod tests {
         req: SymbolsRequest,
         limit: usize,
     ) -> (Vec<String>, u64) {
-        let (sql, binds) = build_symbols_query(guid(), MODEL, &req, limit);
+        let (sql, binds) = build_symbols_query(guid(), &req, limit);
         pool.transaction(CancellationToken::new(), move |tx| {
             let mut total = 0u64;
             let paths = tx
@@ -11190,20 +11409,16 @@ mod tests {
             )]),
             programming_languages: None,
         });
-        let (sql, binds) = build_symbols_query(guid(), "m", &req, 10);
+        let (sql, binds) = build_symbols_query(guid(), &req, 10);
         assert!(
             sql.contains("file_path IN (SELECT path FROM project_files"),
             "the scope is a subquery, not a join — build_file_filter emits unqualified \
              column names: {sql}"
         );
         assert_eq!(
-            &binds[..3],
-            &[
-                Bind::Guid(guid()),
-                Bind::Path("m".into()),
-                Bind::Path("collect".into()),
-            ],
-            "the query's own binds must keep positions 1-3: {binds:?}"
+            &binds[..2],
+            &[Bind::Guid(guid()), Bind::Path("collect".into())],
+            "the query's own binds must keep positions 1-2: {binds:?}"
         );
     }
 
@@ -11211,9 +11426,9 @@ mod tests {
     /// public `/symbols` endpoint provably did not change when scoping was added.
     #[test]
     fn an_unscoped_symbols_lookup_builds_the_sql_it_always_did() {
-        let (sql, binds) = build_symbols_query(guid(), "m", &symbols_req("collect", None), 10);
+        let (sql, binds) = build_symbols_query(guid(), &symbols_req("collect", None), 10);
         assert!(!sql.contains("file_path IN"), "{sql}");
-        assert_eq!(binds.len(), 3, "project, model, name — nothing else");
+        assert_eq!(binds.len(), 2, "project and name — nothing else");
     }
 
     #[tokio::test]
@@ -11275,8 +11490,6 @@ mod tests {
     // a windowed post (nothing outside the window moves) and a rewrite (the
     // old shas go, and their paths go with them).
 
-    const HISTORY_MODEL: &str = "BAAI/bge-m3";
-
     async fn history_pool() -> SQLite3Pool {
         // Pool size 1 so the ":memory:" connection — and therefore the schema —
         // is the same one every later transaction gets.
@@ -11319,12 +11532,7 @@ mod tests {
         commits: Vec<CommitEntry>,
     ) -> HistoryResponse {
         p.transaction(CancellationToken::new(), move |tx| {
-            reconcile_history(
-                tx,
-                guid(),
-                HISTORY_MODEL,
-                &HistoryRequest { since, commits },
-            )
+            reconcile_history(tx, guid(), &HistoryRequest { since, commits })
         })
         .await
         .unwrap()
@@ -11462,7 +11670,7 @@ mod tests {
 
     async fn prune(p: &SQLite3Pool, q: HistoryPruneQuery) -> HistoryPruneResponse {
         p.transaction(CancellationToken::new(), move |tx| {
-            prune_history(tx, guid(), HISTORY_MODEL, &q)
+            prune_history(tx, guid(), &q)
         })
         .await
         .unwrap()
@@ -11688,7 +11896,7 @@ mod tests {
         path: &'static str,
     ) -> (bool, bool, usize, Vec<CommitSummary>) {
         p.transaction(CancellationToken::new(), move |tx| {
-            read_file_history(tx, guid(), HISTORY_MODEL, path, FILE_HISTORY_LIMIT)
+            read_file_history(tx, guid(), path, FILE_HISTORY_LIMIT)
         })
         .await
         .unwrap()
@@ -11769,13 +11977,7 @@ mod tests {
         // (`evidence_width` 2) actually reaches the read.
         let widened = p
             .transaction(CancellationToken::new(), move |tx| {
-                read_file_history(
-                    tx,
-                    guid(),
-                    HISTORY_MODEL,
-                    "src/a.rs",
-                    scaled_width(FILE_HISTORY_LIMIT, 2),
-                )
+                read_file_history(tx, guid(), "src/a.rs", scaled_width(FILE_HISTORY_LIMIT, 2))
             })
             .await
             .unwrap();
@@ -11824,6 +12026,9 @@ mod tests {
         ConfigResponse {
             version: "0.0.0-test",
             model_id: "test-embedder".into(),
+            embedding_dim: 1024,
+            min_chunk_tokens: 128,
+            max_chunk_tokens: 364,
             languages: vec!["rust"],
             embed_batch: 256,
             db_pool_size: 4,
@@ -12000,6 +12205,62 @@ mod tests {
                 "llms_doc.md contains {s:?} — a phrase that reads as an instruction \
                  to the model rather than a description of this API, and is what \
                  gets the document refused"
+            );
+        }
+    }
+
+    /// The other three `llms_doc` guards check structure or provenance — that a
+    /// route exists, that an empty catalogue is not dressed up as a populated
+    /// one, that the register does not read as an attack. None of them can see
+    /// a sentence that is well-formed, well-mannered and false about how
+    /// retrieval works, and this document shipped two of those for the whole of
+    /// v3: that `/search` was "hybrid semantic + lexical retrieval" (it is one
+    /// dense vector and one nearest-neighbour query — no lexical leg exists),
+    /// and a "Measured retrieval property" about identifiers ranking
+    /// implementation first, which nothing in `bench/results/` measures.
+    ///
+    /// Both were harmless-looking prose and both misdirect the one reader this
+    /// endpoint has: an agent deciding which tool to reach for. A caller told
+    /// search is lexical does not reach for `symbols` or `grep`, which are the
+    /// tools that actually match a string.
+    ///
+    /// This is a lint and not a proof — it cannot know whether a *new* sentence
+    /// is true. What it does is make the vocabulary of a retrieval architecture
+    /// unusable by accident, so that describing one here is a deliberate act
+    /// that has to delete an entry from this list. When a lexical leg ships
+    /// (`bench/PROTOCOL.md` family F10 is the measurement that would justify
+    /// one), drop the terms it earns and leave the rest.
+    #[test]
+    fn llms_doc_makes_no_unmeasured_retrieval_claim() {
+        // Deliberately phrases, not bare words: the document legitimately says
+        // "measured p50/p90" of research costs it really does measure, and
+        // calls the *question* `grep` answers a lexical one.
+        const UNEARNED: &[&str] = &[
+            "hybrid",
+            "lexical retrieval",
+            "semantic + lexical",
+            "sparse",
+            "bm25",
+            "rerank",
+            "fusion",
+            "colbert",
+            "measured retrieval property",
+        ];
+
+        let doc = llms_document(&llms_test_config(
+            vec!["glm-4:9b".into()],
+            Some(1_700_000_000),
+            vec![],
+        ))
+        .to_lowercase();
+
+        for term in UNEARNED {
+            assert!(
+                !doc.contains(term),
+                "llms_doc.md contains {term:?} — retrieval-architecture vocabulary \
+                 this service has not earned. `/search` is dense-only; if that has \
+                 changed, the measurement justifying it belongs in bench/PROTOCOL.md \
+                 §12 and this term belongs out of UNEARNED"
             );
         }
     }
@@ -12236,10 +12497,7 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![guid(), MODEL],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![guid()])?;
             for (path, code) in &files {
                 let lang = if path.ends_with(".md") {
                     "markdown"
@@ -12248,27 +12506,21 @@ mod tests {
                 };
                 tx.execute(
                     "INSERT INTO project_files
-                         (project_guid, model_id, path, sha256, programming_language, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'indexing')",
-                    params![guid(), MODEL, path, "0".repeat(64), lang],
+                         (project_guid, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, ?4, 'indexing')",
+                    params![guid(), path, "0".repeat(64), lang],
                 )?;
                 tx.execute(
                     "UPDATE project_files SET status = 'indexed'
-                      WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-                    params![guid(), MODEL, path],
+                      WHERE project_guid = ?1 AND path = ?2",
+                    params![guid(), path],
                 )?;
                 tx.execute(
                     "INSERT INTO project_file_chunks
-                         (project_guid, file_path, model_id, code, qdrant_guid,
+                         (project_guid, file_path, code, qdrant_guid, tokens,
                           start_line, end_line, start_column, end_column, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 10, 0, 1, 'active')",
-                    params![
-                        guid(),
-                        path,
-                        MODEL,
-                        code,
-                        Uuid::new_v4().simple().to_string()
-                    ],
+                     VALUES (?1, ?2, ?3, ?4, 3, 1, 10, 0, 1, 'active')",
+                    params![guid(), path, code, Uuid::new_v4().simple().to_string()],
                 )?;
             }
             Ok(())
@@ -12678,10 +12930,10 @@ mod tests {
             for (name, kind, line, parent) in &rows {
                 tx.execute(
                     "INSERT INTO project_file_symbols
-                         (project_guid, model_id, file_path, name, kind,
+                         (project_guid, file_path, name, kind,
                           start_line, end_line, start_column, end_column, parent_name)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, 1, ?7)",
-                    params![guid(), MODEL, path, name, kind, line, parent],
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, 1, ?6)",
+                    params![guid(), path, name, kind, line, parent],
                 )?;
             }
             Ok(())
@@ -13223,10 +13475,7 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![guid(), MODEL],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![guid()])?;
             // One file per status, each reaching it the legal way.
             for (path, target) in [
                 ("done.rs", "indexed"),
@@ -13243,15 +13492,15 @@ mod tests {
                 };
                 tx.execute(
                     "INSERT INTO project_files
-                         (project_guid, model_id, path, sha256, programming_language, status)
-                     VALUES (?1, ?2, ?3, ?4, 'rust', ?5)",
-                    params![guid(), MODEL, path, "a".repeat(64), entry],
+                         (project_guid, path, sha256, programming_language, status)
+                     VALUES (?1, ?2, ?3, 'rust', ?4)",
+                    params![guid(), path, "a".repeat(64), entry],
                 )?;
                 if target != entry {
                     tx.execute(
-                        "UPDATE project_files SET status = ?4
-                          WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-                        params![guid(), MODEL, path, target],
+                        "UPDATE project_files SET status = ?3
+                          WHERE project_guid = ?1 AND path = ?2",
+                        params![guid(), path, target],
                     )?;
                 }
             }
@@ -13322,9 +13571,6 @@ mod tests {
             _collection: &str,
             chunk_ids: Vec<UUIDv4>,
             _dense: Vec<f32>,
-            _sparse_indices: Vec<u32>,
-            _sparse_values: Vec<f32>,
-            _colbert: Vec<Vec<f32>>,
             _top_k: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             self.asked.lock().unwrap().push(chunk_ids.clone());
@@ -13358,25 +13604,37 @@ mod tests {
         }
     }
 
-    /// One vector per head for a single query — the shape `search_core` requires.
-    struct OneVectorEmbedder;
+    /// One vector for a single query — the shape `search_core` requires. Also
+    /// records every text it was asked to embed, so the query-prefix rule is
+    /// assertable: `/search` must arrive prefixed, indexing must not.
+    struct OneVectorEmbedder {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl OneVectorEmbedder {
+        fn new() -> Self {
+            Self {
+                asked: std::sync::Mutex::new(vec![]),
+            }
+        }
+    }
 
     #[async_trait]
-    impl crate::models::bge_m3::BGEm3Model for OneVectorEmbedder {
-        async fn encode(
+    impl crate::models::embedder::Embedder for OneVectorEmbedder {
+        async fn embed(
             &self,
-            req: BGEm3EmbedRequest,
+            texts: Vec<String>,
             _token: CancellationToken,
-        ) -> Result<BGEm3EmbedResponse, EncodeError> {
-            let n = req.texts.len();
-            Ok(BGEm3EmbedResponse {
-                dense_vecs: vec![vec![0.1; 4]; n],
-                sparse_vecs: vec![std::collections::HashMap::from([(1u32, 0.5f32)]); n],
-                colbert_vecs: vec![vec![vec![0.1; 4]]; n],
-            })
+        ) -> Result<Vec<Vec<f32>>, EncodeError> {
+            let n = texts.len();
+            self.asked.lock().unwrap().extend(texts);
+            Ok(vec![vec![0.1; 4]; n])
         }
         async fn health(&self) -> Result<(), EncodeError> {
             Ok(())
+        }
+        async fn served_models(&self) -> Result<Vec<String>, EncodeError> {
+            Ok(vec!["Qwen/Qwen3-Embedding-0.6B".to_string()])
         }
     }
 
@@ -13387,11 +13645,9 @@ mod tests {
         });
         let mut s = router_state(pool);
         s.qdrant = Arc::clone(&store) as Arc<dyn VectorStore>;
-        let embedder: Arc<dyn crate::models::bge_m3::BGEm3Model> = Arc::new(OneVectorEmbedder);
-        s.model = EmbeddingModel::BGEm3 {
-            model_id: MODEL.to_string(),
-            client: Arc::clone(&embedder),
-        };
+        let embedder: Arc<dyn crate::models::embedder::Embedder> =
+            Arc::new(OneVectorEmbedder::new());
+        s.model.client = Arc::clone(&embedder);
         s.query_model = embedder;
         (s, store)
     }
@@ -13421,22 +13677,19 @@ mod tests {
         // A second project in the same database, and a soft-deleted chunk in this one.
         let other = UUIDv4(Uuid::from_u128(7));
         pool.transaction(CancellationToken::new(), move |tx| {
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![other, MODEL],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![other])?;
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, ?2, 'src/theirs.rs', ?3, 'rust', 'indexing')",
-                params![other, MODEL, "0".repeat(64)],
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'src/theirs.rs', ?2, 'rust', 'indexing')",
+                params![other, "0".repeat(64)],
             )?;
             tx.execute(
                 "INSERT INTO project_file_chunks
-                     (project_guid, file_path, model_id, code, qdrant_guid,
+                     (project_guid, file_path, code, qdrant_guid, tokens,
                       start_line, end_line, start_column, end_column, status)
-                 VALUES (?1, 'src/theirs.rs', ?2, 'secret', ?3, 1, 2, 0, 1, 'active')",
-                params![other, MODEL, Uuid::new_v4().simple().to_string()],
+                 VALUES (?1, 'src/theirs.rs', 'secret', ?2, 3, 1, 2, 0, 1, 'active')",
+                params![other, Uuid::new_v4().simple().to_string()],
             )?;
             // And soft-delete one of ours.
             tx.execute(
@@ -13585,9 +13838,6 @@ mod tests {
                 _c: &str,
                 _ids: Vec<UUIDv4>,
                 _d: Vec<f32>,
-                _si: Vec<u32>,
-                _sv: Vec<f32>,
-                _cb: Vec<Vec<f32>>,
                 _k: u64,
             ) -> Result<Vec<SearchHit>, VectorStoreError> {
                 Ok(vec![SearchHit {
@@ -13668,7 +13918,6 @@ mod tests {
             &pool,
             &pg,
             "a.rs",
-            MODEL,
             "cancelled",
             false,
             CancellationToken::new(),
@@ -13711,8 +13960,8 @@ mod tests {
             .transaction(CancellationToken::new(), |tx| {
                 tx.query_row(
                     "SELECT status, retry_count, sha256 FROM project_files
-                      WHERE project_guid = ?1 AND model_id = ?2 AND path = 'a.rs'",
-                    params![guid(), MODEL],
+                      WHERE project_guid = ?1 AND path = 'a.rs'",
+                    params![guid()],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
@@ -13769,23 +14018,32 @@ mod tests {
 
     // ── /health, including the split-embedder configuration ──────────────────
 
-    /// An embedder that answers or refuses on command.
+    /// An embedder that answers or refuses on command. A healthy one also
+    /// passes the identity handshake by serving the registry's HF repo id —
+    /// `/health` now checks liveness AND identity in one probe.
     struct HealthEmbedder {
         ok: bool,
     }
 
     #[async_trait]
-    impl crate::models::bge_m3::BGEm3Model for HealthEmbedder {
-        async fn encode(
+    impl crate::models::embedder::Embedder for HealthEmbedder {
+        async fn embed(
             &self,
-            _req: BGEm3EmbedRequest,
+            _texts: Vec<String>,
             _token: CancellationToken,
-        ) -> Result<BGEm3EmbedResponse, EncodeError> {
-            unreachable!("health does not encode")
+        ) -> Result<Vec<Vec<f32>>, EncodeError> {
+            unreachable!("health does not embed")
         }
         async fn health(&self) -> Result<(), EncodeError> {
             if self.ok {
                 Ok(())
+            } else {
+                Err(EncodeError::Decode("embedder is down".into()))
+            }
+        }
+        async fn served_models(&self) -> Result<Vec<String>, EncodeError> {
+            if self.ok {
+                Ok(vec!["Qwen/Qwen3-Embedding-0.6B".to_string()])
             } else {
                 Err(EncodeError::Decode("embedder is down".into()))
             }
@@ -13820,9 +14078,6 @@ mod tests {
             _c: &str,
             _ids: Vec<UUIDv4>,
             _d: Vec<f32>,
-            _si: Vec<u32>,
-            _sv: Vec<f32>,
-            _cb: Vec<Vec<f32>>,
             _k: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             unreachable!()
@@ -13842,12 +14097,9 @@ mod tests {
 
         let mut s = router_state(pool);
         s.qdrant = Arc::new(HealthyStore);
-        let indexer: Arc<dyn crate::models::bge_m3::BGEm3Model> =
+        let indexer: Arc<dyn crate::models::embedder::Embedder> =
             Arc::new(HealthEmbedder { ok: index_ok });
-        s.model = EmbeddingModel::BGEm3 {
-            model_id: MODEL.to_string(),
-            client: Arc::clone(&indexer),
-        };
+        s.model.client = Arc::clone(&indexer);
         // `None` = one instance does both, which is the *same* `Arc` — that identity
         // is what `/health` decides on.
         s.query_model = match query {
@@ -13987,10 +14239,7 @@ mod tests {
                     tx.execute_batch(m)?;
                 }
                 for g in &guids {
-                    tx.execute(
-                        "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
-                        params![g],
-                    )?;
+                    tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![g])?;
                 }
                 Ok(())
             })
