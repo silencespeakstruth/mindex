@@ -684,8 +684,8 @@ async fn main() -> Result<(), BoxError> {
                     served = ?models,
                     "The embedder answers but serves a different model than \
                      [model].id names; refusing to start. Sysadmin: point \
-                     [model].server_url at the vLLM instance serving this model, \
-                     or fix [model].id / [model].served_name."
+                     [model].server_url at the server hosting this model, or fix \
+                     [model].id / [model].served_name (deploy/embedder/)."
                 );
                 return Err(format!(
                     "embedder model mismatch on the {role} instance: expected \

@@ -298,11 +298,24 @@ therefore calls `POST /gc` on a fixed interval (`gc_every_instances` in
 because it affects nothing but disk — if it ever appears to affect a metric,
 that is a bug worth finding.
 
-**Index-state equivalence is verified, not assumed.** For a random sample of
-20 instances per corpus, the incrementally-reached index state is compared
-against a from-scratch index of the same commit: file set, chunk count, and
-chunk boundaries must match. A divergence is a mindex bug, not a harness
-artifact, and blocks the run.
+**Index-state equivalence is verified, not assumed.** For an evenly spread
+sample of 20 instances per corpus, the incrementally-reached index state is
+compared against a from-scratch index of the same commit: file set, chunk
+count, and chunk boundaries must match. A divergence is a mindex bug, not a
+harness artifact, and blocks the run.
+
+**The sample is 1 on a single-snapshot corpus**, which is the descriptive tier:
+one checkout, one index, and every later instance querying a byte-identical
+state (`index=0ms` on each, nothing soft-deleted, every GC tick reporting
+`chunks_removed: 0`). There is exactly one index state in such a run, so twenty
+samples verify it once and re-verify it nineteen times. Measured on
+django-docs-short before the rule existed: 20 x ~148 s of cold rebuild inside a
+55-minute run whose 1 115 queries cost 45 ms each — about 45 of those 55 minutes
+bought nothing. The single check runs at the **first** instance, so a wrong
+index costs three minutes rather than an hour, and the periodic GC is skipped on
+the same grounds. `run.py` prints which of the two regimes it chose; a run that
+quietly did less work than the protocol says would be the exact failure this
+section exists to prevent.
 
 ---
 
@@ -713,6 +726,7 @@ is for. No result existed that they could have been fitted to.
 | 2026-08-05 | **families F5–F9 declared** (§5.3), with the held-out rule and the search-vs-comparison rule | The first round asked what each stage of the deployed pipeline contributes. It answered, and the answer moved the question: the largest measured effect in the whole investigation is the *embedder* (+0.051 nDCG@10 for a 137M code model over the entire three-head pipeline), and the second largest is the *combination rule*, not any stage it combines. So the second round decides a set of retrieval legs and the rule that fuses them, and it needs families declared before the runs that choose them. Declared **after** F1–F3 were published and **before** any F5–F9 arm was scored. The two binding rules are not decoration: a fusion weight is worth ~0.015, which is the scale at which choosing and reporting on the same queries *is* the result, and a 36-cell method sweep reports a maximum that no multiple-comparison correction can turn back into a test. |
 | 2026-08-05 | `map@20` is retained as `score.py`'s and excluded from the `ranx` migration | The metric arithmetic was cross-checked against `ranx` over seven archived runs on both corpora (`tests/test_ranx_equivalence.py`). nDCG@10, MRR@10 and recall@{1,5,10,20} agree **exactly**. `map@20` does not, on exactly one query in 1 475: `score.py` normalises AP by `min(\|gold\|, k)` and `ranx` — following trec_eval's `map_cut`, which unlike `ndcg_cut` does not cap its ideal — normalises by `\|gold\|`. The one query has 26 gold files against a cutoff of 20. `score.py`'s convention is the one argued for in its own docstring (a query with more gold than the cutoff must still be able to score 1.0, or the metric is measuring the query), so it stays and the divergence is pinned by a test rather than resolved. No published number changes. |
 | 2026-08-05 | **the measured task changed**: descriptive retrieval from project documentation replaces issue localization as the primary corpus (§1, §3) | The original §1 justified issue localization as "the task mindex is actually used for". That claim was wrong, and it was load-bearing — it chose the entire corpus. Localizing a bug from its symptoms requires **inference**; mindex performs **matching**, and the inference belongs to `/research`, a different endpoint. The consequence is not that the numbers were merely less relevant: family F2 asks whether ColBERT earns 99.6% of stored bytes, and answering it on a task the component does not perform can select the wrong configuration with a confidence interval attached. Ground truth for the replacement is each project's own Sphinx documentation — prose written by its maintainers describing its own code, with the link made explicit by directives and roles (django: 3 212 and 8 589 of them). Still not an exam we wrote. Issue localization is retained as a secondary tier and relabelled. Raised by the author of the request, not by the harness. |
+| 2026-08-06 | **equivalence sampling is 1 on a single-snapshot corpus**, and the periodic GC is skipped there (§3) | The check compares an incrementally-reached index against a cold build. The descriptive tier reaches its index in one step and never moves it, so nineteen of the twenty samples re-verified a state that could not have changed — `index=0ms` on every instance, `chunks_removed: 0` on every GC tick. Measured cost on django-docs-short: 20 x ~148 s of rebuild in a 55-minute run whose queries take 45 ms. No published number changes: the same index is measured by the same queries, and the one surviving check covers the one state that exists. |
 
 ---
 

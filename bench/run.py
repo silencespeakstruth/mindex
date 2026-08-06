@@ -41,11 +41,13 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -119,23 +121,45 @@ def const_from_source(root: Path, relpath: str, name: str) -> str | None:
     return text[start : text.index('"', start)]
 
 
-def embedder_invocation() -> str | None:
-    """The embedder's own command line, verbatim.
+def embedder_invocation(server_url: str | None = None) -> str | None:
+    """Who is serving the embeddings, as a string that changes when they do.
 
-    CLAUDE.md records that this host's two torch backends are NOT bit-identical
-    and that the XPU one silently returns NaN for padded fp16 rows off its
-    default attention kernel. Which backend produced a set of vectors is
-    therefore a real confound, and the argv is the only place that says so —
-    the /health endpoint reports liveness, not identity. Read from the process
-    table rather than from systemd because the embedder is as often started by
-    hand from its venv as by the unit template.
+    Which process produced a set of vectors is a real confound and nothing on
+    the wire says so: `/health` reports liveness, and `/v1/models` reports the
+    model NAME, which is identical across backends serving the same weights at
+    different precisions — the case CLAUDE.md documents as presenting like a
+    ranking-quality problem rather than an error.
+
+    So the identity is the **argv of whatever holds the embedder's port**, read
+    through the listening socket rather than by grepping the process table for
+    a server name. The grep was the first version and it was wrong twice over:
+    it named `bge_m3_api`, a server that no longer exists, and any command line
+    merely MENTIONING that string matched — including this harness's own shell.
+    A false "the embedder changed" aborts a corpus that was fine.
+
+    Falls back to `/v1/models` when the socket cannot be attributed (a container,
+    another user's process), and to None when there is nothing to ask.
     """
-    proc = subprocess.run(
-        ["ps", "-eo", "args"], capture_output=True, text=True, check=False
-    )
-    for line in proc.stdout.splitlines():
-        if "bge_m3_api" in line and "grep" not in line:
-            return line.strip()
+    if not server_url:
+        return None
+    port = urllib.parse.urlparse(server_url).port
+    if port:
+        proc = subprocess.run(
+            ["ss", "-ltnpH", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        match = re.search(r"pid=(\d+)", proc.stdout)
+        if match:
+            try:
+                raw = Path(f"/proc/{match.group(1)}/cmdline").read_bytes()
+                return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+            except OSError:
+                pass
+        served = probe_json(f"{server_url.rstrip('/')}/v1/models")
+        if served:
+            return json.dumps(served, sort_keys=True)
     return None
 
 
@@ -156,7 +180,10 @@ def build_provenance(
     root: Path, server_config: Path, label: str, seed: int
 ) -> dict[str, Any]:
     config_bytes = server_config.read_bytes()
-    embedder = probe_json("http://localhost:11211/health") or {}
+    model_cfg = tomllib.loads(server_config.read_text()).get("model", {})
+    embedder_url = model_cfg.get("server_url")
+    embedder = probe_json(f"{embedder_url.rstrip('/')}/health") if embedder_url else {}
+    embedder = embedder or {}
     qdrant = probe_json("http://localhost:6333/") or {}
     return {
         "label": label,
@@ -174,7 +201,8 @@ def build_provenance(
             root, "src/db/qdrant.rs", "COLLECTION_SCHEMA_VERSION"
         ),
         "server_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
-        "embedder_invocation": embedder_invocation(),
+        "embedder_invocation": embedder_invocation(embedder_url),
+        "embedder_server_url": embedder_url,
         "embedder_health": embedder,
         "qdrant_version": qdrant.get("version"),
         "top_k": TOP_K,
@@ -673,17 +701,53 @@ def run_corpus(
     # than sampled randomly: the first steps of a corpus are the ones where
     # incremental and fresh trivially agree, so a random draw concentrated
     # there would pass without testing anything.
+    #
+    # ON A SINGLE-SNAPSHOT CORPUS THE SAMPLE IS ONE, and this is not a
+    # relaxation of the check — it is the check applied to what is actually
+    # there. The comparison exists to catch an index that was reached
+    # INCREMENTALLY and diverged from a cold build. A descriptive corpus checks
+    # out once, indexes once, and then never moves: every later instance re-runs
+    # the query set against a byte-identical index (the log says `index=0ms` on
+    # each), nothing is soft-deleted, and every GC tick reports
+    # `chunks_removed: 0`. So there is exactly one index state in the run, and
+    # sampling it twenty times re-verifies the same state nineteen times over —
+    # measured on django-docs-short, that is 20 x ~148 s of cold rebuild inside
+    # a 55-minute run whose queries take 45 ms each.
+    #
+    # The one check is placed at the FIRST instance rather than the last, on the
+    # grounds that a wrong index should cost three minutes rather than an hour;
+    # nothing after that point can change it.
     check_at: set[int] = set()
     if equivalence_sample > 0 and instances:
-        stride = max(1, len(instances) // equivalence_sample)
-        check_at = set(range(stride - 1, len(instances), stride))
+        if single_snapshot:
+            check_at = {0}
+        else:
+            stride = max(1, len(instances) // equivalence_sample)
+            check_at = set(range(stride - 1, len(instances), stride))
 
-    gc_every = int(run_cfg["gc_every_instances"])
+    # Same reasoning, same condition: GC reclaims the vectors of chunks a
+    # reindex superseded, and a single-snapshot corpus supersedes nothing. Every
+    # tick on django-docs-short reported zeros. Skipping them removes a periodic
+    # process-wide lock from the middle of a latency measurement.
+    gc_every = 0 if single_snapshot else int(run_cfg["gc_every_instances"])
     server_url = run_cfg["server_url"]
     no_verify = bool(run_cfg["no_verify"])
     db_path = Path(config["run"]["db_path"])
 
     print(f"\n=== {name}: {len(instances)} instances, project {guid} ===")
+    # State the plan rather than silently doing less work: a run that skipped
+    # its own integrity check without saying so is the failure this check
+    # exists to prevent, one level up.
+    if single_snapshot:
+        print(
+            "  single snapshot: one checkout, one index, "
+            f"{len(check_at)} equivalence rebuild(s), no periodic GC"
+        )
+    else:
+        print(
+            f"  {len(instances)} snapshots: {len(check_at)} equivalence rebuild(s), "
+            f"GC every {gc_every}"
+        )
     started_all = time.perf_counter()
     equivalence_problems: list[str] = []
     refusals: dict[str, int] = {}
@@ -694,6 +758,7 @@ def run_corpus(
     if not integrity_at_start:
         print("  WARN: /metrics unavailable; NaN and orphaned winners go unchecked")
     embedder_at_start = provenance["embedder_invocation"]
+    embedder_url = provenance.get("embedder_server_url")
 
     with out_path.open("w") as out:
         indexed_sha: str | None = None
@@ -783,7 +848,7 @@ def run_corpus(
             # host has two backends that are documented as NOT bit-identical.
             # Swapping one mid-corpus makes the first half and the second half
             # different experiments sharing one results file.
-            if embedder_invocation() != embedder_at_start:
+            if embedder_invocation(embedder_url) != embedder_at_start:
                 raise RuntimeError(
                     f"the embedder changed during {name}: the vectors before "
                     f"{inst['instance_id']} were produced by a different process "
@@ -850,7 +915,7 @@ def run_corpus(
             out.write(json.dumps(record, sort_keys=True) + "\n")
             out.flush()
 
-            if pos % gc_every == 0:
+            if gc_every and pos % gc_every == 0:
                 gc_report = server.gc()
                 print(f"  [{pos}/{len(instances)}] gc: {gc_report}")
             elif pos % 10 == 0 or pos == len(instances):
