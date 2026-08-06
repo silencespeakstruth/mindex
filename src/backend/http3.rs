@@ -719,6 +719,25 @@ impl RoutePolicy {
 /// nothing checks. The extractors keep that, and re-check the action too: the
 /// overlap is deliberate, since a defence that is only in one place is one
 /// refactor away from being nowhere.
+/// Whether a `(method, path)` miss in [`ROUTE_POLICY`] is this build's fault.
+///
+/// Two different things reach the miss branch and only one of them is a defect.
+/// A path named under *some* method and asked for under another is an ordinary
+/// wrong-method request: axum matched the path, so `MatchedPath` is set and the
+/// layer runs, but the router serves no handler for that method and would have
+/// answered 405. The refusal is right either way — deciding authorization by
+/// omission is the one thing this layer exists to prevent — but the *alarm* is
+/// not: "this is a defect in this build" sends an operator hunting for a
+/// ROUTE_POLICY row that is not missing, over a request a client got wrong.
+/// Observed as an `ERROR` on every run of the integration suite, which is how a
+/// log line that means "wake up" stops meaning anything.
+///
+/// So only a path named under **no** method is the case
+/// `every_route_is_named_by_the_authorization_policy` should have caught.
+fn policy_gap_is_a_build_defect(matched: &str) -> bool {
+    !ROUTE_POLICY.iter().any(|(_, p, _)| *p == matched)
+}
+
 async fn enforce_route_policy(
     auth: Option<Arc<AuthState>>,
     req: Request<Body>,
@@ -746,15 +765,24 @@ async fn enforce_route_policy(
         .iter()
         .find(|(m, p, _)| *m == method && *p == matched)
     else {
-        tracing::error!(
-            method = %method,
-            path = %matched,
-            "Refused a routed endpoint that ROUTE_POLICY does not name. \
-             Hint for the sysadmin: this is a defect in this build, not in the \
-             request — the endpoint is served by the router but nobody decided \
-             what a token needs to reach it, so it fails closed. \
-             `every_route_is_named_by_the_authorization_policy` should have caught it."
-        );
+        if !policy_gap_is_a_build_defect(matched) {
+            tracing::debug!(
+                method = %method,
+                path = %matched,
+                "Refused a method this path does not serve; the router would have \
+                 answered 405. Nothing to fix here."
+            );
+        } else {
+            tracing::error!(
+                method = %method,
+                path = %matched,
+                "Refused a routed endpoint that ROUTE_POLICY does not name. \
+                 Hint for the sysadmin: this is a defect in this build, not in the \
+                 request — the endpoint is served by the router but nobody decided \
+                 what a token needs to reach it, so it fails closed. \
+                 `every_route_is_named_by_the_authorization_policy` should have caught it."
+            );
+        }
         return crate::backend::error::ApiError::RouteNotConfigured.into_response();
     };
 
@@ -1389,6 +1417,34 @@ mod tests {
                 "ROUTE_POLICY names {method} {path}, which this server does not route"
             );
         }
+    }
+
+    /// A method a path does not serve is a client's mistake, not this build's.
+    ///
+    /// Both refuse — that is not in question and is asserted elsewhere. What is
+    /// asserted here is which of them raises the "defect in this build" alarm,
+    /// because an ERROR that fires on ordinary wrong-method traffic is one an
+    /// operator learns to scroll past, and the row it accuses is present.
+    /// `POST /projects/{project_guid}/files` is the observed instance: the path
+    /// serves GET and DELETE, and `test_a_credential_is_never_echoed_back` POSTs
+    /// to it on every integration run.
+    #[test]
+    fn a_method_a_path_does_not_serve_is_not_a_build_defect() {
+        assert!(
+            ROUTE_POLICY
+                .iter()
+                .any(|(m, p, _)| *m == "DELETE" && *p == "/projects/{project_guid}/files"),
+            "the fixture this test reasons about has moved"
+        );
+        assert!(
+            !policy_gap_is_a_build_defect("/projects/{project_guid}/files"),
+            "a path the policy names under another method is not a missing row"
+        );
+        assert!(
+            policy_gap_is_a_build_defect("/a-future-endpoint"),
+            "a path the policy names under no method at all is the case the \
+             build-time guard exists for"
+        );
     }
 
     /// Every handler behind a non-public route takes the extractor its policy

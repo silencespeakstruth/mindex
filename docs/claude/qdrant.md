@@ -122,17 +122,38 @@ is deleted before the new index is confirmed good.
    `curl -s localhost:11211/v1/models`. Verify the **pooler** by cross-checking
    one embedding against `sentence-transformers` (that README's check 2) — a
    wrong pooler is a clean-looking null result, not an error.
-2. Point `[model].server_url` at it and start mindex. Startup will:
+2. **Put the new tokenizer where mindex will look, before starting it.** The
+   slicer loads `spec.tokenizer_hf_id` from the HF hub at startup, and there is
+   no `HF_HUB_OFFLINE` equivalent on the Rust side — so on a host whose unit
+   confines the network (`IPAddressDeny=any`, which *drops* rather than
+   refuses), the process sits through a TCP timeout and then exits 1, naming
+   `huggingface.co` and nothing else. It reads `$HF_HOME`, and the copy that
+   satisfies it is small: `tokenizer.json` and its siblings, not the weights.
+   Copying the whole snapshot out of the embedder's own cache works and costs
+   1.2 GB; deleting `model.safetensors` and its blob afterwards brings it to
+   16 MB. Measured here: this is what stopped the rollover, between a clean
+   handshake and the first `mindex-index` run.
+3. Point `[model].server_url` at it and start mindex. Startup will:
    - **refuse** an old-lineage database, naming the file and the remedy;
    - cross-check the registry against `embedding_models`;
    - log `Embedder handshake ok.` per instance — this is the line that says the
      server behind the URL is the model config names.
-3. Delete the old database file and start clean.
-4. `mindex-index --force` per project. Confirm `{guid}_q3e06b_v3` exists with
-   the expected point count and dimension.
-5. Search something obvious. `search_unscorable_winners` must stay 0 (it counts
-   NaN scores — the split-precision symptom).
-6. Drop the old collections once the new index is confirmed:
+4. Delete the old database file **and its `-wal`/`-shm` companions**, plus any
+   `.pre-migration*` copies beside it — they are the same lineage and the same
+   refusal. Start clean.
+5. **Drop any `_v3` collection already carrying a name this deployment is about
+   to write.** Normally there is none; there is one whenever something else has
+   pointed at the same Qdrant with a different database — a bench server is the
+   case that happened here. Search would not have been wrong (the candidate set
+   comes from SQLite), but the points stay forever and step 7's count check
+   stops being a check.
+6. `mindex-index --force` per project — and `--history` too if the project uses
+   the git channel, since reindexing code restores no commits. Confirm
+   `{guid}_q3e06b_v3` exists with the expected point count and dimension.
+7. Search something obvious. `search_unscorable_winners` must stay 0 (it counts
+   NaN scores — the split-precision symptom), and the collection's point count
+   must equal SQLite's active-chunk count.
+8. Drop the old collections once the new index is confirmed:
    `curl -X DELETE <qdrant>/collections/<name>` for every `_v1`/`_v2` name the
    stale worker lists.
 
