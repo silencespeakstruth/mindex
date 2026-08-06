@@ -161,6 +161,39 @@ ROCm) are in `deploy/embedder/README.md`.
 
 ### Fixed
 
+- **A client that asked for frames with `Accept: text/event-stream` was answered with
+  one JSON body, silently.** `POST /v0/{guid}/research`, its `/challenge` sibling and
+  `POST /v0/{guid}/index` now read that header as the second spelling of
+  `?stream=yes`. Making frames opt-in (1.2.0) was right — a caller that does not read
+  the stream to `done` cancels the run and spends the whole budget for nothing — but
+  the query was made the *only* way to ask, which turned the same defect around and
+  aimed it at the caller who had done everything right: its frame parser found nothing
+  in the body, so a finished run read as one that never terminated, with no error
+  anywhere. 1.2.0's own upgrade note called that symptom "unambiguous rather than
+  subtle", and it is neither. Every pre-2.0.0 client hits it, `curl -N -H 'Accept:
+  text/event-stream'` hits it, and the VS Code extension could not be upgraded past
+  it because the release page carried no `.vsix` (below).
+
+  One predicate decides for all three endpoints (`models::wants_stream`), so they
+  cannot drift. `?stream=` still wins whenever it is present, in **both** directions —
+  an explicit `no` is a decision a header may not override — and a wildcard `*/*` is
+  **not** a request for frames, since that is what Swagger UI, a browser and every
+  default HTTP client send while wanting exactly the JSON mode. Nothing about a run
+  changes: same loop, same budgets, same journal row.
+- **The v2.0.0 release page was published with no assets at all**, and nothing in the
+  release workflow could notice. Every upload job is independent, so the run's own
+  conclusion says nothing about whether the page is complete — the same blind spot
+  that left `mindex-cli-x86_64-apple-darwin.tar.gz` missing from v1.1.0 and v1.2.0
+  while `README.md` promised it. A final `verify` job now reads the release itself and
+  fails when a promised artefact is absent. It runs under `if: always()`, because a
+  job whose dependencies were *cancelled* is skipped rather than failed — and
+  queued-then-cancelled is precisely the observed failure: on the v2.0.0 rebuild five
+  jobs were evicted after fifteen minutes without ever being assigned a runner.
+- **Every research turn logged the same immutable fact.** `effective_num_ctx` emitted
+  `Model's context window exceeds [research].max_num_ctx_tokens; capping` on each
+  call, though the `/api/show` answer behind it is cached per model per process — one
+  `medium` run wrote it seventeen times and buried the lines that do move. The window
+  is now announced once, on the pass that establishes it.
 - **`/llms.txt` described a retrieval pipeline this server does not have.** The
   discovery document told every agent that reads it that `POST /v0/{guid}/search` is
   "hybrid semantic + lexical retrieval", and carried a "Measured retrieval property"
