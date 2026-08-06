@@ -12,7 +12,7 @@ MINDEX_URL = __import__("conftest").MINDEX_URL
 # Fixtures: Rust source snippets
 # ---------------------------------------------------------------------------
 
-# Large enough to produce at least one chunk (≥128 BGE-M3 tokens).
+# Large enough to produce at least one chunk (≥128 tokens, the window's floor).
 RUST_V1 = """\
 pub fn process_records(
     records: &[(String, Vec<i64>)],

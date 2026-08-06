@@ -415,7 +415,7 @@ struct FileIndexer<'a> {
     spec: &'static EmbeddingModelSpec,
     project_guid: UUIDv4,
     collection: &'a str,
-    /// Embed/upsert batch sizing + sparse threshold (from config).
+    /// Embed and upsert batch sizing (from config).
     embed_tuning: crate::embed::EmbedTuning,
     /// Slicer token window (from config).
     min_chunk_tokens: usize,

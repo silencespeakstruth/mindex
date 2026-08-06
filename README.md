@@ -105,7 +105,7 @@ Bottom-up: embedder → Qdrant → mindex.
 # 1. Embedder — never in a container (it wants the GPU directly). deploy/embedder/
 #    has the venv, the systemd unit and two alternative stacks, with the numbers
 #    that tell them apart.
-cd deploy/embedder && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 11212
+cd deploy/embedder && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 11211
 
 # 2. Qdrant + mindex. No host ports by default; add the overlay to reach the API
 #    from the host (both loopback-only).
@@ -146,7 +146,7 @@ enabled = false                                   # the default; with it off, TL
                                                   # each caller reaches.
 
 [model]
-server_url = "http://localhost:11212"             # any OpenAI-compatible embedder
+server_url = "http://localhost:11211"             # any OpenAI-compatible embedder
 id         = "qwen3-embedding-0.6b"               # from the compiled registry
 
 [qdrant]

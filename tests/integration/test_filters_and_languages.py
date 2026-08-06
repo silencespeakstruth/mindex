@@ -13,7 +13,7 @@ MINDEX_URL = __import__("conftest").MINDEX_URL
 
 # ---------------------------------------------------------------------------
 # Fixtures: non-rust source snippets, each validated to produce >= 1 chunk
-# (128-512 BGE-M3 tokens) by the real tree-sitter slicer.
+# (the configured 128-364 token window) by the real tree-sitter slicer.
 # ---------------------------------------------------------------------------
 
 PYTHON_SRC = """\

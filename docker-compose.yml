@@ -5,7 +5,7 @@
 #
 # No host ports are published: the whole stack lives on the internal compose network and
 # talks to itself there. The only host boundary it crosses is OUTBOUND — reaching the
-# embedder on the host (host.docker.internal:11212 by default — see deploy/embedder/,
+# embedder on the host (host.docker.internal:11211 by default — see deploy/embedder/,
 # via extra_hosts below). Integration tests use docker-compose.test.yml instead (not
 # this file).
 services:
@@ -48,7 +48,7 @@ services:
       - --cert-path=/certs/cert.pem
       - --key-path=/certs/key.pem
       - --qdrant-server=http://qdrant:6334
-      - --model-server=${MINDEX_MODEL_SERVER:-http://host.docker.internal:11212}
+      - --model-server=${MINDEX_MODEL_SERVER:-http://host.docker.internal:11211}
       # Chunks per /v1/embeddings call — the GPU-batch lever.
       - --embed-batch=${MINDEX_EMBED_BATCH:-1024}
       # Connection pool: the indexer's --concurrency must stay <= this (the pool

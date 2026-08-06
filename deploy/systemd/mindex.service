@@ -84,7 +84,7 @@ RestartSec=5
 
 # ── network ──────────────────────────────────────────────────────────────────
 #
-# Everything mindex speaks to is on loopback: the vLLM embedder (11212/11213),
+# Everything mindex speaks to is on loopback: the embedder (11211),
 # Qdrant (6334) and Ollama (11434). So the whole of its legitimate traffic fits inside
 # `localhost`, and a compromised process gets no route off this machine — which
 # is the point, since the service is reachable from the internet through the

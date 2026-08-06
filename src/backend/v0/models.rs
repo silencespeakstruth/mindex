@@ -510,8 +510,9 @@ pub struct SearchFilter {
     pub programming_languages: Option<Vec<ProgrammingLanguage>>,
 }
 
-/// `POST /v0/{project_guid}/search` body. Hybrid retrieval: dense + sparse prefetch →
-/// RRF fusion → ColBERT MaxSim rerank → top-k.
+/// `POST /v0/{project_guid}/search` body. Dense retrieval: one cosine query over the
+/// project's active chunks → top-k. There is no second leg and no rerank — fusing one
+/// in measured *below* the single leg it fused (`docs/claude/retrieval-v2.md`).
 #[derive(Deserialize, Serialize, Debug, ToSchema)]
 pub struct SearchRequest {
     /// Natural-language or code query. Embedded by the same model the chunks
@@ -530,7 +531,8 @@ pub struct SearchRequest {
 /// sorted by `score` descending.
 #[derive(Serialize, Debug, ToSchema)]
 pub struct SearchResult {
-    /// Fusion/rerank score; higher is more relevant. Not normalized to any range.
+    /// Cosine similarity to the query vector; higher is more relevant. Not normalized
+    /// to any range, and comparable only within one response.
     pub score: f32,
     pub path: UnixPath,
     /// The chunk's source text.

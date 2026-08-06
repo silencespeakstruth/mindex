@@ -50,7 +50,7 @@ WorkingDirectory=/path/to/mindex/deploy/embedder
 # the model, the device, the dtype, the GPU batch and the truncation length.
 EnvironmentFile=/home/YOUR_USER/.config/mindex/embedder.env
 ExecStart=/path/to/mindex/deploy/embedder/.venv/bin/uvicorn server:app \
-    --host 127.0.0.1 --port 11212
+    --host 127.0.0.1 --port 11211
 Restart=on-failure
 RestartSec=5
 # Model load is slow on a cold page cache; don't let systemd call it a failure.
@@ -60,7 +60,7 @@ TimeoutStartSec=300
 IPAddressDeny=any
 IPAddressAllow=localhost
 SocketBindDeny=any
-SocketBindAllow=tcp:11212
+SocketBindAllow=tcp:11211
 RestrictNetworkInterfaces=lo
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # CONSEQUENCE, and it must be spelled to the library or it hangs instead of
@@ -115,6 +115,15 @@ SupplementaryGroups=render video
 #   huggingface        — the weights
 #   miopen             — ROCm kernel perf DB
 #   neo_compiler_cache — intel-compute-runtime's compiled-kernel cache
+#
+# ⚠️ IF ANY OF THESE IS A SYMLINK, NAME BOTH SPELLINGS. ProtectSystem=strict
+# applies to the path the process actually opens after resolution, so on a host
+# where ~/.cache points at another filesystem (this one: /data), the /home
+# spelling alone leaves every write denied and the /data spelling alone leaves
+# the symlink dangling inside the namespace. Add the resolved path beside each
+# one — `readlink -f` says which. mindex.service's own sandbox drop-in carries
+# the same pair for the same reason, and the failure is silent both ways: a
+# model that cannot write its cache recompiles kernels on every start.
 ProtectSystem=strict
 ReadWritePaths=/home/YOUR_USER/.cache/huggingface
 ReadWritePaths=/home/YOUR_USER/.config/miopen

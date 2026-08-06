@@ -29,7 +29,7 @@ max_body_mib = 512
 
 [model]
 id         = "qwen3-embedding-0.6b"
-server_url = "http://localhost:11212"
+server_url = "http://localhost:11211"
 
 [qdrant]
 server_url = "http://localhost:6334"

@@ -27,7 +27,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mindex_url="https://127.0.0.1:11111"
-embedder_url="http://127.0.0.1:11212"
+embedder_url="http://127.0.0.1:11211"
 protocol="v0"
 corpus="$here/corpus/data/default"
 results_dir="$here/results"
@@ -41,7 +41,7 @@ usage() {
     cat <<'EOF'
 Usage: run.sh [options]
   --mindex-url URL     mindex base URL        (default: https://127.0.0.1:11111)
-  --embedder-url URL   embedder base URL      (default: http://127.0.0.1:11212)
+  --embedder-url URL   embedder base URL      (default: http://127.0.0.1:11211)
                        pass "" to skip the reachability probe
   --protocol VER       API version segment    (default: v0)
   --corpus DIR         corpus dir (shards + manifest.json)

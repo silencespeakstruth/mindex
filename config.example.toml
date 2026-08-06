@@ -65,7 +65,7 @@ leeway_seconds = 60
 # stored chunks — rebuilds under the new model, into its own collection, and
 # switching back reuses the old one.
 id = "qwen3-embedding-0.6b"
-server_url = "http://localhost:11212" # the embedding server (OpenAI-compatible).
+server_url = "http://localhost:11211" # the embedding server (OpenAI-compatible).
                                       # deploy/embedder/ measures the recipes: a
                                       # torch server reindexes this repo in 51 s,
                                       # llama.cpp in 410 s, queries alike
@@ -81,7 +81,7 @@ encode_timeout_ms = 600000           # whole embed call incl. busy retries (ms);
 # the right URL would otherwise poison every vector silently.
 # served_name = "Qwen/Qwen3-Embedding-0.6B"
 
-# OPTIONAL second vLLM instance serving only the QUERY path (/search, and every
+# OPTIONAL second embedder instance serving only the QUERY path (/search, and every
 # search a /research run makes). Commented out = one instance does both, which is
 # the default. A second instance on the other GPU keeps queries answering while a
 # bulk reindex saturates the first. It must serve the SAME model — the handshake

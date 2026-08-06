@@ -51,7 +51,7 @@ deliberately):
 |---|---|
 | `[model].name` | **renamed** to `[model].id`; value is a registry id (`qwen3-embedding-0.6b` \| `-4b` \| `-8b`), not an HF repo |
 | `[model].served_name` | **new**, optional — for a server started with `--served-model-name` |
-| `[model].server_url` | default `:11211` → **`:12434`** |
+| `[model].server_url` | port unchanged (`:11211`), but what answers it is not — an OpenAI-compatible server instead of the vendored one's binary `/encode` |
 | `[model].max_429_retries` | unchanged, but now also covers **503** — the other spelling of "busy" |
 | `[qdrant].dense_prefetch_limit` | **removed** (no prefetch) |
 | `[qdrant].sparse_prefetch_limit` | **removed** (no sparse leg) |

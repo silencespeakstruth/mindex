@@ -2,8 +2,8 @@
 
 Reference units for the deployment described in `deploy/gate/` — mindex and
 Qdrant on one machine, reachable from outside only through the gateway. The
-embedding server's unit lives in `../vllm/` (a template with per-GPU env
-files), and everything below about network confinement, `IPAddressDeny=`
+embedding server's unit lives beside its server in `../embedder/`, and
+everything below about network confinement, `IPAddressDeny=`
 drop-not-refuse and `PrivateDevices=` applies to it verbatim — the measured
 failures happened on its predecessor. They are the units this project's own
 host runs, with its paths left in place: read them as a worked example, not as
@@ -38,7 +38,7 @@ mindex" was a race that lingering happened to win.
 
 ## `IPAddressDeny=` drops packets; libraries hang rather than fail
 
-Everything mindex speaks to is on loopback (the vLLM embedder, Qdrant,
+Everything mindex speaks to is on loopback (the embedder, Qdrant,
 Ollama), so `IPAddressAllow=localhost` costs nothing — except that both mindex
 and the embedder fetch model files through a Hugging Face hub client that
 falls back to `huggingface.co`. Denied traffic is **dropped, not refused**, so

@@ -90,7 +90,7 @@ sudo systemctl enable --now mindex-embedder
 ```toml
 [model]
 id         = "qwen3-embedding-0.6b"
-server_url = "http://127.0.0.1:11212"
+server_url = "http://127.0.0.1:11211"
 ```
 
 Four decisions inside it are worth knowing, because each was a measured failure
@@ -173,7 +173,7 @@ Heavier to install on ROCm (no PyPI wheel: `aur/python-vllm-rocm` builds from
 source, or use the `rocm/vllm` image). Not measured here.
 
 ```sh
-vllm serve Qwen/Qwen3-Embedding-0.6B --task embed --port 11212 \
+vllm serve Qwen/Qwen3-Embedding-0.6B --task embed --port 11211 \
     --dtype bfloat16 --max-model-len 8192
 ```
 
@@ -210,7 +210,7 @@ ref = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device="cpu").encode(
 )
 
 req = urllib.request.Request(
-    "http://127.0.0.1:11212/v1/embeddings",
+    "http://127.0.0.1:11211/v1/embeddings",
     data=json.dumps({"model": "qwen3-embedding-0.6b", "input": TEXTS}).encode(),
     headers={"Content-Type": "application/json"},
 )

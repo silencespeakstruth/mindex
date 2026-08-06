@@ -41,8 +41,8 @@ it just retrieves worse.
 
 Run:
     MINDEX_EMBED_MODEL=Qwen/Qwen3-Embedding-0.6B \
-    MINDEX_EMBED_DEVICE=cuda MINDEX_EMBED_DTYPE=float16 \
-    uvicorn server:app --host 127.0.0.1 --port 11212
+    MINDEX_EMBED_DEVICE=cuda MINDEX_EMBED_DTYPE=bfloat16 \
+    uvicorn server:app --host 127.0.0.1 --port 11211
 """
 
 from __future__ import annotations
@@ -55,9 +55,9 @@ import time
 # The stubs for these live in the venv this server runs in, not in the repo's
 # lint environment; the mock embedder under tests/ carries the same ignores.
 import numpy as np  # type: ignore[import-not-found]
+import orjson  # type: ignore[import-not-found]
 import torch  # type: ignore[import-not-found]
-from fastapi import FastAPI, HTTPException  # type: ignore[import-not-found]
-from fastapi.responses import ORJSONResponse  # type: ignore[import-not-found]
+from fastapi import FastAPI, HTTPException, Response  # type: ignore[import-not-found]
 from pydantic import BaseModel  # type: ignore[import-not-found]
 from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
 
@@ -131,7 +131,7 @@ _model: SentenceTransformer | None = None
 # for.
 _gpu = threading.Lock()
 
-app = FastAPI(title="mindex embedder", default_response_class=ORJSONResponse)
+app = FastAPI(title="mindex embedder")
 
 
 class EmbeddingsRequest(BaseModel):
@@ -265,7 +265,7 @@ def _encode_into(out: list[object], texts: list[str], group: list[int]) -> None:
 
 
 @app.post("/v1/embeddings")
-def embeddings(req: EmbeddingsRequest) -> ORJSONResponse:
+def embeddings(req: EmbeddingsRequest) -> Response:
     if _model is None:
         raise HTTPException(status_code=503, detail="model still loading")
     texts = [req.input] if isinstance(req.input, str) else req.input
@@ -293,10 +293,12 @@ def embeddings(req: EmbeddingsRequest) -> ORJSONResponse:
         len(texts) / max(dt, 1e-9),
     )
 
-    # orjson serialises numpy arrays natively, which matters: this response is
-    # len(texts) x width floats and JSON encoding of it is the one CPU cost on
-    # the path that scales with the batch.
-    return ORJSONResponse(
+    # Serialised here rather than returned as a dict, for two reasons that both
+    # matter at this size: FastAPI's own path would validate and re-encode
+    # len(texts) x width floats, and orjson writes numpy arrays natively with
+    # OPT_SERIALIZE_NUMPY instead of converting each row to a Python list first.
+    # JSON encoding is the one CPU cost on this path that scales with the batch.
+    payload = orjson.dumps(
         {
             "object": "list",
             "model": SERVED_NAME,
@@ -308,5 +310,7 @@ def embeddings(req: EmbeddingsRequest) -> ORJSONResponse:
                 for i, v in enumerate(out)
             ],
             "usage": {"prompt_tokens": 0, "total_tokens": 0},
-        }
+        },
+        option=orjson.OPT_SERIALIZE_NUMPY,
     )
+    return Response(content=payload, media_type="application/json")

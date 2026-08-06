@@ -1,5 +1,16 @@
 # Retrieval v3 — Qwen3-Embedding via vLLM, the model registry, and everything that dies on the way
 
+> **Executed, and corrected on two points by execution (2026-08-06).** Everything
+> below shipped except the serving half of Phase 7. **The stack is not vLLM**:
+> `deploy/embedder/` is a contract (`/v1/embeddings` + `/v1/models` + `/health`)
+> with three recipes measured against each other, and what runs here is a
+> ~200-line torch server, because llama.cpp reindexed this repository in 410 s
+> against its 51 s — an order of magnitude, for identical vectors. vLLM survives
+> as recipe C, unmeasured. **The port is 11211, not 11212**: v3 changed what
+> answers it, not where, so an existing `[model].server_url` keeps pointing at
+> the right process. Read this file for the design and its grounds; read
+> `deploy/embedder/README.md` for what is actually deployed.
+
 *Implementation spec, approved 2026-08-05. Supersedes the implementation half of
 `retrieval-v2.md` (whose **measurement record stands** and is the evidence base
 here); read that file's §1/§6 for the numbers and the open questions. This file

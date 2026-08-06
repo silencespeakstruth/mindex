@@ -38,7 +38,12 @@ const DEFAULT_MAX_BODY_MIB: usize = 256;
 /// VRAM cost is negligible beside the research LLM. The other registry entries
 /// are one config line away.
 const DEFAULT_MODEL_ID: &str = "qwen3-embedding-0.6b";
-const DEFAULT_MODEL_SERVER: &str = "http://localhost:11212";
+/// The port the embedder has always answered on here. v3 changed what speaks it
+/// — an OpenAI-compatible `/v1/embeddings` rather than the vendored server's
+/// binary `/encode` — but not where, so an existing deployment's `server_url`
+/// keeps pointing at the right process. (It is also memcached's registered
+/// port; nothing else claims it on a host running mindex's embedder.)
+const DEFAULT_MODEL_SERVER: &str = "http://localhost:11211";
 const DEFAULT_HEALTH_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_MAX_429_RETRIES: u32 = 3;
 const DEFAULT_BACKOFF_BASE_MS: u64 = 200;
@@ -1323,7 +1328,7 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Embedding server, OpenAI-compatible (default: http://localhost:11212).
+    /// Embedding server, OpenAI-compatible (default: http://localhost:11211).
     #[arg(long)]
     pub model_server: Option<Url>,
 

@@ -1544,7 +1544,8 @@ grounds.
 
 **The client speaks OpenAI, and it checks who answered.**
 `src/models/embedder.rs` posts `/v1/embeddings` to whatever OpenAI-compatible
-server is configured — llama.cpp on this host, vLLM equally (the vendored BGE-M3
+server is configured — the torch server in `deploy/embedder/` on this host,
+llama.cpp or vLLM equally (the vendored BGE-M3
 server is deleted; it existed only because nothing general returned three heads
 at once). Two properties carried over verbatim: the **whole-call deadline**
 (`[model].encode_timeout_ms`, default 10 min — per-attempt bounds let a

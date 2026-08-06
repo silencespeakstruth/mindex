@@ -119,7 +119,7 @@ so this is a **delete and reindex**, and the order matters only in that nothing
 is deleted before the new index is confirmed good.
 
 1. Stand up the embedder: `deploy/embedder/README.md`, then
-   `curl -s localhost:11212/v1/models`. Verify the **pooler** by cross-checking
+   `curl -s localhost:11211/v1/models`. Verify the **pooler** by cross-checking
    one embedding against `sentence-transformers` (that README's check 2) — a
    wrong pooler is a clean-looking null result, not an error.
 2. Point `[model].server_url` at it and start mindex. Startup will:
