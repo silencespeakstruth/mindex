@@ -16,8 +16,11 @@ away). 21 programming languages, plus TOML, YAML and Markdown.
 - **Search** is the paid-precision half: you spend a few chunks and get the byte-exact
   text of one place. Retrieval is one dense leg — deliberately, and after measuring the
   alternative: a sparse leg fused in by RRF, plus a late-interaction rerank on top,
-  scored *below* the single leg it fused while costing 99.6% of the store. The
-  measurement, and the harness that produced it, are in [`bench/`](bench/README.md).
+  scored *below* the single leg it fused while costing 99.6% of the store. Replacing all
+  three with one modern encoder moved nDCG@10 from **0.3549 to 0.4563** on 1 115 queries
+  (Δ +0.1014, 95% CI [+0.0832, +0.1190]) — one corpus, and the harness says so itself.
+  The measurement, its limits, and the pre-registration it was run under are in
+  [`bench/`](bench/README.md).
 - **Research** is the cheap-breadth half, and it costs the caller nothing. You ask a
   question; a **local** model runs the whole investigation — searching, reading code,
   looking up definitions, walking git history — and hands back a cited Markdown report.

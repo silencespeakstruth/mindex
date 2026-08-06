@@ -22,9 +22,22 @@
 # (research). Ablations override individual keys from the command line and
 # record the override in the result rows.
 
+# THREE PATHS ARE NOT IN THIS FILE, AND THAT IS DELIBERATE. The TLS certificate,
+# its key and the database file are per-machine, and a committed absolute path
+# under one author's home directory is the first thing that breaks for everybody
+# else. mindex takes all three as CLI flags, and a flag beats the TOML, so the
+# start command carries them:
+#
+#     mindex --config bench/bench-config.toml \
+#            --cert-path "$MINDEX_BENCH_CERT" \
+#            --key-path  "$MINDEX_BENCH_KEY" \
+#            --db-path   "$MINDEX_BENCH_DB"
+#
+# bench/README.md §Setup has the mkcert invocation that produces the first two.
+# `run.py` needs the database path as well — to read index state out of band —
+# and takes it from `--db-path`, defaulting to `$MINDEX_BENCH_DB`.
+
 [server]
-cert_path = "/home/silencespeakstruth/.config/mindex/mindex-cert.pem"
-key_path  = "/home/silencespeakstruth/.config/mindex/mindex-key.pem"
 max_body_mib = 512
 
 [model]
@@ -35,7 +48,6 @@ server_url = "http://localhost:11211"
 server_url = "http://localhost:6334"
 
 [database]
-path      = "/home/silencespeakstruth/.local/share/mindex-bench/mindex-bench.db"
 pool_size = 64
 
 [indexing]

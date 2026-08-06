@@ -158,8 +158,11 @@ either query length.
 
 **Trap.** Qdrant's `max_sim` returns the **sum** over query tokens; the paper's
 weights assume a **mean**. Un-normalised the ColBERT term outweighs the others
-by two orders of magnitude. See `normalise_maxsim()` in
-`bench/baselines/pipeline_ablation.py`.
+by two orders of magnitude. The implementation that got this right,
+`normalise_maxsim()` in `bench/baselines/pipeline_ablation.py`, was deleted with
+the v2 pipeline (PROTOCOL §11, 2026-08-06); the trap is restated here rather
+than pointed at, because this whole section is moot under v3 — there is no
+late-interaction score to fuse.
 
 **Done when.** The new ordering reproduces the bench arm's numbers to three
 decimals on both corpora, and `bench/stats.py` shows non-inferiority at

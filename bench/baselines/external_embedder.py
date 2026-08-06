@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -138,8 +139,9 @@ def resolve_device(requested: str, torch) -> str:
             return "xpu"
         raise SystemExit(
             "no accelerator: this interpreter has neither CUDA/ROCm nor XPU. "
-            "Run under embedder/.venv-egpu or .venv-igpu, or pass --device cpu "
-            "explicitly and accept that no timing from this run is comparable."
+            "Install a torch build matching your device into bench/.venv (see "
+            "bench/requirements.txt), or pass --device cpu explicitly and accept "
+            "that no timing from this run is comparable."
         )
     if requested == "cuda" and not have_cuda:
         raise SystemExit("--device cuda, but torch.cuda.is_available() is False")
@@ -176,19 +178,29 @@ def main() -> int:
     ap.add_argument(
         "--db",
         type=Path,
-        default=Path.home() / ".local/share/mindex-bench/mindex-bench.db",
+        default=os.environ.get("MINDEX_BENCH_DB"),
+        help="the bench server's SQLite file; defaults to $MINDEX_BENCH_DB",
     )
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument(
         "--baseline-from-qdrant",
         action="store_true",
-        help="rank the STORED BGE-M3 dense vectors by the same exact matmul "
-        "instead of embedding anything. This is the arm the new model must be "
-        "compared against: Qdrant's own search is HNSW and therefore "
-        "approximate, so scoring an exact new model against an approximate "
-        "incumbent would credit the newcomer with the incumbent's recall loss.",
+        help="RETIRED with the v2 pipeline; refuses rather than running. It "
+        "ranked the STORED BGE-M3 dense vectors by the same exact matmul, so "
+        "that the incumbent was not charged HNSW's recall loss while the "
+        "challenger got an exact search. Both halves are gone: the collection "
+        "it read is `{guid}_v2` and the query side came from the vendored "
+        "server's binary /encode. Kept as a refusal because it produced the "
+        "`bgem3-exact` arm in PROTOCOL §12.12, and a flag that silently means "
+        "something else now is worse than one that stops.",
     )
-    ap.add_argument("--qdrant", default="http://127.0.0.1:6333")
+    ap.add_argument(
+        "--qdrant",
+        default=os.environ.get("MINDEX_BENCH_QDRANT", "http://127.0.0.1:6333"),
+        help="Qdrant REST endpoint; $MINDEX_BENCH_QDRANT overrides. Note this "
+        "is the REST port, not the gRPC 6334 that bench-config.toml gives "
+        "mindex.",
+    )
     ap.add_argument(
         "--dtype",
         choices=["float32", "float16", "bfloat16"],
@@ -208,7 +220,17 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.baseline_from_qdrant:
-        args.model = "BAAI/bge-m3"
+        raise SystemExit(
+            "--baseline-from-qdrant is retired with the v2 pipeline and cannot "
+            "run: it reads a `{guid}_v2` collection of BGE-M3 dense vectors that "
+            "v3 neither writes nor keeps, and embeds queries through the "
+            "vendored server's binary /encode, which is deleted. The arm it "
+            "produced (`bgem3-exact`) is frozen in PROTOCOL §12.12 and in "
+            "results/bgem3-exact__*.jsonl; there is no way to reproduce it "
+            "against a v3 server, and pretending otherwise by pointing it at "
+            "/v1/embeddings would measure a different model under the old name. "
+            "See PROTOCOL §11, 2026-08-06."
+        )
     if args.model not in MODELS:
         raise SystemExit(
             f"{args.model} has no entry in MODELS. Its query/document prompting "

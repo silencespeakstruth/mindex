@@ -11,6 +11,13 @@
 [run]
 # A dedicated mindex instance. Collection names derive from the project GUID,
 # so distinct GUIDs are what keep the benchmark off the live index.
+#
+# `https` with `no_verify` is not sloppiness and not a recommendation: mindex is
+# TLS-only, it has no plaintext mode to fall back to, and the bench server runs
+# behind a certificate the harness generated for one loopback port. Verifying it
+# would mean installing a CA for a process whose lifetime is one benchmark pass.
+# It is safe *here* precisely because the connection cannot leave the machine —
+# copy neither line into a deployment.
 server_url = "https://127.0.0.1:11121"
 no_verify  = true
 
@@ -273,4 +280,11 @@ drop_empty_gold = true
 # baseline pays, in the one comparison that is meant to be about retrieval.
 # --keep-over-limit-queries builds the other corpus for anyone who disagrees.
 max_query_tokens = 1023
+# Deliberately still BGE-M3's tokenizer, and not the model v3 serves. This
+# exclusion is part of the *frozen corpora* — it decided which instances the
+# published numbers were computed over, and every arm in PROTOCOL §12 was
+# scored against the set it produced. Re-tokenizing it under Qwen3 would
+# silently change the corpus and make old and new results incomparable. The
+# constraint it encoded is gone (it was Qdrant's multivector limit, one ColBERT
+# row per token); the corpus definition it produced is history and stays.
 tokenizer_model = "BAAI/bge-m3"

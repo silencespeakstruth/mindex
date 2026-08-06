@@ -12,34 +12,60 @@ is only the operating manual.
 
 ## Why this exists
 
-mindex's documentation carries retrieval-quality numbers (`MRR@10 0.3931`,
-`recall@10 20/23`, `512 answers 15/23 documentation questions vs 18/23`) that
-came from a one-off evaluation which no longer exists, over a 23-question set
-that exists nowhere. `docs/claude/qdrant.md` states it plainly: *"there is no
-retrieval-quality harness in this repo."*
+mindex's retrieval was never measured. Its documentation carried numbers
+(`MRR@10 0.3931`, `recall@10 20/23`, `512 answers 15/23 documentation questions
+vs 18/23`) from a one-off evaluation that no longer exists, over a 23-question
+set that exists nowhere — and the integration suite runs against a mock embedder
+whose vectors are seeded by text hash, so it can assert plumbing and ranking
+stability but can never see a semantic regression.
 
-The cost is not only rhetorical. Three roadmap items — ColBERT binary
-quantization, token pooling, and whether ColBERT earns its place at all —
-are explicitly gated on a measurement that does not exist, and ColBERT is
-**99.6% of stored bytes**. Meanwhile the integration suite runs against a mock
-embedder whose vectors are seeded by text hash, so it can assert ranking
-stability and plumbing but can never see a semantic regression.
+The cost was not rhetorical. Four pipeline decisions were being deferred to a
+measurement nobody had: whether the sparse leg earned a slot, whether the
+late-interaction rerank earned **99.6% of stored bytes**, what the chunk window
+should be, and whether the embedder was the right one. This harness answered
+them, and the answers replaced the whole retrieval pipeline in v2.0.0 — see
+[`FINDINGS.md`](FINDINGS.md) §11 and `PROTOCOL.md` §12.15.
 
 ## What is measured
 
-Given a natural-language description of a problem in a repository, does
-mindex's search rank the code that must change near the top? That is issue
-localization framed as retrieval — the task from LocAgent (ACL 2025) and
-SweRank, chosen because it is what mindex is actually used for and because
-third-party ground truth exists, so we do not write our own exam.
+**Descriptive retrieval from a project's own documentation** (the primary tier).
+Given a paragraph of prose a project's maintainers wrote about their own code,
+does mindex's search rank the file that defines what the prose is describing?
+Gold comes from Sphinx `.. class::` directives and `:class:`/`:func:` roles,
+resolved **by AST against the source tree** — a file is gold only if it actually
+defines the symbol — and the query is the section's prose with every explicit
+code reference and code block stripped out.
 
-Ground truth comes from three published datasets, pinned by revision:
+This tier replaced **issue localization** as the primary task on 2026-08-05, and
+the reason is in `PROTOCOL.md` §11: localizing a bug from its symptoms requires
+*inference*, mindex performs *matching*, and the inference belongs to
+`/research`. Answering "does ColBERT earn its storage" on a task the component
+does not perform can select the wrong configuration with a confidence interval
+attached. Issue localization is retained as a secondary tier.
+
+Neither tier is an exam this project wrote. The descriptive gold is derived from
+each project's own published documentation at a pinned commit; the issue tier's
+is third-party:
 
 | dataset | scope | granularity |
 |---|---|---|
 | [`czlll/Loc-Bench_V1`](https://huggingface.co/datasets/czlll/Loc-Bench_V1) | 560 instances, Python | file + function; bug / feature / performance / security |
 | [`ByteDance-Seed/Multi-SWE-bench`](https://huggingface.co/datasets/ByteDance-Seed/Multi-SWE-bench) | 48 repos, 8 languages, CC0 | file |
 | [`SWE-bench`](https://huggingface.co/datasets/SWE-bench/SWE-bench) + Verified | Python, 12 repos | file |
+
+A third tier projects the issue tier's queries into **identifier shape**, keeping
+its gold byte-identically, to ask whether a lexical leg earns a slot when the
+query is a name rather than prose (`PROTOCOL.md` §3.4, family F10 — declared,
+partially run, no verdict).
+
+## What has actually been run, and what has not
+
+The corpora table in `corpora.toml` is a plan. Only **django** and
+**scikit-learn** have ever produced a published number, both Python, both from
+documentation prose. Every other corpus — `cli`, `clap`, `vue-core`, the whole
+tier-2 set — is declared and unrun, as is family F9 (prose retrieval) and the
+research-quality tier (`PROTOCOL.md` §7). `FINDINGS.md` opens with the full list
+of what this harness does not establish; read it before quoting anything here.
 
 ## Setup
 
@@ -55,10 +81,24 @@ Python **3.13+** is required: gold-set globbing uses
 
 A run needs its own mindex, not the one serving your editor:
 
+Three paths are yours and are **not** in the committed config — a benchmark
+whose config names one author's home directory is one that runs on one machine:
+
 ```bash
+export MINDEX_BENCH_DB="$HOME/.local/share/mindex-bench/mindex-bench.db"
+export MINDEX_BENCH_CERT="$HOME/.config/mindex/bench-cert.pem"
+export MINDEX_BENCH_KEY="$HOME/.config/mindex/bench-key.pem"
+mkdir -p "$(dirname "$MINDEX_BENCH_DB")" "$(dirname "$MINDEX_BENCH_CERT")"
+
+# mindex is TLS-only and has no plaintext mode. Any self-signed leaf will do:
+# the harness connects with no_verify over loopback (corpora.toml says why).
+mkcert -cert-file "$MINDEX_BENCH_CERT" -key-file "$MINDEX_BENCH_KEY" \
+       localhost 127.0.0.1                       # or openssl req -x509 ...
+
 cargo build --release --bin mindex
-mkdir -p ~/.local/share/mindex-bench
-./target/release/mindex --config bench/bench-config.toml --bind 127.0.0.1:11121
+./target/release/mindex --config bench/bench-config.toml --bind 127.0.0.1:11121 \
+    --cert-path "$MINDEX_BENCH_CERT" --key-path "$MINDEX_BENCH_KEY" \
+    --db-path "$MINDEX_BENCH_DB"
 ```
 
 It has its own database, its own project GUIDs — which is what keeps its
@@ -67,6 +107,10 @@ collections apart from the live index in a shared Qdrant — and
 a trusted loopback that authorizes nothing. It shares the host's embedder and
 Qdrant, because measuring a different embedder than the one people run would
 defeat the purpose.
+
+`run.py` needs `$MINDEX_BENCH_DB` too (or `--db-path`): it reads index state out
+of the SQLite file directly, and pointing it at the wrong one reports every
+instance as freshly built rather than failing.
 
 Build the binary from the tree you intend to measure. `run.py` records the git
 SHA and warns when `src/` is dirty, but it cannot tell that a stale binary on
@@ -102,6 +146,26 @@ are idempotent.
 Snapshot verification needs the clone. To build a draft against datasets alone,
 pass `--no-verify-snapshots` — never for a real run.
 
+## Checking a published number without running anything
+
+Every figure quoted in `PROTOCOL.md` §12 or `FINDINGS.md` has a committed
+artefact behind it in [`published/`](published/README.md) — the aggregate
+`score.py` produced, or the interval and p-value `stats.py` produced, both a few
+kilobytes. The runs themselves are not committed (654 MB for a tier-1 pass), so
+this is the difference between a table you can check and a table you must trust.
+
+```bash
+# the release headline: v3 vs v2, same corpus, same queries
+python -c 'import json;d=json.load(open("bench/published/v3-vs-v2__django-docs-short.stats.json"));print(d["rows"][0])'
+
+# is your rebuilt corpus the one these numbers came from?
+sha256sum bench/.data/qrels/django-docs-short.jsonl
+python -c 'import json;print(json.load(open("bench/published/qrels.manifest.json"))["django-docs-short.jsonl"]["sha256"])'
+
+# do the committed artefacts still follow from the runs on this machine?
+bench/.venv/bin/python bench/publish.py --check
+```
+
 ## Cost, before you start a tier-1 fetch
 
 Measured on the live index: **~764 KiB per chunk** and **~22 chunks per file**.
@@ -121,17 +185,33 @@ Two consequences that are easy to learn the expensive way:
 
 | file | role |
 |---|---|
-| `PROTOCOL.md` | the pre-registration; everything else implements it |
+| `PROTOCOL.md` | the pre-registration; everything else implements it. §11 amendments, §12 results |
+| `FINDINGS.md` | the working narrative: what was found, what was wrong, what is still open |
+| `CODE_EMBEDDER_SURVEY.md` | the literature read before the model comparison |
 | `corpora.toml` | repos, pinned dataset revisions, gold-set filters, run policy |
-| `bench-config.toml` | the mindex config the benchmark server runs with |
+| `bench-config.toml` | the mindex config the benchmark server runs with (no machine paths — see its header) |
 | `fetch.py` | clone repositories, download ground truth, record a sha256 manifest |
-| `build_qrels.py` | datasets → the frozen query set, plus the drop report |
+| `build_qrels.py` | issue datasets → the frozen query set, plus the drop report |
+| `sphinx_docs.py` | Sphinx docs → queries + AST-verified gold. `--self-test` covers parser and resolver |
+| `build_docs_qrels.py` | driver for the **primary** descriptive corpus; `--short` emits the short-query variant |
+| `build_ident_qrels.py` | the identifier projection (§3.4): four query arms, gold inherited byte-identically |
 | `run.py` | checkout → reindex → drift-prune → query → JSONL |
-| `score.py` | JSONL → nDCG/Recall/MRR/MAP/Acc@k, per corpus and macro |
+| `score.py` | JSONL → nDCG/Recall/MRR/MAP/Acc@k, per corpus and macro. `--json` writes a summary |
+| `stats.py` | paired randomization, BCa interval, non-inferiority against a margin |
+| `ranx_bridge.py` | result JSONL → `ranx` Qrels/Run, keeping the chunk→file dedup |
 | `noise_floor.py` | §5.1: N identical runs → between-run SD → δ → power |
+| `slicer_sweep.py` | rewrite config, restart server, reindex, verify the window by re-tokenizing |
+| `publish.py` | regenerate `published/`; `--check` fails when a number and its artefact disagree |
+| `baselines/bm25_fts5.py` | the lexical floor, plus `--system random` for calibration |
+| `baselines/fusion.py` | chunk-level fusion over `ranx`; `--train`/`--test` refuse the same corpus |
+| `baselines/external_embedder.py` | an embedding model scored by exact brute-force cosine over exported chunks |
+| `baselines/cross_encoder.py` | a reranker over a first stage, reported as a delta over it |
+| `baselines/symbol_lookup.py` | mindex's own `/symbols` as a retrieval arm |
+| `published/` | **committed** — the summary and paired-comparison JSON behind every quoted number, plus a qrels hash manifest |
+| `tests/` | 18 tests cross-checking `score.py` against `ranx` over archived runs |
 
-Still to come, in the order `PROTOCOL.md` §8 stages them: `stats.py`,
-`baselines/`, the tier-0 fixture and `ci.yml`.
+Not built, and named in `PROTOCOL.md` §8: the tier-0 replay fixture and
+`ci.yml`. Nothing in `.github/workflows/` runs this harness.
 
 Two things `run.py` does that are easy to leave out and impossible to notice
 afterwards. A checkout **deletes** files, and mindex is only ever told what a
@@ -168,15 +248,21 @@ in `PROTOCOL.md` §11 with their measured effect:
 
 And one the first run found, in mindex rather than in the harness:
 
-- **`POST /search` answers 503 for any query above 1023 BGE-M3 tokens.**
-  ColBERT emits one 1024-wide row per query token and a Qdrant multivector
-  holds at most 1 048 576 elements. It fails however far above the limit the
-  query sits — the embedder's own `--maxlen` truncation still leaves more rows
-  than the store accepts — and it surfaces as `qdrant.unavailable`, i.e. an
+- **`POST /search` answered 503 for any query above 1023 BGE-M3 tokens.**
+  ColBERT emitted one 1024-wide row per query token and a Qdrant multivector
+  holds at most 1 048 576 elements. It failed however far above the limit the
+  query sat — the embedder's own `--maxlen` truncation still left more rows
+  than the store accepted — and it surfaced as `qdrant.unavailable`, i.e. an
   input-size problem diagnosed as an infrastructure outage. 8.1% of django's
-  queries and 14.3% of ripgrep's are over it. Those instances are excluded from
-  the corpus (§4.2), because the lexical baseline they will be compared against
-  accepts a query of any length.
+  queries and 14.3% of ripgrep's were over it. Those instances are excluded
+  from the corpus (§4.2), because the lexical baseline they are compared
+  against accepts a query of any length.
+
+  **The constraint is gone under v2.0.0** — there is no multivector — but the
+  exclusion stays, and `corpora.toml` still counts it in BGE-M3 tokens. It is
+  part of the *frozen corpus*: it decided which instances every published number
+  was computed over, and re-tokenizing it would silently change the query set
+  and make old and new results incomparable.
 
 None of these were caught by a test. They were caught by reading forty
 instances, which is why the protocol requires it.

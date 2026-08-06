@@ -983,6 +983,16 @@ def main() -> int:
         default=root / "bench" / "bench-config.toml",
         help="the mindex config the bench server was started with",
     )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=os.environ.get("MINDEX_BENCH_DB"),
+        help=(
+            "the bench server's SQLite file, read out of band for index state. "
+            "Defaults to $MINDEX_BENCH_DB. Not taken from --server-config: that "
+            "file is committed and must name no machine's paths."
+        ),
+    )
     parser.add_argument("--corpus", action="append", dest="corpora")
     parser.add_argument("--tier", type=int, default=0)
     parser.add_argument(
@@ -1019,8 +1029,15 @@ def main() -> int:
         raise SystemExit("mindex-index is not on PATH")
 
     config = load_config(args.config)
-    server_config = tomllib.loads(args.server_config.read_text())
-    config["run"]["db_path"] = server_config["database"]["path"]
+    # The committed server config names no machine's paths (see its header), so
+    # the database is a flag. Refuse rather than guess: reading index state from
+    # the wrong file would report every instance as freshly built.
+    if args.db_path is None:
+        raise SystemExit(
+            "the bench server's database path is required: pass --db-path or set "
+            "$MINDEX_BENCH_DB to the file you started mindex with"
+        )
+    config["run"]["db_path"] = str(args.db_path)
 
     corpora = select_corpora(config, args.corpora, args.tier)
     if not corpora:

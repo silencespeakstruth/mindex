@@ -957,14 +957,23 @@ the whole table would stop being true the moment one row stopped qualifying.
 | 2026-08-06 | **retraction**: `top_k = 100` is no longer justified by "a truncation, not a retrieval decision" (§4.3, and the 2026-08-04 row above) | That argument rested on the pipeline prefetching 200 dense + 200 sparse, fusing and reranking before cutting, so that any depth ≤ `fusion_limit` was a deeper slice of one ranking. Under v3 `/search` asks Qdrant for `top_k` directly — no prefetch, no fusion, no rerank — so the depth **is** a retrieval decision and a deeper cut is a different HNSW search. **No published number changes and no result is withdrawn**: every arm within a comparison is cut at the same depth, which is what those comparisons rest on. What is withdrawn is the reason the choice was safe; the value stays at 100. The comment carrying the false claim in `run.py` is annotated rather than silently corrected. Should F10 ship a lexical leg, the original argument becomes true again and this row is what says why. |
 | 2026-08-06 | `baselines/pipeline_ablation.py` deleted; `slicer_sweep.py --ablation` removed with it | The script queried Qdrant directly through BGE-M3's binary protocol (`MAGIC = b"BM3\x01"`) and its arms were `full` / `no-colbert` / `dense-only` / `sparse-only` — a pipeline v3 does not have. It could not run against the current server, and a benchmark script that produces nothing while *looking* runnable is worse than an absent one. F2 and F3 remain fully readable: their arms are frozen in `results/F2__*.json` and `results/F3__*.json`, and re-running a family whose incumbent no longer exists was never possible anyway. §12.7 and §12.10 keep their references to the script as the historical record of how those numbers were produced. |
 | 2026-08-06 | `run.py` reindexes on commit change alone, not on `single_snapshot and` commit change (§3.3) | The guard fired only for the descriptive tier, where every instance shares one commit. The condition it actually needs is the equality by itself: two instances naming the same sha cannot have different trees. This became load-bearing with §3.4, which emits four arms per source instance — on django the old conjunct would have bought 3 248 full reindexes where 812 are required. No published number changes: the skipped work was verifying a state that had not moved. `single_snapshot` still governs the equivalence sample and the GC cadence, which genuinely ask whether the corpus is one tree. |
+| 2026-08-06 | **the §5.1 noise floor was not run as §5.1 specifies**, and δ moved 30× on the result | §5.1 requires the identical configuration end to end **five times including reindexing**; §12.9 ran `--index-repeats 0`, i.e. seven passes of the query path over one fixed index. It found exactly what that measures — the query path is deterministic — and δ fell from the provisional 0.030 to the §5.5 floor of 0.01. The deviation is recorded now rather than when it happened, and it matters in one direction: the excluded variance is *indexing* non-determinism, so δ = 0.01 is justified for same-index comparisons (F1, F2, F7) and **is not measured for cross-index ones** (F3's window, the v3-vs-v2 system comparison), where the only figure that exists is the retired 0.030. §12.5 now splits the two cases and carries the missing run; §12.10 and §12.15 each state which side they are on. No result is withdrawn: §12.15 clears 0.030 by 3×, and §12.10 is relabelled exploratory by the row below rather than by this one. |
+| 2026-08-06 | **F3 was not run as declared**, and the shipped 364 default comes from a sweep | §5.3 declared F3 as `fill_gaps` on/off, `max_doc_chunk_tokens` 512 vs 1024, `doc_semantic_weight` 0 vs 1. What §12.10 ran is a three-arm sweep of `max_chunk_tokens` (512/364/256) — a different knob, and under §5.3's own search-vs-comparison rule a search, which carries no claim and takes no multiple-comparison correction. `[slicer].max_chunk_tokens = 364` nevertheless shipped as the default in v3. Recorded rather than reversed, because the alternative is a default chosen by nothing at all: the sweep is the only evidence anyone has, its effect is in the right direction, and the cost of being wrong is a re-slice. It is labelled exploratory in §12.10 and in the release notes, and the confirmatory version — both remaining corpora, under the Qwen3 tokenizer that actually ships — is on the open list. The pre-registered F3 was never run and is not withdrawn. |
+| 2026-08-06 | **"TOST" renamed to what `stats.py` computes**; **Holm–Bonferroni disclosed as off-tool** | Two labels described procedures the code does not contain. `stats.py` tests non-inferiority as `ci95_lower > -δ` — a BCa interval clearing the margin — which is a CI-based non-inferiority check and not two one-sided tests; scipy was listed as a dependency "because TOST needs the t distribution" and is imported nowhere. The column is now `non-inferior (CI)`, and the difference is not cosmetic: on §12.10's `non-obvious` stratum the check reports FAIL where a reader expecting TOST would read a test that was never run. Separately, §5.6's Holm–Bonferroni exists in no script; the adjusted p-values in §12.6 were computed by hand, and every other family reports unadjusted p — F5 alone is nine comparisons. Both are disclosed rather than implemented, because relabelling is checkable today and an implementation would silently restate published numbers. Neither changes a reported effect or an interval. |
+| 2026-08-06 | **the shipped model is not the one F5 selected**, and the reason is outside this harness | §12.12 broke a statistical tie (p = 0.20 django, 0.91 sklearn) on cost and named `granite-embedding-english-r2` the leg. v3 ships `Qwen3-Embedding`. The grounds are recorded in `docs/claude/retrieval-v3.md` §0 and are not retrieval quality: multilingual queries — the deployment's own are frequently Russian, which no corpus here has ever contained — and a ladder of three sizes sharing one tokenizer, which is what makes a size change a re-embed instead of a re-slice. Recorded here because a reader who checks the document against the code finds the mismatch, and a benchmark whose selected arm quietly loses to an unstated preference is worth less than one that says where the preference entered. The untested half is in §12.5. |
 | 2026-08-06 | **equivalence sampling is 1 on a single-snapshot corpus**, and the periodic GC is skipped there (§3) | The check compares an incrementally-reached index against a cold build. The descriptive tier reaches its index in one step and never moves it, so nineteen of the twenty samples re-verified a state that could not have changed — `index=0ms` on every instance, `chunks_removed: 0` on every GC tick. Measured cost on django-docs-short: 20 x ~148 s of rebuild in a 55-minute run whose queries take 45 ms. No published number changes: the same index is measured by the same queries, and the one surviving check covers the one state that exists. |
 
 ---
 
-## 12. Results of the pre-measurement studies
+## 12. Results
 
-Filled in as each pre-measurement study completes, before any comparison is
-run. Nothing here involves comparing two systems.
+Opened as the record of the **pre-measurement studies** — §§12.1–12.5 and 12.9
+are that, filled in as each completed and before any comparison ran, and their
+heading still said so. It stopped being true at §12.6, and §§12.6–12.8 and
+12.10–12.15 are family results and system comparisons. The heading is corrected
+rather than the sections moved: splitting the file now would renumber sections
+that other documents cite by number, and the dates in each heading already say
+which came first.
 
 ### 12.1 Query set (`build_qrels.py`, 2026-08-04)
 
@@ -1391,16 +1400,41 @@ short-query corpus, django, n = 1 115.
 
 | | 512 | 364 | Δ |
 |---|---|---|---|
-| nDCG@10 | 0.3549 | **0.3658** | **+0.0109** |
+| nDCG@10 | 0.3549 | **0.3657** | **+0.0108** |
 | MRR@10 | 0.3468 | 0.3581 | +0.0113 |
 | recall@1 | 0.1671 | 0.1767 | +0.0096 |
 | recall@5 | 0.4062 | 0.4193 | +0.0130 |
-| recall@10 | 0.5215 | 0.5279 | +0.0064 |
+| recall@10 | 0.5215 | 0.5275 | +0.0060 |
 | recall@20 | 0.6378 | 0.6379 | **+0.0001** |
 | chunks/file | 9.71 | 10.90 | +12% |
 
-Paired: **Δ = +0.0109, 95% CI [+0.0013, +0.0209], p = 0.028**, and it passes
-the non-inferiority gate at δ = 0.01.
+Paired: **Δ = +0.0108, 95% CI [+0.0012, +0.0208], p = 0.030**, and it clears
+the non-inferiority margin at δ = 0.01.
+
+*(Re-derived from the artefact on 2026-08-06 and corrected. This table and
+`FINDINGS.md` §2.5 had been transcribed by hand and disagreed in the last digit
+of every figure — 0.3658/+0.0109/p = 0.028 here against 0.3657/+0.0108/p = 0.030
+there. `results/F3-364-vs-512__django-docs-short.stats.json` is now the record
+and both documents quote it. Nothing about the conclusion moves; what moved is
+that two numbers for one run could not both be checked.)*
+
+**Three qualifications, and together they are why this default is carried as
+exploratory rather than confirmed.**
+
+- **This is a cross-index comparison, and no noise floor exists for one.** The
+  arms are separate builds — a different window is a different set of stored
+  vectors — so §12.9's zero SD, measured over a fixed index, does not apply. The
+  only δ ever measured across a reindex is §12.4's provisional **0.030**, which
+  this effect does not clear. §12.5 carries the missing measurement.
+- **No stratum's interval clears zero**: `mixed` +0.0150 [−0.0017, +0.0333],
+  `obvious` +0.0095 [−0.0037, +0.0226], `non-obvious` +0.0056 [−0.0189, +0.0388].
+  The pooled effect is real at n = 1 115 and the breakdown localizes it nowhere,
+  which is what a small effect spread evenly across strata looks like — and also
+  what an underpowered breakdown of nothing looks like.
+- **F3 as pre-registered in §5.3 is a different experiment.** It named
+  `fill_gaps`, `max_doc_chunk_tokens` and `doc_semantic_weight`. This is a
+  three-arm sweep of `max_chunk_tokens`, which under §5.3's own rule is a search
+  and carries no claim. See §11, 2026-08-06.
 
 **The tickets confound was pre-registered against this result and is absent.**
 A narrower window puts 12% more chunks in each file, and since gold is at file
@@ -1486,12 +1520,28 @@ transfer is assumed. And the weighted-sum arm has been run on one corpus.
 
 ### 12.5 Still pending
 
+Two of the four rows below were answered by §12.9 and are struck here rather
+than deleted, because this table read as "nothing is known" for a day after they
+were. The distinction §12.9 established is the one that decides which:
+**`noise_floor.py --index-repeats 0` measures the query path over a fixed set of
+vectors, and says nothing about a comparison whose arms were indexed
+separately.**
+
 | quantity | value |
 |---|---|
-| between-run SD, nDCG@10 (pooled) | *pending — §5.1, `noise_floor.py`* |
-| δ for nDCG@10, per §5.5 | *pending — derived from the above* |
-| queries needed for 80% power at δ = 0.02 | *pending* |
-| unjudged-but-relevant rate per §9.1 | *pending — needs a first run* |
+| between-run SD, nDCG@10, **same index** | **0.000000** over 7 × 1 296 observations — §12.9 |
+| δ for nDCG@10, **same-index comparisons** | **0.01**, the §5.5 floor — §12.9 |
+| between-run SD, nDCG@10, **across a reindex** | *pending — §5.1 requires `--index-repeats ≥ 1`, and no such run exists under v3* |
+| δ for **cross-index** comparisons | *pending — the only measured value is §12.4's provisional 0.030, from 12 ripgrep queries under BGE-M3* |
+| queries needed for 80% power at δ = 0.02 | **~850**; ~3 400 at δ = 0.01 — §12.9 |
+| unjudged-but-relevant rate per §9.1 | *pending — needs the hand-judging of 50 sampled queries* |
+
+Which comparisons are which is not a detail. F1, F2 and F7 rank a fixed corpus
+of vectors and are same-index. **F3 (§12.10) and the v3-vs-v2 comparison
+(§12.15) are cross-index** — a chunk window and an embedder both change what is
+stored, so their arms are separate builds and the only δ ever measured for that
+case is 0.030. §12.15's interval clears it; §12.10's +0.0108 does not, which is
+recorded at that section.
 
 Retention after snapshot verification is no longer pending; it is in §12.1,
 and it dropped nothing.
@@ -1706,3 +1756,68 @@ Four observations, none of them a family verdict:
 in both directions, and `noise_floor.py` against the v3 pipeline — §12.5 still
 carries the between-run SD as pending, and the decision rule's "Δ ≥ 2 × SD" term
 has no number until it exists.
+
+### 12.15 The shipped v3 system against the shipped v2 system (2026-08-06)
+
+Every comparison above this line is an *arm* — a model scored offline by
+brute-force cosine over exported chunks (§12.12), or one stage of a pipeline
+switched off (§12.7). None of them is mindex. This section is the one number
+that describes the software a reader downloads: **the deployed v3 server against
+the deployed v2 server**, both driven through `POST /v0/{guid}/search`, both
+including the slicer, the tokenizer, the instruct prefix, Qdrant and HNSW.
+
+It is recorded here because it was missing. The release was written around
+§12.12's `0.4540`, which is an offline numpy arm at window 512 — the right
+number for choosing a model and the wrong one for describing a system.
+
+**Runs.** `results/v3-qwen06b-torch__django-docs-short.jsonl` (v3: one dense leg,
+`qwen3-embedding-0.6b` served by `deploy/embedder/server.py`, window 364,
+`Instruct:`/`Query:` prefix, `top_k` 100) against
+`results/F2-full__django-docs-short.jsonl` (v2: BGE-M3 dense + sparse fused by
+RRF, ColBERT rerank, window 512). Same corpus, same query set, same instance
+ids, same cutoff. Paired randomization B = 10 000, BCa bootstrap 95% CI, seed
+20260805. Output: `results/v3-vs-v2__django-docs-short.stats.json`.
+
+| stratum | n | v3 | v2 | Δ mean | 95% CI | p |
+|---|---|---|---|---|---|---|
+| **ALL** | **1115** | **0.4563** | **0.3549** | **+0.1014** | **[+0.0832, +0.1190]** | **0.0001** |
+| `obvious` | 604 | 0.5366 | 0.4023 | +0.1343 | [+0.1098, +0.1596] | 0.0001 |
+| `mixed` | 363 | 0.4148 | 0.3420 | +0.0728 | [+0.0409, +0.1047] | 0.0001 |
+| `non-obvious` | 148 | 0.2308 | 0.1933 | +0.0375 | [−0.0033, +0.0806] | 0.085 |
+
+Three things this does and does not say.
+
+1. **The effect is an order of magnitude above every δ this document has ever
+   used.** The interval's *lower* bound (+0.0832) clears the current δ = 0.01 by
+   8× and the retired reindex-inclusive δ = 0.030 (§12.4) by nearly 3×. That
+   matters because §11 records the δ change as a deviation that flattered
+   marginal results: this result is not one of them, and it is the only result
+   the release headline rests on.
+2. **It is a system comparison, not a model ablation.** Three things move
+   together — the embedder, the chunk window (512 → 364) and the tokenizer that
+   measured it — and the design cannot separate them. §12.12 is where the model
+   is isolated; nothing here attributes the +0.1014 to any one of the three.
+3. **The gain is not confined to the stratum the cheap baseline already wins.**
+   §3.0.1 exists because a pooled win living entirely in `obvious` is a win at
+   string matching. It is largest there (+0.1343), but `mixed` is +0.0728 with a
+   CI clear of zero. `non-obvious` is +0.0375 with a CI through zero at n = 148 —
+   consistent with the pooled effect, establishing nothing on its own, and it is
+   also where both systems are worst in absolute terms (0.23 and 0.19).
+
+**One corpus.** django's documentation prose, Python, single snapshot. There is
+no v3 run on scikit-learn: the sklearn v3 arm in §12.12 is the offline embedder,
+not the server. So this number is the shipped system measured once, on one
+project's docs, and the second corpus is on the open list.
+
+**What the release ships is not what F5 selected, and that is a decision rather
+than a result.** §12.12 concluded `granite-embedding-english-r2` is the leg —
+indistinguishable from Qwen3 on both corpora (p = 0.20 and 0.91) and cheaper, so
+the tie broke on cost. v3 ships Qwen3-Embedding. The reason is recorded in
+`docs/claude/retrieval-v3.md` §0 and is not a retrieval measurement: multilingual
+queries (the deployment's own are frequently Russian, which nothing in this
+harness has ever scored) and a size ladder of three models sharing one tokenizer,
+which is what makes `--vectors-only` a re-embed rather than a re-slice. A reader
+comparing this document against the code will find that mismatch; it is stated
+here so they find the reason with it. The untested half — whether granite's
+English-only training would actually have cost anything on a Russian query — is
+in §12.5.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired comparison of two runs: permutation test, bootstrap CI, TOST.
+"""Paired comparison of two runs: permutation test, bootstrap CI, non-inferiority.
 
 PROTOCOL §5. A difference in two macro means is not a result; this is what
 turns one into a claim or refuses to.
@@ -13,9 +13,22 @@ turns one into a claim or refuses to.
     interval is not reported (§5.2) — "significant" says the sign is probably
     right and nothing about whether the size is worth the 99.6% of stored bytes
     it costs.
-  * **TOST** against a pre-registered margin, for the non-inferiority gate
-    (§5.5). Reported here so the same script serves the release comparison and
-    the CI gate.
+  * **Non-inferiority against a pre-registered margin** (§5.5), for the CI
+    gate, so the same script serves it and the release comparison.
+
+    It is worth being exact about what this is, because it was called TOST for
+    most of this project's life and is not one. TOST is two one-sided t-tests;
+    what runs here is the interval already computed above clearing the margin —
+    `ci95_lower > -delta`. The two answer the same question and are not the same
+    procedure, and a 95% interval is the *conservative* reading of a test that
+    would use a 90% one. The distinction is not academic: on a stratum whose
+    interval is wide, this reports FAIL where a reader expecting a test would
+    read one that never ran. See PROTOCOL §11, 2026-08-06.
+
+    Note also what a PASS means and does not. It says the arm is not worse than
+    the baseline by more than the margin. It does **not** say the arm is better;
+    that is the CI's job, and a row can be non-inferior with an interval
+    straddling zero.
   * **Per stratum**, because §3.0.1 exists: a pooled win that lives entirely in
     the `obvious` bucket is a win at exactly what the cheap baseline already
     does.
@@ -196,7 +209,8 @@ def compare(
         "p_permutation": round(p, 5),
     }
     if delta is not None:
-        # TOST: non-inferiority holds when the whole interval clears -delta.
+        # Non-inferiority holds when the whole interval clears -delta. This is
+        # the interval test, not TOST — see the module docstring.
         row["non_inferior"] = lo > -delta
         row["margin"] = delta
     return row
@@ -303,7 +317,9 @@ def main() -> int:
     ap.add_argument("system", type=Path, help="the run under test")
     ap.add_argument("baseline", type=Path)
     ap.add_argument("--metric", default="ndcg@10")
-    ap.add_argument("--delta", type=float, default=None, help="TOST margin")
+    ap.add_argument(
+        "--delta", type=float, default=None, help="non-inferiority margin (§5.5)"
+    )
     ap.add_argument(
         "--stratum-field",
         default="overlap_bucket",
@@ -340,7 +356,7 @@ def main() -> int:
             rows.append(compare(name, [a[i] - b[i] for i in ids], rng, args.delta))
 
     head = f"  {'stratum':<14}{'n':>6}{'Δ mean':>10}{'95% CI':>20}{'p':>10}"
-    print(head + ("   TOST" if args.delta else ""))
+    print(head + ("   non-inf" if args.delta else ""))
     for r in rows:
         line = (
             f"  {r['stratum']:<14}{r['n']:>6}{r['mean_delta']:>10.4f}"

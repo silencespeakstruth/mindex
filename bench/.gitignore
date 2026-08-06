@@ -3,8 +3,14 @@
 .data/
 .venv/
 
-# Benchmark output: one JSONL per run, named by timestamp + config hash.
-# Kept locally for comparison, published per release, never committed.
+# Benchmark output: one JSONL per run — up to 23 MB each, 654 MB for a full
+# tier-1 pass. Kept locally for comparison, never committed.
+#
+# What IS committed is the small end of the same pipeline: `published/` holds
+# the aggregate summary and the paired-comparison output behind every number
+# quoted in PROTOCOL.md or FINDINGS.md, plus a hash manifest of the query sets.
+# `publish.py --check` fails if the two ever disagree. Without that directory
+# nothing here could be verified without re-running the whole thing on a GPU.
 results/
 
 # The tier-0 replay fixture: a frozen SQLite file, a Qdrant snapshot and a

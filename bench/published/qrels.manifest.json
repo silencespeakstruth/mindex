@@ -1,0 +1,117 @@
+{
+  "django-364-docs-short.jsonl": {
+    "sha256": "6888a9b778bf22e2dce172cf92c7af9edebc61465637bbc0ad5e4d9e0181a375",
+    "bytes": 696881,
+    "instances": 1115,
+    "gold_files": 1801,
+    "strata": {
+      "mixed": 363,
+      "non-obvious": 148,
+      "obvious": 604
+    }
+  },
+  "django-docs-short.jsonl": {
+    "sha256": "6349ba82ec1b92e8cf22872508c3533f7a471fe2551cfa8efda1aa06772115a0",
+    "bytes": 692421,
+    "instances": 1115,
+    "gold_files": 1801,
+    "strata": {
+      "mixed": 363,
+      "non-obvious": 148,
+      "obvious": 604
+    }
+  },
+  "django-docs.jsonl": {
+    "sha256": "19e6351522533f9b23b09745657c9b18b11f5c155e20657d2129fea38e458d69",
+    "bytes": 1529872,
+    "instances": 1296,
+    "gold_files": 2112,
+    "strata": {
+      "mixed": 695,
+      "non-obvious": 245,
+      "obvious": 356
+    }
+  },
+  "django-ident.jsonl": {
+    "sha256": "226ff5bbc53cb021ec7eaef74dfce014941d9a02b29cfb1d77a41f2e4480b5e0",
+    "bytes": 3066072,
+    "instances": 3128,
+    "gold_files": 4864,
+    "strata": {
+      "mixed": 681,
+      "non-obvious": 2227,
+      "obvious": 220
+    }
+  },
+  "django.jsonl": {
+    "sha256": "ed62f2a8ac9f08e29eef4c793ea1c5bf1a7b589f874d0eb058f86f01c3c9d041",
+    "bytes": 1172184,
+    "instances": 812,
+    "gold_files": 1263,
+    "strata": {
+      "unbucketed": 812
+    }
+  },
+  "ripgrep-ident.jsonl": {
+    "sha256": "02d31b5990bbd741df6724704ffee0841665b80d0b67eca944f701a647b8d140",
+    "bytes": 50495,
+    "instances": 44,
+    "gold_files": 296,
+    "strata": {
+      "mixed": 2,
+      "non-obvious": 40,
+      "obvious": 2
+    }
+  },
+  "ripgrep.jsonl": {
+    "sha256": "d55e125cad159f7335e41a54f281959787837afab23c3d586ebe93a63184997e",
+    "bytes": 22429,
+    "instances": 12,
+    "gold_files": 77,
+    "strata": {
+      "unbucketed": 12
+    }
+  },
+  "scikit-learn-docs-short.jsonl": {
+    "sha256": "aafe92913fa9cb34fa15ba09bdeea41364f29f960659fc3e0940db8d5bc456fa",
+    "bytes": 228935,
+    "instances": 360,
+    "gold_files": 587,
+    "strata": {
+      "mixed": 95,
+      "non-obvious": 85,
+      "obvious": 180
+    }
+  },
+  "scikit-learn-docs.jsonl": {
+    "sha256": "214bc462da13821335bafccb0f3024fbe4463fbbd472d25b9dee8e2d828a3b53",
+    "bytes": 671105,
+    "instances": 430,
+    "gold_files": 683,
+    "strata": {
+      "mixed": 202,
+      "non-obvious": 208,
+      "obvious": 20
+    }
+  },
+  "scikit-learn-ident.jsonl": {
+    "sha256": "d4c459aed135f1df7379b86a51b06a79e8ae8cdc9bb72387bbcbc69a25c34ed8",
+    "bytes": 889199,
+    "instances": 800,
+    "gold_files": 1400,
+    "strata": {
+      "mixed": 235,
+      "non-obvious": 463,
+      "obvious": 102
+    }
+  },
+  "scikit-learn.jsonl": {
+    "sha256": "be729f5d7f8b81e6716e54edb51a317e13785fd3ff791db9f29d7ee33125c317",
+    "bytes": 396875,
+    "instances": 203,
+    "gold_files": 354,
+    "strata": {
+      "None": 203
+    }
+  }
+}

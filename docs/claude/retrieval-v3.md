@@ -33,8 +33,8 @@ as a hard requirement.*
 | Sparse deleted too | worth ~+0.004 over a good dense leg, CI through zero, bounded below δ=0.01; plain RRF scores **below** the single leg it fuses (0.4164 vs 0.4448 django) — `retrieval-v2.md` §1 |
 | Model family: **Qwen3-Embedding**, not granite | statistically indistinguishable from granite on both corpora (0.4540 vs 0.4448 django, p=0.20); chosen over granite for multilinguality (the owner's queries are often Russian — `retrieval-v2.md` §6 names this the untested case) and for the size ladder (0.6B/4B/8B, one tokenizer) |
 | All three sizes registered day one, operator-selectable | switching sizes must be a re-embed, never a re-slice; nothing anywhere may hard-code one dim |
-| Served by **vLLM** (OpenAI-compatible API) | the vendored `embedder/` server existed only because no general server returned three heads (`embedder/README.md` said so); with one head it is deletable, as designed |
-| Chunk window default max **364** | +0.0108 nDCG@10, p=0.030 (`bench/FINDINGS.md` §2.5); measured under the BGE tokenizer — carried as best-available default, re-confirmed by the bench re-run |
+| ~~Served by **vLLM**~~ → served by **any OpenAI-compatible server**; a torch reference server ships | the vendored `embedder/` existed only because no general server returned three heads; with one head it is deletable, as designed. **Corrected by execution**: vLLM was never measured and llama.cpp reindexed this repository in 410 s against the torch server's 51 s, so `deploy/embedder/` is a *contract* with three recipes and their numbers rather than one named process. |
+| Chunk window default max **364** | +0.0108 nDCG@10, p=0.030 (`bench/PROTOCOL.md` §12.10); **exploratory** — a sweep, not the pre-registered F3, on one corpus, measured under the BGE tokenizer. Carried as best-available default; the re-sweep under Qwen3's tokenizer is open. |
 | Canonical model ids in SQLite with CHECK | owner requirement: future model additions cheap, maximally safe, identity enforced at the database |
 
 Out of scope this iteration: the `/research` Ollama loop (untouched), sparse

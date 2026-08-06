@@ -1,4 +1,4 @@
-# Search-quality investigation — state of play, 2026-08-05
+# Search-quality investigation — state of play, 2026-08-06
 
 Handoff document. Written to be read cold by whoever continues this, including
 me tomorrow. `PROTOCOL.md` is the pre-registration and the formal record;
@@ -6,8 +6,43 @@ me tomorrow. `PROTOCOL.md` is the pre-registration and the formal record;
 is still open, and where everything lives. Where the two disagree, PROTOCOL.md
 is authoritative for method and this file for state.
 
-Nothing here is committed as a decision. **No retrieval change has been made to
-mindex**, per the release's own non-goal: build the instrument first.
+> **§§0–9 are a snapshot of 2026-08-05, when nothing had been decided.** They
+> open by saying so, in the present tense, and they are left that way because
+> the order in which things were believed is the point of a working narrative.
+> **§11 is what happened next**: the evidence was acted on, retrieval v3
+> shipped, and mindex now runs one dense leg from a Qwen3-Embedding registry.
+> Read §§0–9 for how the investigation arrived; read §11 for what it decided,
+> what the decision does *not* rest on, and which of §8's next steps are now
+> void. Section 10 sits between the two and is the round that produced the
+> evidence §11 acts on.
+
+## What this harness does not establish
+
+Stated at the top rather than in a threats section, because these are the
+limits a reader should carry into every number below.
+
+- **Two corpora, one language, one query shape.** django and scikit-learn, both
+  Python, both query sets derived from the projects' own documentation prose.
+  Every non-Python corpus in `corpora.toml` tiers 1–2 was declared and never
+  run. CoIR measures BM25 varying **56×** across datasets; nothing here bounds
+  how these results travel.
+- **Retrieval of prose is unmeasured (F9).** Gold is always a code file and
+  `docs/**` is excluded from the ranking, so no claim about how documentation
+  itself retrieves follows from anything here.
+- **Russian queries are unmeasured**, and they are the stated reason the shipped
+  model is Qwen3 rather than the arm F5 selected. That reason is a preference
+  with a rationale, not a measurement — see §11.
+- **The noise floor was measured on the query path only.** `--index-repeats 0`
+  says the query path is deterministic; it says nothing about a comparison whose
+  arms were indexed separately, which includes the chunk-window result and the
+  v3-vs-v2 system comparison. PROTOCOL §12.5 carries the missing run.
+- **"Holm–Bonferroni" and "TOST" are not what the code does.** The
+  non-inferiority check is a confidence interval clearing the margin, not two
+  one-sided tests, and the family-wise correction was applied by hand in one
+  family and nowhere else. PROTOCOL §11, 2026-08-06.
+- **Judgments are incomplete and the bias is downward** (PROTOCOL §9.1): the
+  sampled hand-judging that would size it has not been done, so absolute scores
+  are floors and only the paired comparisons are safe to read.
 
 ---
 
@@ -48,11 +83,13 @@ reproducible (0 variance over 9 072 observations).
 | `bench/build_docs_qrels.py` | driver; `--short` emits the short-query variant; `--audit N` samples instances for reading |
 | `bench/run.py` | checkout → reindex → drift-prune → query → JSONL (pre-existing, edited) |
 | `bench/score.py` | nDCG/Recall/MRR/MAP/Acc, strata, `--self-test` (pre-existing) |
-| `bench/stats.py` | **new** — paired permutation, BCa bootstrap, TOST. `--self-test` validates type-I rate, power against analytic, CI coverage |
+| `bench/stats.py` | **new** — paired permutation, BCa bootstrap, non-inferiority against a margin. `--self-test` validates type-I rate, power against analytic, CI coverage |
 | `bench/noise_floor.py` | edited — `--reuse-label` re-queries an existing index |
 | `bench/slicer_sweep.py` | **new** — F3: rewrite config, restart server, reindex, query, verify window by re-tokenizing produced chunks |
 | `bench/baselines/bm25_fts5.py` | **new** — F1 lexical floor + `--system random` calibration arm |
-| `bench/baselines/pipeline_ablation.py` | **new** — F2 arms against Qdrant directly, incl. `weighted-sum` |
+| `bench/baselines/pipeline_ablation.py` | **DELETED 2026-08-06** — F2's arms against Qdrant directly, incl. `weighted-sum`. It spoke BGE-M3's binary protocol and its arms were `full`/`no-colbert`/`dense-only`/`sparse-only`, a pipeline v3 does not have. Every F2 and §6 number below was produced by it and is frozen in `results/F2__*.json`; none can be re-run. PROTOCOL §11. |
+| `bench/build_ident_qrels.py` | **new (round 3)** — the identifier query set (PROTOCOL §3.4): four query projections per instance, gold inherited byte-identically from the frozen issue tier |
+| `bench/baselines/symbol_lookup.py` | **new (round 3)** — ranks by mindex's own `/symbols`, the arm that asks whether a positive F10 argues for a lexical leg or for routing |
 | `bench/ranx_bridge.py` | **new (round 2)** — result JSONL → `ranx` Qrels/Run, keeping the chunk→file dedup |
 | `bench/tests/test_ranx_equivalence.py` | **new (round 2)** — 18 tests; `ranx` reproduces `score.py` exactly on 6 metrics over 7 archived runs, and pins three undocumented `ranx` behaviours |
 | `bench/baselines/fusion.py` | **new (round 2)** — chunk-level fusion over `ranx`'s 25 methods + weight search; `--train`/`--test` refuse the same corpus |
@@ -68,24 +105,31 @@ reproducible (0 variance over 9 072 observations).
 - Logs: `bench/.data/*.log`
 - Clones: `bench/.clones/{django,django-364,scikit-learn,ripgrep}`
 
-### Servers and indexes (LIVE STATE — check before assuming)
+### Servers and indexes
+
+A benchmark pass needs its own mindex process, its own SQLite file and its own
+Qdrant collections, so that it cannot perturb or be perturbed by a live index.
+None of the three is described by an absolute path here: this file is committed
+and public, and the previous version of this section published one machine's
+directory layout, database locations and derived project GUIDs — which is
+operational state that rots in a week and tells a reader nothing they can use.
 
 | | |
 |---|---|
-| bench server | `./target/release/mindex --config bench/.bench-config-256.toml --bind 127.0.0.1:11121` — **left on the 256 config**, restore with `bench/bench-config.toml` |
-| bench DB (512, 256) | `~/.local/share/mindex-bench/mindex-bench.db` |
-| bench DB (364) | `~/.local/share/mindex-bench364/mindex-bench364.db` (its server is stopped) |
-| Qdrant | host service, `~/.local/share/qdrant`, **61 GB** — several bench collections are still there and can be dropped |
-| embedder | `mindex-embedder@egpu`, `:11211` |
+| bench server | `mindex --config bench/bench-config.toml --bind 127.0.0.1:11121 --cert-path "$MINDEX_BENCH_CERT" --key-path "$MINDEX_BENCH_KEY" --db-path "$MINDEX_BENCH_DB"` |
+| bench database | `$MINDEX_BENCH_DB`; `run.py --db-path` reads index state from it out of band |
+| Qdrant | a plain local instance; a full tier-1 pass stores ~113 GiB and bench collections are not cleaned up automatically |
+| embedder | any OpenAI-compatible server on `:11211` — `deploy/embedder/` |
 
-Project GUIDs (derived, `bench/run.py::project_guid`):
+Project GUIDs are **derived, not configured**: `bench/run.py::project_guid`
+hashes the label and the corpus name, so an arm's GUID is reproducible from the
+command that produced it and does not need to be written down. That is also what
+keeps two arms of the same sweep in separate Qdrant collections.
 
-| label | corpus | GUID | window |
-|---|---|---|---|
-| `baseline` | django | `1ae2908e-4415-5f2f-899e-007006da590f` | 512 |
-| `slicer256` | django | `fffe577a-71f4-53e7-9689-aa6f97a40c89` | 256 |
-| `slicer364` | django-364 | `5d15bca9-ba76-549c-b2ad-38e6e5994800` | 364 |
-| `baseline` | scikit-learn | `38ffb943-cd5f-5f03-9514-71041a8b8e80` | 512 |
+A sweep leaves the server on the **last arm's** config (`slicer_sweep.py` writes
+`.bench-config-<window>.toml` and restarts against it). Restart against
+`bench/bench-config.toml` before running anything else — §5's error log records
+what happens when that step is skipped.
 
 ---
 
@@ -223,7 +267,10 @@ in `non-obvious`. Underpowered there (n = 148), but worth a look.
 text); the paper's weights assume FlagEmbedding's `colbert_score`, which
 divides by the query token count. Without normalising, the ColBERT term
 outweighs the others by two orders of magnitude and the "weighted sum" is just
-`full` with extra steps. `normalise_maxsim()` in `pipeline_ablation.py`.
+`full` with extra steps. The fix was `normalise_maxsim()` in
+`pipeline_ablation.py`, which is deleted (§1) — the correction is recorded here
+because it is the kind of thing the next person to fuse a late-interaction score
+into anything has to rediscover, and the code that did it is gone.
 
 ### 2.7 Cost, measured
 
@@ -534,25 +581,30 @@ beats a BM25 floor by only +0.036 nDCG.
 
 ## 8. What to do next, in order
 
-1. **Confirm the weighted sum on the second corpus.** scikit-learn short
-   (360 queries) is built and unrun. If the sign holds, this is a real,
-   cheap improvement to `db/qdrant.rs` — and note Qdrant ≥1.14 has formula
-   queries, so it may need no extra round-trip.
-   `pipeline_ablation.py --corpus scikit-learn --qrels-suffix=-docs-short --arm all`
-2. **Sweep the weights.** [1, 0.3, 1] is MIRACL's. MLDR's is
-   [0.15, 0.5, 0.35], and code chunks are long documents. A weight sweep is
-   pure post-processing over cached scores — no reindex, no GPU.
-3. **Get to ~3 400 short queries.** Only this makes the ColBERT question
-   answerable at δ = 0.01. django (1 115) + sklearn (360) = 1 475. Two or three
-   more Sphinx-documented Python projects would close it. Candidates with large
-   docs trees: sympy, pandas, scipy, matplotlib, Flask, SQLAlchemy.
-4. **Then, and only then, decide on ColBERT.** The decision is three-way, not
-   two: keep / drop / **token pooling** (`qdrant.md` names it; 2–4× smaller at
-   near-parity, and it makes "how much do we pay" the question instead of
-   "keep or drop").
-5. **Re-run F3 at 364 on scikit-learn** — the window result is one corpus.
-6. **Restore the bench server to `bench/bench-config.toml`** and drop the
-   stale bench collections (Qdrant is at 61 GB).
+> **Written 2026-08-05 and largely overtaken.** Items 1, 2 and 4 are **void**:
+> §10 replaced the dense leg, and there is no longer a second leg to weight, a
+> combination rule to tune, or a ColBERT store to decide about — all three were
+> deleted by v3. They are struck rather than removed, because a list of next
+> steps that quietly loses the ones that stopped mattering cannot be checked
+> against what was actually done. §11 carries the current list.
+
+1. ~~**Confirm the weighted sum on the second corpus.**~~ **Void** — the
+   weighted sum combines three heads of a model that is no longer served, and
+   the script that ran the arm is deleted (§1).
+2. ~~**Sweep the weights.**~~ **Void**, same reason.
+3. **Get to ~3 400 short queries.** Still open, and still the only thing that
+   would make a δ = 0.01 effect resolvable at all. django (1 115) + sklearn
+   (360) = 1 475. Candidates with large Sphinx trees: sympy, pandas, scipy,
+   matplotlib, Flask, SQLAlchemy.
+4. ~~**Then, and only then, decide on ColBERT.**~~ **Decided, and not by this
+   item**: F2 never showed it moving a metric, F7 removed the second leg, and
+   v3 deleted the store. The three-way keep/drop/token-pooling framing was the
+   right one and became moot when the leg it reranked was replaced.
+5. **Re-run F3 at 364 on scikit-learn** — still open, and now doubly so: the
+   window result is one corpus *and* was measured under the BGE-M3 tokenizer,
+   while the shipped slicer counts in Qwen3's. PROTOCOL §12.10.
+6. **Restore the bench server to `bench/bench-config.toml`** after any sweep,
+   and drop the bench collections a pass leaves behind.
 7. Tier-0 fixture + `ci.yml`; research evaluation; `docs/BENCHMARK.md`.
 
 ### Cheap wins available immediately
@@ -971,3 +1023,134 @@ What still stands between that and a decision:
 - **Does the sparse head's dominance on scikit-learn and MLDR mean the fusion
   weights should be corpus-adaptive?** That is a much larger question and
   probably the wrong ladder rung.
+
+---
+
+## 11. THIRD ROUND, 2026-08-06 — the evidence was acted on, and what it does not cover
+
+§§0–9 say in the present tense that nothing has been decided. That was true when
+they were written and stopped being true the next day. **Retrieval v3 shipped**:
+one dense leg from a registry of Qwen3-Embedding models over an
+OpenAI-compatible `/v1/embeddings`, no sparse leg, no ColBERT, no fusion, no
+rerank, per-`(project, model)` Qdrant collections at `_v3`, and a restarted
+SQLite lineage. This section is what a reader needs in order to check that
+decision against the evidence rather than against the narrative that preceded it.
+
+### 11.1 The number the release rests on, which none of §§0–10 contains
+
+Everything above is an **arm**: a model scored offline by brute-force cosine
+over exported chunks, or a stage of the old pipeline switched off. None of it is
+mindex. The shipped system had never been measured end to end, and the release
+was first written around §10.2's `0.4540` — an offline numpy arm at window 512.
+
+Measured 2026-08-06, both systems driven through `POST /v0/{guid}/search`,
+same corpus, same query set, same instance ids, same cutoff
+(PROTOCOL §12.15, `results/v3-vs-v2__django-docs-short.stats.json`):
+
+| | v3 shipped | v2 shipped | Δ | 95% CI | p |
+|---|---|---|---|---|---|
+| django-docs-short, n = 1 115 | **0.4563** | 0.3549 | **+0.1014** | [+0.0832, +0.1190] | 0.0001 |
+
+Three things worth saying plainly.
+
+- **The lower bound of the interval is 8× the δ this project uses and ~3× the
+  strictest δ it ever measured.** That matters because the δ change is itself a
+  recorded deviation (PROTOCOL §11): this result does not depend on it.
+- **It is a system comparison and not a model ablation.** The embedder, the
+  chunk window and the tokenizer that measures it all move together. §10.2 is
+  where the model is isolated; nothing attributes +0.1014 to any one of them.
+- **The win is not confined to the stratum a lexical baseline already wins.**
+  `obvious` +0.1343, `mixed` +0.0728 (both clear of zero), `non-obvious` +0.0375
+  with a CI through zero at n = 148. §3.0.1 exists to catch exactly the failure
+  where a pooled win lives entirely in `obvious`; this is not that.
+
+**One corpus.** There is no v3 run on scikit-learn — the sklearn Qwen3 arm in
+§10.2 is the offline embedder, not the server.
+
+### 11.2 The shipped model is not the arm F5 selected
+
+§10.2 concluded **granite-embedding-english-r2 is the leg**: indistinguishable
+from Qwen3 on both corpora (p = 0.20 django, 0.91 sklearn) and cheaper, so the
+tie broke on cost. v3 ships **Qwen3-Embedding**.
+
+The reason is in `docs/claude/retrieval-v3.md` §0 and it is a preference with a
+rationale, not a measurement: multilingual queries — this deployment's are often
+Russian, and no corpus here has ever contained one — plus a ladder of three
+sizes (0.6B/4B/8B) sharing a single tokenizer, which is what makes a size change
+a re-embed (`mindex-index --vectors-only`) rather than a re-slice.
+
+It is stated here because a reader who checks this document against the code
+finds the mismatch either way, and §9's own list already named the Russian case
+as untested. What would settle it is a Russian query set against granite's
+multilingual sibling (311M, already surveyed, unrun).
+
+### 11.3 What F10 established, and what it did not
+
+Round 3 built the identifier query set (PROTOCOL §3.4) to ask the one question
+§10's limits left standing: both corpora are Python and both query sets are
+documentation prose, so does a lexical leg earn its slot when the *query* is an
+identifier? Declared as a family with three pre-registered routes to a negative
+result before the corpus existed.
+
+**F10 has no verdict.** Only scikit-learn has been run; django, the held-out
+fusion in both directions, and a v3 noise floor are all outstanding
+(PROTOCOL §12.14). What the scikit-learn arms did show, and what makes the
+question worth finishing:
+
+- **The identifier projection is the dense leg's best arm, not its worst** —
+  0.5915 against 0.5222 on the full bug report. The corpus was built on the
+  premise that identifier queries are where a lexical leg would earn its slot.
+- **Perturb the literal string and BM25 collapses** to 0.0651, near the random
+  floor, while dense holds 0.4581. Whatever a lexical leg offers is conditional
+  on the caller spelling the name correctly.
+- **`symbols` recovers nearly all of BM25's signal** (0.2513 against 0.2796).
+  If a positive result ever arrives, it argues for routing to a tool that
+  already ships as readily as for a second leg.
+
+**F6 was withdrawn unrun** — its comparator was BGE-M3's sparse head, which no
+longer exists.
+
+### 11.4 Corrections made to this record on 2026-08-06
+
+None of these changes a conclusion; all of them were things a reader could not
+check.
+
+- The **v3-vs-v2 comparison** did not exist as a written result. It does now
+  (§11.1, PROTOCOL §12.15).
+- **"TOST" and "Holm–Bonferroni"** named procedures the code does not implement.
+  Relabelled and disclosed; PROTOCOL §11.
+- **The noise floor** was run without reindexing, which is not what §5.1
+  specifies, and δ moved 30× on the result. Filed as an amendment, and PROTOCOL
+  §12.5 now separates same-index from cross-index comparisons — the second has
+  no measured floor, and the window result is one of them.
+- **The 364 window** was reported with different digits here and in PROTOCOL.
+  Re-derived from the artefact: `0.3657`, Δ **+0.0108**, CI [+0.0012, +0.0208],
+  p = **0.030**, and `results/F3-364-vs-512__django-docs-short.stats.json` is
+  now the record both documents quote. It is also relabelled **exploratory**:
+  the F3 that was pre-registered is a different experiment.
+- **`pipeline_ablation.py`** was cited as runnable in three places after being
+  deleted. Marked as deleted, with what it produced and where those numbers are
+  frozen.
+- **Machine state** — database paths, a live server's config file, derived
+  project GUIDs — was published in §1 as if it were a handoff note. Replaced
+  with the commands that regenerate it.
+
+### 11.5 What to do next, replacing §8
+
+1. **A second corpus for the shipped system.** scikit-learn under v3, end to
+   end, paired against its v2 baseline. One number, and it is the difference
+   between "measured" and "measured once".
+2. **The v3 noise floor, with reindexing** (`noise_floor.py --index-repeats 5`).
+   Until it exists, no cross-index comparison in this project has a floor, and
+   that includes the chunk window.
+3. **Re-sweep the chunk window under the Qwen3 tokenizer**, on both corpora.
+   364 is currently a default chosen by an exploratory sweep measured with a
+   different tokenizer.
+4. **Finish F10**: django's identifier corpus, then the held-out fusion.
+5. **A Russian query set**, against Qwen3 and granite's multilingual sibling.
+   It is the stated reason for the shipped model and the largest untested claim
+   in this file.
+6. **Judge 50 sampled queries by hand** (PROTOCOL §9.1) to size the
+   unjudged-but-relevant rate. Every absolute number here is a floor until then.
+7. **Commit what a reader can check**: the tier-0 fixture, `ci.yml`, and the
+   qrels/summary/stats artefacts behind each published number.

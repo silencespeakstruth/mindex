@@ -16,13 +16,41 @@ registry of Qwen3-Embedding models**, served by any OpenAI-compatible endpoint. 
 the largest breaking change the project has made, and it is not a refactor: the vectors
 are from a different model, so **every index must be rebuilt from scratch**.
 
-The grounds are measured, not architectural. `bench/` (new in this cycle) scored the
-deployed pipeline against alternatives on this corpus, and RRF fusion of the dense and
-sparse legs came out **below the single dense leg it fused**; the late-interaction
-rerank was never shown to move a metric while costing 99.6% of Qdrant's storage
-(838 MB per segment against 2.6 MB dense). Swapping the model, by contrast, moved
-nDCG@10 from **0.3549 to 0.4540**. The embedder was the lever; the extra heads were
-not. Full record: `docs/claude/retrieval-v2.md`, `bench/FINDINGS.md`,
+The grounds are measured, not architectural. `bench/` (new in this cycle) is a
+pre-registered retrieval-quality harness — ground truth built from each project's own
+Sphinx documentation and resolved by AST against the source tree, so no model and no LLM
+touches the answer key.
+
+**The headline is the two shipped systems against each other**, both driven through
+`POST /v0/{guid}/search`, same corpus, same queries, same cutoff:
+
+| | v3 | v2 | Δ | 95% CI | p |
+|---|---|---|---|---|---|
+| django docs, n = 1 115 | **0.4563** | 0.3549 | **+0.1014** | [+0.0832, +0.1190] | 0.0001 |
+
+Three qualifications, because the number is worth less without them. It is **one
+corpus** — Python, documentation prose, and there is no v3 run on the second one. It is
+a **system** comparison, so the embedder, the chunk window (512 → 364) and the tokenizer
+that measures it all move together and no part of the gain is attributable to one of
+them. And the gain is **not** confined to the easy stratum: `obvious` +0.1343, `mixed`
++0.0728 with an interval clear of zero, `non-obvious` +0.0375 with an interval through
+it at n = 148.
+
+What the extra heads were worth, separately: equal-weight RRF over the dense and sparse
+legs scored **below the single dense leg it fused** (0.4164 against 0.4448), and the
+sparse leg contributed +0.004 with both intervals through zero once the dense leg was a
+2026 encoder. The late-interaction rerank **significantly harmed** long queries (−0.016,
+p = 0.023) and was never established either way on short ones — a comparison the corpus
+is underpowered for by 3× — while costing 99.6% of Qdrant's storage (838 MB per segment
+against 2.6 MB dense). The embedder was the lever; the extra heads were not.
+
+Two things the harness does **not** establish, stated here rather than left to be found:
+the model that ships is not the one the model comparison selected — granite-r2 was
+statistically indistinguishable and cheaper, and Qwen3 was chosen for multilingual
+queries and its one-tokenizer size ladder, neither of which is measured here — and the
+364 chunk window comes from an exploratory sweep, on one corpus, under the *previous*
+tokenizer. Full record, including the corrections made to it before this release:
+`bench/PROTOCOL.md` §11–§12, `bench/FINDINGS.md` §11, `docs/claude/retrieval-v2.md`,
 `docs/claude/qdrant.md`.
 
 ### Upgrading — REQUIRED, and it is a rebuild
@@ -58,7 +86,7 @@ deliberately):
 | `[qdrant].fusion_limit` | **removed** (no fusion) |
 | `[qdrant].search_hnsw_ef` | kept; the successor rule is `>= [search].max_top_k` |
 | `[indexing].sparse_min_weight` | **removed** (no sparse weights) |
-| `[slicer].max_chunk_tokens` | default 512 → **364** (measured; the only hard ceiling is now the model's own 32k context) |
+| `[slicer].max_chunk_tokens` | default 512 → **364** (exploratory: +0.0108, p = 0.030, one corpus, measured under the *previous* tokenizer — `bench/PROTOCOL.md` §12.10. The only hard ceiling is now the model's own 32k context.) |
 
 **4. Rebuild.** `mindex-index --force` per project, then drop the `_v1`/`_v2` Qdrant
 collections the startup log names. Runbook: `docs/claude/qdrant.md`.
