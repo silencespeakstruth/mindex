@@ -296,3 +296,76 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The release page is the deliverable, and until now nothing checked it. Every
+  # upload job is independent, so a release could be — and twice was — published
+  # short of an artefact while the run's own conclusion said nothing useful: on
+  # v1.1.0 and v1.2.0 the retired macos-13 runner never picked its job up, five
+  # siblings succeeded, and `mindex-cli-x86_64-apple-darwin.tar.gz` was silently
+  # absent from both pages while README.md promised it. v2.0.0 then published with
+  # ZERO assets.
+  #
+  # Two properties make this catch that class rather than describe it:
+  #
+  #   `if: always()` — a job whose `needs` were CANCELLED is SKIPPED, not failed,
+  #   and queued-then-cancelled is exactly the observed failure (on the v2.0.0
+  #   rebuild five jobs were evicted after 15 minutes without ever being assigned
+  #   a runner, `runner_name` empty). Without this the guard would go quiet in the
+  #   one case it exists for.
+  #
+  #   It reads the RELEASE, not the jobs. What matters is whether the artefact is
+  #   downloadable now — which also covers an upload that succeeded into the wrong
+  #   tag, and a re-run that was meant to backfill one missing file.
+  #
+  # The Docker image is deliberately not checked here: it is not a release asset,
+  # it lives in ghcr, and `docker/build-push-action` fails its own job on a failed
+  # push. Keep EXPECTED in step with the packaging steps above — it names files,
+  # so a renamed archive fails here rather than on somebody's download.
+  verify:
+    name: Verify the release page
+    runs-on: ubuntu-latest
+    needs: [cli, server, vsix, embedder, image]
+    if: always()
+    steps:
+      - name: Every promised asset is on the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED=(
+            mindex-cli-x86_64-unknown-linux-gnu.tar.gz
+            mindex-cli-x86_64-apple-darwin.tar.gz
+            mindex-cli-aarch64-apple-darwin.tar.gz
+            mindex-cli-x86_64-pc-windows-msvc.zip
+            mindex-server-x86_64-unknown-linux-gnu.tar.gz
+            server.py
+            requirements.txt
+          )
+
+          echo "Assets on $TAG:"
+          gh release view "$TAG" --repo "$REPO" --json assets \
+            --jq '.assets[].name' | sort | tee assets.txt
+
+          missing=()
+          for want in "${EXPECTED[@]}"; do
+            grep -qxF "$want" assets.txt || missing+=("$want")
+          done
+
+          # The .vsix carries the version in its name, so it is matched by shape
+          # rather than spelled out — pinning the version here would mean editing
+          # this file every release, which is how a guard rots into a lie.
+          grep -qE '^mindex-vscode-.*\.vsix$' assets.txt || missing+=("mindex-vscode-<version>.vsix")
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo
+            echo "::error::The release is short of ${#missing[@]} artefact(s). A release page missing what the notes promise is the failure this job exists to refuse; re-run the jobs that produce them."
+            printf '  missing: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+          echo
+          echo "All expected assets are present."
