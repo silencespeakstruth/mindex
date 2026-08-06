@@ -13,10 +13,14 @@ name: release
 #   - mindex-index / mindex-watch are pure Rust over reqwest+rustls with no C
 #     grammars and no protoc. They cross platforms cleanly, and they are what a
 #     user actually runs on their own machine.
-#   - the mindex server is Linux x86-64 only. It is developed, run and released
-#     on Linux; Docker is the supported way to run it elsewhere. A server binary
-#     nobody has exercised on a platform is worse on the release page than an
-#     absent one.
+#   - the mindex server is Linux x86-64 only as a *binary*. It is developed, run
+#     and released on Linux; a server binary nobody has exercised on a platform
+#     is worse on the release page than an absent one. Docker is what the README
+#     tells everyone else to use, so the image is built and pushed here — saying
+#     "use Docker" while publishing no image was the gap this closes.
+#   - deploy/embedder/{server.py,requirements.txt} ship as assets too. mindex no
+#     longer contains an embedder and cannot start without one, so the reference
+#     implementation of the contract belongs beside the binary that needs it.
 #
 # The release itself is created by hand (`gh release create`) so its notes are
 # written rather than generated; these jobs only upload into it. `--clobber` makes
@@ -37,7 +41,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A release build is not the place to discover a warning.
+  # A release build is not the place to discover a warning — but note the blast
+  # radius: RUSTFLAGS is process-global, so this denies warnings in every
+  # DEPENDENCY crate too, and one upstream deprecation in a transitive fails the
+  # release. Scoping it to this workspace means `[lints]` in Cargo.toml, which is
+  # the right place and a change to the build rather than to CI; until then, a
+  # release that fails here and nowhere else is almost always somebody else's
+  # crate.
   RUSTFLAGS: "-D warnings"
 
 jobs:
@@ -195,3 +205,67 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: gh release upload "$TAG" ./*.vsix --clobber
+
+  embedder:
+    name: Reference embedder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # No build: it is one Python file and its dependency list. It is published
+      # because mindex ships no embedder and refuses to start without one, so
+      # "download the server, then go and find something that speaks
+      # /v1/embeddings" is not a complete release. Staged into its own directory
+      # so the upload glob cannot catch anything else.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp deploy/embedder/server.py deploy/embedder/requirements.txt \
+             deploy/embedder/embedder.env.example \
+             deploy/embedder/mindex-embedder.service \
+             deploy/embedder/README.md dist/
+          (cd dist && sha256sum server.py > server.py.sha256)
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # linux/amd64 only, matching the binary job and for the same reason: the
+      # server carries twenty tree-sitter C grammars and protobuf codegen, and an
+      # arm64 image built under emulation would take an hour to produce something
+      # nobody has run. Add a platform when someone runs it.
+      #
+      # Two tags: the version, and `latest`. `latest` moves only on a real
+      # release, because this workflow fires on `v*` tags and nothing else.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.event.inputs.tag || github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

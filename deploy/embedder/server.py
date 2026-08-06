@@ -5,19 +5,23 @@ WHY THIS EXISTS, since mindex deliberately stopped shipping an embedder.
 The claim that retired the vendored BGE-M3 server was that any general model
 server now returns what dense-only retrieval needs. That is true of the
 *protocol* and false of the *throughput*, measured on the reference host (AMD
-R9700, ROCm 7.2) with Qwen3-Embedding-0.6B:
+R9700, ROCm 7.2) with Qwen3-Embedding-0.6B by reindexing this repository end to
+end:
 
-    llama.cpp b10221, Q8_0, best of every configuration tried    ~11 chunks/s
-    this file, torch fp16, batch 128                            ~119 chunks/s
+    this file, torch bf16                                  51 s   (~16 ms/query)
+    llama.cpp b10221, Q8_0, best of every configuration    410 s  (~30 ms/query)
 
-Eleven times, on the same card, for the same model. Nothing in llama.cpp's
-configuration closes it: `-np` 1/8/32, three `--ubatch-size` values, ROCm and
-Vulkan backends, and 1/4/8 concurrent clients all landed between 8.5 and 20.7
-chunks/s, while `llama-bench` reports 24 400 tok/s for the same weights — so
-even its own backend delivers ~3x what its server does for many short
-sequences. Indexing is ~91% embedder time, so an 11x embedder is an 11x
-reindex, and "reindexing is close to free" is the property this project is
-built on.
+**Eight times**, on the same card, for the same model. (These are the numbers in
+README.md's table; earlier drafts of this docstring quoted a chunks/s figure from
+a different corpus and said eleven, which is how one file ends up disagreeing
+with the one beside it.) Nothing in llama.cpp's configuration closes it: `-np`
+1/8/32, three `--ubatch-size` values, ROCm and Vulkan backends, and 1/4/8
+concurrent clients were all measured, while `llama-bench` reports 24 400 tok/s
+for the same weights — so even its own backend delivers ~3x what its server does
+for many short sequences. Indexing is ~91% embedder time, so an 8x embedder is an
+8x reindex, and "reindexing is close to free" is the property this project is
+built on. Query latency goes the other way and barely matters: 16 ms against
+30 ms, which is what `[model].query_server_url` exists to let you split.
 
 So this is a *reference implementation of the contract*, not a return to a
 vendored protocol. mindex speaks the same OpenAI endpoints to it as to vLLM or
@@ -51,6 +55,8 @@ import logging
 import os
 import threading
 import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 # The stubs for these live in the venv this server runs in, not in the repo's
 # lint environment; the mock embedder under tests/ carries the same ignores.
@@ -122,6 +128,45 @@ MAX_SEQ = int(os.environ.get("MINDEX_EMBED_MAX_SEQ", "1024"))
 # peak allocation rather than releasing it afterwards. Set this only on a stack
 # where you have verified the call is harmless.
 
+
+def _accelerator():  # type: ignore[no-untyped-def]
+    """`torch.cuda`, `torch.xpu`, … for the configured device — or None on CPU.
+
+    Everything torch exposes per-backend (`empty_cache`, `memory_reserved`,
+    `is_available`) lives on a module named after the device family, and this
+    file used to hardcode `torch.cuda`. That is right for ROCm — its torch build
+    keeps the `cuda` spelling, which is why `MINDEX_EMBED_DEVICE=cuda` is correct
+    on an AMD card — and wrong for the two fallbacks the env var otherwise
+    invites: `xpu` (Intel) would `AttributeError` on the OOM path, and `cpu` has
+    no such module at all.
+
+    Returning None for CPU rather than raising is the point: on CPU there is no
+    allocator pool to trim and no OOM to recover from by trimming, so every
+    caller's correct behaviour is to skip.
+    """
+    family = DEVICE.split(":", 1)[0]
+    if family == "cpu":
+        return None
+    return getattr(torch, family, None)
+
+
+def _empty_cache() -> None:
+    """Return the allocator's pool to the driver, if this backend has one."""
+    accel = _accelerator()
+    if accel is not None and hasattr(accel, "empty_cache"):
+        accel.empty_cache()
+
+
+def _memory_reserved() -> int:
+    accel = _accelerator()
+    if accel is None or not hasattr(accel, "memory_reserved"):
+        return 0
+    try:
+        return int(accel.memory_reserved())
+    except Exception:  # noqa: BLE001 — a diagnostic must not fail a request
+        return 0
+
+
 _model: SentenceTransformer | None = None
 # One GPU, one forward at a time. mindex-index sends several requests
 # concurrently by design (it overlaps slicing and Qdrant upserts with the GPU);
@@ -130,8 +175,6 @@ _model: SentenceTransformer | None = None
 # of clients, which is how an embedder OOMs under exactly the load it was sized
 # for.
 _gpu = threading.Lock()
-
-app = FastAPI(title="mindex embedder")
 
 
 class EmbeddingsRequest(BaseModel):
@@ -142,7 +185,38 @@ class EmbeddingsRequest(BaseModel):
     encoding_format: str | None = None
 
 
-@app.on_event("startup")
+def _width(model: SentenceTransformer) -> int:
+    """The model's output width, across a sentence-transformers rename.
+
+    `get_sentence_embedding_dimension` is deprecated in favour of
+    `get_embedding_dimension` and currently emits a FutureWarning on every start.
+    It is only used for a log line, so the fallback costs nothing — and a log
+    line is exactly the kind of caller that gets left behind when the old name
+    finally goes, taking the startup with it.
+    """
+    for name in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
+        fn = getattr(model, name, None)
+        if fn is not None:
+            return int(fn())
+    return -1
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+    """Load the model once, before the first request is served.
+
+    A lifespan handler rather than `@app.on_event("startup")`, which is
+    deprecated and will be removed. That matters more here than the usual
+    deprecation does, because of how this file fails without it: when the hook
+    stops running, `_model` stays None forever, every `/v1/embeddings` answers
+    503 — and `/health` would have gone on answering 200, so mindex would have
+    kept the embedder marked healthy while nothing could be embedded. The
+    503-while-loading fix above and this one close the same hole from two sides.
+    """
+    _load()
+    yield
+
+
 def _load() -> None:
     global _model
     t = time.time()
@@ -155,11 +229,14 @@ def _load() -> None:
     LOG.info(
         "loaded in %.1fs, width %d, token budget %d, max rows %d, max_seq %d",
         time.time() - t,
-        model.get_sentence_embedding_dimension(),
+        _width(model),
         TOKEN_BUDGET,
         MAX_ROWS,
         MAX_SEQ,
     )
+
+
+app = FastAPI(title="mindex embedder", lifespan=_lifespan)
 
 
 def _token_lengths(model: SentenceTransformer, texts: list[str]) -> list[int]:
@@ -199,8 +276,24 @@ def _groups(lengths: list[int]) -> list[list[int]]:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok" if _model is not None else "loading"}
+def health(response: Response) -> dict[str, str]:
+    """Liveness, and it must be **503 while loading**, not 200.
+
+    mindex's client checks `error_for_status()` and nothing else, so a 200 here
+    means "the embedder is Ok" — on `GET /health` and in the startup handshake
+    alike. A cold load takes up to five minutes (`TimeoutStartSec=300` in the
+    unit), and for all of it this returned 200 while every `/v1/embeddings`
+    answered 503. Since 503 is on mindex's retry path, files spent their whole
+    retry budget against a server it had been told was healthy, and the operator
+    saw `checks.embedder: "ok"` throughout.
+
+    The body keeps its word for a human reading it directly; the status is what
+    anything automated reads.
+    """
+    if _model is None:
+        response.status_code = 503
+        return {"status": "loading"}
+    return {"status": "ok"}
 
 
 @app.get("/v1/models")
@@ -233,7 +326,19 @@ def _encode_into(out: list[object], texts: list[str], group: list[int]) -> None:
     except torch.OutOfMemoryError:
         if len(group) == 1:
             raise
-        torch.cuda.empty_cache()
+        # YES, THIS IS THE CALL TRIM_MIB SPENDS TWENTY LINES REFUSING TO MAKE,
+        # and the difference is not inconsistency. There, it ran *between*
+        # healthy requests to shrink a pool nothing needed shrunk, buying tidier
+        # `rocm-smi` output at the price of a documented corruption. Here the
+        # allocator has already failed, the retry needs the blocks back, and the
+        # alternative is a 500 that fails the caller's whole batch of files.
+        #
+        # What makes it safe rather than merely necessary: each recursive call
+        # runs its own `np.isfinite` check below, so the exact failure mode the
+        # TRIM_MIB note describes — NaN for the longest chunks after a trim — is
+        # caught on the retry rather than shipped. A NaN here costs a recompute;
+        # a NaN there would have reached Qdrant.
+        _empty_cache()
         half = len(group) // 2
         LOG.warning("out of memory at %d rows; splitting", len(group))
         _encode_into(out, texts, group[:half])
@@ -245,17 +350,37 @@ def _encode_into(out: list[object], texts: list[str], group: list[int]) -> None:
     # only place that can still do something about it. Recomputing the group in
     # fp32 is the fix that keeps the request whole; if THAT is not finite the
     # request fails, because shipping a NaN to an index is worse than failing.
+    #
+    # THE RECOMPUTE HAS TO CHANGE THE WEIGHTS, and the first version of it did
+    # not. It passed `precision="float32"` to `encode`, which selects the OUTPUT
+    # quantization (`float32|int8|uint8|binary|ubinary`) and is already the
+    # default — and wrapped the call in `torch.autocast(enabled=False)`, which
+    # does nothing for a model whose parameters are natively bf16, since autocast
+    # is not what reduced their precision. So the "recompute in float32" branch
+    # recomputed in exactly the precision that had just produced NaN, and the
+    # deterministic outcome was a second NaN and a 500: a documented safety net
+    # that was not there, in the file published as the reference server.
+    #
+    # Casting the module is the only thing that actually raises the compute
+    # precision. It is expensive (a 0.6B model is 1.2 GiB in bf16, 2.4 GiB in
+    # fp32) and it is a rare path — and it is done under `_gpu`, which the caller
+    # already holds, so no concurrent request can observe the model mid-cast. The
+    # restore is in a `finally` because a model left in fp32 would silently halve
+    # throughput for the life of the process.
     if not np.isfinite(vecs).all():
         LOG.warning("non-finite output for %d rows; recomputing in float32", len(group))
-        with torch.autocast(device_type="cuda", enabled=False):
+        original = next(_model.parameters()).dtype
+        try:
+            _model.to(torch.float32)
             vecs = _model.encode(
                 [texts[i] for i in group],
                 batch_size=max(1, len(group) // 2),
                 normalize_embeddings=True,
                 convert_to_numpy=True,
                 show_progress_bar=False,
-                precision="float32",
             )
+        finally:
+            _model.to(original)
         if not np.isfinite(vecs).all():
             raise HTTPException(
                 status_code=500, detail="embedder produced non-finite vectors"
@@ -278,12 +403,8 @@ def embeddings(req: EmbeddingsRequest) -> Response:
         lengths = _token_lengths(_model, texts)
         for group in _groups(lengths):
             _encode_into(out, texts, group)
-    if (
-        TRIM_MIB
-        and torch.cuda.is_available()
-        and (torch.cuda.memory_reserved() > TRIM_MIB * 1024 * 1024)
-    ):
-        torch.cuda.empty_cache()
+    if TRIM_MIB and _memory_reserved() > TRIM_MIB * 1024 * 1024:
+        _empty_cache()
     dt = time.time() - t
     LOG.info(
         "embedded %d texts (%d tokens) in %.2fs (%.1f/s)",

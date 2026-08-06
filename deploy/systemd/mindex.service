@@ -1,5 +1,29 @@
 # mindex — semantic code index/search server.
 #
+# THIS IS ONE REAL HOST'S UNIT, NOT A TEMPLATE, and it is committed that way on
+# purpose. Its sibling `deploy/embedder/mindex-embedder.service` is parameterized
+# with YOUR_USER because nothing in it depends on where anything lives; this one
+# is the opposite. Half its lines exist because *this* machine splits a home
+# across two filesystems (/home is a btrfs subvolume, .cargo/.cache/.local are
+# symlinks into /data), and the BindReadOnlyPaths= pairs below are the shape that
+# fact forces — source on /data, destination where the process actually looks.
+# Substituting a placeholder would produce a file that reads as portable, is not,
+# and no longer explains itself.
+#
+# SO EDIT IT, and here is the whole list:
+#
+#   * `silencespeakstruth` -> your user, everywhere (User=, Group=, HOME=,
+#     HF_HOME=, ExecStart=, WorkingDirectory=, every Bind*Paths=)
+#   * the `/data/...:/home/...` bind pairs -> if your home is on ONE filesystem,
+#     collapse each pair to its single real path. Read the comment above them
+#     first; getting this wrong yields a dangling symlink inside the sandbox,
+#     and the symptom is "no such file" for a path that plainly exists.
+#   * `Documentation=` -> wherever you cloned the repository
+#
+# Verify with `systemd-analyze security mindex.service`, and then by actually
+# indexing a file and searching for it — every sandbox failure recorded in
+# `deploy/systemd/README.md` passed a start-and-check-health test.
+#
 # WHY THIS IS A SYSTEM UNIT AND NOT A USER UNIT
 #
 # It ran as a --user unit until 2026-08-04 and the filesystem sandbox worked

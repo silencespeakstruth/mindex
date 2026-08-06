@@ -1,8 +1,26 @@
 # The embedding server for mindex (deploy/embedder/server.py).
 #
-# EXAMPLE UNIT. Three things must be edited: the two absolute paths (systemd
-# requires the first token of ExecStart= literal, and a system unit has no %h to
-# expand), and the user name.
+# EXAMPLE UNIT. Edit the user name and, if you install elsewhere, the paths.
+# Nothing here can be relative or expanded: systemd requires the first token of
+# ExecStart= literal, and a system unit has no %h.
+#
+# THE PATHS BELOW POINT AT /var/lib/mindex-embedder, NOT AT THE CHECKOUT, and
+# that is the one thing worth not "simplifying" back. The venv and server.py
+# lived inside `deploy/embedder/` on the reference host for a release, which
+# made a production service a dependency of a working tree: a branch switch, a
+# `git clean -xfd` or moving the directory stops the embedder, and mindex's only
+# symptom is every file going `failed` while the retry worker re-attempts
+# forever. Deploy is a copy, not a checkout:
+#
+#     sudo mkdir -p /var/lib/mindex-embedder
+#     sudo python -m venv /var/lib/mindex-embedder/venv
+#     sudo /var/lib/mindex-embedder/venv/bin/pip install \
+#         --index-url https://download.pytorch.org/whl/rocm7.0 torch
+#     sudo /var/lib/mindex-embedder/venv/bin/pip install -r deploy/embedder/requirements.txt
+#     sudo install -m0644 deploy/embedder/server.py /var/lib/mindex-embedder/
+#
+# Re-run the last line after pulling a change to server.py; nothing does it for
+# you, and that is the price of the isolation.
 #
 # This is the old BGE-M3 unit with its subject replaced. Every hardening
 # paragraph below was written against a failure that had already happened on
@@ -44,12 +62,12 @@ Type=exec
 User=YOUR_USER
 Group=YOUR_USER
 Environment=HOME=/home/YOUR_USER
-WorkingDirectory=/path/to/mindex/deploy/embedder
+WorkingDirectory=/var/lib/mindex-embedder
 # EnvironmentFile is read by the manager before the namespace exists, so this
 # path needs no bind below. It carries MINDEX_EMBED_* (see server.py's header):
 # the model, the device, the dtype, the GPU batch and the truncation length.
 EnvironmentFile=/home/YOUR_USER/.config/mindex/embedder.env
-ExecStart=/path/to/mindex/deploy/embedder/.venv/bin/uvicorn server:app \
+ExecStart=/var/lib/mindex-embedder/venv/bin/uvicorn server:app \
     --host 127.0.0.1 --port 11211
 Restart=on-failure
 RestartSec=5
