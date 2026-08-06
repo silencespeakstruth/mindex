@@ -599,82 +599,31 @@ modifying `tools/vscode`.
   callers now use **`refreshNow`**, which waits the in-flight read out and then
   takes its turn: at most one extra pass per write, and a tick still refuses,
   so the request-storm the guard exists to prevent stays prevented.
-- MCP `scout` (`tools/mcp/scout/`): token-economy layer, one tool —
-- VS Code (`tools/vscode`): `npm run check` = prettier + eslint + `tsc` + the
-  `node --test` suite (`src/*.test.ts`, compiled to `dist/`).
-- Shell: `shellcheck scripts/entrypoint.sh`, `shellcheck --shell=bash
-  tools/search/mindex-search.sh`; format `shfmt -i 4 -ci` (bare shfmt
-  defaults to tabs).
-- Python (`tests/`): `ruff check`, `ruff format --check` **and**
-  `black --check` (kept compatible), `mypy` (`fastapi` is `# type: ignore` —
-  stubs only in the mock's image). Run mypy **per directory** — `mypy tests/`
-  fails with `Duplicate module named "main"`:
-  `for d in tests/integration tests/mock_embedder tests/mock_ollama; do mypy $d; done`.
-- Python (MCP servers): the same four, per server —
-  `(cd tools/mcp/scout && ruff check . && ruff format --check . && black --check . && mypy src)`,
-  likewise for `tools/mcp/mindex`. Easy to forget: neither is under `tests/`.
-- SQL: `sqlfluff lint src/db/migrations/` (dialect/layout from repo-root
-  `.sqlfluff`; schema is intentionally column-aligned).
-- Prefer a scoped `#[allow(...)]`/config exclusion **with a reason** over
-  contorting code; never project-wide suppression.
 
-## When modifying code
+---
 
-1. New loops touching Qdrant/SQLite/embedder must respect the
-   `CancellationToken`.
-2. Multi-row DB writes go inside a `transaction`.
-3. New endpoints: register in `backend::http3::run`, use `RouterState`,
-   `{param}` routes, `#[debug_handler]`, the `ApiJson`/`ApiPath`/`ApiQuery`
-   extractors, return `Result<_, ApiError>`, validate at the top via
-   `backend::v0::validate` (new check = new `ApiError` variant + arms +
-   `codes_are_stable` + a unit test). Add a `#[utoipa::path]` annotation
-   (existing tag, every error `body = ProblemDetails`, a `**Concurrency:**`
-   note) **and** an entry in `openapi.rs` `paths(...)` (+ new types in
-   `schemas(...)`) — a handler missing there is silently absent from Swagger;
-   `openapi_spec_is_complete_and_versioned` guards the count. Swagger UI at
-   `/swagger-ui` (assets vendored, no network).
-4. Reach Qdrant only via `VectorStore`; collection names via
-   `collection_for`.
-5. Any search-path SQLite query must include `AND c.status = 'active'`.
-6. Status writes use `set_file_status` and must be a legal transition
-   (triggers enforce it). New status-changing paths need a transition test.
-7. Adding a language → the full checklist under **Languages**.
-8. Schema change → new migration in the `MIGRATIONS` slice with the next
-   sequential version; startup applies those above `PRAGMA user_version`,
-   then stamps it. All SQL `IF NOT EXISTS` (cold re-run = no-op, enforced by
-   `every_migration_sql_is_idempotent`). SQLite can't `ALTER` a `CHECK` onto
-   an existing table — add new constraints as `BEFORE INSERT/UPDATE` triggers
-   (the status-machine pattern, additive). New *columns* are equally blocked:
-   `ADD COLUMN` has no `IF NOT EXISTS` form, so it fails the idempotency
-   test. **v1.0.0 is frozen** — an in-place edit is skipped in silence on any
-   database stamped at 1; first symptom is a 500 with `no such
-   table`/`no such column`. New *tables* are the easy case
-   (`v1.1.0_git_history.sql`). **Widening a constraint, and adding a column,
-   are both answered by the table rebuild** — `v1.1.0_toml_yaml_languages.sql`
-   is the precedent; copy its shape: create the replacement under a temporary
-   name, copy rows with columns **named** (`SELECT *` binds by position),
-   `DROP` the original, rename, recreate its triggers (the `DROP` took them).
-   It runs under `SQLite3Pool::migration_transaction` because both halves
-   need foreign keys suspended (rename-first makes the children follow the
-   discarded table; `ON DELETE RESTRICT` refuses the `DROP`);
-   `apply_pending_migrations` pays that back with one
-   `PRAGMA foreign_key_check` before stamping. Idempotency comes from the
-   leading `DROP TABLE IF EXISTS <tmp>`. Rehearse on a copy of a real
-   database and compare row counts per table. **A 1:1 side table is not the
-   answer for a new field** (the three that existed each cost a hot-path
-   JOIN); `v1.2.0_research_context.sql` is the precedent for rebuilding to
-   add columns. One rebuild consequence: the FK suspension also suspends
-   `ON DELETE CASCADE`, so dropping the old table does **not** take child
-   rows with it — `id` surviving the copy is what makes them still resolve;
-   load-bearing, pinned by
-   `rebuilding_research_runs_keeps_the_baselines_that_reference_it` (through
-   an ordinary transaction the same migration silently erases every child
-   row).
-9. Changing how chunks or symbols are derived → bump the matching const under
-   **Derivation versions** — that is what makes the change reach files
-   already indexed; skipping it leaves them stale behind a matching hash,
-   silently.
-10. Changing which files a project contains, how a path is spelled, what
-    bytes are hashed, or which files a client refuses to post → **the full
-    list under Four clients, one working-tree view**, in the same commit. One
-    client changed alone is not a smaller version of the change; it is
+## Where the rest of the rules are
+
+The 80 lines that used to sit here were a **copy** — the "Linting" and "When
+modifying code" sections of `.claude/CLAUDE.md`, pasted whole when that file was
+split into companions, and truncated mid-sentence at the join. Nothing checked
+it, so it drifted: it still named the six v1 migrations as the precedent to copy
+after they were deleted, and still described `scout` as having one tool after it
+gained `challenge`.
+
+A second copy of a checklist is worse than no copy, because the reader who finds
+the stale one has no way to tell. **`.claude/CLAUDE.md` is authoritative** for
+the lint matrix and for all ten modification rules; this file carries only what
+is specific to the extension, which is everything above.
+
+Two of those rules bite hardest here and are worth naming so a reader knows to go
+and read them in full:
+
+- **Rule 10, "Four clients, one working-tree view."** `scanner.ts`,
+  `languages.ts`'s `EXT_TO_LANGUAGE` and `mindexFile.ts` are three of the copies
+  that rule governs. A change to what a file set is, how a path is spelled or
+  what bytes are hashed lands in every client **in the same commit** — the
+  failure mode is not an error but drift that reindexing cannot clear.
+- **The build is part of the client.** The extension runs `dist/`, so a change to
+  `src/` that was never `npm run compile`d leaves a plugin scanning by
+  yesterday's rules. Recompile before concluding the plugin is wrong.

@@ -74,7 +74,9 @@ ships as a `.vsix` on the
 **Prebuilt**, from the [releases page](https://github.com/silencespeakstruth/mindex/releases):
 `mindex-index` and `mindex-watch` for Linux, Windows and macOS (Intel and Apple
 silicon), the `mindex` server for Linux x86-64, and the VS Code `.vsix`. Unpack and put
-the binaries on `PATH`; each archive carries a `SHA256SUMS`.
+the binaries on `PATH`. Each archive is published with a `.sha256` sidecar beside
+it (`mindex-cli-x86_64-unknown-linux-gnu.tar.gz.sha256`), so
+`sha256sum -c <file>.sha256` verifies a download without a second tool.
 
 **From source:**
 

@@ -2709,15 +2709,18 @@ mod tests {
     // ── the language checklist, as far as one crate can check it ─────────────
 
     /// **The silent step of the Languages checklist.** The
-    /// `project_files.programming_language` CHECK lives in *two* files, and editing
-    /// only the first is invisible: `v1.0.0_schema.sql` builds a fresh database and
-    /// is never re-read, so a database in use needs the later rebuild migration to
-    /// carry the widened list too. Get it wrong and the language works perfectly in
-    /// a new container and fails on every existing one — a 500 from a constraint,
-    /// at insert time, for that language only.
+    /// `project_files.programming_language` CHECK is written in the baseline
+    /// schema, and the baseline is **frozen**: the migration filter is
+    /// `version > user_version`, so an in-place edit to `v2.0.0_schema.sql` never
+    /// reaches a database already stamped at that version and is skipped in
+    /// silence. A database in use therefore needs a *new* migration rebuilding
+    /// `project_files` with the widened list, and both files must end with the
+    /// same one. Get it wrong and the language works perfectly in a fresh
+    /// container and fails on every existing one — a 500 from a constraint, at
+    /// insert time, for that language only.
     ///
     /// This walks `ALL` against a fully migrated database, which is the state a real
-    /// deployment is in, so the second copy is the one being checked.
+    /// deployment is in, so it checks the list as a running server actually holds it.
     #[tokio::test]
     async fn every_language_in_all_is_accepted_by_the_migrated_schema() {
         use crate::db::sqlite3::SQLite3Pool;
@@ -2755,8 +2758,11 @@ mod tests {
             assert!(
                 inserted.is_ok(),
                 "the schema rejects `{}`, which `ProgrammingLanguage::ALL` offers. \
-                 The CHECK constraint is in two files — a new language needs the \
-                 rebuild migration as well as v1.0.0_schema.sql: {inserted:?}",
+                 The CHECK constraint needs widening in TWO places: the baseline \
+                 (`v2.0.0_schema.sql`, for fresh databases) and a NEW migration \
+                 that rebuilds `project_files` (for databases already stamped — \
+                 the baseline is frozen and an edit to it is skipped in silence): \
+                 {inserted:?}",
                 pl.name()
             );
         }

@@ -22,7 +22,10 @@ Rust" or "just the Python linters"). The full matrix, from the project conventio
 **Rust**
 - `cargo test --bin mindex`
 - `cargo clippy --bin mindex` (zero-warnings expected)
-- `cd tools/indexer && cargo clippy` (separate crate, own lock)
+- `cargo fmt --check`
+- **All three `tools/` crates are separate workspaces with their own lock**, so
+  each needs its own pass and none is reached by the root command:
+  `for c in indexer watcher mindexfile; do (cd tools/$c && cargo clippy && cargo fmt --check); done`
 
 **Integration tests** (Docker; slow — only when asked or when the change touches the
 HTTP/DB/embed path):

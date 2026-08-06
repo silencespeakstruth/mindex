@@ -16,5 +16,22 @@ docker-compose*.yml
 **/node_modules/
 **/dist/
 **/out/
-**/.venv/
+**/.venv*/
 **/__pycache__/
+
+# The two harnesses, and the same reasoning a third time. Neither is in the image
+# and both keep working trees full of foreign source: `perf/corpus/.clones` holds
+# five cloned GitHub repositories and `bench/.clones` holds four more, plus
+# `bench/results` (654 MB for a full pass) and `bench/.data` (downloaded ground
+# truth). Measured before this entry: **332 MB of build context** on a machine
+# that had run both, sent to the daemon on every `docker compose build`.
+#
+# It matters more now than it did: the release workflow builds and pushes an image
+# in CI, so this is also the difference between a checkout and a checkout plus
+# whatever a benchmark left behind. The scripts themselves are excluded too — they
+# are not in the image either, and a partial exclusion would leave the directory
+# looking like it was meant to be there.
+perf/corpus/
+perf/results/
+perf/plots/
+bench/

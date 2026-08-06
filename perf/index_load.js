@@ -62,11 +62,20 @@ export const options = {
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 
+// Empty unless the server authorizes. `[auth].enabled` is mandatory behind a
+// gateway and off by default, so both shapes are real deployments — but without
+// this every request 401s and the run surfaces as `err_other` with an empty CSV,
+// which reads as a broken harness rather than a missing credential. The token
+// needs only `index` (and `delete`, for the per-level project cleanup in run.sh).
+const AUTH_HEADERS = __ENV.MINDEX_TOKEN
+  ? { Authorization: `Bearer ${__ENV.MINDEX_TOKEN}` }
+  : {};
+
 export default function () {
   const i = exec.scenario.iterationInTest; // unique 0..SHARD_COUNT-1
   const url = `${__ENV.MINDEX_URL}/${PROTOCOL}/${__ENV.PROJECT_GUID}/index`;
   const res = http.post(url, shards[i], {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
     tags: { name: 'index' },
     timeout: __ENV.REQ_TIMEOUT || '600s', // default 60s is far too short for /index
   });

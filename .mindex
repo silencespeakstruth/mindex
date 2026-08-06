@@ -13,7 +13,8 @@
 # Scope policy for this repo: index everything that is written, exclude only what
 # is generated, fetched or secret. That deliberately includes the tooling — the
 # indexer, watcher, mindexfile, both MCP servers, the VS Code extension, the
-# embedder, the shell scripts, the SQL migrations and the documentation — because
+# reference embedder server, the shell scripts, the SQL migrations and the
+# documentation — because
 # all of it is code someone has to answer questions about.
 
 guid: c2d7e2c1-3165-42f5-9366-0ff1492b4bab
@@ -43,8 +44,8 @@ exclude_paths:
   # stays in; the dashboard is its output, and answers no question the generator
   # does not answer better.
   - deploy/grafana/mindex-service.json
-  # Python environments and tool caches. The embedder's venvs are per-backend
-  # (.venv-egpu / .venv-igpu), so the plain `.venv` glob does not reach them.
+  # Python environments and tool caches. The `-*` variant catches the ones that
+  # are not plainly `.venv` (a per-backend `.venv-egpu`, a per-tool `.venv-lint`).
   - "**/.venv/**"
   - "**/.venv-*/**"
   - "**/__pycache__/**"

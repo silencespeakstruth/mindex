@@ -2096,11 +2096,13 @@ silently skipped file):
    `every_language_constructs_or_declines` (`slicing/symbols.rs`), which
    iterates `ALL` — a broken tags query for that language ships untested.
 2. `CHECK` constraint on `project_files.programming_language` — in **two**
-   places, and editing only the first is silent. `v1.0.0_schema.sql` builds a
-   *fresh* database and is never re-read; a database in use needs a new
-   migration rebuilding `project_files` with the widened list —
-   `v1.1.0_toml_yaml_languages.sql` is the pattern (rule 8 has the rebuild's
-   shape and hazards). Both files must end with the same list.
+   places, and editing only the first is silent. `v2.0.0_schema.sql` builds a
+   *fresh* database and, being the frozen baseline, is never re-read by one that
+   exists; a database in use needs a new migration rebuilding `project_files`
+   with the widened list (rule 8 has the rebuild's shape and hazards). Both
+   files must end with the same list, which
+   `every_language_in_all_is_accepted_by_the_migrated_schema` checks against a fully migrated
+   database.
 3. `tree-sitter-<lang>` in `Cargo.toml` (verify ≥ 0.23).
 4. Arm in `tree_sitter_language(pl)` (`handlers.rs`) — total match, missing
    arm = compile error. A grammar here does **not** commit the language to the
@@ -2416,7 +2418,7 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
     host-side scripts in `perf/` driving this stack (`command:` flags read
     env; swap profiles via `--env-file perf/env/<f>.env`). **No host ports**;
     outbound-only `extra_hosts: host.docker.internal:host-gateway` reaches
-    the host-run embedder (`:12434` by default, deliberately not composed —
+    the host-run embedder (`:11211` by default, deliberately not composed —
     a model server plus a GPU runtime is a multi-gigabyte image and a device
     the compose stack has no business claiming). TOML-only knobs require
     mounting a `config.toml`.
@@ -2539,12 +2541,16 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
    an existing table — add new constraints as `BEFORE INSERT/UPDATE` triggers
    (the status-machine pattern, additive). New *columns* are equally blocked:
    `ADD COLUMN` has no `IF NOT EXISTS` form, so it fails the idempotency
-   test. **v1.0.0 is frozen** — an in-place edit is skipped in silence on any
-   database stamped at 1; first symptom is a 500 with `no such
-   table`/`no such column`. New *tables* are the easy case
-   (`v1.1.0_git_history.sql`). **Widening a constraint, and adding a column,
-   are both answered by the table rebuild** — `v1.1.0_toml_yaml_languages.sql`
-   is the precedent; copy its shape: create the replacement under a temporary
+   test. **The baseline `v2.0.0_schema.sql` is frozen** — an in-place edit is
+   skipped in silence on any database already stamped at its version; first
+   symptom is a 500 with `no such table`/`no such column`. New *tables* are the
+   easy case: one `CREATE TABLE IF NOT EXISTS` in a new file. **Widening a
+   constraint, and adding a column, are both answered by the table rebuild.**
+   The v1 lineage's rebuild migrations are deleted along with it, so there is no
+   file left to copy — the shape is here instead, and
+   `every_migration_sql_is_idempotent` plus
+   `rebuilding_research_runs_keeps_the_baselines_that_reference_it` are what
+   check a new one. Create the replacement under a temporary
    name, copy rows with columns **named** (`SELECT *` binds by position),
    `DROP` the original, rename, recreate its triggers (the `DROP` took them).
    It runs under `SQLite3Pool::migration_transaction` because both halves
@@ -2555,8 +2561,7 @@ yesterday's rules. Recompile before concluding the plugin is wrong.
    leading `DROP TABLE IF EXISTS <tmp>`. Rehearse on a copy of a real
    database and compare row counts per table. **A 1:1 side table is not the
    answer for a new field** (the three that existed each cost a hot-path
-   JOIN); `v1.2.0_research_context.sql` is the precedent for rebuilding to
-   add columns. One rebuild consequence: the FK suspension also suspends
+   JOIN); rebuild instead. One rebuild consequence: the FK suspension also suspends
    `ON DELETE CASCADE`, so dropping the old table does **not** take child
    rows with it — `id` surviving the copy is what makes them still resolve;
    load-bearing, pinned by

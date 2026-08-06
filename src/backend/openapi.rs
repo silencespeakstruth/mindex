@@ -87,10 +87,11 @@ Field-specific errors add `field` and a structured `meta` for interpolation. The
 catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_path`, \
 `request.body_too_large`, \
 `internal.error`, `embedder.unavailable`, `qdrant.unavailable`, `database.busy`, \
-`gc.already_running`, \
+`gc.already_running`, `index.file_in_flight`, \
 `project.not_found`, `search.no_match`, `selector.empty`, \
 `auth.token_missing`, `auth.token_invalid`, `auth.token_expired`, \
-`auth.action_not_permitted`, \
+`auth.action_not_permitted`, `auth.route_not_configured`, \
+`validation.index_modes_exclusive`, \
 `validation.path_invalid`, `validation.sha256_invalid`, `validation.top_k_out_of_range`, \
 `validation.query_empty`, `validation.query_too_long`, `validation.code_too_large`, \
 `validation.too_many_files`, `validation.selector_too_large`, \
@@ -105,7 +106,7 @@ catalogue: `request.cancelled`, `request.malformed_body`, `request.malformed_pat
 `validation.research_list_limit_out_of_range`, `research.run_not_found`, \
 `research.challenge_subject_invalid`, `research.challenge_subject_is_challenge`, \
 `research.scope_matches_nothing`, `research.model_lacks_tools`, \
-`ollama.unavailable`, `ollama.error`, `research.no_report`.",
+`ollama.unavailable`, `ollama.error`, `research.no_report`, `research.invented`.",
     ),
     paths(
         // Indexing

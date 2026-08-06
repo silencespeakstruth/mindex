@@ -112,18 +112,26 @@ EOF
     echo "  wrote $png" >&2
 }
 
-# The four standard views (see README "Reading the results").
-render throughput_vs_embedder_batch.png \
-    "Throughput vs embedder --batch (GPU-feed lever)" \
-    "embedder --batch" "chunks/s" embedder_batch chunks_per_s
-render latency_vs_throughput.png \
-    "Latency vs throughput (knee = optimum)" \
-    "chunks/s" "p95 /index latency (ms)" chunks_per_s req_dur_p95
+# The three standard views (see README "Reading the results").
+#
+# THERE WERE FOUR. `throughput_vs_embedder_batch` and `fwd_batch_vs_throughput`
+# plotted `embedder_batch` and `fwd_batch_mean`, which came from the vendored
+# BGE-M3 server's `/stats` and have been `NA` on every row since v3 deleted it —
+# so both rendered a blank chart with axes, which is a worse answer than no chart.
+# The columns are gone from run.sh's header; these went with them.
+#
+# What they were for is not gone: how full the GPU's forward pass gets is still
+# the lever, it is just no longer readable from the client side. Sweep
+# `--shard-files` and mindex's `--embed-batch`, and read the effect off
+# `chunks_per_s` in the first plot below.
 render throughput_vs_concurrency.png \
     "Throughput vs concurrency" \
     "concurrency (VUs)" "chunks/s" concurrency chunks_per_s
-render fwd_batch_vs_throughput.png \
-    "Effective forward-pass batch vs throughput" \
-    "forward_batch_mean" "chunks/s" fwd_batch_mean chunks_per_s
+render latency_vs_throughput.png \
+    "Latency vs throughput (knee = optimum)" \
+    "chunks/s" "p95 /index latency (ms)" chunks_per_s req_dur_p95
+render throughput_vs_embed_batch.png \
+    "Throughput vs mindex --embed-batch" \
+    "embed_batch (chunks per /v1/embeddings call)" "chunks/s" embed_batch chunks_per_s
 
 echo "Plots in $outdir" >&2

@@ -74,8 +74,10 @@ slower, with no line anywhere saying why.
 
 So `/dev` stays real and the restriction is done with `DevicePolicy=closed` plus
 the `DeviceAllow=` list. The check that it is still armed is not `/health`, which
-cannot tell: it is `Model loaded … target_devices=['xpu']` in the journal, and
-the absence of the zero-device warning.
+cannot tell — it answers "ok" from a server running entirely on CPU. It is the
+throughput line the embedder logs per request (`embedded N texts in …`): on this
+host a CPU fallback reads ~0.3 chunks/s against ~119 on the GPU, which is not a
+difference anyone has to interpret.
 
 ## A syscall filter is a time bomb aimed at the code path you did not exercise
 
@@ -96,16 +98,30 @@ Every failure above passed a start-and-check-health test.
 
 ## Installing
 
+The embedder's unit lives beside the server it starts, in `deploy/embedder/`, not
+here — so the install takes two lines, and **both units need editing first**:
+each carries absolute paths and a user name that cannot be `%h`-expanded, because
+a system unit has no `%h`.
+
 ```sh
 sudo install -m0644 deploy/systemd/*.service /etc/systemd/system/
+sudo install -m0644 deploy/embedder/mindex-embedder.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now qdrant mindex-embedder@igpu mindex
+sudo systemctl enable --now qdrant mindex-embedder mindex
 ```
 
-The embedder is a template; `@igpu` and `@egpu` select the torch backend and are
-mutually exclusive (see the unit's own `Conflicts=`). Ordering is declared by
-Qdrant and the embedder (`Before=mindex.service`) rather than by mindex, so the
-chain reads in one direction and mindex needs no knowledge of their unit names.
+`mindex-embedder.service` is a plain unit, not a template: one OpenAI-compatible
+server on `:11211`, and which device it uses is
+`MINDEX_EMBED_DEVICE` in `~/.config/mindex/embedder.env`
+(`deploy/embedder/embedder.env.example`) rather than an instance name. The
+predecessor was `mindex-embedder@igpu`/`@egpu` with a `Conflicts=`, and the
+template bought nothing once the choice became one environment variable.
+
+Ordering is declared by Qdrant and the embedder (`Before=mindex.service`) rather
+than by mindex, so the chain reads in one direction and mindex needs no knowledge
+of their unit names. It is only enforced because all three are **system** units:
+a system unit cannot order itself after a user manager's unit, and
+`Before=mindex.service` pointing across managers silently does nothing.
 
 Verify, in this order — the last two are the ones that catch what the first
 misses:

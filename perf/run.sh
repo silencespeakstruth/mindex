@@ -4,17 +4,18 @@
 #
 # Assumes mindex + embedder + Qdrant are ALREADY RUNNING with whatever flags you are
 # testing — this script starts nothing and touches no hardware. It drives one k6 load
-# run per concurrency level, auto-detects the live config (mindex GET /config +
-# embedder GET /stats — see the note below), and appends one self-describing row per
-# run to a CSV.
+# run per concurrency level, auto-detects the live config from mindex's own
+# GET /config, and appends one self-describing row per run to a CSV.
 #
-# NOTE (retrieval v3): the embedder-side columns came from the vendored server's
-# /stats endpoint, which is gone. vLLM does not serve it, so embedder_batch,
-# fwd_batch_mean, embedder_encode_s, queue_highwater and embedder_429 record NA.
-# The mindex-side columns — throughput, latency quantiles, error classes, pool
-# availability — are unaffected and are what this harness is for.
+# IT MEASURES THE CLIENT SIDE ONLY, and that is now the whole of it. The
+# embedder-side columns came from the vendored BGE-M3 server's `/stats`, which v3
+# deleted along with the server; the replacement is a contract that no
+# OpenAI-compatible server extends with introspection. Those eight columns are
+# removed rather than left recording NA — see the note at `header=`. What remains
+# is what this harness is actually for: throughput, latency quantiles, error
+# classes and pool availability, all read from mindex or from k6.
 #
-# To sweep process-level flags (vLLM's serving knobs, mindex
+# To sweep process-level flags (the embedder's own serving knobs, mindex
 # --embed-batch / --db-pool-size): change them, restart those services, rerun this
 # script. The CSV is append-only, so the matrix grows across reruns. Always use a
 # fresh corpus run against a fresh project GUID (handled here) so nothing is
@@ -51,8 +52,10 @@ Usage: run.sh [options]
   --label TEXT         free-text tag on every row this run
   -h, --help           this help
 
-The per-run process flags (embedder --batch, mindex --embed-batch, …) are read live
-from the servers, not passed here — restart the servers to change them, then rerun.
+mindex's own flags (--embed-batch, --db-pool-size, [model].id) are read live from
+GET /config, not passed here — restart mindex to change them, then rerun. The
+embedder's flags are not readable over the OpenAI-compatible contract at all, so
+record them in --label if you are sweeping them.
 EOF
 }
 
@@ -130,10 +133,33 @@ curl -sk --max-time 5 "$mindex_url/health" >/dev/null 2>&1 || {
 if [ -n "$embedder_url" ]; then
     curl -s --max-time 5 "$embedder_url/health" >/dev/null 2>&1 || {
         echo "embedder unreachable at $embedder_url — start it, e.g.:" >&2
-        echo "    systemctl start mindex-vllm@egpu   # see deploy/vllm/README.md" >&2
+        echo "    systemctl start mindex-embedder   # see deploy/embedder/README.md" >&2
         echo "or pass --embedder-url \"\" to skip the probe." >&2
         exit 1
     }
+fi
+
+# Authorization. Empty unless the server is running with `[auth].enabled`, which is
+# off by default and MANDATORY behind a gateway — so both shapes are real deployments.
+# Without this every request 401s and the whole run lands in `err_other` with an empty
+# CSV, which reads as a broken harness rather than a missing credential.
+#
+# `/health` and `/config` are public (liveness and discovery), but the other three
+# endpoints this harness touches are not: `/index` needs `index`, the per-level
+# `DELETE /projects/{guid}` needs `delete`, and `GET /status` — the pool-headroom
+# poller — is `admin`, because nothing about it is per-project. So:
+#
+#     export MINDEX_TOKEN="$(mindex mint-token --sub perf --project '*' \
+#         --can index,delete,admin --days 1)"
+#
+# `admin` is wider than a benchmark ought to hold. Drop it and lose only
+# `min_pool_available` (the poller silently records NA) — which is the right trade
+# against a long-lived credential, but not against a one-day one on loopback.
+#
+# It rides on every curl below and is passed to k6 through the environment.
+auth_header=()
+if [ -n "${MINDEX_TOKEN:-}" ]; then
+    auth_header=(-H "Authorization: Bearer $MINDEX_TOKEN")
 fi
 
 # fdiv NUM DEN [DECIMALS] — safe float divide (0 when DEN<=0).
@@ -153,16 +179,27 @@ gen_guid() {
 }
 
 jget() { # URL JQ-FILTER DEFAULT — GET + extract, DEFAULT on any failure
-    curl -sk --max-time 10 "$1" 2>/dev/null | jq -r "$2 // \"$3\"" 2>/dev/null || echo "$3"
+    curl -sk --max-time 10 "${auth_header[@]}" "$1" 2>/dev/null | jq -r "$2 // \"$3\"" 2>/dev/null || echo "$3"
 }
 
+# EIGHT COLUMNS WERE REMOVED HERE, and the reason is worth keeping. They came
+# from the vendored BGE-M3 server's `GET /stats` -- embedder_batch,
+# embedder_max_inflight, embedder_maxlen, fwd_batch_mean, fwd_batch_max,
+# embedder_encode_s, queue_highwater, embedder_429. v3 replaced that server with
+# a contract (`/v1/embeddings` + `/v1/models` + `/health`) that no OpenAI-compatible
+# server extends with introspection, so every one of them recorded `NA` on every
+# row while `plot.sh` still charted two of them and README still taught a tuning
+# method built on a third. A column that is always NA is worse than an absent one:
+# it reads as a measurement that failed rather than one that was never taken.
+#
+# What replaces them, when you need it, is the embedder's own metrics endpoint if
+# it has one -- scrape it beside mindex rather than sampling it from here, which
+# is what `deploy/victoriametrics/` is for.
 header="timestamp,label,mindex_version,model_id,embed_batch,db_pool_size,\
-embedder_batch,embedder_max_inflight,embedder_maxlen,\
 concurrency,corpus,total_files,total_bytes,total_chunks,\
 wall_clock_s,chunks_per_s,files_per_s,mb_per_s,\
 req_dur_p50,req_dur_p90,req_dur_p95,req_dur_p99,http_reqs,\
-err_429,err_499,err_500,err_503,err_other,\
-fwd_batch_mean,fwd_batch_max,embedder_encode_s,queue_highwater,embedder_429,min_pool_available"
+err_429,err_499,err_500,err_503,err_other,min_pool_available"
 
 safe_label="${label//,/;}"
 safe_label="${safe_label//$'\n'/ }"
@@ -173,14 +210,14 @@ if [ -z "$out" ]; then
     mkdir -p "$results_dir"
     n_eb="$(jget "$mindex_url/config" '.embed_batch' NA)"
     n_pool="$(jget "$mindex_url/config" '.db_pool_size' NA)"
-    n_xb=NA
-    # Guard the pipeline: under `set -euo pipefail` an unreachable embedder makes
-    # curl|jq exit non-zero and kills the whole script before the first echo — a
-    # silent exit. `|| echo NA` keeps auto-naming working when the embedder is down.
-    [ -n "$embedder_url" ] &&
-        n_xb="$(curl -sk --max-time 10 "$embedder_url/stats" 2>/dev/null | jq -r '.config.batch // "NA"' 2>/dev/null || echo NA)"
+    # The model is part of the configuration being measured — v3 makes it
+    # switchable, and two runs at different embedders are not comparable. It
+    # replaces the old `_xb<embedder batch>` component, which read the vendored
+    # server's /stats and had been baking a literal `NA` into every filename.
+    n_model="$(jget "$mindex_url/config" '.model_id' NA)"
+    n_model="${n_model//[^a-zA-Z0-9._-]/-}"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    fn="${stamp}_eb${n_eb}_pool${n_pool}_xb${n_xb}"
+    fn="${stamp}_${n_model}_eb${n_eb}_pool${n_pool}"
     # filename-safe label fragment
     lbl="$(printf '%s' "$safe_label" | tr ' /' '--' | tr -cd 'A-Za-z0-9._-')"
     [ -n "$lbl" ] && fn="${fn}_${lbl}"
@@ -206,12 +243,6 @@ for c in $concurrency; do
         continue
     fi
 
-    # Reset embedder rolling counters so this run's /stats are clean.
-    if [ -n "$embedder_url" ]; then
-        curl -sk --max-time 10 -X POST "$embedder_url/stats/reset" >/dev/null 2>&1 ||
-            echo "  warn: embedder /stats/reset failed (stale stats expected)" >&2
-    fi
-
     guid="$(gen_guid)"
     summary="$(mktemp)"
     pool_log="$(mktemp)"
@@ -219,7 +250,7 @@ for c in $concurrency; do
     # Sample mindex pool headroom in the background for the whole run.
     (
         while :; do
-            curl -sk --max-time 5 "$mindex_url/status" 2>/dev/null |
+            curl -sk --max-time 5 "${auth_header[@]}" "$mindex_url/status" 2>/dev/null |
                 jq -r '.pool_available' 2>/dev/null >>"$pool_log" || true
             sleep "$poll_interval"
         done
@@ -228,6 +259,7 @@ for c in $concurrency; do
 
     SUMMARY_OUT="$summary" \
         MINDEX_URL="$mindex_url" PROTOCOL="$protocol" PROJECT_GUID="$guid" \
+        MINDEX_TOKEN="${MINDEX_TOKEN:-}" \
         CORPUS_DIR="$corpus" SHARD_COUNT="$shard_count" CONCURRENCY="$c" \
         INSECURE="true" REQ_TIMEOUT="${REQ_TIMEOUT:-600s}" \
         k6 run "$script" >&2 || echo "  warn: k6 exited non-zero" >&2
@@ -261,43 +293,21 @@ for c in $concurrency; do
     embed_batch="$(jget "$mindex_url/config" '.embed_batch' NA)"
     db_pool="$(jget "$mindex_url/config" '.db_pool_size' NA)"
 
-    # Live embedder config + rolling stats.
-    eb=NA
-    emaxinf=NA
-    emaxlen=NA
-    fwd_mean=NA
-    fwd_max=NA
-    enc_s=NA
-    qhw=NA
-    e429srv=NA
-    if [ -n "$embedder_url" ]; then
-        stats="$(curl -sk --max-time 10 "$embedder_url/stats" 2>/dev/null || echo '{}')"
-        eb="$(echo "$stats" | jq -r '.config.batch // "NA"')"
-        emaxinf="$(echo "$stats" | jq -r '.config.max_inflight // "NA"')"
-        emaxlen="$(echo "$stats" | jq -r '.config.maxlen // "NA"')"
-        fwd_mean="$(echo "$stats" | jq -r '.runtime.forward_batch_mean // "NA"')"
-        fwd_max="$(echo "$stats" | jq -r '.runtime.forward_batch_max // "NA"')"
-        enc_s="$(echo "$stats" | jq -r '.runtime.encode_seconds_total // "NA"')"
-        qhw="$(echo "$stats" | jq -r '.runtime.queue_depth_highwater // "NA"')"
-        e429srv="$(echo "$stats" | jq -r '.runtime.requests_429 // "NA"')"
-    fi
-
     min_pool="$(sort -n "$pool_log" 2>/dev/null | awk 'NF{print;exit}')"
     [ -z "$min_pool" ] && min_pool=NA
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$safe_label" "$mver" "$model" \
-        "$embed_batch" "$db_pool" "$eb" "$emaxinf" "$emaxlen" \
+        "$embed_batch" "$db_pool" \
         "$c" "$corpus_name" "$total_files" "$total_bytes" "$chunks" \
         "$wall_s" "$chunks_per_s" "$files_per_s" "$mb_per_s" \
         "$p50" "$p90" "$p95" "$p99" "$http_reqs" \
-        "$e429" "$e499" "$e500" "$e503" "$eother" \
-        "$fwd_mean" "$fwd_max" "$enc_s" "$qhw" "$e429srv" "$min_pool" >>"$out"
+        "$e429" "$e499" "$e500" "$e503" "$eother" "$min_pool" >>"$out"
 
-    echo "  chunks/s=$chunks_per_s  wall=${wall_s}s  encode=${enc_s}s  fwd_batch_mean=$fwd_mean  min_pool=$min_pool  429(client/srv)=$e429/$e429srv" >&2
+    echo "  chunks/s=$chunks_per_s  wall=${wall_s}s  min_pool=$min_pool  429=$e429  503=$e503" >&2
 
     # Clean up so the next level starts from an empty project (Qdrant + SQLite).
-    curl -sk --max-time 30 -X DELETE "$mindex_url/projects/$guid" >/dev/null 2>&1 ||
+    curl -sk --max-time 30 "${auth_header[@]}" -X DELETE "$mindex_url/projects/$guid" >/dev/null 2>&1 ||
         echo "  warn: project cleanup failed for $guid" >&2
 
     rm -f "$summary" "$pool_log"

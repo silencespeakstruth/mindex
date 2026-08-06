@@ -271,7 +271,7 @@ mod tests {
         }
     }
 
-    /// The cross-implementation glob contract. `tools/vscode/src/scanner.test.ts`
+    /// The cross-implementation glob contract. `tools/vscode/src/globContract.test.ts`
     /// runs the identical table through picomatch: the two engines differ, the
     /// supported subset must not. Keep the two tables byte-identical.
     #[test]

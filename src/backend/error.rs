@@ -1080,6 +1080,46 @@ mod tests {
         );
     }
 
+    /// **The catalogue in the OpenAPI description is the published contract, and
+    /// nothing checked it.** `openapi.rs`'s `info.description` calls the `code`
+    /// "the field a client localizes against" and then lists them — which makes
+    /// that list the one a client author reads, and an omission a code they
+    /// never write a message for. Four had accumulated
+    /// (`index.file_in_flight`, `auth.route_not_configured`,
+    /// `validation.index_modes_exclusive`, `research.invented`), each shipped by
+    /// a change that correctly updated `codes_are_stable` next door and did not
+    /// know the prose existed.
+    ///
+    /// Asserted in one direction only, deliberately. Every real code must be
+    /// listed; the reverse would forbid the description from ever mentioning a
+    /// retired code in a sentence about its retirement, which is the one thing a
+    /// contract document should be free to do.
+    #[test]
+    fn the_published_error_catalogue_names_every_code() {
+        let doc = crate::backend::openapi::api_doc();
+        let description = doc
+            .info
+            .description
+            .expect("the spec's description carries the code catalogue");
+
+        let missing: Vec<&str> = every_variant()
+            .iter()
+            .map(ApiError::code)
+            // Backticked, so a code cannot be matched by a substring of a longer
+            // one — `research.no_report` would otherwise satisfy nothing and
+            // `ollama.error` would be found inside `internal.error` if the
+            // delimiters were dropped.
+            .filter(|code| !description.contains(&format!("`{code}`")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these codes exist and are absent from the catalogue in \
+             openapi.rs's info.description, which clients are told to key on: \
+             {missing:?}"
+        );
+    }
+
     /// Two errors sharing a code are indistinguishable to every client, and the
     /// sorted snapshot above cannot catch it: a duplicate simply appears twice in
     /// both lists and matches. The `code` is the localization key, so a collision
