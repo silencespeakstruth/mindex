@@ -119,6 +119,10 @@ pub enum ApiError {
     /// has, or it sends the caller looking for one that does not exist.
     SelectorEmpty { field: &'static str },
 
+    /// `/index` was asked for `symbols_only` and `vectors_only` at once — two
+    /// disjoint "rebuild only this half" modes whose conjunction is empty.
+    IndexModesExclusive,
+
     // ── Validation (each carries the data its detail/meta interpolate) ──────────
     /// A repo-relative path violated the path rules (absolute / `..` / backslash / empty). 400.
     PathInvalid { path: String },
@@ -282,6 +286,7 @@ impl ApiError {
             ApiError::MalformedPath(_) => "request.malformed_path",
             ApiError::BodyTooLarge => "request.body_too_large",
             ApiError::SelectorEmpty { .. } => "selector.empty",
+            ApiError::IndexModesExclusive => "validation.index_modes_exclusive",
             ApiError::PathInvalid { .. } => "validation.path_invalid",
             ApiError::Sha256Invalid { .. } => "validation.sha256_invalid",
             ApiError::TopKOutOfRange { .. } => "validation.top_k_out_of_range",
@@ -377,6 +382,7 @@ impl ApiError {
             ApiError::MalformedPath(_) => "Malformed path parameter",
             ApiError::BodyTooLarge => "Request body too large",
             ApiError::SelectorEmpty { .. } => "Empty selector",
+            ApiError::IndexModesExclusive => "Exclusive index modes",
             ApiError::PathInvalid { .. } => "Invalid file path",
             ApiError::Sha256Invalid { .. } => "Invalid sha256",
             ApiError::TopKOutOfRange { .. } => "Invalid top_k",
@@ -502,6 +508,12 @@ impl ApiError {
                 "This endpoint refuses an empty selector, so that a destructive request \
                  cannot match everything by omission. Name what it applies to in `{field}`."
             ),
+            ApiError::IndexModesExclusive => {
+                "`symbols_only` and `vectors_only` are mutually exclusive: one rebuilds \
+                 only the symbol table, the other re-embeds only the stored chunks, and \
+                 a request asking for both asks for nothing."
+                    .into()
+            }
             ApiError::PathInvalid { path } => format!(
                 "Path {path:?} is invalid: paths must be non-empty, repo-relative (no leading '/'), \
                  free of '..' traversal, and use '/' (no backslash)."

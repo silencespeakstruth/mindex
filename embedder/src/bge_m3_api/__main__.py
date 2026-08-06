@@ -298,6 +298,16 @@ parser.add_argument(
     default=600.0,
     help="Seconds of inactivity after which the model is unloaded from the GPU.",
 )
+parser.add_argument(
+    "--fp16",
+    action="store_true",
+    help="Load the weights in half precision. BGE-M3 is 568M params, so this saves "
+    "~1.1 GiB of weights, but the real win is activations: they dominate memory at "
+    "any useful batch and halve with the dtype. FlagEmbedding defaults to fp32. "
+    "⚠️ On XPU this is the configuration that triggers the padded-row NaN described "
+    "in attention_backend() — that workaround is what makes this flag safe there. "
+    "Verify with a cosine check against fp32 after changing it, per-device.",
+)
 args = parser.parse_args()
 
 
@@ -307,11 +317,14 @@ args = parser.parse_args()
 
 
 class ModelManager:
-    def __init__(self, name: str, device: str, batch: int, maxlen: int) -> None:
+    def __init__(
+        self, name: str, device: str, batch: int, maxlen: int, fp16: bool = False
+    ) -> None:
         self._name = name
         self._device = device
         self._batch = batch
         self._maxlen = maxlen
+        self._fp16 = fp16
         self._model: BGEM3FlagModel | None = None
         self._last_used = time.monotonic()
 
@@ -330,11 +343,15 @@ class ModelManager:
             # which on a multi-GPU box returns *all* CUDA devices and triggers a
             # multi-process encode pool (breaks single-GPU serialization). A single
             # device string keeps it one in-process device.
-            self._model = BGEM3FlagModel(self._name, devices=self._device)
+            model = BGEM3FlagModel(
+                self._name, devices=self._device, use_fp16=self._fp16
+            )
+            self._model = model
             log.info(
-                "Model loaded in %.1fs (target_devices=%s)",
+                "Model loaded in %.1fs (target_devices=%s, dtype=%s)",
                 time.monotonic() - t0,
-                getattr(self._model, "target_devices", "?"),
+                getattr(model, "target_devices", "?"),
+                next(model.model.parameters()).dtype,
             )
         return self._model
 
@@ -441,7 +458,9 @@ class Stats:
 
 STATS = Stats()
 
-MANAGER = ModelManager(MODEL_NAME, args.device, args.batch, args.maxlen)
+MANAGER = ModelManager(
+    MODEL_NAME, args.device, args.batch, args.maxlen, fp16=args.fp16
+)
 
 # One worker thread = serialized GPU access; FIFO over its internal queue.
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bge-gpu")

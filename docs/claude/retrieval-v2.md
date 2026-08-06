@@ -1,5 +1,17 @@
 # Retrieval v2 — one dense leg, and everything that falls away with it
 
+> **Superseded (2026-08-05) by `retrieval-v3.md`.** The measurement record below
+> (§1, §6) stands and is the evidence base; the implementation spec does not.
+> What changed against this file's conclusion: the shipped family is
+> **Qwen3-Embedding** (0.6B/4B/8B, operator-selectable), not granite —
+> multilinguality (§6's untested Russian-query case) and the size ladder decided
+> the tie that cost alone had broken, and vLLM serving reopens the throughput
+> arithmetic (§6 already noted the 87 chunks/s figure was a floor). v3 also adds
+> what §2 declined: a compiled model registry with canonical ids CHECKed into
+> SQLite, per-model Qdrant collections, and a `vectors_only` re-embed path —
+> because "a future model swap is cheap" was promoted from a property worth
+> keeping to the point of the exercise.
+
 *Companion to `.claude/CLAUDE.md`, **Retrieval pipeline**. That file holds the
 invariants of the system as it stands; this one is the **implementation spec for
 replacing it**, plus the measurement record that chose the replacement. Read

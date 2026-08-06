@@ -27,16 +27,11 @@ pub async fn set_file_status(
     db_pool: &SQLite3Pool,
     project_guid: &str,
     path: &str,
-    model_id: &str,
     status: &'static str,
     increment_retry: bool,
     token: CancellationToken,
 ) -> bool {
-    let (pg, p, m) = (
-        project_guid.to_string(),
-        path.to_string(),
-        model_id.to_string(),
-    );
+    let (pg, p) = (project_guid.to_string(), path.to_string());
     // A reindex/retry that reaches 'indexed' clears the failure counter; a failure
     // bumps it; anything else (e.g. moving to 'indexing') leaves it as-is.
     let retry_expr = if status == "indexed" {
@@ -49,12 +44,12 @@ pub async fn set_file_status(
     let sql = format!(
         "UPDATE project_files
          SET status = ?1, retry_count = {retry_expr}, status_updated_at = unixepoch()
-         WHERE project_guid = ?2 AND path = ?3 AND model_id = ?4"
+         WHERE project_guid = ?2 AND path = ?3"
     );
 
     let result = db_pool
         .transaction(token, move |tx| {
-            Ok(tx.execute(&sql, rusqlite::params![status, pg, p, m])?)
+            Ok(tx.execute(&sql, rusqlite::params![status, pg, p])?)
         })
         .await;
 
@@ -96,7 +91,6 @@ mod tests {
     use std::path::Path;
 
     const PG: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const MODEL: &str = "BAAI/bge-m3";
     const PATH: &str = "a.rs";
 
     async fn migrated_pool() -> SQLite3Pool {
@@ -105,10 +99,7 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, ?2)",
-                params![PG, MODEL],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![PG])?;
             Ok(())
         })
         .await
@@ -130,9 +121,9 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, ?2, ?3, ?4, 'rust', ?5)",
-                params![PG, MODEL, PATH, "0".repeat(64), status],
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, ?3, 'rust', ?4)",
+                params![PG, PATH, "0".repeat(64), status],
             )?;
             Ok(())
         })
@@ -144,8 +135,8 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "UPDATE project_files SET status = ?1, status_updated_at = unixepoch()
-                 WHERE project_guid = ?2 AND model_id = ?3 AND path = ?4",
-                params![new, PG, MODEL, PATH],
+                 WHERE project_guid = ?2 AND path = ?3",
+                params![new, PG, PATH],
             )?;
             Ok(())
         })
@@ -160,8 +151,8 @@ mod tests {
         pool.transaction(CancellationToken::new(), |tx| {
             tx.query_row(
                 "SELECT status, retry_count FROM project_files
-                 WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-                params![PG, MODEL, PATH],
+                 WHERE project_guid = ?1 AND path = ?2",
+                params![PG, PATH],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
             .map_err(SQLite3PoolError::from)
@@ -356,9 +347,9 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing')",
-                params![PG, MODEL, PATH, sha256],
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, ?2, ?3, 'rust', 'indexing')",
+                params![PG, PATH, sha256],
             )?;
             Ok(())
         })
@@ -376,13 +367,12 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO project_file_chunks
-                     (project_guid, file_path, model_id, code, qdrant_guid,
+                     (project_guid, file_path, code, qdrant_guid, tokens,
                       start_line, end_line, start_column, end_column, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
+                 VALUES (?1, ?2, ?3, ?4, 3, ?5, ?6, ?7, ?8, 'active')",
                 params![
                     PG,
                     PATH,
-                    MODEL,
                     code,
                     uuid::Uuid::new_v4().simple().to_string(),
                     lines.0,
@@ -411,8 +401,8 @@ mod tests {
             .transaction(CancellationToken::new(), |tx| {
                 tx.execute(
                     "UPDATE project_files SET sha256 = ?1
-                     WHERE project_guid = ?2 AND model_id = ?3 AND path = ?4",
-                    params!["Z".repeat(64), PG, MODEL, PATH],
+                     WHERE project_guid = ?2 AND path = ?3",
+                    params!["Z".repeat(64), PG, PATH],
                 )?;
                 Ok(())
             })
@@ -438,10 +428,10 @@ mod tests {
             .transaction(CancellationToken::new(), |tx| {
                 tx.execute(
                     "INSERT INTO project_files
-                         (project_guid, model_id, path, sha256, programming_language,
+                         (project_guid, path, sha256, programming_language,
                           status, retry_count)
-                     VALUES (?1, ?2, ?3, ?4, 'rust', 'indexing', -1)",
-                    params![PG, MODEL, PATH, "0".repeat(64)],
+                     VALUES (?1, ?2, ?3, 'rust', 'indexing', -1)",
+                    params![PG, PATH, "0".repeat(64)],
                 )?;
                 Ok(())
             })
@@ -456,8 +446,8 @@ mod tests {
             .transaction(CancellationToken::new(), |tx| {
                 tx.execute(
                     "UPDATE project_files SET retry_count = retry_count - 1
-                     WHERE project_guid = ?1 AND model_id = ?2 AND path = ?3",
-                    params![PG, MODEL, PATH],
+                     WHERE project_guid = ?1 AND path = ?2",
+                    params![PG, PATH],
                 )?;
                 Ok(())
             })
@@ -505,41 +495,14 @@ mod tests {
         let pool = pool_with_file("indexing").await;
 
         // A failure bumps retry_count.
-        let _ = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "failed",
-            true,
-            CancellationToken::new(),
-        )
-        .await;
+        let _ = set_file_status(&pool, PG, PATH, "failed", true, CancellationToken::new()).await;
         assert_eq!(current(&pool).await, ("failed".to_string(), 1));
 
         // Retry: failed→indexing (no change), then a success resets the counter.
-        let _ = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "indexing",
-            false,
-            CancellationToken::new(),
-        )
-        .await;
+        let _ = set_file_status(&pool, PG, PATH, "indexing", false, CancellationToken::new()).await;
         assert_eq!(current(&pool).await, ("indexing".to_string(), 1));
 
-        let _ = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "indexed",
-            false,
-            CancellationToken::new(),
-        )
-        .await;
+        let _ = set_file_status(&pool, PG, PATH, "indexed", false, CancellationToken::new()).await;
         assert_eq!(current(&pool).await, ("indexed".to_string(), 0));
     }
 
@@ -551,28 +514,11 @@ mod tests {
     #[tokio::test]
     async fn a_write_the_triggers_reject_returns_false() {
         let pool = pool_with_file("indexing").await;
-        let _ = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "indexed",
-            false,
-            CancellationToken::new(),
-        )
-        .await;
+        let _ = set_file_status(&pool, PG, PATH, "indexed", false, CancellationToken::new()).await;
 
         // `indexed → failed` is not a legal move; the trigger raises.
-        let moved = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "failed",
-            true,
-            CancellationToken::new(),
-        )
-        .await;
+        let moved =
+            set_file_status(&pool, PG, PATH, "failed", true, CancellationToken::new()).await;
 
         assert!(!moved, "a rejected transition was reported as a move");
         assert_eq!(
@@ -598,16 +544,8 @@ mod tests {
         .await
         .expect("delete");
 
-        let moved = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "indexed",
-            false,
-            CancellationToken::new(),
-        )
-        .await;
+        let moved =
+            set_file_status(&pool, PG, PATH, "indexed", false, CancellationToken::new()).await;
 
         assert!(!moved, "a write matching no row was reported as a move");
     }
@@ -620,7 +558,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let moved = set_file_status(&pool, PG, PATH, MODEL, "indexed", false, token).await;
+        let moved = set_file_status(&pool, PG, PATH, "indexed", false, token).await;
 
         assert!(!moved, "a cancelled write was reported as a move");
         assert_eq!(current(&pool).await, ("indexing".to_string(), 0));
@@ -637,31 +575,13 @@ mod tests {
         let a = {
             let p = std::sync::Arc::clone(&pool);
             tokio::spawn(async move {
-                set_file_status(
-                    &p,
-                    PG,
-                    PATH,
-                    MODEL,
-                    "indexed",
-                    false,
-                    CancellationToken::new(),
-                )
-                .await
+                set_file_status(&p, PG, PATH, "indexed", false, CancellationToken::new()).await
             })
         };
         let b = {
             let p = std::sync::Arc::clone(&pool);
             tokio::spawn(async move {
-                set_file_status(
-                    &p,
-                    PG,
-                    PATH,
-                    MODEL,
-                    "cancelled",
-                    false,
-                    CancellationToken::new(),
-                )
-                .await
+                set_file_status(&p, PG, PATH, "cancelled", false, CancellationToken::new()).await
             })
         };
 
@@ -698,16 +618,8 @@ mod tests {
         .await
         .expect("backdate");
 
-        let moved = set_file_status(
-            &pool,
-            PG,
-            PATH,
-            MODEL,
-            "failed",
-            true,
-            CancellationToken::new(),
-        )
-        .await;
+        let moved =
+            set_file_status(&pool, PG, PATH, "failed", true, CancellationToken::new()).await;
         assert!(moved);
 
         let at: i64 = pool

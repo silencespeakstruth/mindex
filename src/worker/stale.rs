@@ -37,6 +37,7 @@ use tracing::{info, warn};
 use crate::backend::metrics::Metrics;
 use crate::db::qdrant::{CollectionAge, VectorStore, classify_collection, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
+use crate::models::registry::EmbeddingModelSpec;
 use tokio_util::future::FutureExt;
 
 /// How often the check repeats. Hourly, like the other slow surveys: the conditions it
@@ -56,6 +57,11 @@ pub(crate) struct StaleReport {
     /// `None` rather than an empty vec, because the two must not publish the same
     /// gauge: an empty listing is the all-clear, and "I could not ask" is not.
     pub orphaned: Option<Vec<String>>,
+    /// Current-layout collections held for a **registered model that is not
+    /// active**. Not garbage — switching `[model].id` back reuses them — so they
+    /// are surfaced at `info!` and never join the orphan gauge or its
+    /// delete-this message. `None` exactly when `orphaned` is.
+    pub other_model: Option<Vec<String>>,
 }
 
 /// One pass. Split from the loop so it is testable without a clock — the
@@ -68,6 +74,7 @@ pub(crate) struct StaleReport {
 pub(crate) async fn check_once(
     db_pool: &SQLite3Pool,
     store: &Arc<dyn VectorStore>,
+    spec: &'static EmbeddingModelSpec,
     token: &CancellationToken,
 ) -> Option<StaleReport> {
     // Projects that believe they have something to search. A project with no active
@@ -104,7 +111,7 @@ pub(crate) async fn check_once(
         if token.is_cancelled() {
             return None;
         }
-        let collection = collection_name(&guid);
+        let collection = collection_name(&guid, spec.collection_slug);
         match store.count_points(&collection).await {
             // The real store answers `Some(0)` for a missing collection too, which is
             // exactly right here: "absent" and "present but empty" are the same defect
@@ -133,14 +140,21 @@ pub(crate) async fn check_once(
     // The orphan half is answered separately and may decline on its own: the stale
     // half is the one that says search is broken, and it must still be published when
     // the store can count but not enumerate.
-    report.orphaned = match store.list_collections().await {
-        Ok(Some(names)) => Some(
-            names
-                .into_iter()
-                .filter(|n| classify_collection(n) == CollectionAge::Previous)
-                .collect(),
-        ),
-        Ok(None) => None,
+    match store.list_collections().await {
+        Ok(Some(names)) => {
+            let mut orphaned = Vec::new();
+            let mut other_model = Vec::new();
+            for n in names {
+                match classify_collection(&n, spec.collection_slug) {
+                    CollectionAge::Previous => orphaned.push(n),
+                    CollectionAge::OtherModel => other_model.push(n),
+                    CollectionAge::Current | CollectionAge::Foreign => {}
+                }
+            }
+            report.orphaned = Some(orphaned);
+            report.other_model = Some(other_model);
+        }
+        Ok(None) => {}
         Err(e) => {
             warn!(
                 error = %e,
@@ -148,9 +162,8 @@ pub(crate) async fn check_once(
                  whether a previous schema version is still holding disk. Sysadmin: \
                  check Qdrant is reachable."
             );
-            None
         }
-    };
+    }
 
     Some(report)
 }
@@ -159,10 +172,11 @@ pub(crate) async fn check_once(
 pub(crate) async fn check_and_publish(
     db_pool: &SQLite3Pool,
     store: &Arc<dyn VectorStore>,
+    spec: &'static EmbeddingModelSpec,
     metrics: &Metrics,
     token: &CancellationToken,
 ) {
-    let Some(report) = check_once(db_pool, store, token).await else {
+    let Some(report) = check_once(db_pool, store, spec, token).await else {
         return;
     };
 
@@ -174,7 +188,20 @@ pub(crate) async fn check_and_publish(
              empty, so every search against them returns no match and nothing else reports \
              an error. Sysadmin: this is what a lost Qdrant volume looks like, and what a \
              COLLECTION_SCHEMA_VERSION bump looks like before the reindex that must follow \
-             it. Fix: run `mindex-index --root <project> --force` for each."
+             it. Fix: run `mindex-index --root <project> --force` for each — or \
+             `--vectors-only` when the chunks are current and only the vectors moved."
+        );
+    }
+
+    if let Some(other) = &report.other_model
+        && !other.is_empty()
+    {
+        info!(
+            count = other.len(),
+            collections = %other.join(", "),
+            "Qdrant holds collections for a registered embedding model that is not \
+             the active one. They are deliberate per-model stores, not garbage: \
+             switching [model].id back reuses them without a reindex."
         );
     }
 
@@ -203,6 +230,7 @@ pub(crate) async fn check_and_publish(
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     store: Arc<dyn VectorStore>,
+    spec: &'static EmbeddingModelSpec,
     metrics: Arc<Metrics>,
     token: CancellationToken,
 ) {
@@ -225,7 +253,7 @@ pub async fn run(
                 break;
             }
         }
-        check_and_publish(&db_pool, &store, &metrics, &token).await;
+        check_and_publish(&db_pool, &store, spec, &metrics, &token).await;
     }
 }
 
@@ -234,8 +262,13 @@ mod tests {
     use super::*;
     use crate::backend::v0::models::UUIDv4;
     use crate::db::qdrant::{ChunkAsVector, SearchHit, VectorStoreError};
+    use crate::models::registry::model_by_id;
     use async_trait::async_trait;
     use std::collections::HashMap;
+
+    fn active() -> &'static EmbeddingModelSpec {
+        model_by_id("qwen3-embedding-0.6b").expect("registered")
+    }
 
     /// A store that answers both provided methods from a fixed map, so a pass can be
     /// driven over any combination of present / empty / absent collections.
@@ -292,9 +325,6 @@ mod tests {
             _: &str,
             _: Vec<UUIDv4>,
             _: Vec<f32>,
-            _: Vec<u32>,
-            _: Vec<f32>,
-            _: Vec<Vec<f32>>,
             _: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             Ok(vec![])
@@ -318,22 +348,19 @@ mod tests {
         .expect("migrated");
         let project = project.to_string();
         pool.transaction(CancellationToken::new(), move |tx| {
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
-                [&project],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", [&project])?;
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, programming_language, sha256, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'a.rs', 'rust', ?2, 'indexing')",
+                     (project_guid, path, programming_language, sha256, status)
+                 VALUES (?1, 'a.rs', 'rust', ?2, 'indexing')",
                 rusqlite::params![&project, "0".repeat(64)],
             )?;
             for i in 0..active_chunks {
                 tx.execute(
                     "INSERT INTO project_file_chunks
-                         (project_guid, file_path, model_id, code, qdrant_guid,
+                         (project_guid, file_path, code, qdrant_guid, tokens,
                           start_line, end_line, start_column, end_column, status)
-                     VALUES (?1, 'a.rs', 'BAAI/bge-m3', 'x', ?2, 1, 2, 0, 0, 'active')",
+                     VALUES (?1, 'a.rs', 'x', ?2, 3, 1, 2, 0, 0, 'active')",
                     rusqlite::params![&project, format!("{i:032x}")],
                 )?;
             }
@@ -351,7 +378,7 @@ mod tests {
         let pool = pool_with(A, 3).await;
         let store = Store::shared(&[], None);
 
-        let report = check_once(&pool, &store, &CancellationToken::new())
+        let report = check_once(&pool, &store, active(), &CancellationToken::new())
             .await
             .expect("the pass completed");
 
@@ -362,9 +389,9 @@ mod tests {
     #[tokio::test]
     async fn a_populated_collection_is_not_reported() {
         let pool = pool_with(A, 3).await;
-        let store = Store::shared(&[(&collection_name(A), 3)], None);
+        let store = Store::shared(&[(&collection_name(A, active().collection_slug), 3)], None);
 
-        let report = check_once(&pool, &store, &CancellationToken::new())
+        let report = check_once(&pool, &store, active(), &CancellationToken::new())
             .await
             .expect("the pass completed");
 
@@ -379,7 +406,7 @@ mod tests {
         let pool = pool_with(A, 0).await;
         let store = Store::shared(&[], None);
 
-        let report = check_once(&pool, &store, &CancellationToken::new())
+        let report = check_once(&pool, &store, active(), &CancellationToken::new())
             .await
             .expect("the pass completed");
 
@@ -391,27 +418,36 @@ mod tests {
     #[tokio::test]
     async fn a_previous_versions_collection_is_reported_as_orphaned() {
         let pool = pool_with(A, 1).await;
+        let slug = active().collection_slug;
         let store = Store::shared(
-            &[(&collection_name(A), 1)],
+            &[(&collection_name(A, slug), 1)],
             Some(&[
-                &collection_name(A),
+                &collection_name(A, slug),
+                // Another registered model's v3 store: held, never orphaned.
+                &collection_name(A, "q3e8b"),
+                // The legacy pre-v3 grammars.
                 &format!("{A}_v1"),
-                &format!("{B}_v1"),
+                &format!("{B}_v2"),
                 // Qdrant may be shared. Somebody else's collection must never be named
                 // in a message telling an operator what to delete.
                 "someone_elses_data",
             ]),
         );
 
-        let report = check_once(&pool, &store, &CancellationToken::new())
+        let report = check_once(&pool, &store, active(), &CancellationToken::new())
             .await
             .expect("the pass completed");
 
         assert!(report.stale.is_empty(), "{report:?}");
         assert_eq!(
             report.orphaned,
-            Some(vec![format!("{A}_v1"), format!("{B}_v1")]),
+            Some(vec![format!("{A}_v1"), format!("{B}_v2")]),
             "the current version was named, or a foreign collection was"
+        );
+        assert_eq!(
+            report.other_model,
+            Some(vec![collection_name(A, "q3e8b")]),
+            "another registered model's collection must be held, not orphaned"
         );
     }
 
@@ -428,7 +464,7 @@ mod tests {
         });
 
         assert!(
-            check_once(&pool, &store, &CancellationToken::new())
+            check_once(&pool, &store, active(), &CancellationToken::new())
                 .await
                 .is_none(),
             "an unreachable Qdrant produced a verdict; a failed check must not be \
@@ -448,7 +484,7 @@ mod tests {
         });
         let metrics = Metrics::new();
 
-        check_and_publish(&pool, &store, &metrics, &CancellationToken::new()).await;
+        check_and_publish(&pool, &store, active(), &metrics, &CancellationToken::new()).await;
 
         let text = metrics.render().expect("renders");
         assert!(

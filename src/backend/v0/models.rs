@@ -220,6 +220,21 @@ pub struct IndexRequest {
     /// invariant. Run an ordinary index pass for those.
     #[serde(default)]
     pub symbols_only: bool,
+
+    /// Re-embed the **stored** chunks into the active model's collection: no
+    /// slicing, no symbols, no tree-sitter — a pure GPU pass over
+    /// `project_file_chunks.code`. This is the cheap half of switching
+    /// `[model].id`: the chunk text is already in SQLite, and every
+    /// Qwen3-Embedding size shares one tokenizer, so the boundaries stay valid
+    /// and only the vectors are re-derived.
+    ///
+    /// A file already embedded under the active model is skipped (`unchanged`);
+    /// a file whose `chunker_id` names a *different* tokenizer is skipped as
+    /// `needs_full_reindex` — its chunk boundaries were measured in different
+    /// units and reusing them would be wrong, not merely stale. Mutually
+    /// exclusive with `symbols_only` (400).
+    #[serde(default)]
+    pub vectors_only: bool,
 }
 
 /// `POST /v0/{project_guid}/index` response: per indexed file, the number of chunks
@@ -289,6 +304,11 @@ pub enum SkipReason {
     InFlight,
     /// A concurrent `POST /cancel` flipped the file after it was prepared.
     Cancelled,
+    /// `vectors_only` only: the stored chunks were sliced under a different
+    /// tokenizer than the active model's (`chunker_id` mismatch), so their
+    /// boundaries are measured in different units and re-embedding them would
+    /// be wrong rather than merely stale. Run an ordinary index pass.
+    NeedsFullReindex,
 }
 
 impl SkipReason {
@@ -297,6 +317,7 @@ impl SkipReason {
             SkipReason::Unchanged => "unchanged",
             SkipReason::InFlight => "in_flight",
             SkipReason::Cancelled => "cancelled",
+            SkipReason::NeedsFullReindex => "needs_full_reindex",
         }
     }
 }
@@ -317,8 +338,13 @@ pub enum IndexEvent {
     /// The request was accepted; counts name what was posted, not what will be
     /// (re)indexed — unchanged files are discovered per file, later.
     /// `symbols_only` says what unit every later `count` is in (symbol rows
-    /// instead of chunks), so a live display never has to guess.
-    Started { files: usize, symbols_only: bool },
+    /// instead of chunks), so a live display never has to guess;
+    /// `vectors_only` says the counts are stored chunks being re-embedded.
+    Started {
+        files: usize,
+        symbols_only: bool,
+        vectors_only: bool,
+    },
     /// Phase 1, one file hash-checked, sliced and its chunks inserted — now
     /// awaiting the shared embed pass. `chunks` is this file's chunk count.
     Prepared {
@@ -383,7 +409,12 @@ impl IndexEvent {
             IndexEvent::Started {
                 files,
                 symbols_only,
-            } => json!({ "files": files, "symbols_only": symbols_only }),
+                vectors_only,
+            } => json!({
+                "files": files,
+                "symbols_only": symbols_only,
+                "vectors_only": vectors_only,
+            }),
             IndexEvent::Prepared {
                 path,
                 language,
@@ -1868,7 +1899,16 @@ pub struct ActiveResearchResponse {
 #[derive(Serialize, Debug, ToSchema)]
 pub struct ConfigResponse {
     pub version: &'static str,
+    /// The active embedding model's **canonical id** (`[model].id`) — a
+    /// registry entry, not an HF repo path.
     pub model_id: String,
+    /// The active model's dense width. What a client comparing two
+    /// deployments' indexes needs before assuming they are comparable.
+    pub embedding_dim: usize,
+    /// The slicer's token window, published so a harness verifying produced
+    /// chunk sizes does not have to re-tokenize to learn what was configured.
+    pub min_chunk_tokens: usize,
+    pub max_chunk_tokens: usize,
     pub languages: Vec<&'static str>,
     pub embed_batch: usize,
     pub db_pool_size: usize,
@@ -2450,6 +2490,7 @@ mod tests {
                 IndexEvent::Started {
                     files: 1,
                     symbols_only: false,
+                    vectors_only: false,
                 },
                 "started",
             ),
@@ -2527,10 +2568,11 @@ mod tests {
                 IndexEvent::Started {
                     files: 1,
                     symbols_only: true,
+                    vectors_only: false,
                 }
                 .data()
             ),
-            ["files", "symbols_only"]
+            ["files", "symbols_only", "vectors_only"]
         );
         let prepared = IndexEvent::Prepared {
             path: "a.rs".into(),
@@ -2683,10 +2725,7 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
-                ["a".repeat(32)],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", ["a".repeat(32)])?;
             Ok(())
         })
         .await
@@ -2698,8 +2737,8 @@ mod tests {
                 .transaction(CancellationToken::new(), move |tx| {
                     tx.execute(
                         "INSERT INTO project_files
-                             (project_guid, model_id, path, sha256, programming_language, status)
-                         VALUES (?1, 'BAAI/bge-m3', ?2, ?3, ?4, 'indexing')",
+                             (project_guid, path, sha256, programming_language, status)
+                         VALUES (?1, ?2, ?3, ?4, 'indexing')",
                         rusqlite::params![
                             "a".repeat(32),
                             format!("src/{}.x", pl.name()),

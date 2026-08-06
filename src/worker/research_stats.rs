@@ -267,10 +267,7 @@ mod tests {
             for (_, m) in crate::MIGRATIONS {
                 tx.execute_batch(m)?;
             }
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
-                ["p".repeat(32)],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", ["p".repeat(32)])?;
             Ok(())
         })
         .await

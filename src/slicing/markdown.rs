@@ -44,9 +44,7 @@
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
-use crate::slicing::traits::{
-    MAX_STORABLE_TOKENS, SlicedChunk, SlicerError, Tokenizing, token_boundary,
-};
+use crate::slicing::traits::{SlicedChunk, SlicerError, Tokenizing, token_boundary};
 
 /// Blocks that stand on their own as a unit of meaning.
 ///
@@ -100,6 +98,9 @@ pub struct DocumentPlan {
     /// Whole-file token offsets, kept so `segment` measures spans the same way
     /// `plan` did rather than re-tokenizing.
     offsets: Vec<(usize, usize)>,
+    /// The slicer's own cap, carried so `block_texts` truncates what it sends
+    /// to the embedder with the same number `segment` will cut to.
+    max_tokens: usize,
 }
 
 impl DocumentPlan {
@@ -126,7 +127,7 @@ impl DocumentPlan {
                     &self.offsets,
                     b.start_byte,
                     b.end_byte,
-                    MAX_STORABLE_TOKENS,
+                    self.max_tokens,
                 )
                 .unwrap_or(b.end_byte);
                 &code[b.start_byte..end]
@@ -162,9 +163,7 @@ impl<'a> MarkdownSlicer<'a> {
         Ok(Self {
             tokenizer,
             parser,
-            // Clamped, not validated: the ceiling is a property of the storage,
-            // and the documentation cap's own default sits above it.
-            max_tokens: max_tokens.min(MAX_STORABLE_TOKENS),
+            max_tokens,
             semantic_weight,
         })
     }
@@ -182,7 +181,11 @@ impl<'a> MarkdownSlicer<'a> {
         if token.is_cancelled() {
             return Err(SlicerError::Cancelled);
         }
-        Ok(DocumentPlan { blocks, offsets })
+        Ok(DocumentPlan {
+            blocks,
+            offsets,
+            max_tokens: self.max_tokens,
+        })
     }
 
     /// Phase 2 (CPU): pack the blocks into chunks.
@@ -228,7 +231,7 @@ impl<'a> MarkdownSlicer<'a> {
                 self.split_by_lines(code, &plan.offsets, first, last, &tokens_between, &mut out);
                 continue;
             }
-            push_chunk(&mut out, code, first, last);
+            push_chunk(&mut out, code, &plan.offsets, first, last);
         }
         Ok(out)
     }
@@ -323,10 +326,10 @@ impl<'a> MarkdownSlicer<'a> {
     ///
     /// The second half is not a refinement of the first. Prose wraps where its
     /// author chose to, so one paragraph on one line is ordinary, and a block
-    /// like that used to leave here still over the cap — which downstream is not
-    /// a coarse chunk but an unstorable one (see the code slicer's
-    /// [`pack_window`](crate::slicing::traits) note on the 1 048 576-element
-    /// multivector limit).
+    /// like that used to leave here still over the cap — which downstream is
+    /// silently truncated by the embedder past the model's context, or fails
+    /// the whole batch when it exhausts GPU memory (see the code slicer's
+    /// [`pack_window`](crate::slicing::traits) note).
     fn split_by_lines(
         &self,
         code: &str,
@@ -348,7 +351,7 @@ impl<'a> MarkdownSlicer<'a> {
         for &le in &line_ends {
             if tokens_between(w_start, le) > self.max_tokens {
                 if last_fit > w_start {
-                    push_span(out, code, w_start, last_fit);
+                    push_span(out, code, offsets, w_start, last_fit);
                     w_start = last_fit;
                 }
                 while tokens_between(w_start, le) > self.max_tokens {
@@ -356,14 +359,14 @@ impl<'a> MarkdownSlicer<'a> {
                     else {
                         break;
                     };
-                    push_span(out, code, w_start, cut);
+                    push_span(out, code, offsets, w_start, cut);
                     w_start = cut;
                 }
             }
             last_fit = le;
         }
         if w_start < end {
-            push_span(out, code, w_start, end);
+            push_span(out, code, offsets, w_start, end);
         }
     }
 }
@@ -510,12 +513,24 @@ fn heading_level(node: Node) -> usize {
 /// trailing newline, so `last.end_line` can be one line past where the stored
 /// text actually stops. Citations and `read_chunks` are keyed on that span
 /// agreeing with the bytes, so there is one place that computes it.
-fn push_chunk(out: &mut Vec<SlicedChunk>, code: &str, first: &Block, last: &Block) {
-    push_span(out, code, first.start_byte, last.end_byte);
+fn push_chunk(
+    out: &mut Vec<SlicedChunk>,
+    code: &str,
+    offsets: &[(usize, usize)],
+    first: &Block,
+    last: &Block,
+) {
+    push_span(out, code, offsets, first.start_byte, last.end_byte);
 }
 
 /// Emit `code[start..end]`, computing the line/column span from the bytes.
-fn push_span(out: &mut Vec<SlicedChunk>, code: &str, start: usize, end: usize) {
+fn push_span(
+    out: &mut Vec<SlicedChunk>,
+    code: &str,
+    offsets: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) {
     let text = code[start..end].trim_end();
     if text.trim().is_empty() {
         return;
@@ -525,8 +540,13 @@ fn push_span(out: &mut Vec<SlicedChunk>, code: &str, start: usize, end: usize) {
     let end_byte = start + text.len();
     let end_line = code[..end_byte].bytes().filter(|&b| b == b'\n').count() + 1;
     let end_line_start = code[..end_byte].rfind('\n').map_or(0, |i| i + 1);
+    let tokens = offsets
+        .partition_point(|&(_, e)| e < end_byte)
+        .saturating_sub(offsets.partition_point(|&(s, _)| s < start))
+        .max(1);
     out.push(SlicedChunk {
         code: text.into(),
+        tokens,
         #[cfg(test)]
         start_byte: start,
         #[cfg(test)]
@@ -545,14 +565,14 @@ fn push_span(out: &mut Vec<SlicedChunk>, code: &str, start: usize, end: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slicing::traits::STORABLE_TOKENS_CEILING;
     use std::sync::OnceLock;
     use tokenizers::Tokenizer;
 
     static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 
     fn tokenizer() -> &'static Tokenizer {
-        TOKENIZER.get_or_init(|| Tokenizer::from_pretrained("BAAI/bge-m3", None).unwrap())
+        TOKENIZER
+            .get_or_init(|| Tokenizer::from_pretrained("Qwen/Qwen3-Embedding-0.6B", None).unwrap())
     }
 
     fn slicer_with(max: usize) -> MarkdownSlicer<'static> {
@@ -704,9 +724,9 @@ mod tests {
 
     /// One paragraph on one line — prose wraps where its author chose to, and
     /// plenty of authors choose never — leaves the line-splitting fallback
-    /// nothing to cut at. It must still come out under the cap: a chunk above
-    /// 1024 ColBERT tokens is one Qdrant refuses to store, so an unenforced cap
-    /// here fails the whole batch the document travelled in.
+    /// nothing to cut at. It must still come out under the cap: an unenforced
+    /// cap is silent truncation by the embedder, or a batch-failing GPU
+    /// exhaustion on a big enough document.
     #[test]
     fn a_block_on_a_single_line_is_cut_to_the_cap() {
         let cap = 64;
@@ -726,26 +746,35 @@ mod tests {
         }
     }
 
-    /// The cap is a knob; what Qdrant will store is not. `max_doc_chunk_tokens`
-    /// defaults to exactly 1024, which is [`SPECIAL_TOKENS`] rows over the
-    /// 1 048 576-element multivector limit, so a chunk packed right up to the
-    /// configured cap has to come out under the structural one instead.
+    /// The cap is genuinely a knob now. Under the v2 layout both slicers
+    /// silently clamped it to 1020 — a Qdrant multivector limit that died with
+    /// ColBERT — so `max_doc_chunk_tokens` above that was quietly ignored.
+    /// This pins the clamp's absence: a large configured cap is honored, and
+    /// chunks above the old ceiling exist.
     #[test]
-    fn a_cap_above_the_storable_ceiling_is_clamped() {
+    fn a_cap_above_the_old_colbert_ceiling_is_honored() {
         let src = format!(
             "# Title\n\n{}\n",
             (0..4000).map(|i| format!("word{i} ")).collect::<String>()
         );
-        for c in chunks(&src, 4096) {
+        let out = chunks(&src, 4096);
+        let mut over_old_ceiling = 0usize;
+        for c in &out {
             let n = tokenizer().encode(c.code.as_str(), false).unwrap().len();
-            // Against the ceiling, not against what the slicer aims for: what
-            // has to hold is that the embedder's own count of this chunk fits.
             assert!(
-                n <= STORABLE_TOKENS_CEILING,
-                "chunk at line {} has {n} tokens (ceiling {STORABLE_TOKENS_CEILING})",
+                n <= 4096 + 8,
+                "chunk at line {} has {n} tokens (cap 4096)",
                 c.start_line
             );
+            if n > 1020 {
+                over_old_ceiling += 1;
+            }
         }
+        assert!(
+            over_old_ceiling > 0,
+            "no chunk exceeded the old 1020-token clamp; either the fixture is \
+             too small or the clamp is back: {out:#?}"
+        );
     }
 
     /// A chunk's stored text is the file's own bytes, and the line span it

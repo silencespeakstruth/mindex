@@ -3,15 +3,19 @@ use tokenizers::Tokenizer;
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Language, LanguageError, Node, Parser};
 
-/// Version of everything that turns a file into `project_file_chunks` rows: the
-/// AST walk and node-selection logic below, the left-extension rule, and the
-/// tokenizer the token window is measured with.
+/// Version of the *algorithm* that turns a file into `project_file_chunks` rows:
+/// the AST walk and node-selection logic below, the left-extension rule, and the
+/// gap pass.
 ///
-/// **Bump this whenever a change would produce different chunk boundaries for the
-/// same source text.** Unlike [`SYMBOLS_DERIVATION_VERSION`](crate::slicing::symbols::SYMBOLS_DERIVATION_VERSION),
+/// **Bump this whenever a code change would produce different chunk boundaries
+/// for the same source text.** Unlike [`SYMBOLS_DERIVATION_VERSION`](crate::slicing::symbols::SYMBOLS_DERIVATION_VERSION),
 /// a bump here is expensive: every affected file is re-sliced, re-embedded on the
-/// GPU, and re-upserted to Qdrant. The `[slicer]` token window is *not* covered —
-/// it is config, and changing it is the operator's call, not a code change.
+/// GPU, and re-upserted to Qdrant. Two axes are deliberately *not* covered: the
+/// `[slicer]` token window (config — changing it is the operator's call), and the
+/// tokenizer the window is measured with, which has its own column
+/// (`project_files.chunker_id`, stamped from the registry's `tokenizer_hf_id`) —
+/// the version cannot see a tokenizer change, and pretending it could is how
+/// stale chunks hide behind a matching hash.
 ///
 /// Stored per file in `project_files.chunks_version` and compared by the
 /// prepare-phase skip, so a bump self-heals on the next ordinary indexer run.
@@ -42,39 +46,6 @@ const ABSORBED_KINDS: &[&str] = &["comment", "attribute", "decorator", "annotati
 /// Smallest gap worth its own chunk. Below this a chunk is a fragment — a
 /// closing brace, one `use` line — that costs a vector and answers nothing.
 const GAP_MIN_TOKENS: usize = 24;
-
-/// Two tokens for the `[CLS]`/`[SEP]` pair the embedder adds around every text.
-/// They are not in the tokenizer offsets a slicer measures with (which are taken
-/// with `add_special_tokens = false`) but they *are* in the ColBERT output, so a
-/// chunk cut to exactly the ceiling below comes back two rows over it.
-const SPECIAL_TOKENS: usize = 2;
-
-/// Tokens whose ColBERT rows still fit in one Qdrant point: a multivector may
-/// hold at most 1 048 576 elements, ColBERT emits one [`VECTOR_DIM`]-element row
-/// per token, and [`SPECIAL_TOKENS`] of those rows are not the chunk's own.
-///
-/// **Structural, not configurable** — like [`VECTOR_DIM`] itself. A chunk above
-/// it is not a coarse chunk, it is one Qdrant refuses, and the refusal fails the
-/// whole upsert batch rather than the offending file.
-pub(crate) const STORABLE_TOKENS_CEILING: usize =
-    (1_048_576 / crate::db::qdrant::VECTOR_DIM as usize) - SPECIAL_TOKENS;
-
-/// What a slicer may aim for, which is not the ceiling itself.
-///
-/// Both slicers measure spans against *whole-file* token offsets, while the
-/// embedder re-tokenizes each chunk on its own — and tokenization is
-/// context-dependent, so the two disagree by an edge token or two (the same fact
-/// `WINDOW_SLACK` exists for in the window test). Aiming at the ceiling
-/// therefore lands just over it, measured: a cut of 1022 came back 1023.
-const RETOKENIZATION_SLACK: usize = 2;
-
-/// Hard ceiling both slicers clamp their configured window to, rather than
-/// trusting config validation to have caught it: `[slicer].max_doc_chunk_tokens`
-/// defaults to exactly 1024, which is already over
-/// [`STORABLE_TOKENS_CEILING`] — so a validation rule would refuse a
-/// configuration the operator never chose. The code window (512) is far below it
-/// and clamping never reaches it.
-pub(crate) const MAX_STORABLE_TOKENS: usize = STORABLE_TOKENS_CEILING - RETOKENIZATION_SLACK;
 
 /// The single tokenizer capability the slicer needs: the byte-offset span of each
 /// token in `text`. Abstracted behind a trait so the AST-walk/selection logic can
@@ -123,6 +94,13 @@ pub struct SlicedChunk {
     /// Source text of `start_byte..end_byte`: the selected node, extended left
     /// over its indentation and any doc comment or attribute above it.
     pub code: String,
+    /// Token count of `code`, measured against the whole-file offsets of the
+    /// tokenizer `chunker_id` names. Persisted, so a future model's window can
+    /// be checked against the corpus by SQL instead of a re-tokenization —
+    /// approximate by one edge token (re-encoding a chunk alone is a different
+    /// measurement; the `WINDOW_SLACK` fact), which is what a blast-radius
+    /// query needs and an exact re-count would not improve on.
+    pub tokens: usize,
     // Only read by this module's own unit tests (to verify `code` lines up byte-for-byte
     // with the source); production code never persists these, so cfg-gate them out of
     // non-test builds rather than carry a permanent dead_code warning.
@@ -157,7 +135,7 @@ impl<'a> Slicer<'a> {
             parser,
             tokenizer,
             min_tokens,
-            max_tokens: max_tokens.min(MAX_STORABLE_TOKENS),
+            max_tokens,
             fill_gaps,
         })
     }
@@ -238,7 +216,13 @@ impl<'a> Slicer<'a> {
                             );
                         }
                         emitted_end = emitted_end.max(node.end_byte());
-                        res.push(new_chunk(code, code_start, node.end_byte(), false));
+                        res.push(new_chunk(
+                            code,
+                            &offsets,
+                            code_start,
+                            node.end_byte(),
+                            false,
+                        ));
                         spans.push((code_start, node.end_byte()));
                         // Do not descend: children would produce overlapping chunks.
                         descend = false;
@@ -367,7 +351,7 @@ impl<'a> Slicer<'a> {
                 if code[window_start..window_end].trim().is_empty() {
                     continue;
                 }
-                res.push(new_chunk(code, window_start, window_end, true));
+                res.push(new_chunk(code, offsets, window_start, window_end, true));
             }
         }
     }
@@ -415,10 +399,10 @@ impl<'a> Slicer<'a> {
                 // so cutting only at line boundaries left the window
                 // unenforced exactly where it matters most. Cut on token
                 // boundaries instead. An over-window chunk is not merely
-                // coarse, it is unusable downstream — see
-                // `STORABLE_TOKENS_CEILING`, and note that both the Qdrant
-                // refusal and the embedder's out-of-memory fail the whole batch
-                // the chunk travelled in, not just its own file.
+                // coarse: past the model's own context it is silently
+                // truncated by the embedder, and a huge one exhausts GPU
+                // memory — which fails the whole batch the chunk travelled
+                // in, not just its own file.
                 while tokens_between(window_start, line_end) > self.max_tokens {
                     let Some(cut) =
                         token_boundary(code, offsets, window_start, line_end, self.max_tokens)
@@ -505,11 +489,25 @@ fn line_starts(code: &str, start: usize, end: usize) -> Vec<usize> {
 }
 
 /// Builds a chunk for `code[start..end]`, with every position derived from that
-/// range so the text and the span it reports can never disagree.
-fn new_chunk(code: &str, start: usize, end: usize, #[allow(unused)] from_gap: bool) -> SlicedChunk {
+/// range so the text and the span it reports can never disagree. `tokens` is
+/// measured against the same whole-file `offsets` both passes select with, and
+/// floored at 1 — the span trigger requires non-empty code, and a count of 0
+/// from a degenerate fake tokenizer must not fail the schema CHECK.
+fn new_chunk(
+    code: &str,
+    offsets: &[(usize, usize)],
+    start: usize,
+    end: usize,
+    #[allow(unused)] from_gap: bool,
+) -> SlicedChunk {
     let text = &code[start..end];
+    let tokens = offsets
+        .partition_point(|&(_, e)| e < end)
+        .saturating_sub(offsets.partition_point(|&(s, _)| s < start))
+        .max(1);
     SlicedChunk {
         code: text.into(),
+        tokens,
         #[cfg(test)]
         start_byte: start,
         #[cfg(test)]
@@ -533,7 +531,8 @@ mod tests {
     static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 
     fn tokenizer() -> &'static Tokenizer {
-        TOKENIZER.get_or_init(|| Tokenizer::from_pretrained("BAAI/bge-m3", None).unwrap())
+        TOKENIZER
+            .get_or_init(|| Tokenizer::from_pretrained("Qwen/Qwen3-Embedding-0.6B", None).unwrap())
     }
 
     /// The production shape: gap filling on.
@@ -611,10 +610,9 @@ mod tests {
 
     /// A minified file is one line for its whole length, so the gap pass has no
     /// line boundary to cut at and used to emit the file as a single chunk of
-    /// any size. Downstream that is not a coarse chunk but an unstorable one:
-    /// Qdrant refuses a multivector point above 1 048 576 elements (1024 ColBERT
-    /// tokens × 1024 dimensions) and the embedder runs out of GPU memory on a
-    /// large one, either of which fails the whole batch, not just this file.
+    /// any size. Downstream that is not merely a coarse chunk: past the model's
+    /// context it is silently truncated by the embedder, and a huge one runs the
+    /// GPU out of memory — failing the whole batch, not just this file.
     #[test]
     fn one_line_longer_than_the_window_is_still_cut_to_it() {
         // One token per byte, so the assertion below reads in bytes.
@@ -842,8 +840,10 @@ mod tests {
     /// 512 can re-encode at 513. (Measured: `src/research.rs` produced one.) The
     /// slack is what keeps this a guard on the window rather than a tripwire on
     /// whichever source file happens to land on a boundary — the guard is that no
-    /// chunk is a fragment or a whole file, and two tokens do not change that.
-    const WINDOW_SLACK: usize = 2;
+    /// chunk is a fragment or a whole file, and three tokens do not change that.
+    /// (Three under the Qwen tokenizer, measured: a boundary chunk in this repo
+    /// re-encodes at +3.)
+    const WINDOW_SLACK: usize = 3;
 
     #[test]
     fn chunks_satisfy_token_window() {

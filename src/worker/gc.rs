@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use crate::backend::metrics::{Metrics, TriggerOutcomeLabels};
 use crate::db::qdrant::{VectorStore, collection_name};
 use crate::db::sqlite3::{SQLite3Pool, SQLite3PoolError};
+use crate::models::registry::EmbeddingModelSpec;
 
 /// Seconds in a day — used to turn the configured retention (in days) into the
 /// `unixepoch()` arithmetic the status-log prune does.
@@ -109,6 +110,7 @@ impl GcOutcome {
 pub(crate) async fn collect(
     db_pool: &SQLite3Pool,
     store: &dyn VectorStore,
+    spec: &'static EmbeddingModelSpec,
     status_log_retention_days: u64,
     metrics: &Metrics,
     trigger: &'static str,
@@ -118,7 +120,7 @@ pub(crate) async fn collect(
     metrics.gc.running.set(1);
 
     let out = GcOutcome {
-        chunks: sweep(db_pool, store, token).await,
+        chunks: sweep(db_pool, store, spec, token).await,
         files: prune_deleted_files(db_pool, token).await,
         status_log: prune_status_log(db_pool, status_log_retention_days, token).await,
         research: prune_expired_research(db_pool, token).await,
@@ -161,9 +163,11 @@ pub(crate) async fn collect(
     out
 }
 
+#[allow(clippy::too_many_arguments)] // the worker's irreducible dependencies
 pub async fn run(
     db_pool: Arc<SQLite3Pool>,
     store: Arc<dyn VectorStore>,
+    spec: &'static EmbeddingModelSpec,
     gc_flag: Arc<AtomicBool>,
     gc_interval_seconds: u64,
     status_log_retention_days: u64,
@@ -194,6 +198,7 @@ pub async fn run(
         let out = collect(
             &db_pool,
             &*store,
+            spec,
             status_log_retention_days,
             &metrics,
             "worker",
@@ -237,7 +242,6 @@ pub(crate) async fn prune_deleted_files(db_pool: &SQLite3Pool, token: &Cancellat
                    AND NOT EXISTS (
                        SELECT 1 FROM project_file_chunks c
                        WHERE c.project_guid = project_files.project_guid
-                         AND c.model_id     = project_files.model_id
                          AND c.file_path    = project_files.path
                    )",
                 [],
@@ -358,6 +362,7 @@ pub(crate) async fn prune_expired_research(
 pub(crate) async fn sweep(
     db_pool: &SQLite3Pool,
     store: &dyn VectorStore,
+    spec: &'static EmbeddingModelSpec,
     token: &CancellationToken,
 ) -> Phase {
     let mut total_removed = 0usize;
@@ -418,7 +423,12 @@ pub(crate) async fn sweep(
         // be orphaned in Qdrant forever, with no SQLite row left to track them.
         let mut confirmed_deleted: Vec<String> = Vec::new();
         for (project_guid, guids) in &by_project {
-            let coll = collection_name(project_guid);
+            // The ACTIVE model's collection: soft-deleted chunks are confirmed
+            // gone against it alone. Points the same chunks left in *other*
+            // models' collections are unreachable by search (the candidate set
+            // comes from SQLite) and cost disk only — reclaimed by a --force
+            // reindex or a collection drop, documented in docs/claude/qdrant.md.
+            let coll = collection_name(project_guid, spec.collection_slug);
             match store.delete_batch(&coll, guids.clone()).await {
                 Ok(()) => confirmed_deleted.extend(guids.iter().cloned()),
                 Err(e) => error!(
@@ -483,6 +493,11 @@ pub(crate) async fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::registry::model_by_id;
+
+    fn spec() -> &'static EmbeddingModelSpec {
+        model_by_id("qwen3-embedding-0.6b").expect("registered")
+    }
     use async_trait::async_trait;
     use rusqlite::params;
     use std::collections::HashSet;
@@ -533,9 +548,6 @@ mod tests {
             _collection: &str,
             _chunk_ids: Vec<UUIDv4>,
             _dense: Vec<f32>,
-            _sparse_indices: Vec<u32>,
-            _sparse_values: Vec<f32>,
-            _colbert: Vec<Vec<f32>>,
             _top_k: u64,
         ) -> Result<Vec<SearchHit>, VectorStoreError> {
             unreachable!("sweep does not call search")
@@ -563,24 +575,21 @@ mod tests {
             .map(|_| Uuid::new_v4().simple().to_string())
             .collect();
         pool.transaction(CancellationToken::new(), move |tx| {
-            tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
-                params![g],
-            )?;
+            tx.execute("INSERT INTO projects (guid) VALUES (?1)", params![g])?;
             // 'indexing' is a legal entry status (the insert guard rejects terminal
             // states); GC only touches chunk rows, so the file's status is irrelevant.
             tx.execute(
                 "INSERT INTO project_files
-                     (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'a.rs', ?2, 'rust', 'indexing')",
+                     (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'a.rs', ?2, 'rust', 'indexing')",
                 params![g, "0".repeat(64)],
             )?;
             for qg in &qdrant_guids {
                 tx.execute(
                     "INSERT INTO project_file_chunks
-                         (project_guid, file_path, model_id, code, qdrant_guid,
+                         (project_guid, file_path, code, qdrant_guid, tokens,
                           start_line, end_line, start_column, end_column, status)
-                     VALUES (?1, 'a.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'deleted')",
+                     VALUES (?1, 'a.rs', 'code', ?2, 3, 1, 2, 0, 1, 'deleted')",
                     params![g, qg],
                 )?;
             }
@@ -614,7 +623,7 @@ mod tests {
         let store = FakeStore {
             fail: HashSet::new(),
         };
-        sweep(&pool, &store, &CancellationToken::new()).await;
+        sweep(&pool, &store, spec(), &CancellationToken::new()).await;
 
         assert_eq!(
             deleted_count(&pool, &guid).await,
@@ -633,9 +642,9 @@ mod tests {
 
         // Fail only the second project's collection.
         let store = FakeStore {
-            fail: HashSet::from([collection_name(&guid_fail)]),
+            fail: HashSet::from([collection_name(&guid_fail, spec().collection_slug)]),
         };
-        sweep(&pool, &store, &CancellationToken::new()).await;
+        sweep(&pool, &store, spec(), &CancellationToken::new()).await;
 
         // Confirmed-deleted project: rows gone. Failed project: rows kept for retry
         // (this is the orphan-prevention regression — old code deleted them anyway).
@@ -666,6 +675,7 @@ mod tests {
             &FakeStore {
                 fail: HashSet::new(),
             },
+            spec(),
             &CancellationToken::new(),
         )
         .await;
@@ -677,8 +687,9 @@ mod tests {
         let broken = sweep(
             &pool,
             &FakeStore {
-                fail: HashSet::from([collection_name(&guid)]),
+                fail: HashSet::from([collection_name(&guid, spec().collection_slug)]),
             },
+            spec(),
             &CancellationToken::new(),
         )
         .await;
@@ -702,7 +713,7 @@ mod tests {
             fail: HashSet::new(),
         };
         // No deleted chunks at all: must return promptly without error.
-        sweep(&pool, &store, &CancellationToken::new()).await;
+        sweep(&pool, &store, spec(), &CancellationToken::new()).await;
     }
 
     #[test]
@@ -858,8 +869,8 @@ mod tests {
             for age_days in [40_i64, 31, 1] {
                 tx.execute(
                     "INSERT INTO project_file_status_log
-                         (project_guid, model_id, path, old_status, new_status, retry_count, at)
-                     VALUES ('p', 'BAAI/bge-m3', 'a.rs', NULL, 'indexing', 0, unixepoch() - ?1)",
+                         (project_guid, path, old_status, new_status, retry_count, at)
+                     VALUES ('p', 'a.rs', NULL, 'indexing', 0, unixepoch() - ?1)",
                     params![age_days * 86_400],
                 )?;
             }
@@ -898,13 +909,13 @@ mod tests {
         let qg = Uuid::new_v4().simple().to_string();
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
-                "INSERT INTO projects (guid, model_id) VALUES (?1, 'BAAI/bge-m3')",
+                "INSERT INTO projects (guid) VALUES (?1)",
                 params![g],
             )?;
             // (a) deleted file, no chunks → must be pruned.
             tx.execute(
-                "INSERT INTO project_files (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'gone.rs', ?2, 'rust', 'indexing')",
+                "INSERT INTO project_files (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'gone.rs', ?2, 'rust', 'indexing')",
                 params![g, sha],
             )?;
             tx.execute(
@@ -913,8 +924,8 @@ mod tests {
             )?;
             // (b) indexed file with an active chunk → must remain (not 'deleted').
             tx.execute(
-                "INSERT INTO project_files (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'keep.rs', ?2, 'rust', 'indexing')",
+                "INSERT INTO project_files (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'keep.rs', ?2, 'rust', 'indexing')",
                 params![g, sha],
             )?;
             tx.execute(
@@ -923,15 +934,15 @@ mod tests {
             )?;
             tx.execute(
                 "INSERT INTO project_file_chunks
-                     (project_guid, file_path, model_id, code, qdrant_guid, start_line, end_line, start_column, end_column, status)
-                 VALUES (?1, 'keep.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'active')",
+                     (project_guid, file_path, code, qdrant_guid, tokens, start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'keep.rs', 'code', ?2, 3, 1, 2, 0, 1, 'active')",
                 params![g, qg],
             )?;
             // (c) deleted file that still has a (soft-deleted) chunk → must remain until
             // sweep removes the chunk first (FK RESTRICT + the NOT EXISTS guard).
             tx.execute(
-                "INSERT INTO project_files (project_guid, model_id, path, sha256, programming_language, status)
-                 VALUES (?1, 'BAAI/bge-m3', 'pending.rs', ?2, 'rust', 'indexing')",
+                "INSERT INTO project_files (project_guid, path, sha256, programming_language, status)
+                 VALUES (?1, 'pending.rs', ?2, 'rust', 'indexing')",
                 params![g, sha],
             )?;
             tx.execute(
@@ -940,8 +951,8 @@ mod tests {
             )?;
             tx.execute(
                 "INSERT INTO project_file_chunks
-                     (project_guid, file_path, model_id, code, qdrant_guid, start_line, end_line, start_column, end_column, status)
-                 VALUES (?1, 'pending.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'deleted')",
+                     (project_guid, file_path, code, qdrant_guid, tokens, start_line, end_line, start_column, end_column, status)
+                 VALUES (?1, 'pending.rs', 'code', ?2, 3, 1, 2, 0, 1, 'deleted')",
                 params![g, Uuid::new_v4().simple().to_string()],
             )?;
             Ok(())
@@ -1010,6 +1021,7 @@ mod tests {
         let out = collect(
             &pool,
             &store,
+            spec(),
             30,
             &metrics,
             "worker",
@@ -1039,13 +1051,14 @@ mod tests {
 
         // Qdrant refuses this project's collection, so `sweep` confirms nothing.
         let store = FakeStore {
-            fail: HashSet::from([collection_name(&guid)]),
+            fail: HashSet::from([collection_name(&guid, spec().collection_slug)]),
         };
         let metrics = Metrics::new();
 
         let out = collect(
             &pool,
             &store,
+            spec(),
             30,
             &metrics,
             "worker",
@@ -1115,9 +1128,6 @@ mod tests {
                 _collection: &str,
                 _chunk_ids: Vec<UUIDv4>,
                 _dense: Vec<f32>,
-                _sparse_indices: Vec<u32>,
-                _sparse_values: Vec<f32>,
-                _colbert: Vec<Vec<f32>>,
                 _top_k: u64,
             ) -> Result<Vec<SearchHit>, VectorStoreError> {
                 unreachable!()
@@ -1134,7 +1144,7 @@ mod tests {
         };
         let metrics = Metrics::new();
 
-        let out = collect(&pool, &store, 30, &metrics, "manual", &token).await;
+        let out = collect(&pool, &store, spec(), 30, &metrics, "manual", &token).await;
 
         assert!(token.is_cancelled(), "the store must have cancelled it");
         assert_eq!(
@@ -1164,7 +1174,7 @@ mod tests {
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        let out = collect(&pool, &store, 30, &metrics, "worker", &cancelled).await;
+        let out = collect(&pool, &store, spec(), 30, &metrics, "worker", &cancelled).await;
 
         assert!(
             out.failed_phases().is_empty(),
@@ -1188,6 +1198,7 @@ mod tests {
         let out = collect(
             &pool,
             &store,
+            spec(),
             30,
             &metrics,
             "manual",
@@ -1262,9 +1273,9 @@ mod tests {
             )?;
             tx.execute(
                 "INSERT INTO project_file_chunks
-                     (project_guid, file_path, model_id, code, qdrant_guid,
+                     (project_guid, file_path, code, qdrant_guid, tokens,
                       start_line, end_line, start_column, end_column, status)
-                 VALUES (?1, 'a.rs', 'BAAI/bge-m3', 'new code', ?2, 1, 2, 0, 1, 'active')",
+                 VALUES (?1, 'a.rs', 'new code', ?2, 3, 1, 2, 0, 1, 'active')",
                 params![g, fresh],
             )?;
             Ok(())
@@ -1278,6 +1289,7 @@ mod tests {
         let out = collect(
             &pool,
             &store,
+            spec(),
             30,
             &Metrics::new(),
             "worker",
@@ -1328,9 +1340,9 @@ mod tests {
         pool.transaction(CancellationToken::new(), move |tx| {
             tx.execute(
                 "INSERT INTO project_file_chunks
-                     (project_guid, file_path, model_id, code, qdrant_guid,
+                     (project_guid, file_path, code, qdrant_guid, tokens,
                       start_line, end_line, start_column, end_column, status)
-                 VALUES (?1, 'a.rs', 'BAAI/bge-m3', 'code', ?2, 1, 2, 0, 1, 'active')",
+                 VALUES (?1, 'a.rs', 'code', ?2, 3, 1, 2, 0, 1, 'active')",
                 params![g, live],
             )?;
             Ok(())
@@ -1344,6 +1356,7 @@ mod tests {
         let out = collect(
             &pool,
             &store,
+            spec(),
             30,
             &Metrics::new(),
             "worker",
@@ -1432,6 +1445,7 @@ mod tests {
             &FakeStore {
                 fail: HashSet::new(),
             },
+            spec(),
             30,
             &Metrics::new(),
             "worker",
@@ -1470,8 +1484,9 @@ mod tests {
         let out = collect(
             &pool,
             &FakeStore {
-                fail: HashSet::from([collection_name(&guid)]),
+                fail: HashSet::from([collection_name(&guid, spec().collection_slug)]),
             },
+            spec(),
             30,
             &Metrics::new(),
             "worker",

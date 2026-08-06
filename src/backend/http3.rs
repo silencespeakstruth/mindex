@@ -38,14 +38,21 @@ use crate::backend::v0::handlers::{
 use crate::db::qdrant::VectorStore;
 use crate::db::sqlite3::SQLite3Pool;
 use crate::embed::EmbedTuning;
-use crate::models::bge_m3::BGEm3Model;
+use crate::models::embedder::Embedder;
+use crate::models::registry::EmbeddingModelSpec;
 
+/// The embedding model this process serves: its registry spec (identity, dim,
+/// prefix, tokenizer, collection slug) plus the client that reaches the
+/// instance embedding for the **index** path.
 #[derive(Clone)]
-pub enum EmbeddingModel {
-    BGEm3 {
-        model_id: String,
-        client: Arc<dyn BGEm3Model>,
-    },
+pub struct ActiveModel {
+    pub spec: &'static EmbeddingModelSpec,
+    /// The name the serving side must answer to in `GET /v1/models` — the
+    /// spec's HF repo unless `[model].served_name` overrides it. Carried here
+    /// so the `/health` handshake compares against the same name the startup
+    /// handshake did.
+    pub served_name: String,
+    pub client: Arc<dyn Embedder>,
 }
 
 #[derive(Clone)]
@@ -53,15 +60,15 @@ pub struct RouterState {
     pub tokenizer: Arc<Tokenizer>,
     pub db_pool: Arc<SQLite3Pool>,
     pub qdrant: Arc<dyn VectorStore>,
-    pub model: EmbeddingModel,
+    pub model: ActiveModel,
     /// Embedder for the **query** path only — `/search` and every `search` a
     /// research run makes. Usually the very same `Arc` as `model`'s client; a
     /// second one when `[model].query_server_url` splits the workloads, because
     /// indexing (batches of hundreds, throughput-bound) and querying (one short
     /// text, latency-bound) want opposite hardware. Kept beside `model` rather
     /// than inside it: the *model* is one model — this is which instance answers.
-    pub query_model: Arc<dyn BGEm3Model>,
-    /// Embed/upsert batch sizing + sparse threshold (`[indexing]`/`[qdrant]` config).
+    pub query_model: Arc<dyn Embedder>,
+    /// Embed/upsert batch sizing (`[indexing]`/`[qdrant]` config).
     pub embed_tuning: EmbedTuning,
     /// Slicer token window (`[slicer]` config).
     pub min_chunk_tokens: usize,

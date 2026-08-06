@@ -1698,7 +1698,7 @@ mod tests {
             .get_or_create(&BuildLabels {
                 version: "1.0.0",
                 db_schema_version: "1".into(),
-                model_id: "BAAI/bge-m3".into(),
+                model_id: "qwen3-embedding-0.6b".into(),
             })
             .set(1);
         s.start_time.set(1);
@@ -1913,7 +1913,7 @@ mod tests {
                 refresh_interval_seconds: 60,
                 probe_dependencies: false,
                 max_retries: 3,
-                model_id: "BAAI/bge-m3".to_string(),
+                model_id: "qwen3-embedding-0.6b".to_string(),
             },
             &tokio_util::sync::CancellationToken::new(),
         )
