@@ -189,6 +189,17 @@ ROCm) are in `deploy/embedder/README.md`.
   job whose dependencies were *cancelled* is skipped rather than failed — and
   queued-then-cancelled is precisely the observed failure: on the v2.0.0 rebuild five
   jobs were evicted after fifteen minutes without ever being assigned a runner.
+
+  The page was empty for a reason outside this repository — GitHub Actions was in a
+  major incident from 2026-08-06T15:22Z with webhook delivery throttled to about 15%,
+  so the tag push never triggered a run at all. What is ours is that nothing said so.
+- **The Windows CLI archive stopped being built**, and `verify` caught it on its first
+  production run. The `Build` step declared no `shell:`, so on the Windows runner it
+  ran under PowerShell, which does not read `\` as a line continuation — a ParserError
+  before cargo was invoked. The continuations arrived together with `--target` in the
+  commit that fixed the macOS gap, so that fix broke this archive in the same breath:
+  `mindex-cli-x86_64-pc-windows-msvc.zip` shipped in v1.1.0 and v1.2.0 and was absent
+  from the v2.0.0 rebuild, with five sibling jobs succeeding around it.
 - **Every research turn logged the same immutable fact.** `effective_num_ctx` emitted
   `Model's context window exceeds [research].max_num_ctx_tokens; capping` on each
   call, though the `/api/show` answer behind it is cached per model per process — one
