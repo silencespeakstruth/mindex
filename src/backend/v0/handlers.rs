@@ -79,12 +79,12 @@ use crate::backend::v0::models::SearchResponse;
 use crate::backend::v0::models::SearchResult;
 use crate::backend::v0::models::SkipReason;
 use crate::backend::v0::models::StatusResponse;
-use crate::backend::v0::models::StreamChoice;
 use crate::backend::v0::models::SymbolInfo;
 use crate::backend::v0::models::SymbolsRequest;
 use crate::backend::v0::models::SymbolsResponse;
 use crate::backend::v0::models::UUIDv4;
 use crate::backend::v0::models::VersionResponse;
+use crate::backend::v0::models::wants_stream;
 use crate::backend::v0::models::{DeleteResearchRunsRequest, DeleteResearchRunsResponse};
 use crate::backend::v0::models::{
     DescriptorDocuments, DescriptorEndpoint, DescriptorTransport, MindexDescriptor,
@@ -1384,7 +1384,7 @@ impl FileIndexer<'_> {
 ///   (its chunks are stale too, and symbols must parallel the chunk set); the response
 ///   count is the number of symbol rows written instead of chunks.
 ///
-/// **Streaming** (`?stream=yes`): the same pipeline reported live as SSE
+/// **Streaming** (`?stream=yes`, or an `Accept: text/event-stream`): the same pipeline reported live as SSE
 /// (`text/event-stream`, named events with JSON `data`), for clients that want a
 /// real progress display instead of one summary at the end. The wire shape lives
 /// in four places that must move together: this doc comment, the OpenAPI 200
@@ -1431,8 +1431,9 @@ impl FileIndexer<'_> {
     ),
     request_body = IndexRequest,
     responses(
-        (status = 200, description = "Without `?stream=yes`: per-file chunk counts for the files \
-actually (re)indexed (JSON). With `?stream=yes`: an SSE stream of indexing events — \
+        (status = 200, description = "Without frames (`?stream=yes` or an `Accept: text/event-stream` \
+asks for them; an explicit `?stream=no` overrides the header): per-file chunk counts for the files \
+actually (re)indexed (JSON). With frames: an SSE stream of indexing events — \
 `started` `{files, symbols_only}`, `prepared` `{path, language, chunks, symbols}`, `skipped` \
 `{path, language, reason: unchanged|in_flight|cancelled}`, `embedded` `{batch_chunks, \
 chunks_done, chunks_total, elapsed_ms}` (one per embed batch, cumulative — the basis for a \
@@ -1451,12 +1452,13 @@ the stable `ApiError` code). Closing the connection cancels the request.", body 
 pub async fn post_index(
     IndexScope(project_guid, _auth): IndexScope,
     ApiQuery(q): ApiQuery<IndexQuery>,
+    headers: axum::http::HeaderMap,
     State(s): State<RouterState>,
     ApiJson(payload): ApiJson<IndexRequest>,
 ) -> Result<Response, ApiError> {
     validate::validate_index_request(&payload, s.max_files_per_request, s.max_code_bytes)?;
 
-    if q.stream != Some(StreamChoice::Yes) {
+    if !wants_stream(q.stream, &headers) {
         // JSON mode — the original behaviour: the guard's Drop (fired when a
         // disconnected client's handler future is dropped) cancels the work, and
         // every failure is an HTTP status.
@@ -4721,14 +4723,23 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 /// Iterative code research driven by a local Ollama model.
 ///
 /// **The answer is one JSON body ([`ResearchResponse`]) unless the caller asks for
-/// frames with `?stream=yes`.** The run itself is identical either way — same
-/// loop, same budgets, same journal row; the query decides only who assembles the
-/// terminal. That is `/index`'s shape, and research adopted it late for a reason
-/// worth stating: while frames were compulsory, *reading the response to the end*
-/// was compulsory too, since a disconnect cancels the run. A caller that issued
-/// the request and did not stay to read it spent the whole budget, received
-/// nothing, and raised no error anywhere. Streaming is worth asking for when the
-/// run is being watched; it is a trap when it is not, so it is now asked for.
+/// frames — `?stream=yes`, or an `Accept: text/event-stream`.** The run itself is
+/// identical either way — same loop, same budgets, same journal row; the request
+/// decides only who assembles the terminal. That is `/index`'s shape, and research
+/// adopted it late for a reason worth stating: while frames were compulsory,
+/// *reading the response to the end* was compulsory too, since a disconnect
+/// cancels the run. A caller that issued the request and did not stay to read it
+/// spent the whole budget, received nothing, and raised no error anywhere.
+/// Streaming is worth asking for when the run is being watched; it is a trap when
+/// it is not, so it is now asked for.
+///
+/// The header is the second notation because the query was briefly the *only* one,
+/// and that inverted the same defect: a client which had declared it reads an event
+/// stream got one JSON body when the run ended, found no frames in it, and reported
+/// nothing wrong. Both spellings are read by one predicate
+/// ([`wants_stream`]), so `/index`, `/research` and `/challenge` cannot disagree
+/// about what asking means. An explicit `?stream=no` still wins over any header, and
+/// a wildcard `*/*` is not a request for frames.
 ///
 /// The non-streaming body carries the report, the citation report, the excerpts,
 /// a challenge's verdict and the `done` payload — every one of them the frame of
@@ -4910,7 +4921,7 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
 /// expires with nothing written, the server ships an honest account of the run in its
 /// place rather than closing the stream without a `summary`.
 ///
-/// Without `?stream=yes` that whole window is one silent request: nothing is sent
+/// Without frames that whole window is one silent request: nothing is sent
 /// until the run ends. Any intermediary between caller and server must therefore
 /// tolerate `worst_case_seconds` (published per effort level by `GET /config`) of
 /// quiet — which is the same tolerance an SSE run between two slow turns already
@@ -4928,7 +4939,9 @@ impl<E: SseWireEvent> futures_core::Stream for SseEventStream<E> {
     ),
     request_body = ResearchRequest,
     responses(
-        (status = 200, description = "Without `?stream=yes`: one JSON body when the run ends — \
+        (status = 200, description = "Frames are what you get for `?stream=yes` or an \
+`Accept: text/event-stream`; an explicit `?stream=no` overrides the header, and `*/*` is not a \
+request for frames. Without frames: one JSON body when the run ends — \
 `run_id`, the resolved `model`/`effort` and their grants, the Markdown `report`, and the \
 `citations`, `excerpts`, `verdict` and `done` objects, each byte-for-byte the SSE frame of the \
 same name (the fields below describe both). `thinking`, `step` and `progress` are omitted: they \
@@ -4936,7 +4949,7 @@ exist to be watched, and a caller that wanted to watch asks for the stream. Noth
 until the run ends, so the connection is silent for up to the level's `worst_case_seconds`. A \
 failure that would have been an `error` frame is instead the response status \
 (`ollama.unavailable`, `ollama.error`, `research.no_report`), since with no stream open there \
-is no point at which the status has already been sent. With `?stream=yes`: an SSE stream of research events \
+is no point at which the status has already been sent. With frames: an SSE stream of research events \
 (started/thinking/step/progress/summary/citations/excerpts/done/error). `started` is always the \
 first frame and carries `run_id` — the name this run answers to for its whole life, in \
 `GET /research/active` and in `DELETE /research/active/{run_id}` — plus `worst_case_ms`, the \
@@ -4999,6 +5012,7 @@ an invalid run is refused up front with 400 `validation.research_context_invalid
 pub async fn post_research(
     ResearchScope(project_guid, _auth): ResearchScope,
     ApiQuery(q): ApiQuery<ResearchQuery>,
+    headers: axum::http::HeaderMap,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ResearchRequest>,
 ) -> Result<Response, ApiError> {
@@ -5067,7 +5081,7 @@ pub async fn post_research(
         params,
         "research",
         None,
-        q.stream,
+        wants_stream(q.stream, &headers),
     )
     .await
 }
@@ -5132,7 +5146,7 @@ pub async fn post_research(
     ),
     request_body = ChallengeRequest,
     responses(
-        (status = 200, description = "Exactly what `POST /v0/{project_guid}/research` answers, in whichever mode `?stream=` selects, plus the challenge's `verdict` — `{challenged_run_id, overall, grounded, claims}`, a field of the JSON body and an event after `excerpts` and before `done` on a stream. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`. On success with a parseable verdict this run **replaces** any existing challenge of the same subject — there is at most one standing challenge per report. An inconclusive run replaces nothing.", body = ResearchResponse),
+        (status = 200, description = "Exactly what `POST /v0/{project_guid}/research` answers, in whichever mode the request selects (`?stream=`, else the `Accept` header), plus the challenge's `verdict` — `{challenged_run_id, overall, grounded, claims}`, a field of the JSON body and an event after `excerpts` and before `done` on a stream. `overall` null = inconclusive (not an acquittal); `grounded: false` caps the verdict at `disputed`. On success with a parseable verdict this run **replaces** any existing challenge of the same subject — there is at most one standing challenge per report. An inconclusive run replaces nothing.", body = ResearchResponse),
         (status = 400, description = "Validation failed: out-of-range budget, disallowed model, an invalid subject (`research.challenge_subject_invalid`), a subject that is itself a challenge (`research.challenge_subject_is_challenge`), a subject whose stored scope now matches no indexed file (`research.scope_matches_nothing`), a model Ollama reports cannot call tools (`research.model_lacks_tools`), or a `?stream=` value other than `yes`/`no`.", body = ProblemDetails),
         (status = 404, description = "This project has no such run.", body = ProblemDetails),
         (status = 429, description = "All research slots are busy.", body = ProblemDetails),
@@ -5144,6 +5158,7 @@ pub async fn post_research(
 pub async fn post_research_challenge(
     ResearchScope((project_guid, run_id), _auth): ResearchScope<(UUIDv4, String)>,
     ApiQuery(q): ApiQuery<ResearchQuery>,
+    headers: axum::http::HeaderMap,
     State(s): State<RouterState>,
     ApiJson(req): ApiJson<ChallengeRequest>,
 ) -> Result<Response, ApiError> {
@@ -5271,7 +5286,7 @@ pub async fn post_research_challenge(
         params,
         "challenge",
         Some(run_id),
-        q.stream,
+        wants_stream(q.stream, &headers),
     )
     .await
 }
@@ -5294,7 +5309,7 @@ async fn launch_research_job(
     params: crate::research::ResearchParams,
     kind: &'static str,
     challenged_run_id: Option<String>,
-    stream: Option<StreamChoice>,
+    stream: bool,
 ) -> Result<Response, ApiError> {
     // Before the permit, and before the scope count: a run is a tool-calling loop, so
     // a model that cannot call tools spends a slot, a model load and a turn only to
@@ -5507,7 +5522,7 @@ async fn launch_research_job(
         .await;
     });
 
-    if stream == Some(StreamChoice::Yes) {
+    if stream {
         let stream = SseEventStream::new(rx, token);
         return Ok(axum::response::sse::Sse::new(stream)
             .keep_alive(

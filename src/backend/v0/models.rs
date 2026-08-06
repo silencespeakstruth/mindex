@@ -256,10 +256,13 @@ pub struct IndexResponse {
 #[serde(deny_unknown_fields)]
 pub struct IndexQuery {
     /// `yes` switches the response to an SSE stream of per-file / per-batch
-    /// indexing events (see the endpoint description); `no` or absent keeps the
-    /// original one-shot JSON summary. An enum rather than a bool so the wire
-    /// spelling is exactly `stream=yes|no` and anything else is a 400, not a
+    /// indexing events (see the endpoint description); `no` keeps the original
+    /// one-shot JSON summary. An enum rather than a bool so the wire spelling is
+    /// exactly `stream=yes|no` and anything else is a 400, not a
     /// silently-ignored truthy string.
+    ///
+    /// **Absent, the `Accept` header decides** — see [`wants_stream`]. Present, it
+    /// wins either way.
     pub stream: Option<StreamChoice>,
 }
 
@@ -277,9 +280,14 @@ pub struct IndexQuery {
 #[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchQuery {
-    /// `yes` streams the run as SSE (see the endpoint description); `no` or absent
-    /// answers one [`ResearchResponse`] when the run ends. Same enum, same 400 on
-    /// a typo, for the same reason it is an enum on `/index`.
+    /// `yes` streams the run as SSE (see the endpoint description); `no` answers
+    /// one [`ResearchResponse`] when the run ends. Same enum, same 400 on a typo,
+    /// for the same reason it is an enum on `/index`.
+    ///
+    /// **Absent, the `Accept` header decides** — see [`wants_stream`]. That second
+    /// notation exists because this one was briefly the only one, which turned the
+    /// opt-in's own defect around: a client that had declared it reads an event
+    /// stream was answered with one JSON body minutes later and raised nothing.
     pub stream: Option<StreamChoice>,
 }
 
@@ -290,6 +298,53 @@ pub struct ResearchQuery {
 pub enum StreamChoice {
     Yes,
     No,
+}
+
+/// The media type that means "send me frames".
+const EVENT_STREAM: &str = "text/event-stream";
+
+/// Whether this request wants frames, from the two notations that can ask for
+/// them. One predicate, shared by `/index`, `/research` and `/challenge`, so the
+/// three cannot disagree about what asking for a stream means.
+///
+/// `?stream=` decides whenever it is present, in both directions: an explicit
+/// `no` stays `no`, because a caller that spelled it out has said something no
+/// header may override. Absent, an `Accept` **naming** `text/event-stream` is the
+/// same request in the other notation.
+///
+/// Reading the header at all is the repair of a real defect rather than a
+/// courtesy. Making frames opt-in protects a caller that does not read them —
+/// research spends its whole budget on a socket nobody is holding — but the
+/// query was made the *only* way to ask, so a client that had declared it reads
+/// an event stream was answered with one JSON body minutes later, its frame
+/// parser found nothing, and it raised no error anywhere. That is the same silent
+/// non-answer the opt-in exists to prevent, pointed at the caller who did
+/// everything right, and it is what every pre-2.0.0 client hits.
+///
+/// Only an explicit token counts. `*/*` must **not** stream: Swagger UI, a
+/// browser and every default HTTP client send it while wanting exactly the JSON
+/// mode, so treating a wildcard as consent would hand frames to the callers the
+/// opt-in was built to protect.
+pub fn wants_stream(q: Option<StreamChoice>, headers: &axum::http::HeaderMap) -> bool {
+    match q {
+        Some(StreamChoice::Yes) => true,
+        Some(StreamChoice::No) => false,
+        // An `Accept` is a comma list whose entries may carry parameters
+        // (`;q=0.9`), and media types are case-insensitive — so the token is
+        // compared after splitting on both and trimming, never by `contains`,
+        // which would also match a type merely *ending* in this one.
+        None => headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|accept| {
+                accept.split(',').any(|entry| {
+                    entry
+                        .split(';')
+                        .next()
+                        .is_some_and(|media| media.trim().eq_ignore_ascii_case(EVENT_STREAM))
+                })
+            }),
+    }
 }
 
 /// Why a posted file produced no work and is absent from the final counts.
@@ -2856,5 +2911,56 @@ mod tests {
             "ProgrammingLanguage::ALL contains a duplicate"
         );
         assert!(!ProgrammingLanguage::ALL.is_empty());
+    }
+
+    fn accepting(value: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::ACCEPT, value.parse().unwrap());
+        h
+    }
+
+    /// The defect this predicate exists for: a caller that declared it reads an
+    /// event stream used to be handed one JSON body when the run ended, minutes
+    /// later, and its frame parser found nothing to raise an error about.
+    #[test]
+    fn an_accept_header_asking_for_frames_streams_without_the_query() {
+        assert!(wants_stream(None, &accepting("text/event-stream")));
+        // Case and parameters are both legal on the wire.
+        assert!(wants_stream(None, &accepting("TEXT/Event-Stream;q=0.9")));
+        // One entry of a list is enough.
+        assert!(wants_stream(
+            None,
+            &accepting("application/json, text/event-stream;q=0.9")
+        ));
+    }
+
+    /// The query decides in BOTH directions when it is present: a caller that
+    /// spelled out `no` has said something no header may override.
+    #[test]
+    fn an_explicit_stream_no_beats_the_accept_header() {
+        assert!(!wants_stream(
+            Some(StreamChoice::No),
+            &accepting("text/event-stream")
+        ));
+        // And the converse: `yes` needs no header's agreement.
+        assert!(wants_stream(
+            Some(StreamChoice::Yes),
+            &accepting("application/json")
+        ));
+    }
+
+    /// `*/*` is what Swagger UI, a browser and every default HTTP client send
+    /// while wanting exactly the JSON mode — reading it as consent would hand
+    /// frames to the very callers the opt-in was built to protect. A media type
+    /// merely *ending* in the token is not the token either.
+    #[test]
+    fn a_wildcard_accept_is_not_a_request_for_frames() {
+        assert!(!wants_stream(None, &accepting("*/*")));
+        assert!(!wants_stream(None, &accepting("application/json")));
+        assert!(!wants_stream(
+            None,
+            &accepting("application/text/event-stream")
+        ));
+        assert!(!wants_stream(None, &axum::http::HeaderMap::new()));
     }
 }

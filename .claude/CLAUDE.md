@@ -657,12 +657,22 @@ contract.** (Design decisions marked "measured" point to the 2026-07-28
 108-run and 2026-07-30 28-run corpora summarized there; the corpus of record
 is the `research_runs` table.) The hard invariants:
 
-- **Streaming is opt-in (`?stream=yes`), and the default answers one JSON body.**
+- **Streaming is opt-in, and the default answers one JSON body.**
   `/index`'s shape, adopted late and for a sharper reason: frames make
   disconnection the cancellation interface, which also makes *reading to `done`*
   compulsory — so a caller that issued the request and did not stay spent the
   whole budget, got nothing, and raised no error anywhere. Safe behaviour is now
-  what you get by not asking. Both entrances read the query through
+  what you get by not asking. **Two notations ask, and the second exists because
+  the first was briefly the only one**: `?stream=yes`, or an `Accept:
+  text/event-stream`. Query-only inverted the very defect the opt-in closes —
+  a client that had *declared* it reads frames was answered with one JSON body
+  minutes later, its parser found none, and it reported nothing wrong; that is
+  what every pre-2.0.0 client hit. `models::wants_stream` is the single predicate
+  (`/index`, `/research`, `/challenge` share it, so they cannot disagree): the
+  query wins in **both** directions when present — an explicit `no` is a decision,
+  not an absence — and only an explicit media type counts, since `*/*` is what
+  Swagger UI, a browser and every default client send while wanting exactly the
+  JSON mode. Both entrances resolve it before
   `launch_research_job`, so it cannot mean one thing on research and another on a
   challenge; everything above the spawn (pre-flight refusals, permit, minted
   `run_id`, registry entry, `started` frame) is identical and only the tail forks.
