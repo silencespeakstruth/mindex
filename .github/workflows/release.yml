@@ -87,7 +87,13 @@ jobs:
       - uses: actions/checkout@v5
 
       # rust-toolchain.toml pins the channel; `rustup show` materialises it.
+      #
+      # `shell: bash` here is prophylactic rather than load-bearing — two bare
+      # commands parse under PowerShell too — but this matrix contains Windows,
+      # and the step below shows what one continuation costs when it does not say
+      # which shell it meant.
       - name: Install the pinned toolchain
+        shell: bash
         run: |
           rustup show
           rustup target add ${{ matrix.target }}
@@ -110,7 +116,16 @@ jobs:
       # a label rather than a fact, and correct only by coincidence. With it the
       # output is always `target/<triple>/release/`, which the packaging steps
       # below now read, so the name and the binary cannot disagree.
+      # `shell: bash` is load-bearing on Windows and nowhere else. Without it the
+      # runner's default there is PowerShell, which does not read `\` as a line
+      # continuation — so the command below is a ParserError and the job dies
+      # before cargo is invoked. The continuations arrived with `--target` in the
+      # commit that fixed the macOS gap, which therefore broke the Windows archive
+      # in the same breath: shipped in v1.1.0 and v1.2.0, absent from the v2.0.0
+      # rebuild. Every other multi-line step in this file already says `shell:
+      # bash` for the same reason, including `Package (windows)` directly below.
       - name: Build
+        shell: bash
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
             --manifest-path tools/indexer/Cargo.toml
