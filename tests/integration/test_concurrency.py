@@ -259,7 +259,7 @@ def test_concurrent_index_and_delete_files(
 def test_embed_failure_marks_failed_then_reindex_recovers(
     client: httpx.Client, project: str, embed_fail: Callable[[int], None]
 ) -> None:
-    # First /encode fails → file 'failed' (chunks inserted, no vectors), so search is
+    # First embed call fails → file 'failed' (chunks inserted, no vectors), so search is
     # empty (404). A reindex of the *same* content must NOT be hash-skipped (the skip
     # is gated on status='indexed'); it re-embeds back to 'indexed'.
     embed_fail(1)
@@ -297,7 +297,7 @@ def test_failed_index_does_not_clobber_a_later_index(
     # After Request 1 finishes, a fresh reindex cleanly wins; the earlier 'failed'
     # state is gone and the file ends 'indexed' with one consistent chunk set.
     embed_delay(1.5)
-    embed_fail(1)  # the in-flight embed (the only /encode in the window) will 503
+    embed_fail(1)  # the in-flight embed (the only embed call in the window) will 503
 
     doomed: dict = {}
 

@@ -808,7 +808,7 @@ impl Metrics {
         );
         registry.register(
             "embed_batch_texts",
-            "Texts per /encode call",
+            "Texts per /v1/embeddings call",
             embed.batch_size.clone(),
         );
         registry.register("embed_texts", "Texts embedded", embed.texts.clone());

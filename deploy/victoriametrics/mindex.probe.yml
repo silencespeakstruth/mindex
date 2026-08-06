@@ -1,0 +1,55 @@
+# EXAMPLE — blackbox probes for the mindex stack. Append to `scrape_configs:`
+# beside the `mindex` job in `mindex.scrape.yml`.
+#
+# WHY BOTH. `mindex.scrape.yml` reads mindex's own `/metrics`, and everything it
+# reports is a statement mindex makes about itself. That is exactly what stops
+# being available in the case worth alerting on: a process that is down, wedged
+# or unreachable publishes nothing, and "no data" is indistinguishable from "the
+# collector was restarted". A probe answers the one question the service cannot
+# answer about itself — is anything listening — with an actual connection rather
+# than systemd's opinion of one.
+#
+# The relabelling is the standard blackbox pattern and it is not optional: without
+# it every series lands with `instance` set to the exporter, so all seven targets
+# collapse into one and the panel shows the exporter's health seven times.
+#
+# `service` is the label to key dashboards and alerts on. Keep the values stable:
+# renaming one silently empties every panel that filters on it, and this file
+# exists partly because one of them said `bge-m3-embedder` for two releases after
+# BGE-M3 was deleted — a probe that was working and lying about what it probed.
+#
+# Needs prometheus/blackbox_exporter on :9115 with `http_2xx` plus a module that
+# accepts mindex's certificate. mindex is TLS-only with a locally-issued leaf, so
+# either install the issuing root in the exporter's trust store or give it a
+# module with `insecure_skip_verify: true` — the probe asks whether the port
+# answers, not whether the chain is good, and the scrape job is where certificate
+# validity is actually established.
+
+  - job_name: 'probe'
+    metrics_path: /probe
+    scrape_interval: 30s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - source_labels: [__param_module]
+        target_label: module
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+    static_configs:
+      # The three mindex cannot report on when it is the thing that is down.
+      - targets: ['https://127.0.0.1:11111/health']
+        labels: {__param_module: https_localhost_2xx, service: mindex}
+      - targets: ['http://127.0.0.1:11211/health']
+        labels: {__param_module: http_2xx, service: mindex-embedder}
+      - targets: ['http://127.0.0.1:6333/readyz']
+        labels: {__param_module: http_2xx, service: qdrant}
+      # Optional; its absence is `degraded`, not `unhealthy` (research stops,
+      # search keeps working), so alert on it at a lower severity than the rest.
+      - targets: ['http://127.0.0.1:11434/api/version']
+        labels: {__param_module: http_2xx, service: ollama}
+      # The collector itself. Self-scraping answers "is VictoriaMetrics up" only
+      # while it is up; this answers it from outside the same process.
+      - targets: ['http://127.0.0.1:8428/health']
+        labels: {__param_module: http_2xx, service: victoriametrics}

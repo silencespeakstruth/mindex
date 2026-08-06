@@ -62,7 +62,7 @@ def project(client: httpx.Client) -> str:
 
 @pytest.fixture
 def embed_delay() -> Iterator[Callable[[float], None]]:
-    """Set the mock embedder's per-/encode delay, always resetting it to 0 after.
+    """Set the mock embedder's per-embed-call delay, always resetting it to 0 after.
 
     Lets a test widen the window a file stays 'indexing' so an /index request can be
     caught in-flight. Yields a setter ``set(secs)``.
@@ -83,7 +83,7 @@ def embed_delay() -> Iterator[Callable[[float], None]]:
 
 @pytest.fixture
 def embed_fail() -> Iterator[Callable[[int], None]]:
-    """Make the next ``n`` /encode calls fail with 503, always resetting to 0 after.
+    """Make the next ``n`` embed calls fail with 503, always resetting to 0 after.
 
     Lets a test drive a file to 'failed' (embed failure) and then observe recovery
     (reindex, or the retry worker). Yields a setter ``fail(n)``.

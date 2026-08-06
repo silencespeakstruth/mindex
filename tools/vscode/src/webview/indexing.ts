@@ -113,7 +113,7 @@ function render(): void {
     clock.textContent = duration(elapsedMs(s));
     subtitle.textContent = subtitleFor(s, running);
 
-    // The embed pass reports **once, on completion** — the server calls `/encode`
+    // The embed pass reports **once, on completion** — the server calls `/v1/embeddings`
     // per `embed_batch` chunks, so a batch below that size sends exactly one
     // `embedded` carrying `chunks_done == chunks_total`. There is no partial number
     // to draw, so the bar goes indeterminate: a `<progress>` with no `value` says
@@ -298,7 +298,7 @@ function rowFor(f: RunFile, unit: string): HTMLElement {
     }
     // The language mark, not a spinner: it is the one thing about the row that is
     // worth a glyph and does not change, and an animation here was measured to say
-    // nothing at all — every row of a batch is in the same `/encode` call, so they
+    // nothing at all — every row of a batch is in the same embed call, so they
     // all pulsed together for the whole embed pass.
     if (row.language !== f.language) {
         row.language = f.language;

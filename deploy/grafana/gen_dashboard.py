@@ -385,6 +385,134 @@ P += [
         "here for minutes by design.",
     ),
 ]
+y += 3
+
+# The two collection alarms, and the build they belong to. These are the only
+# things on this dashboard that can see a schema-version or model bump landing
+# badly, and they had no panel at all through the v2 -> v3 migration — the one
+# event they exist for. README calls them out by name as worth an alert on day
+# one; a dashboard that renders neither, next to that sentence, is the sharpest
+# way to have a signal and not use it.
+#
+# BOTH GAUGES ARE SEEDED AT -1 AND NEVER AT 0. `0` is the healthy reading, so an
+# unreachable Qdrant must not be able to spell it: a pass that could not complete
+# publishes nothing and the gauge stays at whatever it last knew, or at -1 if it
+# has never completed. That is why -1 is mapped to a word rather than left to
+# render as a number below the green threshold.
+_COLLECTION_STATE = [
+    {
+        "type": "value",
+        "options": {"-1": {"text": "no data yet", "index": 0}},
+    }
+]
+
+P += [
+    stat(
+        "Stale collections",
+        gp(4, 3, 0, y),
+        "max(mindex_stale_collections)",
+        mappings=_COLLECTION_STATE,
+        thresholds=[
+            {"color": "text", "value": None},
+            {"color": "green", "value": 0},
+            {"color": "red", "value": 1},
+        ],
+        colour_mode="background",
+        desc="Projects holding active chunks whose current-version collection is "
+        "missing or empty — **their search is broken right now**. Non-zero after "
+        "a COLLECTION_SCHEMA_VERSION or [model].id change means the reindex has "
+        "not been run. `no data yet` means the hourly pass has never completed; "
+        "it is not the same as 0.",
+    ),
+    stat(
+        "Orphaned collections",
+        gp(4, 3, 3, y),
+        "max(mindex_orphaned_collections)",
+        mappings=_COLLECTION_STATE,
+        thresholds=[
+            {"color": "text", "value": None},
+            {"color": "green", "value": 0},
+            {"color": "yellow", "value": 1},
+        ],
+        colour_mode="background",
+        desc="Collections at a superseded schema version: unreachable by anything, "
+        "still holding a whole pre-bump index. Nothing deletes them automatically "
+        "— that is what makes a rollback possible — so this is a disk-space and "
+        "housekeeping number, not an outage. A collection belonging to another "
+        "*registered model* is held rather than orphaned and is not counted here.",
+    ),
+    stat(
+        "Version",
+        gp(4, 3, 6, y),
+        'max by (version) (mindex_build_info{job="mindex"})',
+        desc="From `mindex_build_info`. Two series here means two builds are "
+        "answering the same job — a half-finished rollout.",
+    ),
+    stat(
+        "Embedding model",
+        gp(4, 3, 9, y),
+        'max by (model_id) (mindex_build_info{job="mindex"})',
+        desc="The registry id whose vectors this process writes and searches. "
+        "Changing it writes a NEW collection per project and holds the old one, "
+        "so expect 'Stale collections' to rise until every project is re-embedded "
+        "(`mindex-index --vectors-only`).",
+    ),
+    stat(
+        "Workers running",
+        gp(4, 3, 12, y),
+        "count(mindex_worker_running == 1)",
+        thresholds=[
+            {"color": "red", "value": None},
+            {"color": "green", "value": 7},
+        ],
+        colour_mode="background",
+        desc="Should be 7: gc, retry, metrics, collection_check, ollama_catalog, "
+        "research_stats, research_watchdog. A panicked worker's series goes "
+        "**absent**, not to 0 — supervise() publishes the gauge before the task "
+        "starts precisely so a never-started worker is missing rather than "
+        "invisible. Count, not sum, for that reason.",
+    ),
+    stat(
+        "Dependencies up",
+        gp(4, 3, 15, y),
+        "sum(mindex_dependency_up)",
+        desc="One per configured dependency: sqlite, qdrant, embedder, ollama, "
+        "and query_embedder only in a split deployment. Compare against the "
+        "Embedder & Qdrant row before concluding which is down.",
+    ),
+    stat(
+        "State snapshot age",
+        gp(4, 3, 18, y),
+        "time() - max(mindex_state_refreshed_timestamp_seconds)",
+        unit="s",
+        thresholds=[
+            {"color": "green", "value": None},
+            {"color": "orange", "value": 300},
+        ],
+        colour_mode="background",
+        desc="Since the metrics worker last completed a full read. A failed tick "
+        "keeps the previous gauges rather than zeroing them, which is right and "
+        "also indistinguishable from a healthy one — this is the only thing that "
+        "tells them apart. Every per-project number on this dashboard is this old.",
+    ),
+    stat(
+        "Unscorable winners",
+        gp(4, 3, 21, y),
+        "sum(increase(mindex_search_unscorable_winners_total[$__range])) or vector(0)",
+        thresholds=[
+            {"color": "green", "value": None},
+            {"color": "red", "value": 1},
+        ],
+        colour_mode="background",
+        desc="Expected to stay at 0. A chunk the embedder scored NaN — the "
+        "documented producers are an fp16 embedder returning NaN for padded rows, "
+        "and a split deployment whose two instances differ in precision. They rank "
+        "last rather than first, so the symptom without this counter is 'search "
+        "sometimes puts something irrelevant on top', which reads as a ranking "
+        "complaint and is a misconfigured embedder. `increase()`, not `rate()`: "
+        "the series does not exist until the first event.",
+    ),
+]
 y += 4
 
 P += [
@@ -836,7 +964,7 @@ P += [
         "Embed batch size",
         gp(8, 12, 0, y),
         "sum by (le) (rate(mindex_embed_batch_texts_bucket[$__rate_interval]))",
-        desc="Texts per /encode call. Indexing should cluster near "
+        desc="Texts per /v1/embeddings call. Indexing should cluster near "
         "`[indexing].embed_batch_chunks`; queries are always 1.",
     ),
     ts(
@@ -1411,6 +1539,106 @@ P += [
         ),
         custom=BARS_CUSTOM,
         legend=LEGEND_TABLE_SUM,
+    ),
+]
+y += 7
+
+# The three per-turn contention guards. They all ship armed and they answer a
+# question no other panel here can: a run inching along looks exactly like a
+# broken model, a bad prompt and a wedged server, and before these existed the
+# only evidence was a wall-clock number nobody could attribute.
+#
+# THE RATE AND THE UNACCOUNTED TIME ARE NOT REDUNDANT, and the second is the one
+# that was missing. Ollama's `eval_duration` is taken inside Ollama's own
+# handler, so a turn slowed by *queueing behind another client on the same GPU*
+# generates at full speed while it holds the device and scores healthy. Measured
+# on this host: a plan turn took 912 s of wall clock for 702 tokens while every
+# one of the preceding week's 220 turns sat between 32 and 128 tok/s. The 890
+# lost seconds are entirely in `unaccounted`.
+P += [
+    ts(
+        "Turn generation rate",
+        gp(7, 8, 0, y),
+        targets(
+            (
+                'histogram_quantile(0.5, sum by (le, model) (rate(mindex_research_turn_tokens_per_second_bucket{model=~"$model"}[$__rate_interval])))',
+                "p50 {{model}}",
+            ),
+            (
+                'histogram_quantile(0.1, sum by (le, model) (rate(mindex_research_turn_tokens_per_second_bucket{model=~"$model"}[$__rate_interval])))',
+                "p10 {{model}}",
+            ),
+        ),
+        unit="short",
+        desc="Tokens per second over Ollama's own **generation** clock. A healthy "
+        "rate is a fact about one model on one host — 15 tok/s is fine for a 30B "
+        "and alarming for a 7B — so read the distribution here before setting "
+        "`[research].slow_turn_tokens_per_second`. Points with gaps kept: a "
+        "quantile over a rare histogram is undefined in windows with no run.",
+        custom=POINTS_CUSTOM,
+        overrides=by_name_overrides({"p50": "green", "p10": "orange"}),
+    ),
+    ts(
+        "Time Ollama did not account for",
+        gp(7, 8, 8, y),
+        targets(
+            (
+                "histogram_quantile(0.9, sum by (le) (rate(mindex_research_turn_unaccounted_seconds_bucket[$__rate_interval])))",
+                "p90",
+            ),
+            (
+                "histogram_quantile(0.5, sum by (le) (rate(mindex_research_turn_unaccounted_seconds_bucket[$__rate_interval])))",
+                "p50",
+            ),
+            (
+                "histogram_quantile(0.9, sum by (le) (rate(mindex_research_turn_load_seconds_bucket[$__rate_interval])))",
+                "p90 model load",
+            ),
+        ),
+        unit="s",
+        desc="Wall clock minus everything Ollama reported for the turn. It holds "
+        "HTTP, TLS and NDJSON framing — and, when it is large, time **queued "
+        "behind another client on the same GPU**, which Ollama's own timings "
+        "cannot see because they start inside its handler. `model load` beside it "
+        "separates the other cause: alternating clients asking one model for "
+        "different `num_ctx` evict and reload the weights every turn.",
+        custom=POINTS_CUSTOM,
+        overrides=by_name_overrides(
+            {"p90": "red", "p50": "orange", "p90 model load": "purple"}
+        ),
+    ),
+    ts(
+        "Turns abandoned",
+        gp(7, 8, 16, y),
+        targets(
+            (ev("mindex_research_stalled_turns_total"), "stalled (max_turn_seconds)"),
+            (
+                ev("mindex_research_runaway_thinking_turns_total"),
+                "runaway thinking",
+            ),
+            (
+                ev("mindex_research_tool_call_parse_retries_total"),
+                "tool-call parse retry",
+            ),
+            (ev("mindex_research_watchdog_cancels_total"), "watchdog cancel"),
+        ),
+        unit="short",
+        desc="A turn abandoned as an empty reply — the run continues on the budget "
+        "that is left rather than returning nothing. `stalled` is the only one of "
+        "the four **not** expected to stay at zero on a shared GPU. `watchdog "
+        "cancel` is: it fires for a run past its whole budget plus the grace, and "
+        "a sustained non-zero there means a run is wedged in an await its token "
+        "cannot reach.",
+        custom=BARS_CUSTOM,
+        legend=LEGEND_TABLE_SUM,
+        overrides=by_name_overrides(
+            {
+                "stalled (max_turn_seconds)": "orange",
+                "runaway thinking": "yellow",
+                "tool-call parse retry": "blue",
+                "watchdog cancel": "red",
+            }
+        ),
     ),
 ]
 y += 7

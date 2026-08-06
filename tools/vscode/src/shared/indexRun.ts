@@ -54,7 +54,7 @@ export interface BatchRecord {
  * 14 files / 173 chunks: `prepared` arrived for every file inside 700 ms (3.6% of
  * the run), then **18.5 seconds of total silence**, then one `embedded` carrying
  * `chunks_done == chunks_total` — the embed pass reports once, on completion,
- * because the server calls `/encode` per `embed_batch` (256) chunks and 173 is one
+ * because the server calls `/v1/embeddings` per `embed_batch` (256) chunks and 173 is one
  * call — and then every `indexed` plus `done` inside 2 ms.
  *
  * So 96% of a small run is one phase that emits nothing at all. The panel can
@@ -272,7 +272,7 @@ export class IndexRun {
         this.phase = phase;
         this.phaseSince = now;
         if (phase === "embedding") {
-            // Every prepared file of this batch is in the same `/encode` call.
+            // Every prepared file of this batch is in the same embed call.
             for (const f of this.rows.values()) {
                 if (f.state === "prepared") {
                     f.state = "embedding";

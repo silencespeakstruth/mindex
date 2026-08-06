@@ -117,7 +117,7 @@ const DEFAULT_FILL_GAPS: bool = true;
 /// already marked every topic change; it earns its keep on documents with sparse
 /// or absent headings, where structure alone degenerates to packing blindly up to
 /// the cap. On by default for that reason, and free to turn off: 0 disables the
-/// per-document `/encode` entirely. Above ~4 it outvotes chunk cost and the
+/// per-document embed call entirely. Above ~4 it outvotes chunk cost and the
 /// segmentation collapses toward one block per chunk.
 const DEFAULT_DOC_SEMANTIC_WEIGHT: f64 = 1.0;
 /// Past this the term stops refining and starts shredding, so a larger value is
@@ -466,7 +466,7 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IndexingConfig {
-    /// Chunks per `/encode` call (the GPU batch lever).
+    /// Chunks per `/v1/embeddings` call (the GPU batch lever).
     pub embed_batch_chunks: usize,
     /// Minutes a file may sit in `indexing` before the retry worker treats it as
     /// crash-orphaned. Must exceed the longest legitimate in-flight request.
@@ -486,7 +486,7 @@ pub struct SlicerConfig {
     /// section is a complete claim, and the code slicer's floor would drop it.
     pub max_doc_chunk_tokens: usize,
     /// How much embedding distance influences where documentation is cut.
-    /// 0 turns the term off, and with it the per-document `/encode`.
+    /// 0 turns the term off, and with it the per-document embed call.
     pub doc_semantic_weight: f64,
 }
 
@@ -1344,7 +1344,7 @@ pub struct Cli {
     #[arg(long)]
     pub db_pool_size: Option<usize>,
 
-    /// Chunks sent to the model server per /encode call during indexing (default: 256).
+    /// Chunks sent to the model server per /v1/embeddings call during indexing (default: 256).
     #[arg(long)]
     pub embed_batch: Option<usize>,
 

@@ -425,7 +425,7 @@ struct FileIndexer<'a> {
     /// Documentation chunk cap (from config). Documentation has no minimum.
     max_doc_chunk_tokens: usize,
     /// Weight of the semantic-shift term when cutting documentation; 0 turns it
-    /// off, along with the per-document `/encode`.
+    /// off, along with the per-document embed call.
     doc_semantic_weight: f64,
     /// Request-scoped cancellation token (the handler's `CancellationGuard`).
     token: &'a CancellationToken,
@@ -578,7 +578,7 @@ impl FileIndexer<'_> {
     /// Slices a document, refining its boundaries with block embeddings.
     ///
     /// Runs outside the prepare transaction because the middle step is an
-    /// `/encode` round-trip. The two CPU halves go to `spawn_blocking`: parsing
+    /// `/v1/embeddings` round-trip. The two CPU halves go to `spawn_blocking`: parsing
     /// and the packing DP are cheap, but "cheap" on a 40 KB document is still
     /// milliseconds of tokenizer work, which does not belong on a runtime
     /// thread.
@@ -611,7 +611,7 @@ impl FileIndexer<'_> {
         .map_err(slicer_err_to_pool_err)
         .map_err(ApiError::from)?;
 
-        // One `/encode` for the whole document's blocks. Skipped entirely when
+        // One `/v1/embeddings` call for the whole document's blocks. Skipped entirely when
         // the term is off, so `doc_semantic_weight = 0` costs no round-trip.
         let vectors = if weight > 0.0 && !plan.is_empty() {
             let texts: Vec<String> = plan
@@ -887,7 +887,7 @@ impl FileIndexer<'_> {
     }
 
     /// Phase 2: embed + upsert every chunk across all prepared files in one batched
-    /// pass (`embed_batch` chunks per `/encode`). `progress` is invoked per completed
+    /// pass (`embed_batch` chunks per `/v1/embeddings` call). `progress` is invoked per completed
     /// batch — `None` outside a streaming (`?stream=yes`) request.
     async fn embed_all(
         &self,

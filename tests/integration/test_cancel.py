@@ -91,7 +91,7 @@ def test_cancel_indexed_file_is_noop(client: httpx.Client, project: str) -> None
 def test_cancel_live_indexing_file(
     client: httpx.Client, project: str, embed_delay: Callable[[float], None]
 ) -> None:
-    embed_delay(3.0)  # hold each /encode for 3s so the file lingers in 'indexing'
+    embed_delay(3.0)  # hold each embed call for 3s so the file lingers in 'indexing'
 
     def do_index() -> None:
         with httpx.Client(verify=False, timeout=30.0) as c:

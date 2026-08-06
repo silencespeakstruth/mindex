@@ -116,7 +116,7 @@ synchronous = "normal"  # SQLite synchronous mode: off / normal / full / extra
 # Note: journal_mode=WAL and foreign_keys=ON are fixed (correctness invariants).
 
 [indexing]
-embed_batch_chunks = 256   # chunks per /encode call — the GPU batch lever
+embed_batch_chunks = 256   # chunks per /v1/embeddings call — the GPU batch lever
 stuck_grace_minutes = 30   # how long a file may sit in 'indexing' before the retry
                            # worker treats it as crash-orphaned; MUST exceed the
                            # longest legitimate in-flight indexing request
@@ -135,7 +135,7 @@ max_chunk_tokens = 364  # largest — measured (bench/FINDINGS.md §2.5: +0.011 
 max_doc_chunk_tokens = 1024
 # How much embedding distance refines where documentation is cut, against the
 # heading structure (which always wins outright at heading levels 1-2). 0 turns
-# it off along with the one /encode per document; 1 is the default; above ~4 the
+# it off along with the one embed call per document; 1 is the default; above ~4 the
 # segmentation collapses toward one block per chunk. On a densely-headed corpus
 # this measurably changes nothing — it earns its keep on documents whose headings
 # are sparse or absent, where structure alone can only pack up to the cap.

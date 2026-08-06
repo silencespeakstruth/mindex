@@ -28,7 +28,7 @@
 //! "fill to the cap", cutting mid-topic. Documentation of that quality is the
 //! common case across projects; this repository is not a fair sample of it.
 //!
-//! What it costs is one `/encode` per document, and that is the whole reason it
+//! What it costs is one `/v1/embeddings` call per document, and that is the whole reason it
 //! is a refinement rather than a requirement: when the embedder is unreachable
 //! the slicer falls back to structure alone, which is measured to be equally
 //! good here and is never worse than not indexing the file. Two consequences to

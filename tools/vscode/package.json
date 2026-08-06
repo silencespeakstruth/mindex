@@ -433,7 +433,7 @@
           "default": 10,
           "minimum": 1,
           "maximum": 10000,
-          "markdownDescription": "Files per `/index` request when reindexing. Smaller batches report progress more often: the server emits one `embedded` event per completed embed batch, so a whole reindex sent as one request reports its GPU pass exactly once, on completion. Measured on this stack (14 files, 173 chunks): 14 files/request took 18.7 s and produced 1 progress event; 5 took 17.8 s and 3 events; 2 took 17.1 s and 7 events — so splitting cost no throughput at all here. Raise it for bulk runs on a fast GPU, where larger `/encode` batches do pay."
+          "markdownDescription": "Files per `/index` request when reindexing. Smaller batches report progress more often: the server emits one `embedded` event per completed embed batch, so a whole reindex sent as one request reports its GPU pass exactly once, on completion. Measured on this stack (14 files, 173 chunks): 14 files/request took 18.7 s and produced 1 progress event; 5 took 17.8 s and 3 events; 2 took 17.1 s and 7 events — so splitting cost no throughput at all here. Raise it for bulk runs on a fast GPU, where larger embed batches do pay."
         },
         "mindex.researchModel": {
           "type": "string",
